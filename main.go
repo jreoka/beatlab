@@ -83,6 +83,13 @@ func main() {
 		sources.NewYtDlp(env("BEATLAB_YTDLP", "")),
 		sources.NewTorrent(),
 	)
+	// Sources that miss a search's soft deadline keep running in
+	// the background; their tracks land here so the catalog keeps
+	// warming even after the client got its answer.
+	registry.Sink = func(t store.Track) {
+		tt := t
+		st.UpsertTrack(&tt)
+	}
 	eng := engine.New(st, registry, dataDir, cacheGB)
 	te := taste.New(st, registry)
 	api := subsonic.New(st, registry, eng, te)

@@ -72,6 +72,10 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 	if y.bin == "" {
 		return nil, ErrNotConfigured
 	}
+	// yt-dlp can stall for minutes on a throttled connection; the
+	// search must never wait on it unbounded.
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
 	n := limit
 	if n > 15 {
 		n = 15
@@ -166,6 +170,10 @@ func (y *YtDlpSource) Resolve(ctx context.Context, ref string) (string, error) {
 		return r.url, nil
 	}
 	y.mu.Unlock()
+	// Same stall guard as Search: playback start must not hang
+	// on a stuck yt-dlp either.
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, y.bin, "-g", "-f", "bestaudio/best", "--no-warnings", page)
 	out, err := cmd.Output()
 	if err != nil {
