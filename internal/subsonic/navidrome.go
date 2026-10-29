@@ -110,7 +110,7 @@ func (c *ndCtx) song(t store.Track) map[string]any {
 		"duration":             float64(t.Duration),
 		"genre":                t.Genre,
 		"genres":               genres,
-		"hasCoverArt":          t.CoverURL != "",
+		"hasCoverArt":          true, // real art when it exists, generated tile otherwise — getCoverArt always answers
 		"orderAlbumArtistName": t.Artist,
 		"orderAlbumName":       t.Album,
 		"orderArtistName":      t.Artist,
@@ -165,6 +165,7 @@ func (c *ndCtx) album(g albumGroup) map[string]any {
 	return map[string]any{
 		"id":                    g.id,
 		"name":                  g.name,
+		"coverArtId":            g.id,
 		"albumArtist":           g.artist,
 		"albumArtistId":         artistTrack.ArtistID(),
 		"artist":                g.artist,

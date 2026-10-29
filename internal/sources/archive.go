@@ -64,6 +64,47 @@ type iaMetadata struct {
 	} `json:"files"`
 }
 
+// canonicalGenres maps archive.org's free-text subject tags onto
+// a small set of real music genres. Subjects are uploader chaos —
+// semicolon-joined lists, reversed artist names ("Holiday,
+// Billie"), event descriptions — so anything that isn't clearly
+// a genre is dropped rather than surfaced as one.
+var canonicalGenres = map[string]string{
+	"jazz": "Jazz", "bebop": "Jazz", "swing": "Jazz", "big band": "Jazz",
+	"blues": "Blues", "rock": "Rock", "rock and roll": "Rock", "rock & roll": "Rock",
+	"pop": "Pop", "classical": "Classical", "classic": "Classical", "opera": "Classical",
+	"electronic": "Electronic", "techno": "Electronic", "house": "Electronic",
+	"ambient": "Ambient", "hip hop": "Hip-Hop", "hip-hop": "Hip-Hop", "rap": "Hip-Hop",
+	"folk": "Folk", "country": "Country", "bluegrass": "Country",
+	"soul": "Soul", "funk": "Funk", "r&b": "R&B", "rhythm and blues": "R&B",
+	"reggae": "Reggae", "metal": "Metal", "punk": "Punk",
+	"latin": "Latin", "gospel": "Gospel", "soundtrack": "Soundtrack",
+	"world": "World", "singer-songwriter": "Folk",
+}
+
+func canonicalGenre(subject any) string {
+	var raw []string
+	switch s := subject.(type) {
+	case string:
+		raw = append(raw, s)
+	case []any:
+		for _, p := range s {
+			if str, ok := p.(string); ok {
+				raw = append(raw, str)
+			}
+		}
+	}
+	for _, r := range raw {
+		for _, part := range strings.FieldsFunc(r, func(c rune) bool { return c == ';' || c == ',' }) {
+			key := strings.TrimSpace(strings.ToLower(part))
+			if g, ok := canonicalGenres[key]; ok {
+				return g
+			}
+		}
+	}
+	return ""
+}
+
 func creatorString(v any) string {
 	switch c := v.(type) {
 	case string:
@@ -235,14 +276,7 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 	if len(md.Metadata.Year) >= 4 {
 		fmt.Sscanf(md.Metadata.Year[:4], "%d", &year)
 	}
-	genre := ""
-	if subs, ok := md.Metadata.Subject.([]any); ok && len(subs) > 0 {
-		if s, ok := subs[0].(string); ok {
-			genre = s
-		}
-	} else if s, ok := md.Metadata.Subject.(string); ok {
-		genre = s
-	}
+	genre := canonicalGenre(md.Metadata.Subject)
 
 	cover := pickCover(identifier, md)
 
@@ -266,9 +300,9 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 		}
 		trackArtist := artist
 		if f.Artist != "" {
-			trackArtist = f.Artist
+			trackArtist = strings.TrimSpace(f.Artist)
 		} else if f.Creator != "" {
-			trackArtist = f.Creator
+			trackArtist = strings.TrimSpace(f.Creator)
 		}
 		if trackArtist == "Unknown Artist" {
 			// No attribution anywhere — these unattributed
@@ -277,7 +311,7 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 		}
 		trackAlbum := album
 		if f.Album != "" {
-			trackAlbum = f.Album
+			trackAlbum = strings.TrimSpace(f.Album)
 		}
 		trackNo := 0
 		fmt.Sscanf(f.Track, "%d", &trackNo)

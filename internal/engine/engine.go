@@ -5,14 +5,21 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"fmt"
+	"hash/fnv"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"beatlab/internal/sources"
@@ -27,6 +34,9 @@ type Engine struct {
 	budget    int64
 	http      *http.Client
 	userAgent string
+
+	genMu    sync.Mutex
+	genCache map[string][]byte
 }
 
 func New(st *store.Store, reg *sources.Registry, dataDir string, cacheGB int) *Engine {
@@ -172,18 +182,19 @@ func (e *Engine) evict() {
 	}
 }
 
-// ServeCover returns a track's cover art, disk-cached after first fetch.
-func (e *Engine) ServeCover(w http.ResponseWriter, r *http.Request, t *store.Track) {
+// ServeCover returns a track's real cover art, disk-cached after
+// first fetch. It reports whether it served anything — callers
+// fall back to generated art when it didn't.
+func (e *Engine) ServeCover(w http.ResponseWriter, r *http.Request, t *store.Track) bool {
 	if t.CoverURL == "" {
-		http.NotFound(w, r)
-		return
+		return false
 	}
 	path := filepath.Join(e.coverDir, cacheName(t.ID)+".img")
 	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
 		w.Header().Set("Content-Type", http.DetectContentType(data))
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		w.Write(data)
-		return
+		return true
 	}
 	req, _ := http.NewRequestWithContext(r.Context(), "GET", t.CoverURL, nil)
 	req.Header.Set("User-Agent", e.userAgent)
@@ -192,14 +203,12 @@ func (e *Engine) ServeCover(w http.ResponseWriter, r *http.Request, t *store.Tra
 		if resp != nil {
 			resp.Body.Close()
 		}
-		http.NotFound(w, r)
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil || len(data) == 0 {
-		http.NotFound(w, r)
-		return
+		return false
 	}
 	os.WriteFile(path, data, 0o644)
 	ct := resp.Header.Get("Content-Type")
@@ -209,6 +218,108 @@ func (e *Engine) ServeCover(w http.ResponseWriter, r *http.Request, t *store.Tra
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Write(data)
+	return true
+}
+
+// ServeGenerated serves deterministic generated artwork for a
+// seed (usually an album id): a deep two-tone gradient in a
+// hash-derived hue with the equalizer-bars motif. Much of the
+// open catalog (live recordings especially) simply has no cover
+// art — a designed tile beats a broken-image placeholder, and
+// because it's derived from the album id, every track and view
+// of the album shows the same art.
+func (e *Engine) ServeGenerated(w http.ResponseWriter, seed string) {
+	e.genMu.Lock()
+	if e.genCache == nil {
+		e.genCache = map[string][]byte{}
+	}
+	data, ok := e.genCache[seed]
+	e.genMu.Unlock()
+	if !ok {
+		data = renderGeneratedCover(seed)
+		e.genMu.Lock()
+		if len(e.genCache) < 512 {
+			e.genCache[seed] = data
+		}
+		e.genMu.Unlock()
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(data)
+}
+
+func hsl(h, s, l float64) color.RGBA {
+	// h in [0,360), s and l in [0,1]
+	c := (1 - math.Abs(2*l-1)) * s
+	x := c * (1 - math.Abs(math.Mod(h/60, 2)-1))
+	m := l - c/2
+	var r, g, b float64
+	switch {
+	case h < 60:
+		r, g, b = c, x, 0
+	case h < 120:
+		r, g, b = x, c, 0
+	case h < 180:
+		r, g, b = 0, c, x
+	case h < 240:
+		r, g, b = 0, x, c
+	case h < 300:
+		r, g, b = x, 0, c
+	default:
+		r, g, b = c, 0, x
+	}
+	return color.RGBA{uint8((r + m) * 255), uint8((g + m) * 255), uint8((b + m) * 255), 255}
+}
+
+func renderGeneratedCover(seed string) []byte {
+	const n = 400
+	h := fnv.New32a()
+	h.Write([]byte(seed))
+	sum := h.Sum32()
+	hue := float64(sum % 360)
+	hue2 := float64((sum / 360) % 360)
+	rng := sum
+	next := func() uint32 { rng = rng*1664525 + 1013904223; return rng >> 8 }
+
+	img := image.NewRGBA(image.Rect(0, 0, n, n))
+	top := hsl(hue, 0.45, 0.10)
+	bottom := hsl(hue2, 0.5, 0.20)
+	for y := 0; y < n; y++ {
+		f := float64(y) / n
+		c := color.RGBA{
+			uint8(float64(top.R)*(1-f) + float64(bottom.R)*f),
+			uint8(float64(top.G)*(1-f) + float64(bottom.G)*f),
+			uint8(float64(top.B)*(1-f) + float64(bottom.B)*f),
+			255,
+		}
+		for x := 0; x < n; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	// Equalizer bars, heights from the hash — the favicon motif
+	// at album scale.
+	accent := hsl(hue, 0.85, 0.68)
+	bars := 5
+	barW, gap := 34, 22
+	totalW := bars*barW + (bars-1)*gap
+	x0 := (n - totalW) / 2
+	for i := 0; i < bars; i++ {
+		bh := 60 + int(next()%140)
+		x1 := x0 + i*(barW+gap)
+		y1 := (n - bh) / 2
+		for y := y1; y < y1+bh; y++ {
+			for x := x1; x < x1+barW; x++ {
+				// rounded caps
+				if (y-y1 < 8 || y1+bh-y <= 8) && (x-x1 < 6 || x1+barW-x <= 6) {
+					continue
+				}
+				img.Set(x, y, accent)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
 }
 
 var _ = time.Now

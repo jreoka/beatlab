@@ -758,24 +758,41 @@ func (a *API) handleStream(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) handleCover(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
+	// Album / artist: any track with real art stands in for the
+	// group; if none has art, serve generated art for the group
+	// id so every album and artist always has a face.
 	if strings.HasPrefix(id, "al:") {
-		tracks, _ := a.store.QueryTracks(store.Query{AlbumID: id, Limit: 1})
+		tracks, _ := a.store.QueryTracks(store.Query{AlbumID: id, Limit: 100})
+		for i := range tracks {
+			if tracks[i].CoverURL != "" && a.engine.ServeCover(w, r, &tracks[i]) {
+				return
+			}
+		}
 		if len(tracks) > 0 {
-			a.engine.ServeCover(w, r, &tracks[0])
+			a.engine.ServeGenerated(w, id)
 			return
 		}
 	}
 	if strings.HasPrefix(id, "ar:") {
 		if name, ok := store.ArtistNameFromID(a.store, id); ok {
-			tracks, _ := a.store.QueryTracks(store.Query{Artist: name, Limit: 1})
+			tracks, _ := a.store.QueryTracks(store.Query{Artist: name, Limit: 100})
+			for i := range tracks {
+				if tracks[i].CoverURL != "" && a.engine.ServeCover(w, r, &tracks[i]) {
+					return
+				}
+			}
 			if len(tracks) > 0 {
-				a.engine.ServeCover(w, r, &tracks[0])
+				a.engine.ServeGenerated(w, id)
 				return
 			}
 		}
 	}
 	if t, ok := a.store.Track(id); ok {
-		a.engine.ServeCover(w, r, t)
+		if a.engine.ServeCover(w, r, t) {
+			return
+		}
+		// Seed by album so the whole album shares one generated tile.
+		a.engine.ServeGenerated(w, t.AlbumID())
 		return
 	}
 	http.NotFound(w, r)

@@ -57,8 +57,14 @@ type ytdlpSearchJSON struct {
 		Channel   string  `json:"channel"`
 		Duration  float64 `json:"duration"`
 		Thumbnail string  `json:"thumbnail"`
-		URL       string  `json:"url"`
-		Webpage   string  `json:"webpage_url"`
+		// Flat-playlist output carries thumbnails[]; the singular
+		// thumbnail field is only filled by full extraction.
+		Thumbnails []struct {
+			URL   string `json:"url"`
+			Width int    `json:"width"`
+		} `json:"thumbnails"`
+		URL     string `json:"url"`
+		Webpage string `json:"webpage_url"`
 	} `json:"entries"`
 }
 
@@ -103,6 +109,16 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 		if page == "" {
 			page = "https://www.youtube.com/watch?v=" + e.ID
 		}
+		cover := e.Thumbnail
+		if cover == "" {
+			bestW := -1
+			for _, th := range e.Thumbnails {
+				if th.URL != "" && th.Width >= bestW {
+					bestW = th.Width
+					cover = th.URL
+				}
+			}
+		}
 		tracks = append(tracks, store.Track{
 			ID:        "youtube:" + e.ID,
 			Source:    "youtube",
@@ -111,7 +127,7 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 			Album:     album,
 			Duration:  int(e.Duration),
 			Format:    "opus",
-			CoverURL:  e.Thumbnail,
+			CoverURL:  cover,
 			StreamURL: "ytdlp:" + page, // resolved on demand by Resolve
 			Meta:      page,
 		})

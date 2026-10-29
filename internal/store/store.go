@@ -326,7 +326,13 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 	default:
 		sqlStr += ` ORDER BY ` + q.Order
 	}
-	if q.Limit > 0 {
+	// Virtual-ID filters (AlbumID/ArtistID) are applied in Go
+	// after the query — a SQL LIMIT would cut the catalog down
+	// BEFORE filtering and silently return nothing for most
+	// albums once the catalog outgrows the limit. Only push
+	// LIMIT/OFFSET into SQL when no virtual filter is present.
+	virtual := q.ArtistID != "" || q.AlbumID != ""
+	if q.Limit > 0 && !virtual {
 		sqlStr += fmt.Sprintf(` LIMIT %d`, q.Limit)
 		if q.Offset > 0 {
 			sqlStr += fmt.Sprintf(` OFFSET %d`, q.Offset)
@@ -343,7 +349,6 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 		if err != nil {
 			return nil, err
 		}
-		// virtual-ID filters applied post-query (they derive from fields)
 		if q.ArtistID != "" && t.ArtistID() != q.ArtistID {
 			continue
 		}
@@ -351,6 +356,18 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 			continue
 		}
 		out = append(out, t)
+	}
+	if virtual {
+		if q.Offset > 0 {
+			if q.Offset < len(out) {
+				out = out[q.Offset:]
+			} else {
+				out = nil
+			}
+		}
+		if q.Limit > 0 && len(out) > q.Limit {
+			out = out[:q.Limit]
+		}
 	}
 	return out, nil
 }
