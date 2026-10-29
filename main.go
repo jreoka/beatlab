@@ -54,7 +54,7 @@ func adminPassword(dataDir string) string {
 
 // version identifies the build in the startup log and /healthz,
 // so it's always obvious which binary is actually running.
-const version = "0.1.0-searchfix2"
+const version = "0.1.0-searchfix3"
 
 // statusWriter captures the response status for request logging.
 type statusWriter struct {
@@ -68,15 +68,14 @@ func (w *statusWriter) WriteHeader(code int) {
 }
 
 // logRequests logs one line per API request (method, path,
-// status, duration). Streams and cover art are skipped — they're
-// long-lived binary transfers, not requests that can "hang" in a
-// way a log line would explain. The point is diagnosability: if a
-// client spins, the log shows whether the request arrived and
-// whether it ever finished.
+// status, duration). Only streams are skipped — they're
+// open-ended transfers by design. The point is diagnosability:
+// if a client spins, the log shows whether the request arrived
+// and whether it ever finished.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if strings.Contains(p, "/stream") || strings.Contains(p, "/getCoverArt") {
+		if strings.Contains(p, "/stream") {
 			next.ServeHTTP(w, r)
 			return
 		}

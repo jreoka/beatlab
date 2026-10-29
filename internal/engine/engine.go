@@ -33,6 +33,7 @@ type Engine struct {
 	coverDir  string
 	budget    int64
 	http      *http.Client
+	coverHTTP *http.Client
 	userAgent string
 
 	genMu    sync.Mutex
@@ -41,12 +42,22 @@ type Engine struct {
 
 func New(st *store.Store, reg *sources.Registry, dataDir string, cacheGB int) *Engine {
 	e := &Engine{
-		store:     st,
-		registry:  reg,
-		cacheDir:  filepath.Join(dataDir, "cache", "audio"),
-		coverDir:  filepath.Join(dataDir, "cache", "covers"),
-		budget:    int64(cacheGB) << 30,
-		http:      &http.Client{Timeout: 0},
+		store:    st,
+		registry: reg,
+		cacheDir: filepath.Join(dataDir, "cache", "audio"),
+		coverDir: filepath.Join(dataDir, "cache", "covers"),
+		budget:   int64(cacheGB) << 30,
+		// Streams are long-lived, so no total timeout — but a
+		// stalled upstream must not hold a request open forever
+		// waiting for response headers.
+		http: &http.Client{Transport: &http.Transport{
+			ResponseHeaderTimeout: 20 * time.Second,
+		}},
+		// Covers are small and latency-critical (a page renders
+		// dozens at once): hard total timeout, so one stalled CDN
+		// host can't pin an image slot — the caller falls back to
+		// generated art instead.
+		coverHTTP: &http.Client{Timeout: 10 * time.Second},
 		userAgent: "Beatlab/0.1",
 	}
 	os.MkdirAll(e.cacheDir, 0o755)
@@ -198,7 +209,7 @@ func (e *Engine) ServeCover(w http.ResponseWriter, r *http.Request, t *store.Tra
 	}
 	req, _ := http.NewRequestWithContext(r.Context(), "GET", t.CoverURL, nil)
 	req.Header.Set("User-Agent", e.userAgent)
-	resp, err := e.http.Do(req)
+	resp, err := e.coverHTTP.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			resp.Body.Close()
