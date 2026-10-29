@@ -226,12 +226,30 @@ func (a *API) NDLoginHandler() http.HandlerFunc {
 		rand.Read(buf)
 		token := hex.EncodeToString(buf)
 		a.store.KVSet("ndtoken:"+token, strconv.FormatInt(user.ID, 10))
+		// Feishin (and Navidrome's own clients) build the ongoing
+		// Subsonic credential from subsonicSalt/subsonicToken in
+		// this response: credential = u&…&s=<salt>&t=<token> where
+		// token = md5(password+salt). Without them the login
+		// "succeeds" but every later call fails auth — Feishin
+		// surfaces that as "Failed to get user info" at its
+		// getUser step. The salt is stable per user.
+		saltKey := "ndsalt:" + strconv.FormatInt(user.ID, 10)
+		salt, ok := a.store.KVGet(saltKey)
+		if !ok {
+			sb := make([]byte, 8)
+			rand.Read(sb)
+			salt = hex.EncodeToString(sb)
+			a.store.KVSet(saltKey, salt)
+		}
+		sum := md5.Sum([]byte(user.Password + salt))
 		json.NewEncoder(w).Encode(map[string]any{
-			"id":       strconv.FormatInt(user.ID, 10),
-			"username": user.Username,
-			"name":     user.Username,
-			"token":    token,
-			"isAdmin":  user.IsAdmin,
+			"id":            strconv.FormatInt(user.ID, 10),
+			"username":      user.Username,
+			"name":          user.Username,
+			"token":         token,
+			"isAdmin":       user.IsAdmin,
+			"subsonicSalt":  salt,
+			"subsonicToken": hex.EncodeToString(sum[:]),
 		})
 	}
 }
