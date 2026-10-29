@@ -37,7 +37,7 @@ func (a *API) ndSongList(w http.ResponseWriter, r *http.Request) {
 	year := q.Get("year")
 	starredOnly := q.Get("starred") == "true"
 
-	var out []map[string]any
+	out := []map[string]any{}
 	for _, t := range tracks {
 		if len(albumIDs) > 0 && !inSet(albumIDs, t.AlbumID()) {
 			continue
@@ -93,7 +93,7 @@ func (a *API) ndAlbumList(w http.ResponseWriter, r *http.Request) {
 	starredOnly := q.Get("starred") == "true"
 	year := q.Get("year")
 
-	var out []map[string]any
+	out := []map[string]any{}
 	for _, g := range groups {
 		at := store.Track{Artist: g.artist}
 		if len(artistIDs) > 0 && !inSet(artistIDs, at.ArtistID()) {
@@ -163,7 +163,7 @@ func (a *API) ndArtistList(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	name := strings.ToLower(q.Get("name"))
-	var out []map[string]any
+	out := []map[string]any{}
 	for _, n := range a.store.Artists() {
 		if n == "" || strings.EqualFold(n, "Unknown Artist") {
 			continue

@@ -89,9 +89,9 @@ func (c *ndCtx) song(t store.Track) map[string]any {
 	if bitRate <= 0 {
 		bitRate = 128
 	}
-	var genres any
+	genres := []map[string]any{}
 	if t.Genre != "" {
-		genres = []map[string]any{ndGenreObj(t.Genre)}
+		genres = append(genres, ndGenreObj(t.Genre))
 	}
 	m := map[string]any{
 		"id":                   t.ID,
@@ -157,9 +157,9 @@ func (c *ndCtx) album(g albumGroup) map[string]any {
 			starred = true
 		}
 	}
-	var genres any
+	genres := []map[string]any{}
 	if genre != "" {
-		genres = []map[string]any{ndGenreObj(genre)}
+		genres = append(genres, ndGenreObj(genre))
 	}
 	artistTrack := store.Track{Artist: g.artist}
 	return map[string]any{

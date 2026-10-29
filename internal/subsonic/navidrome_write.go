@@ -96,7 +96,7 @@ func (a *API) ndPlaylistList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := strings.ToLower(r.URL.Query().Get("q"))
-	var out []map[string]any
+	out := []map[string]any{}
 	for _, usr := range a.store.Users() {
 		for _, p := range a.store.Playlists(usr.ID) {
 			pl := p
