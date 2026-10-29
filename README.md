@@ -99,6 +99,17 @@ native login at `POST /auth/login` returning
 accepted via the `X-ND-Authorization` header. Responses in XML or
 JSON (`f=json`).
 
+**Navidrome native API (`/api/*`)** — clients in "Navidrome"
+mode (Feishin) browse and manage playlists through Navidrome's
+own REST API rather than Subsonic's, so Beatlab implements it:
+song/album/artist/genre/tag lists and details (with
+`_start/_end/_sort/_order` pagination and `X-Total-Count`),
+playlist CRUD including track add/remove/move (Navidrome's
+entry-id + `mediaFileId` convention), the user list, the play
+queue, and internet-radio stations (shared with the Subsonic
+`getInternetRadioStations`). Not implemented: shares and image
+upload/delete.
+
 ## Notes & tradeoffs
 
 - **API passwords are stored recoverably in the local SQLite DB.**

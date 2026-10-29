@@ -96,6 +96,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/rest/", api.Handler())
 	mux.HandleFunc("/auth/login", api.NDLoginHandler())
+	mux.Handle("/api/", api.NDHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ok":true}`))

@@ -438,7 +438,13 @@ func (a *API) dispatch(w http.ResponseWriter, r *http.Request) {
 	case "getLyrics":
 		resp = a.ok(E("lyrics"))
 	case "getInternetRadioStations":
-		resp = a.ok(E("internetRadioStations"))
+		root := E("internetRadioStations")
+		for _, s := range a.RadioStations() {
+			root.Add(E("internetRadioStation").
+				A("id", s.ID).A("name", s.Name).
+				A("streamUrl", s.StreamURL).A("homePageUrl", s.HomePageURL))
+		}
+		resp = a.ok(root)
 	case "jukeboxControl":
 		resp = a.fail(0, "Jukebox is not supported by Beatlab")
 	default:
