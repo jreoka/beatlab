@@ -1,0 +1,110 @@
+// Beatlab — Bitlab for music. A single-binary, self-hosted music
+// streaming server speaking the Subsonic/OpenSubsonic API (so
+// Navidrome clients just work), fetching music on demand from
+// multiple sources, caching it locally, and learning each
+// listener's taste to power recommendations and radio auto-mixes.
+package main
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"beatlab/internal/engine"
+	"beatlab/internal/sources"
+	"beatlab/internal/store"
+	"beatlab/internal/subsonic"
+	"beatlab/internal/taste"
+	"beatlab/internal/webui"
+)
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func adminPassword(dataDir string) string {
+	if v := os.Getenv("BEATLAB_ADMIN_PASSWORD"); v != "" {
+		return v
+	}
+	path := filepath.Join(dataDir, "admin-password.txt")
+	if raw, err := os.ReadFile(path); err == nil {
+		if p := strings.TrimSpace(string(raw)); p != "" {
+			return p
+		}
+	}
+	buf := make([]byte, 9)
+	rand.Read(buf)
+	p := hex.EncodeToString(buf)
+	os.MkdirAll(dataDir, 0o755)
+	if err := os.WriteFile(path, []byte(p+"\n"), 0o600); err == nil {
+		log.Printf("[beatlab] generated admin password, saved to %s", path)
+	}
+	return p
+}
+
+func main() {
+	addr := env("BEATLAB_ADDR", ":4533")
+	dataDir := env("BEATLAB_DATA", "./beatlab-data")
+	cacheGB, _ := strconv.Atoi(env("BEATLAB_CACHE_GB", "10"))
+	if cacheGB <= 0 {
+		cacheGB = 10
+	}
+
+	st, err := store.Open(dataDir)
+	if err != nil {
+		log.Fatalf("[beatlab] open store: %v", err)
+	}
+	defer st.Close()
+
+	password := adminPassword(dataDir)
+
+	// Seed the first API user so clients can connect immediately:
+	// username BEATLAB_USER (default "admin"), password = the admin
+	// password. More users are managed in the console.
+	if st.UserCount() == 0 {
+		username := env("BEATLAB_USER", "admin")
+		if _, err := st.CreateUser(username, password, true); err != nil {
+			log.Fatalf("[beatlab] seed user: %v", err)
+		}
+		log.Printf("[beatlab] seeded API user %q (password = admin password)", username)
+	}
+
+	registry := sources.NewRegistry(
+		sources.NewArchive(),
+		sources.NewYtDlp(env("BEATLAB_YTDLP", "")),
+		sources.NewTorrent(),
+	)
+	eng := engine.New(st, registry, dataDir, cacheGB)
+	te := taste.New(st, registry)
+	api := subsonic.New(st, registry, eng, te)
+	ui := webui.New(st, registry, te, password, cacheGB)
+	ui.SetRadioRefresher(api)
+
+	mux := http.NewServeMux()
+	mux.Handle("/rest/", api.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	})
+	mux.Handle("/", ui.Handler())
+
+	log.Printf("[beatlab] data dir: %s", dataDir)
+	log.Printf("[beatlab] sources:")
+	for _, s := range registry.All() {
+		log.Printf("[beatlab]   - %s: %s", s.Name(), s.Status())
+	}
+	log.Printf("[beatlab] admin console: http://localhost%s/admin", addr)
+	log.Printf("[beatlab] Subsonic API:  http://localhost%s/rest (user: %s)", addr, env("BEATLAB_USER", "admin"))
+	log.Printf("[beatlab] listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatal(err)
+	}
+}

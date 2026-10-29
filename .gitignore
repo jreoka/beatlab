@@ -1,0 +1,8 @@
+# Built binaries (rebuild with: go build)
+beatlab.exe
+beatlab-linux
+beatlab
+
+# Runtime data (database, cache, admin password)
+beatlab-data/
+*.db
