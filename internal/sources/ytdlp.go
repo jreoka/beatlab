@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -84,11 +85,20 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 		if e.ID == "" {
 			continue
 		}
-		artist := e.Uploader
-		if artist == "" {
-			artist = e.Channel
+		channel := e.Uploader
+		if channel == "" {
+			channel = e.Channel
 		}
-		artist = strings.TrimSuffix(artist, " - Topic")
+		channel = strings.TrimSuffix(strings.TrimSpace(channel), " - Topic")
+		artist, title := parseYtTitle(e.Title, channel)
+		// Album: the channel (a session/compilation source like
+		// "THE FIRST TAKE" reads correctly as an album), or the
+		// artist for Topic/self uploads. Never a bare "YouTube" —
+		// that collapsed every upload into one junk album.
+		album := channel
+		if album == "" || strings.EqualFold(album, artist) {
+			album = artist
+		}
 		page := e.Webpage
 		if page == "" {
 			page = "https://www.youtube.com/watch?v=" + e.ID
@@ -96,9 +106,9 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 		tracks = append(tracks, store.Track{
 			ID:        "youtube:" + e.ID,
 			Source:    "youtube",
-			Title:     e.Title,
+			Title:     title,
 			Artist:    artist,
-			Album:     "YouTube",
+			Album:     album,
 			Duration:  int(e.Duration),
 			Format:    "opus",
 			CoverURL:  e.Thumbnail,
@@ -107,6 +117,27 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 		})
 	}
 	return tracks, nil
+}
+
+var ytJunkSuffix = regexp.MustCompile(`(?i)\s*[\(\[][^\)\]]*(official|lyric|audio|video|mv|hd|4k|remaster|visualizer)[^\)\]]*[\)\]]`)
+
+// parseYtTitle splits the ubiquitous "Artist - Title" video
+// naming, strips "(Official Video)"-style suffixes, and falls
+// back to the channel as artist.
+func parseYtTitle(raw, channel string) (artist, title string) {
+	title = ytJunkSuffix.ReplaceAllString(strings.TrimSpace(raw), "")
+	title = strings.Join(strings.Fields(title), " ")
+	if i := strings.Index(title, " - "); i > 0 {
+		artist = strings.TrimSuffix(strings.TrimSpace(title[:i]), " - Topic")
+		title = strings.TrimSpace(title[i+3:])
+	}
+	if artist == "" {
+		artist = channel
+	}
+	if title == "" {
+		title = raw
+	}
+	return artist, title
 }
 
 // Resolve turns a "ytdlp:<page>" stream reference into a direct,

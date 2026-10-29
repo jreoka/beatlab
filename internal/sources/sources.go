@@ -47,8 +47,11 @@ func (r *Registry) Get(name string) (Source, bool) {
 // SearchAll fans a query out to every available source and merges
 // the results (first source wins on duplicate track IDs).
 func (r *Registry) SearchAll(ctx context.Context, query string, limit int) []store.Track {
-	seen := map[string]bool{}
-	var out []store.Track
+	// Query every source, then merge round-robin: filling the
+	// result set from the first source alone would starve the
+	// others (archive.org nearly always fills the limit by
+	// itself, which silently hid YouTube results entirely).
+	var perSource [][]store.Track
 	for _, s := range r.list {
 		if !s.Available() {
 			continue
@@ -57,7 +60,18 @@ func (r *Registry) SearchAll(ctx context.Context, query string, limit int) []sto
 		if err != nil {
 			continue
 		}
-		for _, t := range tracks {
+		perSource = append(perSource, tracks)
+	}
+	seen := map[string]bool{}
+	var out []store.Track
+	for i := 0; ; i++ {
+		added := false
+		for _, tracks := range perSource {
+			if i >= len(tracks) {
+				continue
+			}
+			added = true
+			t := tracks[i]
 			if seen[t.ID] {
 				continue
 			}
@@ -67,6 +81,8 @@ func (r *Registry) SearchAll(ctx context.Context, query string, limit int) []sto
 				return out
 			}
 		}
+		if !added {
+			return out
+		}
 	}
-	return out
 }

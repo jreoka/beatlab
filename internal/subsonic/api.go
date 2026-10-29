@@ -5,6 +5,7 @@ package subsonic
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -191,10 +192,79 @@ func wantsJSON(r *http.Request) bool {
 
 // ---------- auth ----------
 
+// ---------- Navidrome native login (Feishin "Navidrome" mode) ----------
+
+// Some clients (Feishin in its Navidrome server mode) don't log in
+// with Subsonic credentials — they POST /auth/login like
+// Navidrome's own web UI and expect {id, username, token} back.
+// Feishin rejects the login with "no user id or username
+// available" when those fields are missing. The returned token is
+// then presented on API calls in the X-ND-Authorization header.
+func (a *API) NDLoginHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var creds struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if r.Method == http.MethodPost {
+			// JSON body (Navidrome clients) or form fallback.
+			json.NewDecoder(r.Body).Decode(&creds)
+			if creds.Username == "" {
+				r.ParseForm()
+				creds.Username = r.FormValue("username")
+				creds.Password = r.FormValue("password")
+			}
+		}
+		user, ok := a.store.UserByName(creds.Username)
+		if !ok || creds.Password == "" || creds.Password != user.Password {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"Invalid username or password"}`))
+			return
+		}
+		buf := make([]byte, 32)
+		rand.Read(buf)
+		token := hex.EncodeToString(buf)
+		a.store.KVSet("ndtoken:"+token, strconv.FormatInt(user.ID, 10))
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":       strconv.FormatInt(user.ID, 10),
+			"username": user.Username,
+			"name":     user.Username,
+			"token":    token,
+			"isAdmin":  user.IsAdmin,
+		})
+	}
+}
+
+// ndUser resolves a Navidrome session token to its user.
+func (a *API) ndUser(token string) (*store.User, bool) {
+	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+	if token == "" {
+		return nil, false
+	}
+	idStr, ok := a.store.KVGet("ndtoken:" + token)
+	if !ok {
+		return nil, false
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return nil, false
+	}
+	return a.store.UserByID(id)
+}
+
 // authenticate validates Subsonic credentials: password (plain or
 // enc:hex), token md5(password+salt), or apiKey (treated as the
-// account password in this build).
+// account password in this build). A Navidrome session token (from
+// /auth/login) is also accepted, via the X-ND-Authorization header
+// or in place of the password.
 func (a *API) authenticate(r *http.Request) (*store.User, *Elem) {
+	if u, ok := a.ndUser(r.Header.Get("X-ND-Authorization")); ok {
+		return u, nil
+	}
+	if u, ok := a.ndUser(r.Header.Get("Authorization")); ok {
+		return u, nil
+	}
 	q := r.URL.Query()
 	username := q.Get("u")
 	if username == "" {
@@ -203,6 +273,11 @@ func (a *API) authenticate(r *http.Request) (*store.User, *Elem) {
 	user, ok := a.store.UserByName(username)
 	if !ok {
 		return nil, a.fail(40, "Wrong username or password")
+	}
+	if p := q.Get("p"); p != "" {
+		if u, ok := a.ndUser(p); ok && u.ID == user.ID {
+			return user, nil
+		}
 	}
 	p := q.Get("p")
 	if strings.HasPrefix(p, "enc:") {

@@ -25,9 +25,9 @@ func NewArchive() *ArchiveSource {
 	return &ArchiveSource{http: &http.Client{Timeout: 30 * time.Second}}
 }
 
-func (a *ArchiveSource) Name() string     { return "archive" }
-func (a *ArchiveSource) Available() bool  { return true }
-func (a *ArchiveSource) Status() string   { return "archive.org — always on, no key needed" }
+func (a *ArchiveSource) Name() string    { return "archive" }
+func (a *ArchiveSource) Available() bool { return true }
+func (a *ArchiveSource) Status() string  { return "archive.org — always on, no key needed" }
 
 type iaSearchResponse struct {
 	Response struct {
@@ -45,10 +45,11 @@ type iaSearchResponse struct {
 
 type iaMetadata struct {
 	Metadata struct {
-		Title   string `json:"title"`
-		Creator any    `json:"creator"` // string or []string
-		Year    string `json:"date"`
-		Subject any    `json:"subject"`
+		Title      string `json:"title"`
+		Creator    any    `json:"creator"` // string or []string
+		Year       string `json:"date"`
+		Subject    any    `json:"subject"`
+		Collection any    `json:"collection"` // string or []string
 	} `json:"metadata"`
 	Files []struct {
 		Name    string `json:"name"`
@@ -142,6 +143,73 @@ func (a *ArchiveSource) Search(ctx context.Context, query string, limit int) ([]
 	return out, nil
 }
 
+// junkCollections are archive.org collections that are spoken
+// word, not music — audiobooks, podcasts, old-time radio. Items
+// from them never enter the catalog.
+var junkCollections = []string{"librivox", "audiobook", "audio_book", "podcast", "old_time_radio", "radioprogram", "radio_show"}
+
+func isJunkItem(md iaMetadata) bool {
+	coll := strings.ToLower(creatorString(md.Metadata.Collection))
+	for _, j := range junkCollections {
+		if strings.Contains(coll, j) {
+			return true
+		}
+	}
+	subj := strings.ToLower(creatorString(md.Metadata.Subject))
+	return strings.Contains(subj, "librivox") || strings.Contains(subj, "audiobook") || strings.Contains(subj, "audio book")
+}
+
+// pickCover chooses the item's real artwork: image files whose
+// names look like cover art first, then the largest image — but
+// never archive.org's auto-generated spectrogram/waveform renders,
+// which masquerade as art for items that have none. Returns ""
+// when the item has no real art (clients show their placeholder).
+func pickCover(identifier string, md iaMetadata) string {
+	type img struct {
+		url   string
+		score int
+		size  int64
+	}
+	audioStems := map[string]bool{}
+	for _, f := range md.Files {
+		if audioFormats[f.Format] {
+			audioStems[strings.ToLower(strings.TrimSuffix(f.Name, "."+extOf(f.Name)))] = true
+		}
+	}
+	var best *img
+	for _, f := range md.Files {
+		e := extOf(f.Name)
+		if e != "jpg" && e != "jpeg" && e != "png" {
+			continue
+		}
+		low := strings.ToLower(f.Name)
+		if strings.Contains(low, "spectrogram") || strings.Contains(low, "waveform") || strings.Contains(low, "__ia_thumb") {
+			continue
+		}
+		score := 0
+		for _, kw := range []string{"cover", "front", "folder", "album", "artwork"} {
+			if strings.Contains(low, kw) {
+				score += 10
+				break
+			}
+		}
+		if audioStems[strings.TrimSuffix(low, "."+e)] {
+			score -= 5 // per-track image (photo/scan of one song), not album art
+		}
+		size := int64(0)
+		fmt.Sscanf(f.Size, "%d", &size)
+		cand := img{url: "https://archive.org/download/" + identifier + "/" + url.PathEscape(f.Name), score: score, size: size}
+		if best == nil || cand.score > best.score || (cand.score == best.score && cand.size > best.size) {
+			c := cand
+			best = &c
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.url
+}
+
 // itemTracks expands one archive.org item into its audio tracks.
 func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]store.Track, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://archive.org/metadata/"+identifier, nil)
@@ -154,6 +222,9 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 	var md iaMetadata
 	if err := json.NewDecoder(resp.Body).Decode(&md); err != nil {
 		return nil, err
+	}
+	if isJunkItem(md) {
+		return nil, nil
 	}
 	album := strings.TrimSpace(md.Metadata.Title)
 	artist := creatorString(md.Metadata.Creator)
@@ -173,15 +244,7 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 		genre = s
 	}
 
-	// cover: prefer an image file in the item, else the item image service
-	cover := "https://archive.org/services/img/" + identifier
-	for _, f := range md.Files {
-		e := extOf(f.Name)
-		if e == "jpg" || e == "jpeg" || e == "png" {
-			cover = "https://archive.org/download/" + identifier + "/" + url.PathEscape(f.Name)
-			break
-		}
-	}
+	cover := pickCover(identifier, md)
 
 	var tracks []store.Track
 	for _, f := range md.Files {
@@ -206,6 +269,11 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 			trackArtist = f.Artist
 		} else if f.Creator != "" {
 			trackArtist = f.Creator
+		}
+		if trackArtist == "Unknown Artist" {
+			// No attribution anywhere — these unattributed
+			// uploads are what filled fresh catalogs with junk.
+			continue
 		}
 		trackAlbum := album
 		if f.Album != "" {

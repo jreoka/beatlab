@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log"
@@ -88,8 +89,13 @@ func main() {
 	ui := webui.New(st, registry, te, password, cacheGB)
 	ui.SetRadioRefresher(api)
 
+	// Seed a fresh catalog with popular music in the background so
+	// a new account opens onto trending tracks, not an empty shelf.
+	go te.Warm(context.Background())
+
 	mux := http.NewServeMux()
 	mux.Handle("/rest/", api.Handler())
+	mux.HandleFunc("/auth/login", api.NDLoginHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ok":true}`))

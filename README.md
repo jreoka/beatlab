@@ -24,7 +24,10 @@ or on Linux: `./beatlab-linux`. Then:
   `beatlab-data/admin-password.txt` (or set `BEATLAB_ADMIN_PASSWORD`).
 - **Clients:** point any Subsonic client at `http://<host>:4533`
   with username `admin` and the admin password (seeded on first
-  run). Create more users in the console.
+  run). Create more users in the console. Clients with a
+  **Navidrome** server mode (e.g. Feishin) work too — Beatlab
+  implements Navidrome's native `POST /auth/login` and accepts the
+  session token on API calls.
 
 ## Config (environment)
 
@@ -49,6 +52,18 @@ Search results **warm into the local catalog** (SQLite) as they're
 found, Bitlab-style, so your library grows out of what you look for
 and listen to. Completed streams are cached to disk under the
 budget; partial/range requests proxy without caching.
+
+## Cold start
+
+A fresh server **warms its catalog in the background** from a
+curated set of popular queries (the heavily-downloaded music
+archive.org actually has — jazz greats, the Dead, classical,
+Marley, Phish…), and fresh accounts get **trending-pool radio
+mixes** until their own listening gives the taste engine
+something to work with. Spoken-word collections (LibriVox
+audiobooks, podcasts, old-time radio) and unattributed uploads
+never enter the catalog, and browse lists hide "Unknown Artist"
+one-offs.
 
 ## The learning layer
 
@@ -78,7 +93,10 @@ getSimilarSongs(2), getArtistInfo(2), getTopSongs, getLyrics
 (empty), getInternetRadioStations (empty), getScanStatus, startScan,
 savePlayQueue/getPlayQueue, stream, download, getCoverArt.
 Auth: password (plain + `enc:`), token `md5(password+salt)`, and
-`apiKey` (= account password in this build). Responses in XML or
+`apiKey` (= account password in this build) — plus Navidrome
+native login at `POST /auth/login` returning
+`{id, username, token}` for clients like Feishin, with the token
+accepted via the `X-ND-Authorization` header. Responses in XML or
 JSON (`f=json`).
 
 ## Notes & tradeoffs

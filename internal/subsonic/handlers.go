@@ -83,6 +83,9 @@ func (a *API) hArtists(r *http.Request, user *store.User) *Elem {
 	byLetter := map[string][]string{}
 	var letters []string
 	for _, name := range a.store.Artists() {
+		if name == "" || strings.EqualFold(name, "Unknown Artist") {
+			continue
+		}
 		letter := "#"
 		if name != "" {
 			letter = strings.ToUpper(name[:1])
@@ -298,6 +301,18 @@ func (a *API) hAlbumList(r *http.Request, user *store.User) *Elem {
 		tracks, _ = a.store.QueryTracks(store.Query{Limit: 2000})
 	}
 	albums := a.groupAlbums(tracks)
+	// Browse lists are discovery surfaces: unattributed uploads
+	// ("Unknown Artist" one-offs) are noise there. They stay in
+	// the catalog and in search — just not on the home shelves.
+	if typ != "starred" {
+		kept := albums[:0]
+		for _, g := range albums {
+			if !strings.EqualFold(g.artist, "Unknown Artist") && g.artist != "" {
+				kept = append(kept, g)
+			}
+		}
+		albums = kept
+	}
 	if typ == "alphabeticalByArtist" {
 		sort.Slice(albums, func(i, j int) bool { return albums[i].artist < albums[j].artist })
 	}

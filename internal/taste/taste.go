@@ -184,15 +184,59 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 	return out
 }
 
+// TrendingQueries seed a fresh catalog with the popular,
+// heavily-downloaded music archive.org actually has, so a new
+// account opens onto real music instead of whatever a raw genre
+// search drags in.
+var TrendingQueries = []string{
+	"grateful dead", "miles davis", "john coltrane", "billie holiday",
+	"louis armstrong", "ella fitzgerald", "charlie parker", "thelonious monk",
+	"duke ellington", "bach", "beethoven", "chopin", "mozart",
+	"muddy waters", "b.b. king", "johnny cash", "hank williams",
+	"pink floyd", "bob marley", "phish", "radiohead",
+	"nina simone", "frank sinatra", "woody guthrie",
+}
+
+// Warm seeds the catalog from the trending queries, once, while
+// the catalog is still small. Safe to call at startup.
+func (e *Engine) Warm(ctx context.Context) {
+	if e.store.TrackCount() >= 150 {
+		return
+	}
+	if _, done := e.store.KVGet("warmed"); done {
+		return
+	}
+	for _, q := range TrendingQueries {
+		for _, t := range e.registry.SearchAll(ctx, q, 14) {
+			t := t
+			e.store.UpsertTrack(&t)
+		}
+	}
+	e.store.KVSet("warmed", "1")
+}
+
+// Cold reports whether the profile has no listening signal yet —
+// fresh accounts get the trending pool instead of personalization.
+func (p *Profile) Cold() bool {
+	return p.Plays == 0 && len(p.Starred) == 0 && len(p.ArtistScore) == 0
+}
+
 // Radio builds an auto-mix queue. Modes:
-//   personal  — affinity-weighted favorites + similar expansion + a
-//               slice of discovery
-//   discovery — mostly new music from sources, seeded by top genres
-//               and artists
-//   favorites — starred and most-played
+//
+//	personal  — affinity-weighted favorites + similar expansion + a
+//	            slice of discovery
+//	discovery — mostly new music from sources, seeded by top genres
+//	            and artists
+//	favorites — starred and most-played
 func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int) []store.Track {
 	p := e.BuildProfile(userID)
-	rng := rand.New(rand.NewSource(time.Now().Unix() / 3600)) // reshuffle hourly
+	// Hourly reshuffle, seeded per mode so the three mixes aren't
+	// the same shuffle of the same pool.
+	modeSeed := int64(0)
+	for _, c := range mode {
+		modeSeed = modeSeed*31 + int64(c)
+	}
+	rng := rand.New(rand.NewSource(time.Now().Unix()/3600 + modeSeed))
 	var pool []store.Track
 
 	switch mode {
@@ -203,16 +247,25 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 				pool = append(pool, t)
 			}
 		}
-	case "discovery":
-		seeds := append(p.TopArtists(3), p.TopGenres(3)...)
-		if len(seeds) == 0 {
-			seeds = []string{"jazz", "electronic", "rock"}
+		if len(pool) == 0 {
+			// Cold start: no favorites yet — serve the trending
+			// pool as a starter mix instead of an empty playlist.
+			pool = append(pool, all...)
 		}
+	case "discovery":
+		// Expand only on artists the user actually listens to.
+		// Raw genre-word searches ("jazz", "rock") are what filled
+		// fresh catalogs with junk — never search those.
+		seeds := p.TopArtists(3)
 		for _, s := range seeds {
 			for _, t := range e.registry.SearchAll(ctx, s, 12) {
 				e.store.UpsertTrack(&t)
 				pool = append(pool, t)
 			}
+		}
+		if p.Cold() {
+			all, _ := e.store.QueryTracks(store.Query{Limit: 500})
+			pool = append(pool, all...)
 		}
 		// anchor with a few familiar tracks
 		all, _ := e.store.QueryTracks(store.Query{Limit: 200})

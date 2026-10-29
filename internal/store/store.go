@@ -29,24 +29,24 @@ type User struct {
 }
 
 type Track struct {
-	ID        string // "<source>:<source-track-id>"
-	Source    string
-	Title     string
-	Artist    string
-	Album     string
-	Genre     string
-	Year      int
-	TrackNo   int
-	Duration  int // seconds
-	Bitrate   int // kbps
-	Format    string // suffix, e.g. mp3
-	Size      int64
-	StreamURL string // direct upstream URL (archive.org download / resolved)
-	CoverURL  string
-	Meta      string // source-specific JSON
-	PlayCount int
+	ID         string // "<source>:<source-track-id>"
+	Source     string
+	Title      string
+	Artist     string
+	Album      string
+	Genre      string
+	Year       int
+	TrackNo    int
+	Duration   int    // seconds
+	Bitrate    int    // kbps
+	Format     string // suffix, e.g. mp3
+	Size       int64
+	StreamURL  string // direct upstream URL (archive.org download / resolved)
+	CoverURL   string
+	Meta       string // source-specific JSON
+	PlayCount  int
 	LastPlayed time.Time
-	Created   time.Time
+	Created    time.Time
 }
 
 func (t *Track) ArtistID() string { return "ar:" + slug(t.Artist) }
@@ -181,6 +181,18 @@ func (s *Store) UserByName(username string) (*User, bool) {
 	var u User
 	var adm int
 	err := s.db.QueryRow(`SELECT id, username, password, is_admin FROM users WHERE username=?`, username).
+		Scan(&u.ID, &u.Username, &u.Password, &adm)
+	if err != nil {
+		return nil, false
+	}
+	u.IsAdmin = adm != 0
+	return &u, true
+}
+
+func (s *Store) UserByID(id int64) (*User, bool) {
+	var u User
+	var adm int
+	err := s.db.QueryRow(`SELECT id, username, password, is_admin FROM users WHERE id=?`, id).
 		Scan(&u.ID, &u.Username, &u.Password, &adm)
 	if err != nil {
 		return nil, false
