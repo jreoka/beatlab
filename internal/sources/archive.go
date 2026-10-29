@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"beatlab/internal/store"
@@ -167,12 +168,31 @@ func (a *ArchiveSource) Search(ctx context.Context, query string, limit int) ([]
 		return nil, err
 	}
 
+	// Fetch item metadata concurrently (order preserved): done
+	// sequentially, a dozen archive.org round trips were most of
+	// a search's latency.
+	perDoc := make([][]store.Track, len(sr.Response.Docs))
+	sem := make(chan struct{}, 6)
+	var wg sync.WaitGroup
+	for i, doc := range sr.Response.Docs {
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			if tracks, err := a.itemTracks(ctx, id); err == nil {
+				perDoc[i] = tracks
+			}
+		}(i, doc.Identifier)
+	}
+	wg.Wait()
+
 	var out []store.Track
-	for _, doc := range sr.Response.Docs {
-		tracks, err := a.itemTracks(ctx, doc.Identifier)
-		if err != nil {
-			continue
-		}
+	for _, tracks := range perDoc {
 		out = append(out, tracks...)
 		if len(out) >= limit {
 			break

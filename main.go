@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"beatlab/internal/engine"
 	"beatlab/internal/sources"
@@ -49,6 +50,41 @@ func adminPassword(dataDir string) string {
 		log.Printf("[beatlab] generated admin password, saved to %s", path)
 	}
 	return p
+}
+
+// version identifies the build in the startup log and /healthz,
+// so it's always obvious which binary is actually running.
+const version = "0.1.0-searchfix2"
+
+// statusWriter captures the response status for request logging.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// logRequests logs one line per API request (method, path,
+// status, duration). Streams and cover art are skipped — they're
+// long-lived binary transfers, not requests that can "hang" in a
+// way a log line would explain. The point is diagnosability: if a
+// client spins, the log shows whether the request arrived and
+// whether it ever finished.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if strings.Contains(p, "/stream") || strings.Contains(p, "/getCoverArt") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(sw, r)
+		log.Printf("[beatlab] %s %s -> %d in %s", r.Method, p, sw.status, time.Since(start).Round(time.Millisecond))
+	})
 }
 
 func main() {
@@ -106,10 +142,11 @@ func main() {
 	mux.Handle("/api/", api.NDHandler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`))
+		w.Write([]byte(`{"ok":true,"version":"` + version + `"}`))
 	})
 	mux.Handle("/", ui.Handler())
 
+	log.Printf("[beatlab] beatlab %s", version)
 	log.Printf("[beatlab] data dir: %s", dataDir)
 	log.Printf("[beatlab] sources:")
 	for _, s := range registry.All() {
@@ -118,7 +155,7 @@ func main() {
 	log.Printf("[beatlab] admin console: http://localhost%s/admin", addr)
 	log.Printf("[beatlab] Subsonic API:  http://localhost%s/rest (user: %s)", addr, env("BEATLAB_USER", "admin"))
 	log.Printf("[beatlab] listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, logRequests(mux)); err != nil {
 		log.Fatal(err)
 	}
 }
