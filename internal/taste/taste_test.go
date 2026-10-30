@@ -333,12 +333,22 @@ func TestSimilarFallbackStaysInWorld(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		catalog = append(catalog, store.Track{ID: fmt.Sprintf("j:%d", i), Source: "youtube", Title: fmt.Sprintf("日本の曲 %d", i), Artist: fmt.Sprintf("日本のバンド %d", i%3), Album: "J", Genre: "", Duration: 200})
 	}
+	// A romaji-titled Japanese artist on YouTube: in the
+	// seed's world by source, and she must get in.
+	catalog = append(catalog, store.Track{ID: "ado:1", Source: "youtube", Title: "Usseewa", Artist: "Ado", Album: "Ado", Genre: "", Duration: 200})
+	// A played Japanese track tagged Jazz — gives the
+	// profile a stray Jazz affinity, which must NOT become
+	// a ticket for latin jazz/classical archive tracks.
+	catalog = append(catalog, store.Track{ID: "jz:1", Source: "archive", Title: "ジャズ入門", Artist: "日本のジャズ", Album: "J", Genre: "Jazz", Duration: 200})
 	// The warming-catalog debris: latin, unplayed, unrelated.
 	debris := []store.Track{
 		{ID: "d:1", Source: "archive", Title: "This Land Is Your Land", Artist: "rutaloot", Album: "Woody Guthrie", Genre: "Folk", Duration: 271},
 		{ID: "d:2", Source: "archive", Title: "Ballade op. 23, n. 1 (in G min.)", Artist: "Primrose Classical White Label", Album: "Chopin", Genre: "Classical", Duration: 543},
 		{ID: "d:3", Source: "archive", Title: "Nocturne No. 6 in F", Artist: "S D Rodrian", Album: "Chopin", Genre: "Classical", Duration: 146},
 		{ID: "d:4", Source: "archive", Title: "In A Sentimental Mood", Artist: "John Coltrane", Album: "Coltrane", Genre: "Jazz", Duration: 257},
+		{ID: "d:5", Source: "archive", Title: "Dual Mr. Tillman Anthony (New Mix)", Artist: "Miles Davis", Album: "Miles", Genre: "Jazz", Duration: 800},
+		{ID: "d:6", Source: "archive", Title: "Laudate Dominum KV 339", Artist: "Wolfgang Amadeus Mozart", Album: "Mozart", Genre: "Classical", Duration: 316},
+		{ID: "d:7", Source: "archive", Title: "Turn On Your Lovelight", Artist: "Grateful Dead", Album: "Dead", Genre: "Rock", Duration: 574},
 	}
 	catalog = append(catalog, debris...)
 	for _, tr := range catalog {
@@ -350,6 +360,7 @@ func TestSimilarFallbackStaysInWorld(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		st.AddEvent(1, fmt.Sprintf("r:%d", i), "play", 1.0)
 	}
+	st.AddEvent(1, "jz:1", "play", 1.0)
 	out := eng.Similar(context.Background(), 1, seed, 20)
 	if len(out) < 10 {
 		t.Fatalf("queue too short: %d", len(out))
@@ -369,6 +380,15 @@ func TestSimilarFallbackStaysInWorld(t *testing.T) {
 	}
 	if !foundAffinity {
 		t.Fatal("affinity artist missing from the queue")
+	}
+	foundAdo := false
+	for _, tr := range out {
+		if tr.ID == "ado:1" {
+			foundAdo = true
+		}
+	}
+	if !foundAdo {
+		t.Fatal("romaji YouTube J-pop (Ado) missing from the queue")
 	}
 	for i := 1; i < len(out); i++ {
 		if out[i].Artist == out[i-1].Artist && len(out) > 2 {

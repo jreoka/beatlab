@@ -297,6 +297,33 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			}
 		}
 	}
+	// The seed's world: whether the seed artist's catalog is
+	// majority-CJK (the seed itself may be romanized while
+	// the catalog behind it is Japanese-titled). For a
+	// Japanese artist, "similar" lives in a specific corner
+	// of the catalog — CJK-titled tracks and YouTube-sourced
+	// uploads, which is where this catalog's J-pop comes
+	// from; its archive.org side skews western classical,
+	// jazz and live tapes. Genre and affinity signals are
+	// only trusted INSIDE that world — otherwise one stray
+	// genre affinity admits Miles Davis and Mozart into a
+	// Yorushika radio.
+	seedCJK := hasCJK(seed.Artist) || hasCJK(seed.Title)
+	if !seedCJK && len(artistRows) > 0 {
+		cjk := 0
+		for _, t := range artistRows {
+			if hasCJK(t.Title) || hasCJK(t.Artist) {
+				cjk++
+			}
+		}
+		seedCJK = cjk*2 > len(artistRows)
+	}
+	worldOK := func(t store.Track) bool {
+		if !seedCJK {
+			return true
+		}
+		return hasCJK(t.Artist) || hasCJK(t.Title) || t.Source == "youtube"
+	}
 	cands := append([]store.Track{}, artistRows...)
 	if effGenre != "" {
 		rows, _ := e.store.QueryTracks(store.Query{Genre: effGenre, Limit: 500, Order: "shuffle", Seed: time.Now().Unix() / 86400})
@@ -327,7 +354,7 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 		switch {
 		case strings.EqualFold(t.Artist, seed.Artist) && seed.Artist != "":
 			add(t, 4)
-		case effGenre != "" && strings.EqualFold(t.Genre, effGenre):
+		case effGenre != "" && strings.EqualFold(t.Genre, effGenre) && worldOK(t):
 			add(t, 1.5)
 		}
 	}
@@ -350,6 +377,9 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 	}
 	admit := func(t store.Track, sameArtist, genreMatch, ungenred float64) {
 		if t.Duration > 1200 || junkTitle(t) {
+			return
+		}
+		if !strings.EqualFold(t.Artist, seed.Artist) && !worldOK(t) {
 			return
 		}
 		switch {
@@ -399,30 +429,24 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			if !usable(t) {
 				continue
 			}
-			if sc := p.scoreTrack(t); sc > 0 {
+			if sc := p.scoreTrack(t); sc > 0 && worldOK(t) {
 				add(t, 1.0+sc)
 			}
 		}
 		if short() {
-			// The seed itself may be romanized ("Yorushika -
-			// Say It.") while the artist's catalog is mostly
-			// Japanese-titled: judge the seed's world by the
-			// artist's catalogued tracks too.
-			seedCJK := hasCJK(seed.Artist) || hasCJK(seed.Title)
-			if !seedCJK && len(artistRows) > 0 {
-				cjk := 0
-				for _, t := range artistRows {
-					if hasCJK(t.Title) || hasCJK(t.Artist) {
-						cjk++
-					}
-				}
-				seedCJK = cjk*2 > len(artistRows)
-			}
 			for _, t := range rows {
 				if !usable(t) {
 					continue
 				}
-				if (hasCJK(t.Artist) || hasCJK(t.Title)) == seedCJK {
+				if seedCJK {
+					// Inside the seed's world, affinity
+					// orders; outside it, nothing enters.
+					if worldOK(t) {
+						add(t, 0.5+p.scoreTrack(t))
+					}
+				} else if hasCJK(t.Artist) || hasCJK(t.Title) {
+					continue // latin seed: CJK uploads are another world
+				} else {
 					add(t, 0.5)
 				}
 			}
@@ -438,6 +462,9 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			for _, t := range e.registry.SearchAll(ctx, a, 15) {
 				e.store.UpsertTrack(&t)
 				if t.Duration > 1200 || junkTitle(t) {
+					continue
+				}
+				if !strings.EqualFold(t.Artist, seed.Artist) && !worldOK(t) {
 					continue
 				}
 				switch {
