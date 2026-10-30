@@ -84,3 +84,40 @@ func TestRadioCapsArtists(t *testing.T) {
 		t.Fatalf("radio let one artist take %d slots: %v", artists["One Artist"], artists)
 	}
 }
+
+
+// Discovery radio must include artists the user has never
+// played, drawn from their top genres — not just more tracks
+// by the artists they already play.
+func TestRadioDiscoveryIncludesUnplayedArtists(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := New(st, sources.NewRegistry())
+	// Played artist: 5 jazz tracks, each with play events.
+	for i := 0; i < 5; i++ {
+		tr := store.Track{ID: fmt.Sprintf("p:%d", i), Source: "test", Title: fmt.Sprintf("Played %d", i), Artist: "Known Player", Album: "K", Genre: "Jazz"}
+		if err := st.UpsertTrack(&tr); err != nil {
+			t.Fatal(err)
+		}
+		st.AddEvent(1, tr.ID, "play", 1.0)
+	}
+	// Unplayed artist, same genre.
+	for i := 0; i < 5; i++ {
+		tr := store.Track{ID: fmt.Sprintf("u:%d", i), Source: "test", Title: fmt.Sprintf("Fresh %d", i), Artist: "Fresh Face", Album: "F", Genre: "Jazz"}
+		if err := st.UpsertTrack(&tr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := eng.Radio(context.Background(), 1, "discovery", 12)
+	found := false
+	for _, tr := range out {
+		if tr.Artist == "Fresh Face" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("discovery mix has no unplayed-artist tracks: %v", out)
+	}
+}

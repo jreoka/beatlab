@@ -54,7 +54,7 @@ func adminPassword(dataDir string) string {
 
 // version identifies the build in the startup log and /healthz,
 // so it's always obvious which binary is actually running.
-const version = "0.1.0-official"
+const version = "0.1.0-audit"
 
 // statusWriter captures the response status for request logging.
 type statusWriter struct {
@@ -68,17 +68,13 @@ func (w *statusWriter) WriteHeader(code int) {
 }
 
 // logRequests logs one line per API request (method, path,
-// status, duration). Only streams are skipped — they're
-// open-ended transfers by design. The point is diagnosability:
-// if a client spins, the log shows whether the request arrived
-// and whether it ever finished.
+// status, duration) when it completes — streams included, so
+// playback problems are diagnosable from the log too. The
+// point: if a client spins, the log shows whether the request
+// arrived and whether it ever finished.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if strings.Contains(p, "/stream") {
-			next.ServeHTTP(w, r)
-			return
-		}
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(sw, r)
@@ -154,7 +150,12 @@ func main() {
 	log.Printf("[beatlab] admin console: http://localhost%s/admin", addr)
 	log.Printf("[beatlab] Subsonic API:  http://localhost%s/rest (user: %s)", addr, env("BEATLAB_USER", "admin"))
 	log.Printf("[beatlab] listening on %s", addr)
-	if err := http.ListenAndServe(addr, logRequests(mux)); err != nil {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           logRequests(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -269,7 +269,10 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 	for _, c := range mode {
 		modeSeed = modeSeed*31 + int64(c)
 	}
-	rng := rand.New(rand.NewSource(time.Now().Unix()/3600 + modeSeed))
+	// Six-hour buckets match the radio playlists' refresh
+	// cadence: every refresh is a genuinely new shuffle, not
+	// the same mix re-served.
+	rng := rand.New(rand.NewSource(time.Now().Unix()/21600 + modeSeed))
 	var pool []store.Track
 
 	switch mode {
@@ -299,6 +302,25 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 		if p.Cold() {
 			all, _ := e.store.QueryTracks(store.Query{Limit: 500})
 			pool = append(pool, all...)
+		} else {
+			// True discovery: catalog tracks in the user's top
+			// genres by artists they have never played. (The
+			// seed-artist searches above mostly return those
+			// artists' own tracks — expansion, not discovery.)
+			topG := map[string]bool{}
+			for _, g := range p.TopGenres(3) {
+				topG[g] = true
+			}
+			topA := map[string]bool{}
+			for _, a := range p.TopArtists(10) {
+				topA[strings.ToLower(a)] = true
+			}
+			all, _ := e.store.QueryTracks(store.Query{Limit: 500})
+			for _, t := range all {
+				if p.TrackPlays[t.ID] == 0 && topG[t.Genre] && !topA[strings.ToLower(t.Artist)] {
+					pool = append(pool, t)
+				}
+			}
 		}
 		// anchor with a few familiar tracks
 		all, _ := e.store.QueryTracks(store.Query{Limit: 200})
@@ -331,7 +353,7 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 			continue
 		}
 		used[t.ID] = true
-		w := p.scoreTrack(t) + rng.Float64()*2.5
+		w := p.scoreTrack(t) + rng.Float64()*3.5
 		if mode == "discovery" && p.TrackPlays[t.ID] == 0 {
 			w += 2
 		}

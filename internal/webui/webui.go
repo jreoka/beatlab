@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"beatlab/internal/sources"
 	"beatlab/internal/store"
@@ -36,12 +37,12 @@ type UI struct {
 	cacheGB       int
 
 	mu       sync.Mutex
-	sessions map[string]bool
+	sessions map[string]time.Time
 }
 
 func New(st *store.Store, reg *sources.Registry, te *taste.Engine, adminPassword string, cacheGB int) *UI {
 	return &UI{store: st, registry: reg, taste: te, adminPassword: adminPassword,
-		cacheGB: cacheGB, sessions: map[string]bool{}}
+		cacheGB: cacheGB, sessions: map[string]time.Time{}}
 }
 
 func (u *UI) SetRadioRefresher(r interface {
@@ -82,7 +83,16 @@ func (u *UI) authed(r *http.Request) bool {
 	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return u.sessions[c.Value]
+	created, ok := u.sessions[c.Value]
+	if !ok {
+		return false
+	}
+	// Sessions expire after a week; the admin logs in again.
+	if time.Since(created) > 7*24*time.Hour {
+		delete(u.sessions, c.Value)
+		return false
+	}
+	return true
 }
 
 func (u *UI) requireAuth(h http.HandlerFunc) http.HandlerFunc {
@@ -192,9 +202,9 @@ func (u *UI) login(w http.ResponseWriter, r *http.Request) {
 			rand.Read(tok)
 			s := hex.EncodeToString(tok)
 			u.mu.Lock()
-			u.sessions[s] = true
+			u.sessions[s] = time.Now()
 			u.mu.Unlock()
-			http.SetCookie(w, &http.Cookie{Name: "beatlab_admin", Value: s, Path: "/", HttpOnly: true})
+			http.SetCookie(w, &http.Cookie{Name: "beatlab_admin", Value: s, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 			http.Redirect(w, r, "/admin", http.StatusFound)
 			return
 		}

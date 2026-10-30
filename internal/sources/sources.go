@@ -7,6 +7,7 @@ package sources
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 
 	"beatlab/internal/store"
@@ -80,6 +81,10 @@ func (r *Registry) SearchAll(ctx context.Context, query string, limit int) []sto
 			defer cancel()
 			tracks, err := s.Search(sctx, query, limit)
 			if err != nil {
+				// Partial results from the other sources still
+				// answer the search, but a dead source must be
+				// visible in the log, not silent.
+				log.Printf("[beatlab] source %s search %q: %v", s.Name(), query, err)
 				tracks = nil
 			}
 			ch <- result{tracks}

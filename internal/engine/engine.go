@@ -7,7 +7,9 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"hash/fnv"
 	"image"
@@ -15,9 +17,11 @@ import (
 	"image/png"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +56,8 @@ func New(st *store.Store, reg *sources.Registry, dataDir string, cacheGB int) *E
 		// waiting for response headers.
 		http: &http.Client{Transport: &http.Transport{
 			ResponseHeaderTimeout: 20 * time.Second,
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
 		}},
 		// Covers are small and latency-critical (a page renders
 		// dozens at once): hard total timeout, so one stalled CDN
@@ -62,7 +68,75 @@ func New(st *store.Store, reg *sources.Registry, dataDir string, cacheGB int) *E
 	}
 	os.MkdirAll(e.cacheDir, 0o755)
 	os.MkdirAll(e.coverDir, 0o755)
+	e.sweepPartials()
+	e.sweepCovers()
 	return e
+}
+
+// randSuffix gives concurrent downloads of the same track
+// distinct temp files, so two clients racing to cache one song
+// never write through each other's partial download.
+func randSuffix() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// sweepPartials removes temp downloads left behind by a crash
+// or kill mid-stream; nothing else ever reclaims them.
+func (e *Engine) sweepPartials() {
+	entries, err := os.ReadDir(e.cacheDir)
+	if err != nil {
+		return
+	}
+	for _, en := range entries {
+		if strings.HasSuffix(en.Name(), ".part") {
+			os.Remove(filepath.Join(e.cacheDir, en.Name()))
+		}
+	}
+}
+
+// coverBudget caps the cover-art cache (which has no other
+// eviction); the sweep runs at startup and drops the oldest
+// files until the directory fits.
+const coverBudget = 512 << 20
+
+func (e *Engine) sweepCovers() {
+	entries, err := os.ReadDir(e.coverDir)
+	if err != nil {
+		return
+	}
+	type f struct {
+		path string
+		size int64
+		mod  time.Time
+	}
+	var files []f
+	var total int64
+	for _, en := range entries {
+		info, err := en.Info()
+		if err != nil {
+			continue
+		}
+		path := filepath.Join(e.coverDir, en.Name())
+		if strings.Contains(en.Name(), ".tmp-") {
+			os.Remove(path)
+			continue
+		}
+		files = append(files, f{path, info.Size(), info.ModTime()})
+		total += info.Size()
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	for _, fl := range files {
+		if total <= coverBudget {
+			break
+		}
+		if os.Remove(fl.path) == nil {
+			total -= fl.size
+		}
+	}
 }
 
 func ContentType(format string) string {
@@ -108,7 +182,7 @@ func (e *Engine) ServeTrack(w http.ResponseWriter, r *http.Request, t *store.Tra
 	if ent, ok := e.store.CacheGet(t.ID); ok {
 		if f, err := os.Open(ent.Path); err == nil {
 			defer f.Close()
-			if st, err := f.Stat(); err == nil {
+			if st, err := f.Stat(); err == nil && (ent.Bytes == 0 || st.Size() == ent.Bytes) {
 				e.store.CacheTouch(t.ID)
 				w.Header().Set("Content-Type", ContentType(t.Format))
 				http.ServeContent(w, r, t.Title+"."+t.Format, st.ModTime(), f)
@@ -157,7 +231,7 @@ func (e *Engine) ServeTrack(w http.ResponseWriter, r *http.Request, t *store.Tra
 		io.Copy(w, resp.Body)
 		return
 	}
-	tmp := filepath.Join(e.cacheDir, cacheName(t.ID)+".part")
+	tmp := filepath.Join(e.cacheDir, cacheName(t.ID)+"."+randSuffix()+".part")
 	f, err := os.Create(tmp)
 	if err != nil {
 		io.Copy(w, resp.Body)
@@ -187,9 +261,24 @@ func (e *Engine) evict() {
 		if len(entries) == 0 {
 			return
 		}
-		oldest := entries[0]
-		os.Remove(oldest.Path)
-		e.store.CacheDelete(oldest.TrackID)
+		progressed := false
+		for _, ent := range entries {
+			if e.store.CacheBytes() <= e.budget {
+				break
+			}
+			// On Windows, removing a file another goroutine is
+			// streaming fails — skip it this pass and evict the
+			// next-oldest instead of spinning or orphaning it.
+			if err := os.Remove(ent.Path); err != nil && !os.IsNotExist(err) {
+				continue
+			}
+			if e.store.CacheDelete(ent.TrackID) {
+				progressed = true
+			}
+		}
+		if !progressed {
+			return
+		}
 	}
 }
 
@@ -202,10 +291,16 @@ func (e *Engine) ServeCover(w http.ResponseWriter, r *http.Request, t *store.Tra
 	}
 	path := filepath.Join(e.coverDir, cacheName(t.ID)+".img")
 	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
-		w.Header().Set("Content-Type", http.DetectContentType(data))
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		w.Write(data)
-		return true
+		if ct := http.DetectContentType(data); strings.HasPrefix(ct, "image/") {
+			w.Header().Set("Content-Type", ct)
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			w.Write(data)
+			return true
+		}
+		// A legacy cache entry that isn't an image (an HTML
+		// error page cached by an older build) — drop it and
+		// fall through to a fresh fetch.
+		os.Remove(path)
 	}
 	req, _ := http.NewRequestWithContext(r.Context(), "GET", t.CoverURL, nil)
 	req.Header.Set("User-Agent", e.userAgent)
@@ -217,14 +312,22 @@ func (e *Engine) ServeCover(w http.ResponseWriter, r *http.Request, t *store.Tra
 		return false
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil || len(data) == 0 {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (8<<20)+1))
+	if err != nil || len(data) == 0 || len(data) > 8<<20 {
 		return false
 	}
-	os.WriteFile(path, data, 0o644)
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = http.DetectContentType(data)
+	// Only ever cache and serve actual images, typed by their
+	// own bytes — an upstream HTML error page must not become a
+	// permanent "cover" served from this origin.
+	ct := http.DetectContentType(data)
+	if !strings.HasPrefix(ct, "image/") {
+		return false
+	}
+	tmp := path + ".tmp-" + randSuffix()
+	if os.WriteFile(tmp, data, 0o644) == nil {
+		if os.Rename(tmp, path) != nil {
+			os.Remove(tmp)
+		}
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "public, max-age=86400")

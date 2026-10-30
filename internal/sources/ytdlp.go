@@ -1,9 +1,11 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -82,8 +84,14 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 	}
 	cmd := exec.CommandContext(ctx, y.bin, "--flat-playlist", "-J", "--no-warnings",
 		fmt.Sprintf("ytsearch%d:%s", n, query))
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
+		// yt-dlp failing (bot wall, outdated build, no network)
+		// must not be indistinguishable from "no results" — the
+		// log is the only place that difference is visible.
+		log.Printf("[beatlab] yt-dlp search %q failed: %v: %s", query, err, firstLine(stderr.String()))
 		return nil, err
 	}
 	var parsed ytdlpSearchJSON
@@ -144,7 +152,26 @@ var ytJunkSuffix = regexp.MustCompile(`(?i)\s*[\(\[][^\)\]]*(official|lyric|audi
 // parseYtTitle splits the ubiquitous "Artist - Title" video
 // naming, strips "(Official Video)"-style suffixes, and falls
 // back to the channel as artist.
+// firstLine returns the first non-empty line of s, truncated —
+// enough of a subprocess's stderr to diagnose a failure in the
+// server log without flooding it.
+func firstLine(s string) string {
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln != "" {
+			if len(ln) > 200 {
+				ln = ln[:200]
+			}
+			return ln
+		}
+	}
+	return ""
+}
+
 func parseYtTitle(raw, channel string) (artist, title string) {
+	// Normalize en/em-dash separators so "Artist – Title" splits
+	// the same way "Artist - Title" does.
+	raw = strings.ReplaceAll(strings.ReplaceAll(raw, " – ", " - "), " — ", " - ")
 	title = ytJunkSuffix.ReplaceAllString(strings.TrimSpace(raw), "")
 	title = strings.Join(strings.Fields(title), " ")
 	if i := strings.Index(title, " - "); i > 0 {
@@ -175,8 +202,11 @@ func (y *YtDlpSource) Resolve(ctx context.Context, ref string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, y.bin, "-g", "-f", "bestaudio/best", "--no-warnings", page)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
+		log.Printf("[beatlab] yt-dlp resolve %s failed: %v: %s", page, err, firstLine(stderr.String()))
 		return "", err
 	}
 	u := strings.TrimSpace(strings.Split(string(out), "\n")[0])

@@ -6,6 +6,7 @@ package subsonic
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -289,7 +290,10 @@ func (a *API) authenticate(r *http.Request) (*store.User, *Elem) {
 		username = q.Get("username")
 	}
 	user, ok := a.store.UserByName(username)
-	if !ok {
+	if !ok || user.Password == "" {
+		// A blank stored password must never authenticate: the
+		// token path would accept md5(salt) from anyone, since
+		// the client chooses the salt.
 		return nil, a.fail(40, "Wrong username or password")
 	}
 	if p := q.Get("p"); p != "" {
@@ -303,7 +307,7 @@ func (a *API) authenticate(r *http.Request) (*store.User, *Elem) {
 			p = string(raw)
 		}
 	}
-	if p != "" && p == user.Password {
+	if p != "" && subtle.ConstantTimeCompare([]byte(p), []byte(user.Password)) == 1 {
 		return user, nil
 	}
 	if t, s := q.Get("t"), q.Get("s"); t != "" && s != "" {
@@ -312,7 +316,7 @@ func (a *API) authenticate(r *http.Request) (*store.User, *Elem) {
 			return user, nil
 		}
 	}
-	if k := q.Get("apiKey"); k != "" && k == user.Password {
+	if k := q.Get("apiKey"); k != "" && subtle.ConstantTimeCompare([]byte(k), []byte(user.Password)) == 1 {
 		return user, nil
 	}
 	return nil, a.fail(40, "Wrong username or password")

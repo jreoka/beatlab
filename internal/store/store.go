@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -74,9 +75,9 @@ func slug(s string) string {
 		// shared "unknown" bucket, merging unrelated artists.
 		// Fall back to a stable hash of the name instead —
 		// distinct names get distinct ids, repeatably.
-		h := fnv.New32a()
+		h := fnv.New64a()
 		h.Write([]byte(s))
-		return "u" + strconv.FormatUint(uint64(h.Sum32()), 16)
+		return "u" + strconv.FormatUint(h.Sum64(), 16)
 	}
 	return out
 }
@@ -271,11 +272,25 @@ func (s *Store) UpsertTrack(t *Track) error {
 	if t.Created.IsZero() {
 		t.Created = time.Unix(now, 0)
 	}
+	// On conflict, an incoming field only replaces the stored
+	// one when it actually carries a value: a later search that
+	// re-returns this track with partial metadata (no duration,
+	// unresolved stream URL) must not downgrade the catalog
+	// entry — worst case an emptied stream_url breaks playback.
+	keepText := func(col string) string {
+		return col + `=CASE WHEN excluded.` + col + `<>'' THEN excluded.` + col + ` ELSE tracks.` + col + ` END`
+	}
+	keepNum := func(col string) string {
+		return col + `=CASE WHEN excluded.` + col + `>0 THEN excluded.` + col + ` ELSE tracks.` + col + ` END`
+	}
+	setClause := strings.Join([]string{
+		keepText("title"), keepText("artist"), keepText("album"), keepText("genre"),
+		keepNum("year"), keepNum("track_no"), keepNum("duration"), keepNum("bitrate"),
+		keepText("format"), keepNum("size"), keepText("stream_url"), keepText("cover_url"),
+		keepText("meta"),
+	}, ", ")
 	_, err := s.db.Exec(`INSERT INTO tracks(`+trackCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET title=excluded.title, artist=excluded.artist, album=excluded.album,
-		genre=excluded.genre, year=excluded.year, track_no=excluded.track_no, duration=excluded.duration,
-		bitrate=excluded.bitrate, format=excluded.format, size=excluded.size, stream_url=excluded.stream_url,
-		cover_url=excluded.cover_url, meta=excluded.meta`,
+		ON CONFLICT(id) DO UPDATE SET `+setClause,
 		t.ID, t.Source, t.Title, t.Artist, t.Album, t.Genre, t.Year, t.TrackNo, t.Duration,
 		t.Bitrate, t.Format, t.Size, t.StreamURL, t.CoverURL, t.Meta, t.PlayCount,
 		t.LastPlayed.Unix(), t.Created.Unix())
@@ -317,9 +332,10 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 		// "say it yorushika" must match title="Say It" +
 		// artist="Yorushika" — a single full-phrase LIKE matches
 		// almost nothing real.
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 		for _, word := range strings.Fields(q.Text) {
-			where = append(where, `(title LIKE ? OR artist LIKE ? OR album LIKE ?)`)
-			like := "%" + word + "%"
+			where = append(where, `(title LIKE ? ESCAPE '\' OR artist LIKE ? ESCAPE '\' OR album LIKE ? ESCAPE '\')`)
+			like := "%" + esc.Replace(word) + "%"
 			args = append(args, like, like, like)
 		}
 	}
@@ -336,13 +352,19 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 		sqlStr += ` WHERE ` + strings.Join(where, " AND ")
 	}
 	switch q.Order {
-	case "":
-		sqlStr += ` ORDER BY artist, album, track_no, title`
+	case "last_played DESC":
+		sqlStr += ` ORDER BY last_played DESC`
+	case "created DESC":
+		sqlStr += ` ORDER BY created DESC`
+	case "play_count DESC":
+		sqlStr += ` ORDER BY play_count DESC`
 	case "shuffle":
 		sqlStr += ` ORDER BY ((CAST(substr(id,1,4) AS BLOB) IS NOT NULL), (rowid * 2654435761 + ?) % 1000003)`
 		args = append(args, q.Seed)
 	default:
-		sqlStr += ` ORDER BY ` + q.Order
+		// Anything else falls back to the default ordering —
+		// the Order field is never interpolated into SQL.
+		sqlStr += ` ORDER BY artist, album, track_no, title`
 	}
 	// Virtual-ID filters (AlbumID/ArtistID) are applied in Go
 	// after the query — a SQL LIMIT would cut the catalog down
@@ -350,8 +372,12 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 	// albums once the catalog outgrows the limit. Only push
 	// LIMIT/OFFSET into SQL when no virtual filter is present.
 	virtual := q.ArtistID != "" || q.AlbumID != ""
-	if q.Limit > 0 && !virtual {
-		sqlStr += fmt.Sprintf(` LIMIT %d`, q.Limit)
+	if !virtual && (q.Limit > 0 || q.Offset > 0) {
+		if q.Limit > 0 {
+			sqlStr += fmt.Sprintf(` LIMIT %d`, q.Limit)
+		} else {
+			sqlStr += ` LIMIT -1`
+		}
 		if q.Offset > 0 {
 			sqlStr += fmt.Sprintf(` OFFSET %d`, q.Offset)
 		}
@@ -375,12 +401,15 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 		}
 		out = append(out, t)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	if virtual {
 		if q.Offset > 0 {
 			if q.Offset < len(out) {
 				out = out[q.Offset:]
 			} else {
-				out = nil
+				out = []Track{}
 			}
 		}
 		if q.Limit > 0 && len(out) > q.Limit {
@@ -430,7 +459,9 @@ func (s *Store) Genres() map[string]int {
 }
 
 func (s *Store) RecordPlay(trackID string) {
-	s.db.Exec(`UPDATE tracks SET play_count=play_count+1, last_played=? WHERE id=?`, time.Now().Unix(), trackID)
+	if _, err := s.db.Exec(`UPDATE tracks SET play_count=play_count+1, last_played=? WHERE id=?`, time.Now().Unix(), trackID); err != nil {
+		log.Printf("[beatlab] store: record play %s: %v", trackID, err)
+	}
 }
 
 // ---- events / learning ----
@@ -469,13 +500,39 @@ func (s *Store) Events(userID int64, since time.Time) []Event {
 
 // ---- stars & ratings ----
 
+// starTx writes the star/rating row and its taste event in a
+// single transaction, so the two can never desync (a starred
+// track the taste engine never heard about, or vice versa).
+func (s *Store) starTx(userID int64, trackID, stmt string, args []any, kind string, value float64) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("[beatlab] store: %s tx begin: %v", kind, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(stmt, args...); err != nil {
+		log.Printf("[beatlab] store: %s %s: %v", kind, trackID, err)
+		return
+	}
+	if _, err := tx.Exec(`INSERT INTO events(user_id, track_id, kind, value, created) VALUES(?,?,?,?,?)`,
+		userID, trackID, kind, value, time.Now().Unix()); err != nil {
+		log.Printf("[beatlab] store: %s event %s: %v", kind, trackID, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[beatlab] store: %s commit %s: %v", kind, trackID, err)
+	}
+}
+
 func (s *Store) Star(userID int64, trackID string) {
-	s.db.Exec(`INSERT OR REPLACE INTO stars(user_id, track_id, created) VALUES(?,?,?)`, userID, trackID, time.Now().Unix())
-	s.AddEvent(userID, trackID, "star", 1)
+	s.starTx(userID, trackID,
+		`INSERT OR REPLACE INTO stars(user_id, track_id, created) VALUES(?,?,?)`,
+		[]any{userID, trackID, time.Now().Unix()}, "star", 1)
 }
 func (s *Store) Unstar(userID int64, trackID string) {
-	s.db.Exec(`DELETE FROM stars WHERE user_id=? AND track_id=?`, userID, trackID)
-	s.AddEvent(userID, trackID, "unstar", 1)
+	s.starTx(userID, trackID,
+		`DELETE FROM stars WHERE user_id=? AND track_id=?`,
+		[]any{userID, trackID}, "unstar", 1)
 }
 func (s *Store) Starred(userID int64) map[string]time.Time {
 	rows, err := s.db.Query(`SELECT track_id, created FROM stars WHERE user_id=?`, userID)
@@ -495,11 +552,14 @@ func (s *Store) Starred(userID int64) map[string]time.Time {
 }
 func (s *Store) SetRating(userID int64, trackID string, rating int) {
 	if rating <= 0 {
-		s.db.Exec(`DELETE FROM ratings WHERE user_id=? AND track_id=?`, userID, trackID)
+		if _, err := s.db.Exec(`DELETE FROM ratings WHERE user_id=? AND track_id=?`, userID, trackID); err != nil {
+			log.Printf("[beatlab] store: unrate %s: %v", trackID, err)
+		}
 		return
 	}
-	s.db.Exec(`INSERT OR REPLACE INTO ratings(user_id, track_id, rating) VALUES(?,?,?)`, userID, trackID, rating)
-	s.AddEvent(userID, trackID, "rate", float64(rating))
+	s.starTx(userID, trackID,
+		`INSERT OR REPLACE INTO ratings(user_id, track_id, rating) VALUES(?,?,?)`,
+		[]any{userID, trackID, rating}, "rate", float64(rating))
 }
 func (s *Store) Ratings(userID int64) map[string]int {
 	rows, err := s.db.Query(`SELECT track_id, rating FROM ratings WHERE user_id=?`, userID)
@@ -531,6 +591,9 @@ type Playlist struct {
 }
 
 func (s *Store) SavePlaylist(p *Playlist) error {
+	if p.SongIDs == nil {
+		p.SongIDs = []string{}
+	}
 	ids, _ := json.Marshal(p.SongIDs)
 	p.Updated = time.Now()
 	if p.ID == 0 {
@@ -542,9 +605,15 @@ func (s *Store) SavePlaylist(p *Playlist) error {
 		p.ID, _ = res.LastInsertId()
 		return nil
 	}
-	_, err := s.db.Exec(`UPDATE playlists SET name=?, kind=?, seed=?, song_ids=?, updated=? WHERE id=?`,
-		p.Name, p.Kind, p.Seed, string(ids), p.Updated.Unix(), p.ID)
-	return err
+	res, err := s.db.Exec(`UPDATE playlists SET name=?, kind=?, seed=?, song_ids=?, updated=? WHERE id=? AND owner=?`,
+		p.Name, p.Kind, p.Seed, string(ids), p.Updated.Unix(), p.ID, p.Owner)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("playlist %d not found for owner %d", p.ID, p.Owner)
+	}
+	return nil
 }
 
 func scanPlaylist(rows *sql.Rows) (Playlist, error) {
@@ -552,7 +621,12 @@ func scanPlaylist(rows *sql.Rows) (Playlist, error) {
 	var ids string
 	var up int64
 	err := rows.Scan(&p.ID, &p.Owner, &p.Name, &p.Kind, &p.Seed, &ids, &up)
-	json.Unmarshal([]byte(ids), &p.SongIDs)
+	if uerr := json.Unmarshal([]byte(ids), &p.SongIDs); uerr != nil {
+		log.Printf("[beatlab] store: playlist %d has corrupt song_ids: %v", p.ID, uerr)
+	}
+	if p.SongIDs == nil {
+		p.SongIDs = []string{}
+	}
 	p.Updated = time.Unix(up, 0)
 	return p, err
 }
@@ -601,8 +675,10 @@ type CacheEntry struct {
 }
 
 func (s *Store) CachePut(trackID, path string, bytes int64) {
-	s.db.Exec(`INSERT OR REPLACE INTO cache_files(track_id, path, bytes, last_access) VALUES(?,?,?,?)`,
-		trackID, path, bytes, time.Now().Unix())
+	if _, err := s.db.Exec(`INSERT OR REPLACE INTO cache_files(track_id, path, bytes, last_access) VALUES(?,?,?,?)`,
+		trackID, path, bytes, time.Now().Unix()); err != nil {
+		log.Printf("[beatlab] store: cache put %s: %v", trackID, err)
+	}
 }
 func (s *Store) CacheGet(trackID string) (*CacheEntry, bool) {
 	var e CacheEntry
@@ -616,10 +692,21 @@ func (s *Store) CacheGet(trackID string) (*CacheEntry, bool) {
 	return &e, true
 }
 func (s *Store) CacheTouch(trackID string) {
-	s.db.Exec(`UPDATE cache_files SET last_access=? WHERE track_id=?`, time.Now().Unix(), trackID)
+	if _, err := s.db.Exec(`UPDATE cache_files SET last_access=? WHERE track_id=?`, time.Now().Unix(), trackID); err != nil {
+		log.Printf("[beatlab] store: cache touch %s: %v", trackID, err)
+	}
 }
-func (s *Store) CacheDelete(trackID string) {
-	s.db.Exec(`DELETE FROM cache_files WHERE track_id=?`, trackID)
+
+// CacheDelete removes a cache index row and reports whether
+// one existed — the eviction loop uses it to prove progress.
+func (s *Store) CacheDelete(trackID string) bool {
+	res, err := s.db.Exec(`DELETE FROM cache_files WHERE track_id=?`, trackID)
+	if err != nil {
+		log.Printf("[beatlab] store: cache delete %s: %v", trackID, err)
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n > 0
 }
 func (s *Store) CacheEntries() []CacheEntry {
 	rows, err := s.db.Query(`SELECT track_id, path, bytes, last_access FROM cache_files ORDER BY last_access ASC`)
@@ -652,5 +739,7 @@ func (s *Store) KVGet(k string) (string, bool) {
 	return v, err == nil
 }
 func (s *Store) KVSet(k, v string) {
-	s.db.Exec(`INSERT OR REPLACE INTO kv(k, v) VALUES(?,?)`, k, v)
+	if _, err := s.db.Exec(`INSERT OR REPLACE INTO kv(k, v) VALUES(?,?)`, k, v); err != nil {
+		log.Printf("[beatlab] store: kv set %s: %v", k, err)
+	}
 }
