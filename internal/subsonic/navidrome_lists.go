@@ -42,6 +42,13 @@ func (a *API) ndSongList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	tracks, _ := a.store.QueryTracks(store.Query{Limit: 4000})
+	// For a title search, relevance beats the requested sort:
+	// the original recording first, covers/instrumentals below.
+	// (Plain list browsing without a title filter keeps the
+	// client's sort.)
+	if q.Get("title") != "" {
+		rankByRelevance(tracks, q.Get("title"))
+	}
 	albumIDs := append(q["album_id"], q["albumId"]...)
 	artistIDs := append(append(q["artist_id"], q["album_artist_id"]...), q["artists_id"]...)
 	genreIDs := q["genre_id"]
@@ -73,7 +80,9 @@ func (a *API) ndSongList(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, c.song(t))
 	}
-	ndSortSongs(out, q)
+	if q.Get("title") == "" {
+		ndSortSongs(out, q)
+	}
 	start, end := ndPage(w, r, len(out))
 	ndJSON(w, http.StatusOK, out[start:end])
 }

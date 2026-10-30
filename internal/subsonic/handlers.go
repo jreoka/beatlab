@@ -218,6 +218,10 @@ func (a *API) hSearch(r *http.Request, user *store.User) *Elem {
 			}
 		}
 	}
+	// Originals first, alternate versions below (see searchrank.go).
+	if query != "" {
+		rankByRelevance(tracks, query)
+	}
 	root := E("searchResult3")
 
 	artistSet := []string{}
