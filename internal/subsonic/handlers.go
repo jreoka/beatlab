@@ -544,9 +544,14 @@ func (a *API) hSimilar(r *http.Request, user *store.User, v2 bool) *Elem {
 		name = "similarSongs2"
 	}
 	root := E(name)
-	for _, s := range a.taste.Similar(r.Context(), user.ID, *t, count) {
+	songs := a.taste.Similar(r.Context(), user.ID, *t, count)
+	for _, s := range songs {
 		root.Add(a.songElem(s, user))
 	}
+	// A radio queue is played immediately: warm the stream
+	// resolves now so pressing play doesn't pay a yt-dlp
+	// spawn per song.
+	a.engine.WarmResolve(songs, 10)
 	return a.ok(root)
 }
 

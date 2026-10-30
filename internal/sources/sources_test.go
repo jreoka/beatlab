@@ -34,3 +34,18 @@ func TestParseYtTitle(t *testing.T) {
 		t.Errorf("got %q / %q", artist, title)
 	}
 }
+
+func TestParseYtTitleSlashConvention(t *testing.T) {
+	artist, title := parseYtTitle("Reira Ushio / Harenohini 2026.04.04 CENTRAL FEST 2026", "汐れいら")
+	if artist != "汐れいら" {
+		t.Fatalf("artist should stay the channel, got %q", artist)
+	}
+	if title != "Harenohini 2026.04.04 CENTRAL FEST 2026" {
+		t.Fatalf("title kept the artist prefix: %q", title)
+	}
+	// A latin-channel title with slashes is not the convention.
+	_, title2 := parseYtTitle("Love / Hate", "Some Channel")
+	if title2 != "Love / Hate" {
+		t.Fatalf("latin slash title should be untouched, got %q", title2)
+	}
+}

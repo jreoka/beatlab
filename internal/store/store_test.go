@@ -126,6 +126,16 @@ func TestSongKeyVersionsCollapse(t *testing.T) {
 	if k("Paul McCartney", "Live and Let Die") == k("Paul McCartney", "Live") {
 		t.Fatal("mid-title version words must survive")
 	}
+	h := k("Reira Ushio", "Harenohini")
+	if k("Reira Ushio", "Harenohini Instrumental") != h {
+		t.Fatal("instrumental version should share the song key")
+	}
+	if k("Reira Ushio", "Harenohini TV size") != h {
+		t.Fatal("TV-size version should share the song key")
+	}
+	if k("Reira Ushio", "Harenohini 2026.04.04 CENTRAL FEST 2026") != h {
+		t.Fatal("festival upload with a date should share the song key")
+	}
 	if k("Other Band", "Carry On Wayward Son") == base {
 		t.Fatal("different artists must not share a key")
 	}

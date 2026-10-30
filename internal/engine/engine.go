@@ -10,12 +10,14 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"image"
 	"image/color"
 	"image/png"
 	"io"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -162,19 +164,75 @@ func cacheName(trackID string) string {
 }
 
 func (e *Engine) resolve(ctx context.Context, t *store.Track) (string, error) {
-	if strings.HasPrefix(t.StreamURL, "ytdlp:") {
-		src, ok := e.registry.Get("youtube")
-		if !ok {
-			return "", fmt.Errorf("youtube source missing")
+	return e.resolveMode(ctx, t, false)
+}
+
+// resolveMode resolves ytdlp: refs, with a persistent cache:
+// a resolved googlevideo URL lives for hours, so it is kept
+// in the kv store (5h TTL) across restarts — without it,
+// every server restart makes the first play of every YouTube
+// track pay a fresh yt-dlp spawn, which is most of the
+// "songs take too long to start" latency.
+func (e *Engine) resolveMode(ctx context.Context, t *store.Track, fresh bool) (string, error) {
+	if !strings.HasPrefix(t.StreamURL, "ytdlp:") {
+		return t.StreamURL, nil
+	}
+	key := "ytres:" + cacheName(t.StreamURL)
+	if !fresh {
+		if raw, ok := e.store.KVGet(key); ok && raw != "" {
+			var ent struct {
+				URL string `json:"u"`
+				At  int64  `json:"a"`
+			}
+			if json.Unmarshal([]byte(raw), &ent) == nil && ent.URL != "" && time.Since(time.Unix(ent.At, 0)) < 5*time.Hour {
+				return ent.URL, nil
+			}
 		}
-		if resolver, ok := src.(interface {
-			Resolve(context.Context, string) (string, error)
-		}); ok {
-			return resolver.Resolve(ctx, t.StreamURL)
-		}
+	}
+	src, ok := e.registry.Get("youtube")
+	if !ok {
+		return "", fmt.Errorf("youtube source missing")
+	}
+	resolver, ok := src.(interface {
+		Resolve(context.Context, string) (string, error)
+	})
+	if !ok {
 		return "", fmt.Errorf("youtube source cannot resolve streams")
 	}
-	return t.StreamURL, nil
+	url, err := resolver.Resolve(ctx, t.StreamURL)
+	if err == nil && url != "" {
+		raw, _ := json.Marshal(map[string]any{"u": url, "a": time.Now().Unix()})
+		e.store.KVSet(key, string(raw))
+	}
+	return url, err
+}
+
+// WarmResolve resolves the stream refs of upcoming tracks in
+// the background (radio queues call this), so pressing play
+// or skipping doesn't stall on a yt-dlp spawn per song.
+func (e *Engine) WarmResolve(tracks []store.Track, limit int) {
+	var refs []store.Track
+	for _, t := range tracks {
+		if strings.HasPrefix(t.StreamURL, "ytdlp:") {
+			refs = append(refs, t)
+			if len(refs) >= limit {
+				break
+			}
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+	go func() {
+		for _, t := range refs {
+			t := t
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			if _, err := e.resolve(ctx, &t); err != nil {
+				log.Printf("[beatlab] warm resolve %s: %v", t.ID, err)
+			}
+			cancel()
+		}
+	}()
 }
 
 // ServeTrack streams a track to the client, caching full downloads.
@@ -197,16 +255,30 @@ func (e *Engine) ServeTrack(w http.ResponseWriter, r *http.Request, t *store.Tra
 		http.Error(w, "stream unavailable", http.StatusBadGateway)
 		return
 	}
-	upReq, _ := http.NewRequestWithContext(r.Context(), "GET", url, nil)
-	upReq.Header.Set("User-Agent", e.userAgent)
 	clientRange := r.Header.Get("Range")
-	if clientRange != "" {
-		upReq.Header.Set("Range", clientRange)
+	fetch := func(u string) (*http.Response, error) {
+		upReq, _ := http.NewRequestWithContext(r.Context(), "GET", u, nil)
+		upReq.Header.Set("User-Agent", e.userAgent)
+		if clientRange != "" {
+			upReq.Header.Set("Range", clientRange)
+		}
+		return e.http.Do(upReq)
 	}
-	resp, err := e.http.Do(upReq)
+	resp, err := fetch(url)
 	if err != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
+	}
+	if resp.StatusCode == http.StatusForbidden && strings.HasPrefix(t.StreamURL, "ytdlp:") {
+		// A persisted resolved URL can die before its TTL;
+		// drop it, resolve fresh, retry exactly once.
+		resp.Body.Close()
+		e.store.KVSet("ytres:"+cacheName(t.StreamURL), "")
+		if fresh, ferr := e.resolveMode(r.Context(), t, true); ferr == nil && fresh != "" {
+			if resp2, ferr2 := fetch(fresh); ferr2 == nil {
+				resp = resp2
+			}
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {

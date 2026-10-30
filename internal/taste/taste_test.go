@@ -268,3 +268,40 @@ func TestSimilarExpandsBeyondSeedArtist(t *testing.T) {
 		t.Fatalf("seed artist took %d slots (cap 4): %v", artists["Kansas"], artists)
 	}
 }
+
+// An ungenred seed with an empty source registry: radio must
+// still mix, drawing other artists from the listener's own
+// catalog by affinity (rung D) instead of collapsing to the
+// seed artist.
+func TestSimilarCatalogAffinityFallback(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := New(st, sources.NewRegistry())
+	seed := store.Track{ID: "s:1", Source: "youtube", Title: "Solo Song", Artist: "Solo Act", Album: "Solo Act", Genre: "", Duration: 200}
+	others := []store.Track{seed,
+		{ID: "s:2", Source: "youtube", Title: "Solo Two", Artist: "Solo Act", Album: "Solo Act", Genre: "", Duration: 200},
+	}
+	for i := 0; i < 12; i++ {
+		others = append(others, store.Track{ID: fmt.Sprintf("o:%d", i), Source: "test", Title: fmt.Sprintf("Other Song %d", i), Artist: fmt.Sprintf("Other Artist %d", i%6), Album: "O", Genre: "", Duration: 200})
+	}
+	for _, tr := range others {
+		tr := tr
+		if err := st.UpsertTrack(&tr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The listener actually plays the other artists.
+	for i := 0; i < 12; i++ {
+		st.AddEvent(1, fmt.Sprintf("o:%d", i), "play", 1.0)
+	}
+	out := eng.Similar(context.Background(), 1, seed, 15)
+	artists := map[string]int{}
+	for _, tr := range out {
+		artists[tr.Artist]++
+	}
+	if len(artists) < 5 {
+		t.Fatalf("ungenred radio collapsed to %d artists: %v (out=%d)", len(artists), artists, len(out))
+	}
+}

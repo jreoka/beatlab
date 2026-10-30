@@ -187,6 +187,16 @@ func parseYtTitle(raw, channel string) (artist, title string) {
 	raw = strings.ReplaceAll(strings.ReplaceAll(raw, " – ", " - "), " — ", " - ")
 	title = ytJunkSuffix.ReplaceAllString(strings.TrimSpace(raw), "")
 	title = strings.Join(strings.Fields(title), " ")
+	// Japanese uploads commonly use "Artist / Title" (or the
+	// fullwidth equivalent). The channel stays the artist of
+	// record, but the title must not keep the prefix — a title
+	// of "Reira Ushio / Harenohini ..." never dedupes against
+	// "Harenohini". Guarded to CJK contexts so a latin title
+	// like "Love / Hate" is left alone.
+	title = strings.ReplaceAll(title, "\uFF0F", " / ")
+	if i := strings.Index(title, " / "); i > 0 && (containsCJK(channel) || containsCJK(title[:i])) {
+		title = strings.TrimSpace(title[i+3:])
+	}
 	if i := strings.Index(title, " - "); i > 0 {
 		artist = strings.TrimSuffix(strings.TrimSpace(title[:i]), " - Topic")
 		title = strings.TrimSpace(title[i+3:])
@@ -198,6 +208,15 @@ func parseYtTitle(raw, channel string) (artist, title string) {
 		title = raw
 	}
 	return artist, title
+}
+
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3000 && r <= 0x30FF) || (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0xFF00 && r <= 0xFFEF) {
+			return true
+		}
+	}
+	return false
 }
 
 // Resolve turns a "ytdlp:<page>" stream reference into a direct,

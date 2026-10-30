@@ -54,7 +54,7 @@ func adminPassword(dataDir string) string {
 
 // version identifies the build in the startup log and /healthz,
 // so it's always obvious which binary is actually running.
-const version = "0.1.0-radiofix3"
+const version = "0.1.0-radiofix4"
 
 // statusWriter captures the response status for request logging.
 type statusWriter struct {

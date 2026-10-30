@@ -308,6 +308,9 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 		if junkTitle(t) {
 			continue
 		}
+		if t.Duration == 0 && t.Source == "youtube" {
+			continue // placeholder/premiere entries, 0:00 long
+		}
 		switch {
 		case strings.EqualFold(t.Artist, seed.Artist) && seed.Artist != "":
 			add(t, 4)
@@ -357,6 +360,23 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			admit(t, 3, 1.2, 0.8)
 		}
 	}
+	// Rung D: the listener's own catalog, other artists
+	// only, affinity-weighted. This is the fallback that
+	// keeps an ungenred seed (no genre anywhere to search
+	// by) from collapsing to its own artist: his catalog
+	// holds the other artists he actually listens to.
+	if short() {
+		rows, _ := e.store.QueryTracks(store.Query{Limit: 300, Order: "shuffle", Seed: time.Now().Unix() / 86400})
+		for _, t := range rows {
+			if strings.EqualFold(t.Artist, seed.Artist) || junkTitle(t) {
+				continue
+			}
+			if t.Duration == 0 && t.Source == "youtube" {
+				continue
+			}
+			add(t, 0.4+math.Min(p.scoreTrack(t), 3))
+		}
+	}
 	if short() {
 		added := 0
 		for _, a := range p.TopArtists(4) {
@@ -366,7 +386,17 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			added++
 			for _, t := range e.registry.SearchAll(ctx, a, 15) {
 				e.store.UpsertTrack(&t)
-				admit(t, 1.2, 0.8, -1)
+				if t.Duration > 1200 || junkTitle(t) {
+					continue
+				}
+				switch {
+				case strings.EqualFold(t.Artist, a):
+					add(t, 1.2)
+				case effGenre != "" && strings.EqualFold(t.Genre, effGenre):
+					add(t, 0.8)
+				case strings.EqualFold(t.Artist, seed.Artist):
+					add(t, 1)
+				}
 			}
 			if !short() {
 				break
@@ -580,6 +610,9 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 		// themselves with the artist's name and ride in as
 		// "same artist" tracks — never queue them.
 		if junkTitle(t) {
+			continue
+		}
+		if t.Duration == 0 && t.Source == "youtube" {
 			continue
 		}
 		w := p.scoreTrack(t) + rng.Float64()*3.5

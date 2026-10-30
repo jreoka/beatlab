@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
@@ -71,7 +72,7 @@ func (t Track) SongKey() string {
 func coreSongTitle(s string) string {
 	var b strings.Builder
 	depth := 0
-	for _, r := range strings.ToLower(s) {
+	for _, r := range s {
 		switch r {
 		case '(', '[', '\u3010', '\u300e', '\u300c':
 			depth++
@@ -85,32 +86,83 @@ func coreSongTitle(s string) string {
 			}
 		}
 	}
-	var words []string
+	type tok struct {
+		low  string
+		caps bool
+	}
+	var toks []tok
 	for _, wd := range strings.Fields(b.String()) {
 		wd = strings.Trim(wd, "-/&,.:;'\"!?")
-		if wd != "" {
-			words = append(words, wd)
+		if wd == "" {
+			continue
 		}
+		low := strings.ToLower(wd)
+		if isDateToken(low) {
+			// "2026.04.04" in a title is an event date,
+			// never song identity — wherever it sits.
+			continue
+		}
+		caps := len(wd) >= 3 && wd == strings.ToUpper(wd) && strings.IndexFunc(wd, unicode.IsLetter) >= 0
+		toks = append(toks, tok{low, caps})
 	}
 	versionWords := map[string]bool{
 		"remaster": true, "remastered": true, "live": true,
 		"edit": true, "version": true, "mono": true, "stereo": true,
 		"mix": true, "radio": true, "single": true, "album": true,
+		"instrumental": true, "inst": true, "karaoke": true,
+		"tv": true, "size": true, "ver": true,
 		// Upload-quality dressing, not song identity:
 		// "Carry On Wayward Son HD" is the same song.
 		"hd": true, "hq": true, "4k": true, "8k": true,
 		"official": true, "video": true, "audio": true, "mv": true,
 		"lyrics": true, "lyric": true, "visualizer": true,
 	}
-	for len(words) > 1 {
-		last := words[len(words)-1]
+	for len(toks) > 1 {
+		last := toks[len(toks)-1].low
 		if versionWords[last] || isYearToken(last) {
-			words = words[:len(words)-1]
+			toks = toks[:len(toks)-1]
+			continue
+		}
+		if last == "fest" || last == "fes" || last == "festival" {
+			// "... CENTRAL FEST 2026": the word before FEST
+			// is the event's name, not the song's.
+			toks = toks[:len(toks)-1]
+			if len(toks) > 1 && toks[len(toks)-1].caps {
+				toks = toks[:len(toks)-1]
+			}
 			continue
 		}
 		break
 	}
+	words := make([]string, len(toks))
+	for i, t := range toks {
+		words[i] = t.low
+	}
 	return strings.Join(words, " ")
+}
+
+// isDateToken matches full dates like 2026.04.04, 2026-4-4
+// and 2025/10/12 — not bare years (a song can be called
+// "1979"; it cannot be called "1979.12.31").
+func isDateToken(s string) bool {
+	parts := strings.FieldsFunc(s, func(r rune) bool { return r == '.' || r == '-' || r == '/' })
+	if len(parts) != 2 && len(parts) != 3 {
+		return false
+	}
+	if !isYearToken(parts[0]) {
+		return false
+	}
+	for _, part := range parts[1:] {
+		if len(part) < 1 || len(part) > 2 {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func isYearToken(s string) bool {
