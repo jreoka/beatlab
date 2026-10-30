@@ -156,6 +156,21 @@ func TestSimilarNoRepeatSongNoPodcasts(t *testing.T) {
 		}
 	}
 	podcast := store.Track{ID: "pod:1", Source: "fake", Title: "Democrats Flip Kansas? - Daily Politics Podcast", Artist: "MSNBC Daily", Album: "Podcast", Genre: "", Duration: 2700}
+	// The screenshot cases: same-song re-uploads in different
+	// dress, and not-a-song uploads wearing the artist's name.
+	extra := []store.Track{
+		{ID: "k:6", Source: "test", Title: "Carry On Wayward Son", Artist: "Kansas", Album: "Greatest Hits", Genre: "Rock", Duration: 325},
+		{ID: "k:7", Source: "test", Title: "Carry On Wayward Son HD (Live - 2009)", Artist: "Kansas", Album: "YouTube", Genre: "Rock", Duration: 403},
+		{ID: "k:8", Source: "test", Title: "Carry On My Wayward Son", Artist: "Kansas", Album: "YouTube", Genre: "Rock", Duration: 321},
+		{ID: "k:9", Source: "test", Title: "Carry On Wayward Son - Reaction Compilation", Artist: "Kansas", Album: "YouTube", Genre: "Rock", Duration: 687},
+		{ID: "k:10", Source: "test", Title: "Carry On Wayward Son - Guitar Tab | Lesson | Cover | Tutorial", Artist: "Kansas", Album: "YouTube", Genre: "Rock", Duration: 312},
+	}
+	for _, tr := range extra {
+		tr := tr
+		if err := st.UpsertTrack(&tr); err != nil {
+			t.Fatal(err)
+		}
+	}
 	eng := New(st, sources.NewRegistry(fakeSource{tracks: []store.Track{podcast}}))
 	seed := versions[0]
 	out := eng.Similar(context.Background(), 1, seed, 12)
@@ -163,6 +178,9 @@ func TestSimilarNoRepeatSongNoPodcasts(t *testing.T) {
 	for _, tr := range out {
 		if tr.ID == "pod:1" {
 			t.Fatal("politics podcast entered the similar queue")
+		}
+		if tr.ID == "k:9" || tr.ID == "k:10" {
+			t.Fatalf("not-a-song upload entered the similar queue: %s", tr.Title)
 		}
 		switch tr.SongKey() {
 		case seed.SongKey():
@@ -172,8 +190,11 @@ func TestSimilarNoRepeatSongNoPodcasts(t *testing.T) {
 			dust++
 		}
 	}
-	if wayward != 1 {
-		t.Fatalf("seed song appears %d times in its own radio queue, want 1", wayward)
+	// The seed song itself must not come back in its own
+	// queue in any dress — the listener just heard it; that
+	// repetition was the original complaint.
+	if wayward != 0 {
+		t.Fatalf("seed song appears %d times in its own radio queue, want 0", wayward)
 	}
 	if dust > 1 {
 		t.Fatalf("Dust in the Wind appears %d times, want at most 1", dust)

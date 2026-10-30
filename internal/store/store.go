@@ -96,6 +96,11 @@ func coreSongTitle(s string) string {
 		"remaster": true, "remastered": true, "live": true,
 		"edit": true, "version": true, "mono": true, "stereo": true,
 		"mix": true, "radio": true, "single": true, "album": true,
+		// Upload-quality dressing, not song identity:
+		// "Carry On Wayward Son HD" is the same song.
+		"hd": true, "hq": true, "4k": true, "8k": true,
+		"official": true, "video": true, "audio": true, "mv": true,
+		"lyrics": true, "lyric": true, "visualizer": true,
 	}
 	for len(words) > 1 {
 		last := words[len(words)-1]

@@ -46,6 +46,120 @@ func decayWeight(at time.Time) float64 {
 }
 
 // BuildProfile folds a user's events into affinity scores.
+// junkTitleWords mark a track as not-a-song for queue
+// purposes: reaction videos, tutorials, lessons, interviews
+// and the like. Uploaders title these with the artist's name
+// ("Kansas - Carry On Wayward Son - Reaction Compilation"),
+// so they otherwise walk into radio queues as "same artist"
+// tracks. Word-boundary matched.
+var junkTitleWords = map[string]bool{
+	"reaction": true, "reactions": true, "reacts": true,
+	"tutorial": true, "lesson": true, "lessons": true,
+	"tab": true, "tabs": true, "commentary": true,
+	"review": true, "reviews": true, "interview": true,
+	"interviews": true, "podcast": true, "trailer": true,
+	"unboxing": true, "breakdown": true, "explained": true,
+	"analysis": true,
+}
+
+func junkTitle(t store.Track) bool {
+	title := strings.ToLower(t.Title)
+	if strings.Contains(title, "how to") {
+		return true
+	}
+	for _, wd := range strings.FieldsFunc(title, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r < 128
+	}) {
+		if junkTitleWords[wd] {
+			return true
+		}
+	}
+	return false
+}
+
+// songTokens are the normalized title tokens behind
+// store.SongKey, for near-duplicate comparison.
+func songTokens(t store.Track) []string {
+	key := t.SongKey()
+	if i := strings.Index(key, "|"); i >= 0 {
+		key = key[i+1:]
+	}
+	if key == "" {
+		return nil
+	}
+	return strings.Fields(key)
+}
+
+var fillerWords = map[string]bool{"my": true, "the": true, "a": true, "an": true, "oh": true}
+
+// sameSongFuzzy reports whether two token lists name the same
+// song allowing one filler word inserted or dropped —
+// "Carry On My Wayward Son" vs "Carry On Wayward Son" is the
+// same recording mistitled, while genuinely different songs
+// ("Love Me" / "Love Me Do") differ by a real word and stay
+// distinct.
+func sameSongFuzzy(a, b []string) bool {
+	if len(a) == len(b) {
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+	long, short := a, b
+	if len(short) > len(long) {
+		long, short = short, long
+	}
+	if len(long)-len(short) != 1 {
+		return false
+	}
+	skipped := false
+	j := 0
+	for i := 0; i < len(long); i++ {
+		if j < len(short) && long[i] == short[j] {
+			j++
+			continue
+		}
+		if skipped || !fillerWords[long[i]] {
+			return false
+		}
+		skipped = true
+	}
+	return j == len(short)
+}
+
+// songDeduper tracks which songs a queue has already taken,
+// by exact SongKey and by filler-variation, per artist.
+type songDeduper struct {
+	keys map[string]bool
+	toks map[string][][]string
+}
+
+func newSongDeduper() *songDeduper {
+	return &songDeduper{keys: map[string]bool{}, toks: map[string][][]string{}}
+}
+
+func (d *songDeduper) Seen(t store.Track) bool {
+	if d.keys[t.SongKey()] {
+		return true
+	}
+	artist := strings.ToLower(t.Artist)
+	toks := songTokens(t)
+	for _, taken := range d.toks[artist] {
+		if sameSongFuzzy(toks, taken) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *songDeduper) Mark(t store.Track) {
+	d.keys[t.SongKey()] = true
+	artist := strings.ToLower(t.Artist)
+	d.toks[artist] = append(d.toks[artist], songTokens(t))
+}
+
 func (e *Engine) BuildProfile(userID int64) *Profile {
 	p := &Profile{
 		ArtistScore: map[string]float64{},
@@ -157,6 +271,8 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 		cands = append(cands, rows...)
 	}
 	seen := map[string]bool{seed.ID: true}
+	dedup := newSongDeduper()
+	dedup.Mark(seed)
 	type scored struct {
 		t store.Track
 		s float64
@@ -170,6 +286,9 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 		list = append(list, scored{t, base + p.scoreTrack(t)})
 	}
 	for _, t := range cands {
+		if junkTitle(t) {
+			continue
+		}
 		switch {
 		case strings.EqualFold(t.Artist, seed.Artist) && seed.Artist != "":
 			add(t, 4)
@@ -185,7 +304,7 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			// about the state. Expansion results must look like
 			// songs: song-length, and (for other artists) in the
 			// seed's genre.
-			if t.Duration > 1200 {
+			if t.Duration > 1200 || junkTitle(t) {
 				continue
 			}
 			if strings.EqualFold(t.Artist, seed.Artist) {
@@ -212,7 +331,6 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 	}
 	counts := map[string]int{}
 	taken := map[string]bool{}
-	keys := map[string]bool{}
 	var out []store.Track
 	// Pass 1: per-artist caps + one version per song. Pass 2:
 	// caps off, still one version per song — a queue with the
@@ -226,8 +344,7 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			if taken[s.t.ID] {
 				continue
 			}
-			sk := s.t.SongKey()
-			if keys[sk] {
+			if dedup.Seen(s.t) {
 				continue
 			}
 			if pass == 0 {
@@ -241,7 +358,7 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 				}
 				counts[key]++
 			}
-			keys[sk] = true
+			dedup.Mark(s.t)
 			taken[s.t.ID] = true
 			out = append(out, s.t)
 		}
@@ -400,6 +517,12 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 		if !p.Cold() && t.Genre == "" && p.scoreTrack(t) <= 0 {
 			continue
 		}
+		// Reaction videos, tutorials and lessons title
+		// themselves with the artist's name and ride in as
+		// "same artist" tracks — never queue them.
+		if junkTitle(t) {
+			continue
+		}
 		w := p.scoreTrack(t) + rng.Float64()*3.5
 		if mode == "discovery" && p.TrackPlays[t.ID] == 0 {
 			w += 2
@@ -408,7 +531,7 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].w > items[j].w })
 	var out []store.Track
-	songKeys := map[string]bool{}
+	dedup := newSongDeduper()
 	// Pass 1 enforces the per-artist cap; pass 2 relaxes the
 	// cap for thin pools. The one-version-per-song rule holds
 	// in both — a shorter mix beats a repeated song.
@@ -417,8 +540,7 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 			if len(out) >= count {
 				break
 			}
-			sk := it.t.SongKey()
-			if songKeys[sk] {
+			if dedup.Seen(it.t) {
 				continue
 			}
 			key := strings.ToLower(it.t.Artist)
@@ -426,7 +548,7 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 				continue
 			}
 			artistCount[key]++
-			songKeys[sk] = true
+			dedup.Mark(it.t)
 			out = append(out, it.t)
 		}
 	}

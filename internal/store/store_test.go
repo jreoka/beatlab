@@ -114,6 +114,9 @@ func TestSongKeyVersionsCollapse(t *testing.T) {
 	if k("Kansas", "Carry On Wayward Son - Live") != base {
 		t.Fatal("live version should share the song key")
 	}
+	if k("Kansas", "Carry On Wayward Son HD") != base {
+		t.Fatal("upload-quality suffix should share the song key")
+	}
 	if k("Kansas", "Carry On Wayward Son [Radio Edit]") != base {
 		t.Fatal("radio edit should share the song key")
 	}
