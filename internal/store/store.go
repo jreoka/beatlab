@@ -64,6 +64,55 @@ func (t Track) SongKey() string {
 	return slug(t.Artist) + "|" + coreSongTitle(t.Title)
 }
 
+// SongAliases are the alternate song identities hidden in a
+// title's bracketed segments. Japanese uploads routinely
+// carry the translated title in brackets — "Itte (Say It)
+// [Karaoke/Off-Vocal]" IS "Say It" — but coreSongTitle drops
+// bracketed content wholesale, so the karaoke of the seed
+// song survived dedupe under its Japanese name alone. Each
+// bracketed segment, normalized the same way, is an alias
+// key for queue dedupe.
+func (t Track) SongAliases() []string {
+	primary := t.SongKey()
+	var out []string
+	for _, seg := range bracketSegments(t.Title) {
+		key := slug(t.Artist) + "|" + coreSongTitle(seg)
+		if coreSongTitle(seg) != "" && key != primary {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// bracketSegments returns the contents of every bracketed
+// segment ((), [], and the CJK bracket pairs) in s.
+func bracketSegments(s string) []string {
+	var segs []string
+	var cur strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '(', '[', '\u3010', '\u300e', '\u300c':
+			if depth == 0 {
+				cur.Reset()
+			}
+			depth++
+		case ')', ']', '\u3011', '\u300f', '\u300d':
+			if depth > 0 {
+				depth--
+				if depth == 0 && cur.Len() > 0 {
+					segs = append(segs, cur.String())
+				}
+			}
+		default:
+			if depth > 0 {
+				cur.WriteRune(r)
+			}
+		}
+	}
+	return segs
+}
+
 // coreSongTitle normalizes a title for SongKey: brackets and
 // their contents dropped, punctuation removed, and trailing
 // version words (remaster, live, radio edit, a bare year, ...)

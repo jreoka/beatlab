@@ -53,7 +53,7 @@ func decayWeight(at time.Time) float64 {
 // so they otherwise walk into radio queues as "same artist"
 // tracks. Word-boundary matched.
 var junkTitleWords = map[string]bool{
-	"reaction": true, "reactions": true, "reacts": true,
+	"reaction": true, "reactions": true, "reacts": true, "react": true,
 	"tutorial": true, "lesson": true, "lessons": true,
 	"tab": true, "tabs": true, "commentary": true,
 	"review": true, "reviews": true, "interview": true,
@@ -157,6 +157,11 @@ func (d *songDeduper) Seen(t store.Track) bool {
 	if d.keys[t.SongKey()] {
 		return true
 	}
+	for _, alias := range t.SongAliases() {
+		if d.keys[alias] {
+			return true
+		}
+	}
 	artist := strings.ToLower(t.Artist)
 	toks := songTokens(t)
 	for _, taken := range d.toks[artist] {
@@ -169,6 +174,9 @@ func (d *songDeduper) Seen(t store.Track) bool {
 
 func (d *songDeduper) Mark(t store.Track) {
 	d.keys[t.SongKey()] = true
+	for _, alias := range t.SongAliases() {
+		d.keys[alias] = true
+	}
 	artist := strings.ToLower(t.Artist)
 	d.toks[artist] = append(d.toks[artist], songTokens(t))
 }
@@ -268,6 +276,52 @@ func (p *Profile) scoreTrack(t store.Track) float64 {
 // Similar returns songs similar to the seed: same artist and
 // genre-mates first, expanded with a live source search for the
 // seed artist when the local catalog is thin.
+// RandomPool is the quality-controlled pool behind
+// getRandomSongs. Feishin's AUTO DJ pads its queue from
+// getRandomSongs whenever similar songs run short — its
+// algorithm literally falls back to "random songs, limit
+// 50" — so serving that endpoint a raw shuffle of the whole
+// catalog is what kept injecting unplayed archive.org
+// warming debris (Woody Guthrie, Chopin, Mozart, Dead
+// tapes) into queues no Similar change could clean: those
+// tracks never passed through Similar at all. The pool
+// prefers tracks with an engagement signal — played,
+// starred by this user, or YouTube-sourced (arrived via
+// real searches rather than background warming) — and
+// backfills from the general catalog only when the engaged
+// pool cannot fill the request (a fresh server still gets
+// variety).
+func (e *Engine) RandomPool(userID int64, genre string, size int) []store.Track {
+	if size <= 0 {
+		size = 10
+	}
+	rows, _ := e.store.QueryTracks(store.Query{Genre: genre, Limit: 1000, Order: "shuffle", Seed: time.Now().UnixNano()})
+	starred := e.store.Starred(userID)
+	var engaged, rest []store.Track
+	for _, t := range rows {
+		if junkTitle(t) {
+			continue
+		}
+		if t.Duration == 0 && t.Source == "youtube" {
+			continue
+		}
+		_, isStarred := starred[t.ID]
+		if t.PlayCount > 0 || isStarred || t.Source == "youtube" {
+			engaged = append(engaged, t)
+		} else {
+			rest = append(rest, t)
+		}
+	}
+	out := engaged
+	if len(out) < size {
+		out = append(out, rest...)
+	}
+	if len(out) > size {
+		out = out[:size]
+	}
+	return out
+}
+
 func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, count int) []store.Track {
 	p := e.BuildProfile(userID)
 	// Targeted queries, not a catalog window: QueryTracks'

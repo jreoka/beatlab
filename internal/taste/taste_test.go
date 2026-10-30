@@ -401,3 +401,69 @@ func TestSimilarFallbackStaysInWorld(t *testing.T) {
 		}
 	}
 }
+
+// getRandomSongs is Feishin AUTO DJ's padding source. The
+// pool must prefer engaged tracks (played / YouTube-sourced)
+// and keep unplayed archive.org warming debris out when the
+// engaged pool can fill the request.
+func TestRandomPoolPrefersEngaged(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(tr store.Track) store.Track {
+		st.UpsertTrack(&tr)
+		return tr
+	}
+	yt := mk(store.Track{ID: "y:1", Source: "youtube", Title: "Real Song", Artist: "Some Artist", Duration: 200})
+	played := mk(store.Track{ID: "a:1", Source: "archive", Title: "Played Archive Song", Artist: "Old Band", Duration: 200})
+	mk(store.Track{ID: "a:2", Source: "archive", Title: "Ship in the Sky", Artist: "Woody Guthrie", Duration: 155})
+	mk(store.Track{ID: "a:3", Source: "archive", Title: "Nocturne in C Sharp Minor", Artist: "Bibliotheque Music", Duration: 135})
+	mk(store.Track{ID: "y:2", Source: "youtube", Title: "Song | MUSICIANS REACT", Artist: "Some Artist", Duration: 300})
+	st.RecordPlay(played.ID)
+	eng := New(st, sources.NewRegistry())
+	out := eng.RandomPool(1, "", 2)
+	if len(out) != 2 {
+		t.Fatalf("pool size = %d, want 2 (%v)", len(out), out)
+	}
+	for _, tr := range out {
+		if tr.ID == "a:2" || tr.ID == "a:3" || tr.ID == "y:2" {
+			t.Fatalf("pool contains debris/junk track %s (%s)", tr.ID, tr.Title)
+		}
+	}
+	_ = yt
+}
+
+// "Itte (Say It) [Karaoke/Off-Vocal]" is the seed song "Say
+// It." wearing its Japanese title plus a bracketed
+// translation — the bracket alias must dedupe it out of the
+// seed's own radio.
+func TestSimilarExcludesBracketAliasOfSeed(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(tr store.Track) store.Track {
+		st.UpsertTrack(&tr)
+		return tr
+	}
+	seed := mk(store.Track{ID: "s:1", Source: "youtube", Title: "Say It.", Artist: "Yorushika", Duration: 244})
+	mk(store.Track{ID: "s:2", Source: "youtube", Title: "Itte (Say It) [Karaoke/Off-Vocal]", Artist: "Yorushika", Duration: 246})
+	mk(store.Track{ID: "s:3", Source: "youtube", Title: "Hitchcock", Artist: "Yorushika", Duration: 200})
+	eng := New(st, sources.NewRegistry())
+	out := eng.Similar(context.Background(), 1, seed, 10)
+	for _, tr := range out {
+		if tr.ID == "s:2" {
+			t.Fatal("karaoke alias of the seed song entered its radio")
+		}
+	}
+	found := false
+	for _, tr := range out {
+		if tr.ID == "s:3" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the artist's other song missing")
+	}
+}

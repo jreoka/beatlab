@@ -340,12 +340,8 @@ func (a *API) hAlbumList(r *http.Request, user *store.User) *Elem {
 func (a *API) hRandomSongs(r *http.Request, user *store.User) *Elem {
 	size := paramInt(r, "size", 10)
 	genre := r.URL.Query().Get("genre")
-	tracks, _ := a.store.QueryTracks(store.Query{Genre: genre, Order: "shuffle", Seed: time.Now().UnixNano(), Limit: 500})
 	root := E("randomSongs")
-	for i, t := range tracks {
-		if i >= size {
-			break
-		}
+	for _, t := range a.taste.RandomPool(user.ID, genre, size) {
 		root.Add(a.songElem(t, user))
 	}
 	return a.ok(root)
