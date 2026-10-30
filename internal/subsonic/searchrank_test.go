@@ -44,3 +44,37 @@ func ids(ts []store.Track) []string {
 	}
 	return out
 }
+
+// The real YouTube result set for "harenohini" (captured live),
+// as Beatlab stores the tracks. The official Music Video must
+// lead; a different song whose title merely starts with the
+// query ("Harenohini Amagasa...") must not ride the Topic
+// boost to #1; lives, TV-size and piano covers sink.
+func TestRankHarenohiniRealWorld(t *testing.T) {
+	tracks := []store.Track{
+		{ID: "ft", Source: "youtube", Title: "Harenohini / THE FIRST TAKE", Artist: "Ushio Reira", Album: "THE FIRST TAKE"},
+		{ID: "mv", Source: "youtube", Title: "Reira Ushio / Harenohini【Music Video】TV Anime『The Fragrant Flower Blooms with Dignity』Ending Theme", Artist: "汐れいら", Album: "汐れいら"},
+		{ID: "ah", Source: "youtube", Title: "Harenohini Amagasa Sasuyatsuniwa Goyoujin", Artist: "Audio Highs", Album: "Audio Highs"},
+		{ID: "fest", Source: "youtube", Title: "Reira Ushio / Harenohini 2026.04.04 CENTRAL FEST 2026", Artist: "汐れいら", Album: "汐れいら"},
+		{ID: "tv", Source: "youtube", Title: "Harenohini TV size", Artist: "汐れいら", Album: "汐れいら"},
+		{ID: "inst", Source: "youtube", Title: "Harenohini Instrumental", Artist: "汐れいら", Album: "汐れいら"},
+		{ID: "piano", Source: "youtube", Title: "(Full) The Fragrant Flower Blooms with Dignity ED『Harenohini / ハレの日に』 Reira Ushio [piano]", Artist: "YXY Piano Covers", Album: "YXY Piano Covers"},
+	}
+	rankByRelevance(tracks, "harenohini")
+	if tracks[0].ID != "mv" {
+		t.Fatalf("official MV should rank first, got %v", ids(tracks))
+	}
+	pos := map[string]int{}
+	for i, tr := range tracks {
+		pos[tr.ID] = i
+	}
+	if pos["ah"] < 3 {
+		t.Fatalf("different-song Topic track ranked #%d, want below top 3: %v", pos["ah"]+1, ids(tracks))
+	}
+	if pos["piano"] < len(tracks)-2 || pos["ah"] < len(tracks)-2 {
+		t.Fatalf("piano cover and the different-song track should be the bottom two: %v", ids(tracks))
+	}
+	if pos["tv"] < pos["mv"] || pos["inst"] < pos["mv"] {
+		t.Fatalf("versions outranked the MV: %v", ids(tracks))
+	}
+}

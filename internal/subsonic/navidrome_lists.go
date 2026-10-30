@@ -41,11 +41,13 @@ func (a *API) ndSongList(w http.ResponseWriter, r *http.Request) {
 	// latin substring test, yet it is exactly what the user
 	// searched for.
 	leadIDs := map[string]bool{}
+	var lead []store.Track
 	if searchTerm != "" {
 		for _, t := range a.registry.SearchAll(r.Context(), searchTerm, 40) {
 			tt := t
 			a.store.UpsertTrack(&tt)
 			leadIDs[tt.ID] = true
+			lead = append(lead, tt)
 		}
 	}
 	tracks, _ := a.store.QueryTracks(store.Query{Limit: 4000})
@@ -89,8 +91,19 @@ func (a *API) ndSongList(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 
+	// Lead results first, in source order, so the stable
+	// relevance sort breaks ties by the source's own ranking
+	// rather than catalog insertion order.
 	var matched []store.Track
+	for _, t := range lead {
+		if fresh, ok := a.store.Track(t.ID); ok && matches(*fresh) {
+			matched = append(matched, *fresh)
+		}
+	}
 	for _, t := range tracks {
+		if leadIDs[t.ID] {
+			continue
+		}
 		if matches(t) {
 			matched = append(matched, t)
 		}

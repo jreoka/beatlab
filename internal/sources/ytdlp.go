@@ -77,8 +77,8 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	n := limit
-	if n > 15 {
-		n = 15
+	if n > 30 {
+		n = 30
 	}
 	cmd := exec.CommandContext(ctx, y.bin, "--flat-playlist", "-J", "--no-warnings",
 		fmt.Sprintf("ytsearch%d:%s", n, query))
