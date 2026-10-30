@@ -174,12 +174,45 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 		}
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].s > list[j].s })
+	// "Similar" must not come back as a single-artist list: the
+	// seed artist's own tracks score highest by construction, so
+	// without caps a radio queue built from this is one artist
+	// wall to wall. Cap the seed artist hard and every other
+	// artist loosely, then backfill without caps if the catalog
+	// is too thin to fill the list otherwise.
+	seedCap := count / 5
+	if seedCap < 2 {
+		seedCap = 2
+	}
+	otherCap := count / 4
+	if otherCap < 3 {
+		otherCap = 3
+	}
+	counts := map[string]int{}
+	taken := map[string]bool{}
 	var out []store.Track
-	for i, s := range list {
-		if i >= count {
-			break
+	for _, pass := range []bool{true, false} {
+		for _, s := range list {
+			if len(out) >= count {
+				return out
+			}
+			if taken[s.t.ID] {
+				continue
+			}
+			if pass {
+				key := strings.ToLower(s.t.Artist)
+				cap := otherCap
+				if strings.EqualFold(s.t.Artist, seed.Artist) {
+					cap = seedCap
+				}
+				if counts[key] >= cap {
+					continue
+				}
+				counts[key]++
+			}
+			taken[s.t.ID] = true
+			out = append(out, s.t)
 		}
-		out = append(out, s.t)
 	}
 	return out
 }
