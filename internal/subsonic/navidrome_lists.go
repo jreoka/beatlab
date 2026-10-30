@@ -29,6 +29,18 @@ func (a *API) ndSongList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	// A title search goes live, like the Subsonic search does:
+	// fan out to the sources (soft-deadline bounded), warm the
+	// results into the catalog, then answer from the catalog.
+	// Without this, the Navidrome-mode Tracks tab only ever
+	// finds what's already local and reads as "search is empty"
+	// for anything new.
+	if title := q.Get("title"); title != "" {
+		for _, t := range a.registry.SearchAll(r.Context(), title, 40) {
+			tt := t
+			a.store.UpsertTrack(&tt)
+		}
+	}
 	tracks, _ := a.store.QueryTracks(store.Query{Limit: 4000})
 	albumIDs := append(q["album_id"], q["albumId"]...)
 	artistIDs := append(append(q["artist_id"], q["album_artist_id"]...), q["artists_id"]...)
