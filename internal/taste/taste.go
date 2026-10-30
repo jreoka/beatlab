@@ -261,13 +261,32 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 	// default order is alphabetical by artist, so a flat
 	// Limit-N window silently exiles every late-alphabet
 	// artist once the catalog outgrows it.
-	var cands []store.Track
+	var artistRows []store.Track
 	if seed.Artist != "" {
-		rows, _ := e.store.QueryTracks(store.Query{Artist: seed.Artist, Limit: 500})
-		cands = append(cands, rows...)
+		artistRows, _ = e.store.QueryTracks(store.Query{Artist: seed.Artist, Limit: 500})
 	}
-	if seed.Genre != "" {
-		rows, _ := e.store.QueryTracks(store.Query{Genre: seed.Genre, Limit: 500, Order: "shuffle", Seed: time.Now().Unix() / 86400})
+	// The seed's effective genre: its own tag, or — YouTube
+	// uploads carry no genre — the seed artist's most common
+	// genre in the catalog. Without it a genre-less seed can
+	// only ever return its own artist.
+	effGenre := seed.Genre
+	if effGenre == "" && len(artistRows) > 0 {
+		counts := map[string]int{}
+		for _, t := range artistRows {
+			if t.Genre != "" {
+				counts[t.Genre]++
+			}
+		}
+		best := 0
+		for g, n := range counts {
+			if n > best {
+				best, effGenre = n, g
+			}
+		}
+	}
+	cands := append([]store.Track{}, artistRows...)
+	if effGenre != "" {
+		rows, _ := e.store.QueryTracks(store.Query{Genre: effGenre, Limit: 500, Order: "shuffle", Seed: time.Now().Unix() / 86400})
 		cands = append(cands, rows...)
 	}
 	seen := map[string]bool{seed.ID: true}
@@ -292,25 +311,65 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 		switch {
 		case strings.EqualFold(t.Artist, seed.Artist) && seed.Artist != "":
 			add(t, 4)
-		case seed.Genre != "" && strings.EqualFold(t.Genre, seed.Genre):
+		case effGenre != "" && strings.EqualFold(t.Genre, effGenre):
 			add(t, 1.5)
 		}
 	}
-	if len(list) < count && seed.Artist != "" {
+	// Expansion ladder. The trigger is not just a short list
+	// but a MONO-ARTIST one: a genre-less seed in a thin
+	// catalog used to return three songs by the seed artist
+	// and stop — a "radio" that never leaves the artist.
+	// Climb until the list is long and varied enough: the
+	// artist's own name, then the genre (which is how other
+	// artists enter at all), then the listener's top artists.
+	distinctArtists := func() int {
+		set := map[string]bool{}
+		for _, sc := range list {
+			set[strings.ToLower(sc.t.Artist)] = true
+		}
+		return len(set)
+	}
+	short := func() bool {
+		return len(list) < count || (count >= 10 && distinctArtists() < 5)
+	}
+	admit := func(t store.Track, sameArtist, genreMatch, ungenred float64) {
+		if t.Duration > 1200 || junkTitle(t) {
+			return
+		}
+		switch {
+		case strings.EqualFold(t.Artist, seed.Artist):
+			add(t, sameArtist)
+		case effGenre != "" && strings.EqualFold(t.Genre, effGenre):
+			add(t, genreMatch)
+		case t.Genre == "" && ungenred >= 0:
+			add(t, ungenred)
+		}
+	}
+	if short() && seed.Artist != "" {
 		for _, t := range e.registry.SearchAll(ctx, seed.Artist, 25) {
 			e.store.UpsertTrack(&t)
-			// A bare artist-name search drags in everything the
-			// name touches — for "Kansas", politics podcasts
-			// about the state. Expansion results must look like
-			// songs: song-length, and (for other artists) in the
-			// seed's genre.
-			if t.Duration > 1200 || junkTitle(t) {
+			admit(t, 3.5, 1, -1)
+		}
+	}
+	if short() && effGenre != "" {
+		for _, t := range e.registry.SearchAll(ctx, effGenre, 30) {
+			e.store.UpsertTrack(&t)
+			admit(t, 3, 1.2, 0.8)
+		}
+	}
+	if short() {
+		added := 0
+		for _, a := range p.TopArtists(4) {
+			if added >= 2 || strings.EqualFold(a, seed.Artist) {
 				continue
 			}
-			if strings.EqualFold(t.Artist, seed.Artist) {
-				add(t, 3.5)
-			} else if seed.Genre != "" && strings.EqualFold(t.Genre, seed.Genre) {
-				add(t, 1)
+			added++
+			for _, t := range e.registry.SearchAll(ctx, a, 15) {
+				e.store.UpsertTrack(&t)
+				admit(t, 1.2, 0.8, -1)
+			}
+			if !short() {
+				break
 			}
 		}
 	}

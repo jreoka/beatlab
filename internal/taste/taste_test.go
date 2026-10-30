@@ -200,3 +200,71 @@ func TestSimilarNoRepeatSongNoPodcasts(t *testing.T) {
 		t.Fatalf("Dust in the Wind appears %d times, want at most 1", dust)
 	}
 }
+
+type queryAwareSource struct {
+	byQuery map[string][]store.Track
+}
+
+func (f queryAwareSource) Name() string    { return "qa" }
+func (f queryAwareSource) Available() bool { return true }
+func (f queryAwareSource) Status() string  { return "qa" }
+func (f queryAwareSource) Search(ctx context.Context, q string, limit int) ([]store.Track, error) {
+	return f.byQuery[q], nil
+}
+
+// The genre-less seed: a YouTube-sourced Kansas track has no
+// genre, and the local catalog holds only a few Kansas songs.
+// Radio must still become a classic-rock mix — the engine
+// derives the artist's genre from their catalogued tracks
+// and expands through a genre search, not just the artist's
+// name.
+func TestSimilarExpandsBeyondSeedArtist(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedTracks := []store.Track{
+		{ID: "k:1", Source: "youtube", Title: "Carry On Wayward Son", Artist: "Kansas", Album: "Kansas", Genre: "", Duration: 324},
+		{ID: "k:2", Source: "youtube", Title: "Dust in the Wind", Artist: "Kansas", Album: "Kansas", Genre: "", Duration: 208},
+		{ID: "k:3", Source: "youtube", Title: "Point of No Return", Artist: "Kansas", Album: "Kansas", Genre: "", Duration: 174},
+		{ID: "k:4", Source: "archive", Title: "Miracles out of Nowhere", Artist: "Kansas", Album: "Leftoverture", Genre: "Rock", Duration: 387},
+		{ID: "k:5", Source: "archive", Title: "Song for America", Artist: "Kansas", Album: "Kansas", Genre: "Rock", Duration: 600},
+	}
+	for _, tr := range seedTracks {
+		tr := tr
+		if err := st.UpsertTrack(&tr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	genreResults := []store.Track{
+		{ID: "e:1", Source: "fake", Title: "Hotel California", Artist: "Eagles", Album: "Eagles", Genre: "", Duration: 390},
+		{ID: "e:2", Source: "fake", Title: "Take It Easy", Artist: "Eagles", Album: "Eagles", Genre: "Rock", Duration: 192},
+		{ID: "b:1", Source: "fake", Title: "More Than a Feeling", Artist: "Boston", Album: "Boston", Genre: "", Duration: 285},
+		{ID: "b:2", Source: "fake", Title: "Peace of Mind", Artist: "Boston", Album: "Boston", Genre: "Rock", Duration: 300},
+		{ID: "f:1", Source: "fake", Title: "Dreams", Artist: "Fleetwood Mac", Album: "Fleetwood Mac", Genre: "", Duration: 254},
+		{ID: "f:2", Source: "fake", Title: "Go Your Own Way", Artist: "Fleetwood Mac", Album: "Fleetwood Mac", Genre: "Rock", Duration: 218},
+		{ID: "j:1", Source: "fake", Title: "Dream On", Artist: "Aerosmith", Album: "Aerosmith", Genre: "", Duration: 268},
+		{ID: "j:2", Source: "fake", Title: "Sweet Emotion", Artist: "Aerosmith", Album: "Aerosmith", Genre: "Rock", Duration: 260},
+		{ID: "z:1", Source: "fake", Title: "La Grange", Artist: "ZZ Top", Album: "ZZ Top", Genre: "", Duration: 230},
+		{ID: "z:2", Source: "fake", Title: "Tush", Artist: "ZZ Top", Album: "ZZ Top", Genre: "Rock", Duration: 147},
+		{ID: "q:1", Source: "fake", Title: "Another One Bites the Dust", Artist: "Queen", Album: "Queen", Genre: "", Duration: 215},
+		{ID: "q:2", Source: "fake", Title: "Crazy Little Thing Called Love", Artist: "Queen", Album: "Queen", Genre: "Rock", Duration: 164},
+	}
+	eng := New(st, sources.NewRegistry(queryAwareSource{byQuery: map[string][]store.Track{
+		"Rock": genreResults,
+	}}))
+	out := eng.Similar(context.Background(), 1, seedTracks[0], 20)
+	if len(out) < 12 {
+		t.Fatalf("similar returned %d tracks, want a full mix (>= 12)", len(out))
+	}
+	artists := map[string]int{}
+	for _, tr := range out {
+		artists[tr.Artist]++
+	}
+	if len(artists) < 5 {
+		t.Fatalf("similar mix has only %d artists: %v", len(artists), artists)
+	}
+	if artists["Kansas"] > 4 {
+		t.Fatalf("seed artist took %d slots (cap 4): %v", artists["Kansas"], artists)
+	}
+}
