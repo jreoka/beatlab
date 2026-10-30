@@ -1,9 +1,11 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -44,24 +46,49 @@ type iaSearchResponse struct {
 	} `json:"response"`
 }
 
+// flexString decodes a JSON field archive.org serves as a
+// string on some items and a bare number on others. A plain
+// string field makes the WHOLE document fail to unmarshal —
+// the same trap the creator field already needed `any` for —
+// and one bad file used to silently zero out an entire item.
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		*f = ""
+		return nil
+	}
+	if b[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		*f = flexString(str)
+		return nil
+	}
+	*f = flexString(string(b))
+	return nil
+}
+
 type iaMetadata struct {
 	Metadata struct {
-		Title      string `json:"title"`
-		Creator    any    `json:"creator"` // string or []string
-		Year       string `json:"date"`
-		Subject    any    `json:"subject"`
-		Collection any    `json:"collection"` // string or []string
+		Title      string     `json:"title"`
+		Creator    any        `json:"creator"` // string or []string
+		Year       flexString `json:"date"`
+		Subject    any        `json:"subject"`
+		Collection any        `json:"collection"` // string or []string
 	} `json:"metadata"`
 	Files []struct {
-		Name    string `json:"name"`
-		Format  string `json:"format"`
-		Length  string `json:"length"` // "3:47" or seconds
-		Size    string `json:"size"`
-		Track   string `json:"track"`
-		Title   string `json:"title"`
-		Artist  string `json:"artist"`
-		Album   string `json:"album"`
-		Creator string `json:"creator"`
+		Name    string     `json:"name"`
+		Format  string     `json:"format"`
+		Length  flexString `json:"length"` // "3:47" or seconds
+		Size    flexString `json:"size"`
+		Track   flexString `json:"track"`
+		Title   flexString `json:"title"`
+		Artist  flexString `json:"artist"`
+		Album   flexString `json:"album"`
+		Creator flexString `json:"creator"`
 	} `json:"files"`
 }
 
@@ -138,6 +165,7 @@ func parseLength(s string) int {
 
 var audioFormats = map[string]bool{
 	"VBR MP3": true, "MP3": true, "Ogg Vorbis": true, "FLAC": true,
+	"WAVE": true, "WAV": true, "Opus": true, "AIFF": true,
 	"128Kbps MP3": true, "64Kbps MP3": true, "256Kbps MP3": true, "320Kbps MP3": true,
 }
 
@@ -150,6 +178,9 @@ func extOf(name string) string {
 }
 
 func (a *ArchiveSource) Search(ctx context.Context, query string, limit int) ([]store.Track, error) {
+	if limit < 1 {
+		return nil, nil
+	}
 	// Phrase-match the whole query against creator/title: a bare
 	// multi-word Lucene query ORs the words and drowns in radio
 	// airchecks and other spoken-word noise.
@@ -163,6 +194,9 @@ func (a *ArchiveSource) Search(ctx context.Context, query string, limit int) ([]
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("archive.org search: %s", resp.Status)
+	}
 	var sr iaSearchResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
 		return nil, err
@@ -186,6 +220,8 @@ func (a *ArchiveSource) Search(ctx context.Context, query string, limit int) ([]
 			}
 			if tracks, err := a.itemTracks(ctx, id); err == nil {
 				perDoc[i] = tracks
+			} else {
+				log.Printf("[beatlab] archive.org item %s: %v", id, err)
 			}
 		}(i, doc.Identifier)
 	}
@@ -258,7 +294,7 @@ func pickCover(identifier string, md iaMetadata) string {
 			score -= 5 // per-track image (photo/scan of one song), not album art
 		}
 		size := int64(0)
-		fmt.Sscanf(f.Size, "%d", &size)
+		fmt.Sscanf(string(f.Size), "%d", &size)
 		cand := img{url: "https://archive.org/download/" + identifier + "/" + url.PathEscape(f.Name), score: score, size: size}
 		if best == nil || cand.score > best.score || (cand.score == best.score && cand.size > best.size) {
 			c := cand
@@ -271,6 +307,16 @@ func pickCover(identifier string, md iaMetadata) string {
 	return best.url
 }
 
+// stripExt removes "."+ext from name case-insensitively
+// ("Song.MP3" must not keep its extension as a title).
+func stripExt(name, ext string) string {
+	suffix := "." + ext
+	if len(name) > len(suffix) && strings.EqualFold(name[len(name)-len(suffix):], suffix) {
+		return name[:len(name)-len(suffix)]
+	}
+	return name
+}
+
 // itemTracks expands one archive.org item into its audio tracks.
 func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]store.Track, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://archive.org/metadata/"+identifier, nil)
@@ -280,6 +326,9 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("archive.org metadata %s: %s", identifier, resp.Status)
+	}
 	var md iaMetadata
 	if err := json.NewDecoder(resp.Body).Decode(&md); err != nil {
 		return nil, err
@@ -293,8 +342,8 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 		artist = "Unknown Artist"
 	}
 	year := 0
-	if len(md.Metadata.Year) >= 4 {
-		fmt.Sscanf(md.Metadata.Year[:4], "%d", &year)
+	if ys := string(md.Metadata.Year); len(ys) >= 4 {
+		fmt.Sscanf(ys[:4], "%d", &year)
 	}
 	genre := canonicalGenre(md.Metadata.Subject)
 
@@ -302,11 +351,16 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 
 	var tracks []store.Track
 	for _, f := range md.Files {
+		if len(tracks) >= 250 {
+			// Mega-items (tape trees with thousands of files)
+			// must not materialize unboundedly per search.
+			break
+		}
 		ext := extOf(f.Name)
-		if !audioFormats[f.Format] && ext != "mp3" && ext != "ogg" && ext != "flac" && ext != "m4a" {
+		if !audioFormats[f.Format] && ext != "mp3" && ext != "ogg" && ext != "flac" && ext != "m4a" && ext != "wav" && ext != "opus" && ext != "aiff" && ext != "aif" {
 			continue
 		}
-		dur := parseLength(f.Length)
+		dur := parseLength(string(f.Length))
 		// Songs, not broadcasts: hour-long files are radio
 		// airchecks, audiobooks and podcasts — drop them when the
 		// duration is known.
@@ -314,15 +368,15 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 			continue
 		}
 		// skip derivative duplicates: keep the best single encoding per title
-		title := strings.TrimSpace(f.Title)
+		title := strings.TrimSpace(string(f.Title))
 		if title == "" {
-			title = strings.TrimSuffix(f.Name, "."+ext)
+			title = stripExt(f.Name, ext)
 		}
 		trackArtist := artist
 		if f.Artist != "" {
-			trackArtist = strings.TrimSpace(f.Artist)
+			trackArtist = strings.TrimSpace(string(f.Artist))
 		} else if f.Creator != "" {
-			trackArtist = strings.TrimSpace(f.Creator)
+			trackArtist = strings.TrimSpace(string(f.Creator))
 		}
 		if trackArtist == "Unknown Artist" {
 			// No attribution anywhere — these unattributed
@@ -331,12 +385,12 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 		}
 		trackAlbum := album
 		if f.Album != "" {
-			trackAlbum = strings.TrimSpace(f.Album)
+			trackAlbum = strings.TrimSpace(string(f.Album))
 		}
 		trackNo := 0
-		fmt.Sscanf(f.Track, "%d", &trackNo)
+		fmt.Sscanf(string(f.Track), "%d", &trackNo)
 		size := int64(0)
-		fmt.Sscanf(f.Size, "%d", &size)
+		fmt.Sscanf(string(f.Size), "%d", &size)
 		id := "archive:" + identifier + ":" + f.Name
 		tracks = append(tracks, store.Track{
 			ID:        id,
@@ -347,7 +401,7 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 			Genre:     genre,
 			Year:      year,
 			TrackNo:   trackNo,
-			Duration:  parseLength(f.Length),
+			Duration:  dur,
 			Format:    ext,
 			Size:      size,
 			StreamURL: "https://archive.org/download/" + identifier + "/" + url.PathEscape(f.Name),
@@ -357,7 +411,7 @@ func (a *ArchiveSource) itemTracks(ctx context.Context, identifier string) ([]st
 	// Dedupe same title+track (multiple encodings): keep the largest file.
 	best := map[string]store.Track{}
 	for _, t := range tracks {
-		k := fmt.Sprintf("%d|%s", t.TrackNo, strings.ToLower(t.Title))
+		k := fmt.Sprintf("%d|%s|%s", t.TrackNo, strings.ToLower(t.Artist), strings.ToLower(t.Title))
 		if old, ok := best[k]; !ok || t.Size > old.Size {
 			best[k] = t
 		}

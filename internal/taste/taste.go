@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"beatlab/internal/sources"
@@ -29,6 +30,7 @@ type Profile struct {
 type Engine struct {
 	store    *store.Store
 	registry *sources.Registry
+	warming  atomic.Bool
 }
 
 func New(st *store.Store, reg *sources.Registry) *Engine {
@@ -141,7 +143,19 @@ func (p *Profile) scoreTrack(t store.Track) float64 {
 // seed artist when the local catalog is thin.
 func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, count int) []store.Track {
 	p := e.BuildProfile(userID)
-	cands, _ := e.store.QueryTracks(store.Query{Limit: 400})
+	// Targeted queries, not a catalog window: QueryTracks'
+	// default order is alphabetical by artist, so a flat
+	// Limit-N window silently exiles every late-alphabet
+	// artist once the catalog outgrows it.
+	var cands []store.Track
+	if seed.Artist != "" {
+		rows, _ := e.store.QueryTracks(store.Query{Artist: seed.Artist, Limit: 500})
+		cands = append(cands, rows...)
+	}
+	if seed.Genre != "" {
+		rows, _ := e.store.QueryTracks(store.Query{Genre: seed.Genre, Limit: 500, Order: "shuffle", Seed: time.Now().Unix() / 86400})
+		cands = append(cands, rows...)
+	}
 	seen := map[string]bool{seed.ID: true}
 	type scored struct {
 		t store.Track
@@ -251,6 +265,10 @@ var TrendingQueries = []string{
 // Warm seeds the catalog from the trending queries, once, while
 // the catalog is still small. Safe to call at startup.
 func (e *Engine) Warm(ctx context.Context) {
+	if !e.warming.CompareAndSwap(false, true) {
+		return
+	}
+	defer e.warming.Store(false)
 	if e.store.TrackCount() >= 150 {
 		return
 	}
@@ -290,12 +308,13 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 	// Six-hour buckets match the radio playlists' refresh
 	// cadence: every refresh is a genuinely new shuffle, not
 	// the same mix re-served.
-	rng := rand.New(rand.NewSource(time.Now().Unix()/21600 + modeSeed))
+	bucketSeed := time.Now().Unix()/21600 + modeSeed
+	rng := rand.New(rand.NewSource(bucketSeed))
 	var pool []store.Track
 
 	switch mode {
 	case "favorites":
-		all, _ := e.store.QueryTracks(store.Query{Limit: 500})
+		all, _ := e.store.QueryTracks(store.Query{Limit: 500, Order: "shuffle", Seed: bucketSeed})
 		for _, t := range all {
 			if p.Starred[t.ID] || p.TrackPlays[t.ID] > 0 {
 				pool = append(pool, t)
@@ -320,7 +339,7 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 			}
 		}
 		if p.Cold() {
-			all, _ := e.store.QueryTracks(store.Query{Limit: 500})
+			all, _ := e.store.QueryTracks(store.Query{Limit: 500, Order: "shuffle", Seed: bucketSeed})
 			pool = append(pool, all...)
 		} else {
 			// True discovery: catalog tracks in the user's top
@@ -335,7 +354,7 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 			for _, a := range p.TopArtists(10) {
 				topA[strings.ToLower(a)] = true
 			}
-			all, _ := e.store.QueryTracks(store.Query{Limit: 500})
+			all, _ := e.store.QueryTracks(store.Query{Limit: 500, Order: "shuffle", Seed: bucketSeed})
 			for _, t := range all {
 				if p.TrackPlays[t.ID] == 0 && topG[t.Genre] && !topA[strings.ToLower(t.Artist)] {
 					pool = append(pool, t)
@@ -343,14 +362,14 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 			}
 		}
 		// anchor with a few familiar tracks
-		all, _ := e.store.QueryTracks(store.Query{Limit: 200})
+		all, _ := e.store.QueryTracks(store.Query{Limit: 200, Order: "shuffle", Seed: bucketSeed})
 		for _, t := range all {
 			if p.scoreTrack(t) > 2 {
 				pool = append(pool, t)
 			}
 		}
 	default: // personal
-		all, _ := e.store.QueryTracks(store.Query{Limit: 500})
+		all, _ := e.store.QueryTracks(store.Query{Limit: 500, Order: "shuffle", Seed: bucketSeed})
 		pool = append(pool, all...)
 		for _, a := range p.TopArtists(2) {
 			for _, t := range e.registry.SearchAll(ctx, a, 10) {
@@ -431,8 +450,15 @@ func (e *Engine) RecommendedArtists(userID int64, count int) []string {
 		if seen[a] || p.ArtistScore[a] != 0 {
 			continue
 		}
-		tracks, _ := e.store.QueryTracks(store.Query{Artist: a, Limit: 1})
-		if len(tracks) > 0 && topGenres[tracks[0].Genre] {
+		tracks, _ := e.store.QueryTracks(store.Query{Artist: a, Limit: 5})
+		genreMatch := false
+		for _, t := range tracks {
+			if topGenres[t.Genre] {
+				genreMatch = true
+				break
+			}
+		}
+		if genreMatch {
 			out = append(out, a)
 			seen[a] = true
 			if len(out) >= count {

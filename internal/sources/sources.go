@@ -64,6 +64,9 @@ var SearchSoftDeadline = 6 * time.Second
 const searchSourceTimeout = 30 * time.Second
 
 func (r *Registry) SearchAll(ctx context.Context, query string, limit int) []store.Track {
+	if limit <= 0 {
+		return nil
+	}
 	var avail []Source
 	for _, s := range r.list {
 		if s.Available() {

@@ -425,7 +425,7 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 	case "play_count DESC":
 		sqlStr += ` ORDER BY play_count DESC`
 	case "shuffle":
-		sqlStr += ` ORDER BY ((CAST(substr(id,1,4) AS BLOB) IS NOT NULL), (rowid * 2654435761 + ?) % 1000003)`
+		sqlStr += ` ORDER BY (rowid * 2654435761 + ?) % 1000003`
 		args = append(args, q.Seed)
 	default:
 		// Anything else falls back to the default ordering —

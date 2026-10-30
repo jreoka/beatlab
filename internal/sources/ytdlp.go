@@ -103,12 +103,25 @@ func (y *YtDlpSource) Search(ctx context.Context, query string, limit int) ([]st
 		if e.ID == "" {
 			continue
 		}
+		// Songs, not broadcasts — the same rule archive.org
+		// applies. Flat results also surface mixes, livestreams
+		// and full-album uploads; deleted/private entries come
+		// back with placeholder titles.
+		if e.Duration > 1200 {
+			continue
+		}
+		if e.Title == "[Deleted video]" || e.Title == "[Private video]" {
+			continue
+		}
 		channel := e.Uploader
 		if channel == "" {
 			channel = e.Channel
 		}
 		channel = strings.TrimSuffix(strings.TrimSpace(channel), " - Topic")
 		artist, title := parseYtTitle(e.Title, channel)
+		if artist == "" {
+			continue // unattributed — the catalog drops these on the archive side too
+		}
 		// Album: the channel (a session/compilation source like
 		// "THE FIRST TAKE" reads correctly as an album), or the
 		// artist for Topic/self uploads. Never a bare "YouTube" —
@@ -214,6 +227,13 @@ func (y *YtDlpSource) Resolve(ctx context.Context, ref string) (string, error) {
 		return "", fmt.Errorf("yt-dlp returned no stream URL")
 	}
 	y.mu.Lock()
+	if len(y.resolved) > 256 {
+		for k, r := range y.resolved {
+			if time.Since(r.at) > 25*time.Minute {
+				delete(y.resolved, k)
+			}
+		}
+	}
 	y.resolved[page] = resolvedURL{url: u, at: time.Now()}
 	y.mu.Unlock()
 	return u, nil
