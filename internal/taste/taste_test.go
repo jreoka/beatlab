@@ -305,3 +305,79 @@ func TestSimilarCatalogAffinityFallback(t *testing.T) {
 		t.Fatalf("ungenred radio collapsed to %d artists: %v (out=%d)", len(artists), artists, len(out))
 	}
 }
+
+// The Yorushika screenshot: an ungenred Japanese seed whose
+// catalog fallback filled the queue with Woody Guthrie,
+// Chopin and classical-label uploads from the warming pool.
+// The fallback must draw on affinity first, then same-script
+// tracks — never the whole catalog at a flat score — and the
+// result must interleave artists instead of front-loading
+// the seed artist.
+func TestSimilarFallbackStaysInWorld(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := New(st, sources.NewRegistry())
+	seed := store.Track{ID: "y:1", Source: "youtube", Title: "Say It.", Artist: "Yorushika", Album: "Yorushika", Genre: "", Duration: 244}
+	catalog := []store.Track{seed}
+	for i := 0; i < 5; i++ {
+		catalog = append(catalog, store.Track{ID: fmt.Sprintf("y:%d", i+2), Source: "youtube", Title: fmt.Sprintf("ヨルシカ曲 %d", i), Artist: "Yorushika", Album: "Yorushika", Genre: "", Duration: 200})
+	}
+	// Affinity artist: Japanese, and the listener plays her.
+	for i := 0; i < 4; i++ {
+		tr := store.Track{ID: fmt.Sprintf("r:%d", i), Source: "youtube", Title: fmt.Sprintf("汐れいら Song %d", i), Artist: "汐れいら", Album: "汐れいら", Genre: "", Duration: 200}
+		catalog = append(catalog, tr)
+	}
+	// Other Japanese artists in the catalog, unplayed.
+	for i := 0; i < 6; i++ {
+		catalog = append(catalog, store.Track{ID: fmt.Sprintf("j:%d", i), Source: "youtube", Title: fmt.Sprintf("日本の曲 %d", i), Artist: fmt.Sprintf("日本のバンド %d", i%3), Album: "J", Genre: "", Duration: 200})
+	}
+	// The warming-catalog debris: latin, unplayed, unrelated.
+	debris := []store.Track{
+		{ID: "d:1", Source: "archive", Title: "This Land Is Your Land", Artist: "rutaloot", Album: "Woody Guthrie", Genre: "Folk", Duration: 271},
+		{ID: "d:2", Source: "archive", Title: "Ballade op. 23, n. 1 (in G min.)", Artist: "Primrose Classical White Label", Album: "Chopin", Genre: "Classical", Duration: 543},
+		{ID: "d:3", Source: "archive", Title: "Nocturne No. 6 in F", Artist: "S D Rodrian", Album: "Chopin", Genre: "Classical", Duration: 146},
+		{ID: "d:4", Source: "archive", Title: "In A Sentimental Mood", Artist: "John Coltrane", Album: "Coltrane", Genre: "Jazz", Duration: 257},
+	}
+	catalog = append(catalog, debris...)
+	for _, tr := range catalog {
+		tr := tr
+		if err := st.UpsertTrack(&tr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		st.AddEvent(1, fmt.Sprintf("r:%d", i), "play", 1.0)
+	}
+	out := eng.Similar(context.Background(), 1, seed, 20)
+	if len(out) < 10 {
+		t.Fatalf("queue too short: %d", len(out))
+	}
+	for _, tr := range out {
+		for _, d := range debris {
+			if tr.ID == d.ID {
+				t.Fatalf("catalog debris entered the queue: %s by %s", tr.Title, tr.Artist)
+			}
+		}
+	}
+	foundAffinity := false
+	for _, tr := range out {
+		if tr.Artist == "汐れいら" {
+			foundAffinity = true
+		}
+	}
+	if !foundAffinity {
+		t.Fatal("affinity artist missing from the queue")
+	}
+	for i := 1; i < len(out); i++ {
+		if out[i].Artist == out[i-1].Artist && len(out) > 2 {
+			// Adjacent duplicates are only acceptable when
+			// nothing else remains — with this catalog there
+			// is always an alternative early on.
+			if i < 6 {
+				t.Fatalf("queue front-loads one artist at position %d: %v", i, out)
+			}
+		}
+	}
+}

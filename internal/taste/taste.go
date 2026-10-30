@@ -77,6 +77,19 @@ func junkTitle(t store.Track) bool {
 	return false
 }
 
+// hasCJK reports whether a string contains CJK characters —
+// a rough but effective "same musical world" signal: a
+// Japanese seed's radio should stay Japanese, and a latin
+// seed's should not wander into CJK uploads (or vice versa).
+func hasCJK(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3000 && r <= 0x30FF) || (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0xFF00 && r <= 0xFFEF) {
+			return true
+		}
+	}
+	return false
+}
+
 // songTokens are the normalized title tokens behind
 // store.SongKey, for near-duplicate comparison.
 func songTokens(t store.Track) []string {
@@ -361,20 +374,58 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 		}
 	}
 	// Rung D: the listener's own catalog, other artists
-	// only, affinity-weighted. This is the fallback that
-	// keeps an ungenred seed (no genre anywhere to search
-	// by) from collapsing to its own artist: his catalog
-	// holds the other artists he actually listens to.
+	// only. Two passes with real signals, because the first
+	// version of this rung admitted everything at a flat
+	// base and a Yorushika radio filled with Woody Guthrie,
+	// Chopin and a Biggie/Sinatra mashup from the warming
+	// catalog:
+	//   D1 affinity — anything the profile actually scores
+	//      (artists/genres the listener plays and stars);
+	//   D2 same script — tracks from the seed's musical
+	//      world by writing system (CJK seed → CJK tracks),
+	//      which is where his other J-pop lives.
 	if short() {
-		rows, _ := e.store.QueryTracks(store.Query{Limit: 300, Order: "shuffle", Seed: time.Now().Unix() / 86400})
-		for _, t := range rows {
+		rows, _ := e.store.QueryTracks(store.Query{Limit: 400, Order: "shuffle", Seed: time.Now().Unix() / 86400})
+		usable := func(t store.Track) bool {
 			if strings.EqualFold(t.Artist, seed.Artist) || junkTitle(t) {
-				continue
+				return false
 			}
 			if t.Duration == 0 && t.Source == "youtube" {
+				return false
+			}
+			return true
+		}
+		for _, t := range rows {
+			if !usable(t) {
 				continue
 			}
-			add(t, 0.4+math.Min(p.scoreTrack(t), 3))
+			if sc := p.scoreTrack(t); sc > 0 {
+				add(t, 1.0+sc)
+			}
+		}
+		if short() {
+			// The seed itself may be romanized ("Yorushika -
+			// Say It.") while the artist's catalog is mostly
+			// Japanese-titled: judge the seed's world by the
+			// artist's catalogued tracks too.
+			seedCJK := hasCJK(seed.Artist) || hasCJK(seed.Title)
+			if !seedCJK && len(artistRows) > 0 {
+				cjk := 0
+				for _, t := range artistRows {
+					if hasCJK(t.Title) || hasCJK(t.Artist) {
+						cjk++
+					}
+				}
+				seedCJK = cjk*2 > len(artistRows)
+			}
+			for _, t := range rows {
+				if !usable(t) {
+					continue
+				}
+				if (hasCJK(t.Artist) || hasCJK(t.Title)) == seedCJK {
+					add(t, 0.5)
+				}
+			}
 		}
 	}
 	if short() {
@@ -428,7 +479,7 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 	for pass := 0; pass < 2; pass++ {
 		for _, s := range list {
 			if len(out) >= count {
-				return out
+				return interleaveByArtist(out)
 			}
 			if taken[s.t.ID] {
 				continue
@@ -451,6 +502,34 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			taken[s.t.ID] = true
 			out = append(out, s.t)
 		}
+	}
+	return interleaveByArtist(out)
+}
+
+// interleaveByArtist reorders a similar-songs result so the
+// same artist never plays twice in a row when the list has
+// an alternative — score order is preserved greedily, but a
+// radio queue that opens with five songs by the seed artist
+// (their scores are highest by construction) feels broken
+// even when every pick is defensible.
+func interleaveByArtist(in []store.Track) []store.Track {
+	if len(in) < 3 {
+		return in
+	}
+	out := make([]store.Track, 0, len(in))
+	rest := append([]store.Track{}, in...)
+	last := ""
+	for len(rest) > 0 {
+		idx := 0
+		for i, t := range rest {
+			if !strings.EqualFold(t.Artist, last) {
+				idx = i
+				break
+			}
+		}
+		out = append(out, rest[idx])
+		last = rest[idx].Artist
+		rest = append(rest[:idx], rest[idx+1:]...)
 	}
 	return out
 }
