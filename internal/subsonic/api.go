@@ -6,6 +6,7 @@ package subsonic
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -209,16 +210,19 @@ func (a *API) NDLoginHandler() http.HandlerFunc {
 			Password string `json:"password"`
 		}
 		if r.Method == http.MethodPost {
-			// JSON body (Navidrome clients) or form fallback.
-			json.NewDecoder(r.Body).Decode(&creds)
-			if creds.Username == "" {
+			// Branch on Content-Type: decoding JSON first would
+			// drain the body, so the form fallback used to see an
+			// empty form and reject correct credentials.
+			if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+				json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&creds)
+			} else {
 				r.ParseForm()
 				creds.Username = r.FormValue("username")
 				creds.Password = r.FormValue("password")
 			}
 		}
 		user, ok := a.store.UserByName(creds.Username)
-		if !ok || creds.Password == "" || creds.Password != user.Password {
+		if !ok || creds.Password == "" || subtle.ConstantTimeCompare([]byte(creds.Password), []byte(user.Password)) != 1 {
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"error":"Invalid username or password"}`))
 			return
@@ -226,7 +230,7 @@ func (a *API) NDLoginHandler() http.HandlerFunc {
 		buf := make([]byte, 32)
 		rand.Read(buf)
 		token := hex.EncodeToString(buf)
-		a.store.KVSet("ndtoken:"+token, strconv.FormatInt(user.ID, 10))
+		a.store.KVSet("ndtoken:"+token, ndTokenValue(user))
 		// Feishin (and Navidrome's own clients) build the ongoing
 		// Subsonic credential from subsonicSalt/subsonicToken in
 		// this response: credential = u&…&s=<salt>&t=<token> where
@@ -261,15 +265,40 @@ func (a *API) ndUser(token string) (*store.User, bool) {
 	if token == "" {
 		return nil, false
 	}
-	idStr, ok := a.store.KVGet("ndtoken:" + token)
+	raw, ok := a.store.KVGet("ndtoken:" + token)
 	if !ok {
 		return nil, false
 	}
-	id, err := strconv.ParseInt(idStr, 10, 64)
+	parts := strings.Split(raw, "|")
+	if len(parts) != 3 {
+		return nil, false
+	}
+	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
 		return nil, false
 	}
-	return a.store.UserByID(id)
+	issued, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || time.Since(time.Unix(issued, 0)) > 90*24*time.Hour {
+		return nil, false
+	}
+	user, ok := a.store.UserByID(id)
+	if !ok {
+		return nil, false
+	}
+	sum := sha256.Sum256([]byte(user.Password))
+	if hex.EncodeToString(sum[:])[:16] != parts[1] {
+		return nil, false
+	}
+	return user, true
+}
+
+// ndTokenValue binds a session token to the user's current
+// password fingerprint and issue time: changing the password
+// invalidates every outstanding token, and tokens expire at
+// 90 days.
+func ndTokenValue(u *store.User) string {
+	sum := sha256.Sum256([]byte(u.Password))
+	return strconv.FormatInt(u.ID, 10) + "|" + hex.EncodeToString(sum[:])[:16] + "|" + strconv.FormatInt(time.Now().Unix(), 10)
 }
 
 // authenticate validates Subsonic credentials: password (plain or

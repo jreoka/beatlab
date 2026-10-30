@@ -135,7 +135,7 @@ func (a *API) ndPlaylistCreate(w http.ResponseWriter, r *http.Request) {
 		Comment *string `json:"comment"`
 		Public  *bool   `json:"public"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	ndDecode(w, r, &body)
 	if strings.TrimSpace(body.Name) == "" {
 		ndErr(w, http.StatusBadRequest, "name is required")
 		return
@@ -170,7 +170,7 @@ func (a *API) ndPlaylistUpdate(w http.ResponseWriter, r *http.Request) {
 		Comment *string `json:"comment"`
 		Public  *bool   `json:"public"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	ndDecode(w, r, &body)
 	if body.Name != nil && strings.TrimSpace(*body.Name) != "" {
 		p.Name = *body.Name
 		a.store.SavePlaylist(p)
@@ -183,7 +183,11 @@ func (a *API) ndPlaylistUpdate(w http.ResponseWriter, r *http.Request) {
 		meta.Public = *body.Public
 	}
 	a.setNDPlaylistMeta(p.ID, meta)
-	fresh, _ := a.store.Playlist(p.ID)
+	fresh, ok2 := a.store.Playlist(p.ID)
+	if !ok2 {
+		ndErr(w, http.StatusNotFound, "playlist gone")
+		return
+	}
 	ndJSON(w, http.StatusOK, a.ndPlaylistObj(c, fresh))
 }
 
@@ -197,7 +201,7 @@ func (a *API) ndPlaylistDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.store.DeletePlaylist(p.ID)
-	ndJSON(w, http.StatusOK, nil)
+	ndJSON(w, http.StatusOK, map[string]any{})
 }
 
 // ndPlaylistSongs returns playlist entries: each entry's id is its
@@ -240,7 +244,7 @@ func (a *API) ndPlaylistAdd(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		IDs []string `json:"ids"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	ndDecode(w, r, &body)
 	added := 0
 	for _, id := range body.IDs {
 		if _, found := a.store.Track(id); found {
@@ -306,7 +310,7 @@ func (a *API) ndPlaylistMove(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		InsertBefore string `json:"insert_before"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	ndDecode(w, r, &body)
 	to, err := strconv.Atoi(body.InsertBefore)
 	if err != nil || to < 0 || to > len(p.SongIDs) {
 		ndErr(w, http.StatusBadRequest, "invalid insert_before")
@@ -321,7 +325,7 @@ func (a *API) ndPlaylistMove(w http.ResponseWriter, r *http.Request) {
 	copy(p.SongIDs[to+1:], p.SongIDs[to:])
 	p.SongIDs[to] = item
 	a.store.SavePlaylist(p)
-	ndJSON(w, http.StatusOK, nil)
+	ndJSON(w, http.StatusOK, map[string]any{})
 }
 
 // ---------- users ----------
@@ -389,11 +393,24 @@ func (a *API) ndQueueGet(w http.ResponseWriter, r *http.Request) {
 	if updated == "" {
 		updated = ndTS(time.Time{})
 	}
+	cur := q.Current
+	if cur < 0 || cur >= len(items) {
+		cur = 0
+		if len(items) > 0 {
+			if q.Current >= len(items) {
+				cur = len(items) - 1
+			}
+		}
+	}
+	pos := q.Position
+	if pos < 0 {
+		pos = 0
+	}
 	ndJSON(w, http.StatusOK, map[string]any{
 		"id":        strconv.FormatInt(c.user.ID, 10),
 		"userId":    strconv.FormatInt(c.user.ID, 10),
-		"current":   q.Current,
-		"position":  q.Position,
+		"current":   cur,
+		"position":  pos,
 		"changedBy": q.ChangedBy,
 		"createdAt": updated,
 		"updatedAt": updated,
@@ -411,7 +428,7 @@ func (a *API) ndQueueSave(w http.ResponseWriter, r *http.Request) {
 		Current  *int      `json:"current"`
 		Position *int      `json:"position"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	ndDecode(w, r, &body)
 	q := a.ndQueueLoad(c.user.ID)
 	if body.IDs != nil {
 		q.IDs = *body.IDs
@@ -422,11 +439,23 @@ func (a *API) ndQueueSave(w http.ResponseWriter, r *http.Request) {
 	if body.Position != nil {
 		q.Position = *body.Position
 	}
+	if q.Current < 0 {
+		q.Current = 0
+	}
+	if len(q.IDs) > 0 && q.Current >= len(q.IDs) {
+		q.Current = len(q.IDs) - 1
+	}
+	if len(q.IDs) == 0 {
+		q.Current = 0
+	}
+	if q.Position < 0 {
+		q.Position = 0
+	}
 	q.ChangedBy = c.user.Username
 	q.UpdatedAt = ndTS(time.Now())
 	raw, _ := json.Marshal(q)
 	a.store.KVSet("ndqueue:"+strconv.FormatInt(c.user.ID, 10), string(raw))
-	ndJSON(w, http.StatusOK, nil)
+	ndJSON(w, http.StatusOK, map[string]any{})
 }
 
 // ---------- internet radio ----------
@@ -473,7 +502,12 @@ func (a *API) ndRadioList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) ndRadioCreate(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.ndAuth(w, r); !ok {
+	c, ok := a.ndAuth(w, r)
+	if !ok {
+		return
+	}
+	if !c.user.IsAdmin {
+		ndErr(w, http.StatusForbidden, "admin only")
 		return
 	}
 	var body struct {
@@ -481,7 +515,7 @@ func (a *API) ndRadioCreate(w http.ResponseWriter, r *http.Request) {
 		StreamURL   string `json:"streamUrl"`
 		HomePageURL string `json:"homePageUrl"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	ndDecode(w, r, &body)
 	if body.Name == "" || body.StreamURL == "" {
 		ndErr(w, http.StatusBadRequest, "name and streamUrl are required")
 		return
@@ -497,7 +531,12 @@ func (a *API) ndRadioCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) ndRadioUpdate(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.ndAuth(w, r); !ok {
+	c, ok := a.ndAuth(w, r)
+	if !ok {
+		return
+	}
+	if !c.user.IsAdmin {
+		ndErr(w, http.StatusForbidden, "admin only")
 		return
 	}
 	id := r.PathValue("id")
@@ -506,7 +545,7 @@ func (a *API) ndRadioUpdate(w http.ResponseWriter, r *http.Request) {
 		StreamURL   string `json:"streamUrl"`
 		HomePageURL string `json:"homePageUrl"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	ndDecode(w, r, &body)
 	stations := a.RadioStations()
 	for i, s := range stations {
 		if s.ID == id {
@@ -523,7 +562,12 @@ func (a *API) ndRadioUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) ndRadioDelete(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.ndAuth(w, r); !ok {
+	c, ok := a.ndAuth(w, r)
+	if !ok {
+		return
+	}
+	if !c.user.IsAdmin {
+		ndErr(w, http.StatusForbidden, "admin only")
 		return
 	}
 	id := r.PathValue("id")
@@ -535,5 +579,5 @@ func (a *API) ndRadioDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.saveRadioStations(kept)
-	ndJSON(w, http.StatusOK, nil)
+	ndJSON(w, http.StatusOK, map[string]any{})
 }

@@ -271,7 +271,7 @@ var dashTpl = template.Must(template.New("dash").Funcs(template.FuncMap{
 		if s == "" {
 			return "?"
 		}
-		return strings.ToUpper(s[:1])
+		return strings.ToUpper(string([]rune(s)[0]))
 	},
 }).Parse(headHTML + `
 <header><div class="hwrap">
@@ -388,7 +388,7 @@ func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 		seenAlbum[key] = true
 		initial := "♪"
 		if t.Album != "" {
-			initial = strings.ToUpper(t.Album[:1])
+			initial = strings.ToUpper(string([]rune(t.Album)[0]))
 		}
 		d.Recent = append(d.Recent, albumCard{Title: t.Album, Artist: t.Artist, Cover: t.CoverURL, Initial: initial})
 	}

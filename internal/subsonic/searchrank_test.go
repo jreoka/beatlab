@@ -78,3 +78,19 @@ func TestRankHarenohiniRealWorld(t *testing.T) {
 		t.Fatalf("versions outranked the MV: %v", ids(tracks))
 	}
 }
+
+func TestRelevanceKeywordsAreWordBounded(t *testing.T) {
+	discover := relevanceScore(store.Track{Title: "Discover", Artist: "Some Band"}, "discovery mix")
+	plain := relevanceScore(store.Track{Title: "Untitled", Artist: "Some Band"}, "discovery mix")
+	if discover < plain {
+		t.Fatalf(`"Discover" was penalized as a cover version (%d < %d)`, discover, plain)
+	}
+	alive := relevanceScore(store.Track{Title: "Alive", Artist: "Some Band"}, "golden hits")
+	if alive < plain {
+		t.Fatalf(`"Alive" was penalized as a live version (%d < %d)`, alive, plain)
+	}
+	real := relevanceScore(store.Track{Title: "Golden Hits (Piano Cover)", Artist: "Some Band"}, "golden hits")
+	if real >= plain {
+		t.Fatalf("a real piano cover should be penalized (%d >= %d)", real, plain)
+	}
+}

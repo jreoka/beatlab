@@ -178,6 +178,9 @@ func (a *API) ndAlbumList(w http.ResponseWriter, r *http.Request) {
 	key := q.Get("_sort")
 	desc := strings.EqualFold(q.Get("_order"), "DESC")
 	sort.SliceStable(out, func(i, j int) bool {
+		if desc {
+			i, j = j, i
+		}
 		var less bool
 		switch key {
 		case "album_artist", "artist":
@@ -190,9 +193,6 @@ func (a *API) ndAlbumList(w http.ResponseWriter, r *http.Request) {
 			less = out[i]["songCount"].(int) < out[j]["songCount"].(int)
 		default:
 			less = strings.ToLower(out[i]["name"].(string)) < strings.ToLower(out[j]["name"].(string))
-		}
-		if desc {
-			return !less
 		}
 		return less
 	})
@@ -233,11 +233,10 @@ func (a *API) ndArtistList(w http.ResponseWriter, r *http.Request) {
 	}
 	desc := strings.EqualFold(q.Get("_order"), "DESC")
 	sort.SliceStable(out, func(i, j int) bool {
-		less := strings.ToLower(out[i]["name"].(string)) < strings.ToLower(out[j]["name"].(string))
 		if desc {
-			return !less
+			i, j = j, i
 		}
-		return less
+		return strings.ToLower(out[i]["name"].(string)) < strings.ToLower(out[j]["name"].(string))
 	})
 	start, end := ndPage(w, r, len(out))
 	ndJSON(w, http.StatusOK, out[start:end])

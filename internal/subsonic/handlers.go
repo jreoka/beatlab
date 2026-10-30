@@ -88,7 +88,7 @@ func (a *API) hArtists(r *http.Request, user *store.User) *Elem {
 		}
 		letter := "#"
 		if name != "" {
-			letter = strings.ToUpper(name[:1])
+			letter = strings.ToUpper(string([]rune(name)[0]))
 		}
 		if _, ok := byLetter[letter]; !ok {
 			letters = append(letters, letter)
@@ -232,10 +232,12 @@ func (a *API) hSearch(r *http.Request, user *store.User) *Elem {
 			artistSet = append(artistSet, t.Artist)
 		}
 	}
+	addedA := 0
 	for i, name := range artistSet {
-		if i < artistOffset || len(root.Children) >= artistOffset+artistCount {
+		if i < artistOffset || addedA >= artistCount {
 			continue
 		}
+		addedA++
 		root.Add(artistElem(name, len(a.albumsOf(name))))
 	}
 	albums := a.groupAlbums(tracks)
@@ -503,11 +505,15 @@ func (a *API) hNowPlaying(r *http.Request, user *store.User) *Elem {
 	root := E("nowPlaying")
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, np := range a.playing {
+	for uid, np := range a.playing {
 		mins := int(time.Since(np.started).Minutes())
-		e := a.songElem(np.track, user)
+		owner := user
+		if o, ok := a.store.UserByID(uid); ok {
+			owner = o
+		}
+		e := a.songElem(np.track, owner)
 		e.Name = "entry"
-		e.A("username", user.Username).A("minutesAgo", mins).A("playerId", 1).A("playerName", np.player)
+		e.A("username", owner.Username).A("minutesAgo", mins).A("playerId", 1).A("playerName", np.player)
 		root.Add(e)
 	}
 	return a.ok(root)

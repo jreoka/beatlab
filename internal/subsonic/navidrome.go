@@ -258,6 +258,9 @@ func ndSortSongs(songs []map[string]any, q map[string][]string) {
 		}
 	}
 	sort.SliceStable(songs, func(i, j int) bool {
+		if desc {
+			i, j = j, i
+		}
 		a, b := get(songs[i]), get(songs[j])
 		less := false
 		switch av := a.(type) {
@@ -271,11 +274,15 @@ func ndSortSongs(songs []map[string]any, q map[string][]string) {
 			bv, _ := b.(float64)
 			less = av < bv
 		}
-		if desc {
-			return !less
-		}
 		return less
 	})
+}
+
+// ndDecode decodes a JSON request body with a hard size cap —
+// an unbounded decoder on any endpoint is a memory-exhaustion
+// invitation.
+func ndDecode(w http.ResponseWriter, r *http.Request, v any) error {
+	return json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v)
 }
 
 // ---------- handler ----------

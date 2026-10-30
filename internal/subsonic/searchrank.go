@@ -20,6 +20,45 @@ import (
 	"beatlab/internal/store"
 )
 
+// titleWords tokenizes a lowercased title on non-letter/digit
+// boundaries for word-exact keyword matching.
+func titleWords(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+// hasKeyword reports whether kw appears in the title: as a
+// token sequence for ASCII keywords — so "cover" does not hit
+// "Discover" and "live" does not hit "Alive" — and as a raw
+// substring for CJK keywords, which have no word boundaries.
+func hasKeyword(title string, words []string, kw string) bool {
+	ascii := true
+	for _, r := range kw {
+		if r > 127 {
+			ascii = false
+			break
+		}
+	}
+	if !ascii {
+		return strings.Contains(title, kw)
+	}
+	kwWords := strings.Fields(kw)
+	for i := 0; i+len(kwWords) <= len(words); i++ {
+		ok := true
+		for j, w := range kwWords {
+			if words[i+j] != w {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
 // versionKeywords mark a track as an alternate take on a song.
 // The penalty applies only when the keyword does not appear in
 // the query itself.
@@ -92,6 +131,7 @@ func coreTitle(title string) string {
 func relevanceScore(t store.Track, query string) int {
 	q := strings.ToLower(strings.TrimSpace(query))
 	title := strings.ToLower(t.Title)
+	words := titleWords(title)
 	artist := strings.ToLower(t.Artist)
 	if q == "" {
 		return 0
@@ -116,7 +156,7 @@ func relevanceScore(t store.Track, query string) int {
 		tailStr := strings.Join(tailWords, " ")
 		explained := false
 		for _, vk := range versionKeywords {
-			if strings.Contains(tailStr, vk.word) {
+			if hasKeyword(tailStr, tailWords, vk.word) {
 				explained = true
 				break
 			}
@@ -149,14 +189,14 @@ func relevanceScore(t store.Track, query string) int {
 	// For much of the catalog the Music Video IS the official
 	// release of the song; it should sit with the originals, not
 	// below live recordings and lyric slideshows.
-	if strings.Contains(title, "music video") || strings.Contains(title, "official video") {
+	if hasKeyword(title, words, "music video") || hasKeyword(title, words, "official video") {
 		score += 15
 	}
 	if concertDate.MatchString(title) {
 		score -= 20
 	}
 	for _, vk := range versionKeywords {
-		if strings.Contains(title, vk.word) && !strings.Contains(q, vk.word) {
+		if hasKeyword(title, words, vk.word) && !strings.Contains(q, vk.word) {
 			score -= vk.penalty
 		}
 	}
