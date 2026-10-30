@@ -85,7 +85,6 @@ func TestRadioCapsArtists(t *testing.T) {
 	}
 }
 
-
 // Discovery radio must include artists the user has never
 // played, drawn from their top genres — not just more tracks
 // by the artists they already play.
@@ -119,5 +118,64 @@ func TestRadioDiscoveryIncludesUnplayedArtists(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("discovery mix has no unplayed-artist tracks: %v", out)
+	}
+}
+
+type fakeSource struct{ tracks []store.Track }
+
+func (f fakeSource) Name() string    { return "fake" }
+func (f fakeSource) Available() bool { return true }
+func (f fakeSource) Status() string  { return "fake" }
+func (f fakeSource) Search(ctx context.Context, q string, limit int) ([]store.Track, error) {
+	return f.tracks, nil
+}
+
+// The Kansas problem: a radio queue seeded from "Carry On
+// Wayward Son" must contain that song ONCE (not the original +
+// remaster + live take), and a bare artist-name search must
+// not pull politics podcasts about the state into the queue.
+func TestSimilarNoRepeatSongNoPodcasts(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions := []store.Track{
+		{ID: "k:1", Source: "test", Title: "Carry On Wayward Son", Artist: "Kansas", Album: "Leftoverture", Genre: "Rock", Duration: 323},
+		{ID: "k:2", Source: "test", Title: "Carry On Wayward Son (Remastered 2011)", Artist: "Kansas", Album: "Leftoverture", Genre: "Rock", Duration: 324},
+		{ID: "k:3", Source: "test", Title: "Carry On Wayward Son - Live", Artist: "Kansas", Album: "Live", Genre: "Rock", Duration: 350},
+		{ID: "k:4", Source: "test", Title: "Dust in the Wind", Artist: "Kansas", Album: "Point of Know Return", Genre: "Rock", Duration: 208},
+		{ID: "k:5", Source: "test", Title: "Dust in the Wind (Remaster)", Artist: "Kansas", Album: "Point of Know Return", Genre: "Rock", Duration: 209},
+	}
+	for i := 0; i < 8; i++ {
+		versions = append(versions, store.Track{ID: fmt.Sprintf("r:%d", i), Source: "test", Title: fmt.Sprintf("Rock Song %d", i), Artist: fmt.Sprintf("Rocker %d", i), Album: "R", Genre: "Rock", Duration: 200})
+	}
+	for _, tr := range versions {
+		tr := tr
+		if err := st.UpsertTrack(&tr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	podcast := store.Track{ID: "pod:1", Source: "fake", Title: "Democrats Flip Kansas? - Daily Politics Podcast", Artist: "MSNBC Daily", Album: "Podcast", Genre: "", Duration: 2700}
+	eng := New(st, sources.NewRegistry(fakeSource{tracks: []store.Track{podcast}}))
+	seed := versions[0]
+	out := eng.Similar(context.Background(), 1, seed, 12)
+	wayward, dust := 0, 0
+	for _, tr := range out {
+		if tr.ID == "pod:1" {
+			t.Fatal("politics podcast entered the similar queue")
+		}
+		switch tr.SongKey() {
+		case seed.SongKey():
+			wayward++
+		}
+		if tr.Title == "Dust in the Wind" || tr.Title == "Dust in the Wind (Remaster)" {
+			dust++
+		}
+	}
+	if wayward != 1 {
+		t.Fatalf("seed song appears %d times in its own radio queue, want 1", wayward)
+	}
+	if dust > 1 {
+		t.Fatalf("Dust in the Wind appears %d times, want at most 1", dust)
 	}
 }

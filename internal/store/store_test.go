@@ -102,3 +102,28 @@ func TestSavePlaylistOwnerChecked(t *testing.T) {
 		t.Fatalf("playlist changed by cross-owner save: %+v", got)
 	}
 }
+
+func TestSongKeyVersionsCollapse(t *testing.T) {
+	k := func(artist, title string) string {
+		return Track{Artist: artist, Title: title}.SongKey()
+	}
+	base := k("Kansas", "Carry On Wayward Son")
+	if k("Kansas", "Carry On Wayward Son (Remastered 2011)") != base {
+		t.Fatal("remaster should share the song key")
+	}
+	if k("Kansas", "Carry On Wayward Son - Live") != base {
+		t.Fatal("live version should share the song key")
+	}
+	if k("Kansas", "Carry On Wayward Son [Radio Edit]") != base {
+		t.Fatal("radio edit should share the song key")
+	}
+	if k("Kansas", "Dust in the Wind") == base {
+		t.Fatal("different songs must not share a key")
+	}
+	if k("Paul McCartney", "Live and Let Die") == k("Paul McCartney", "Live") {
+		t.Fatal("mid-title version words must survive")
+	}
+	if k("Other Band", "Carry On Wayward Son") == base {
+		t.Fatal("different artists must not share a key")
+	}
+}

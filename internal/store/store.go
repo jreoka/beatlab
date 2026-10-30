@@ -53,7 +53,73 @@ type Track struct {
 }
 
 func (t *Track) ArtistID() string { return "ar:" + slug(t.Artist) }
-func (t *Track) AlbumID() string  { return "al:" + slug(t.Artist) + "|" + slug(t.Album) }
+
+// SongKey identifies the song itself, ignoring which upload or
+// version a track happens to be: "Carry On Wayward Son", its
+// remaster and a live rendition share one key. Queues that play
+// tracks back to back (radio, similar) dedupe on it so the same
+// song never repeats in different dress.
+func (t Track) SongKey() string {
+	return slug(t.Artist) + "|" + coreSongTitle(t.Title)
+}
+
+// coreSongTitle normalizes a title for SongKey: brackets and
+// their contents dropped, punctuation removed, and trailing
+// version words (remaster, live, radio edit, a bare year, ...)
+// stripped. Mid-title words are untouched — "Live and Let Die"
+// keeps its "live".
+func coreSongTitle(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range strings.ToLower(s) {
+		switch r {
+		case '(', '[', '\u3010', '\u300e', '\u300c':
+			depth++
+		case ')', ']', '\u3011', '\u300f', '\u300d':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	var words []string
+	for _, wd := range strings.Fields(b.String()) {
+		wd = strings.Trim(wd, "-/&,.:;'\"!?")
+		if wd != "" {
+			words = append(words, wd)
+		}
+	}
+	versionWords := map[string]bool{
+		"remaster": true, "remastered": true, "live": true,
+		"edit": true, "version": true, "mono": true, "stereo": true,
+		"mix": true, "radio": true, "single": true, "album": true,
+	}
+	for len(words) > 1 {
+		last := words[len(words)-1]
+		if versionWords[last] || isYearToken(last) {
+			words = words[:len(words)-1]
+			continue
+		}
+		break
+	}
+	return strings.Join(words, " ")
+}
+
+func isYearToken(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s >= "1900" && s <= "2099"
+}
+func (t *Track) AlbumID() string { return "al:" + slug(t.Artist) + "|" + slug(t.Album) }
 
 func slug(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))

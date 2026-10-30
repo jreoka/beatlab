@@ -166,9 +166,17 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 	if len(list) < count && seed.Artist != "" {
 		for _, t := range e.registry.SearchAll(ctx, seed.Artist, 25) {
 			e.store.UpsertTrack(&t)
+			// A bare artist-name search drags in everything the
+			// name touches — for "Kansas", politics podcasts
+			// about the state. Expansion results must look like
+			// songs: song-length, and (for other artists) in the
+			// seed's genre.
+			if t.Duration > 1200 {
+				continue
+			}
 			if strings.EqualFold(t.Artist, seed.Artist) {
 				add(t, 3.5)
-			} else {
+			} else if seed.Genre != "" && strings.EqualFold(t.Genre, seed.Genre) {
 				add(t, 1)
 			}
 		}
@@ -190,8 +198,13 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 	}
 	counts := map[string]int{}
 	taken := map[string]bool{}
+	keys := map[string]bool{}
 	var out []store.Track
-	for _, pass := range []bool{true, false} {
+	// Pass 1: per-artist caps + one version per song. Pass 2:
+	// caps off, still one version per song — a queue with the
+	// seed song three times in different versions is the bug
+	// this prevents, and a shorter queue beats a repeated song.
+	for pass := 0; pass < 2; pass++ {
 		for _, s := range list {
 			if len(out) >= count {
 				return out
@@ -199,7 +212,11 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 			if taken[s.t.ID] {
 				continue
 			}
-			if pass {
+			sk := s.t.SongKey()
+			if keys[sk] {
+				continue
+			}
+			if pass == 0 {
 				key := strings.ToLower(s.t.Artist)
 				cap := otherCap
 				if strings.EqualFold(s.t.Artist, seed.Artist) {
@@ -210,6 +227,7 @@ func (e *Engine) Similar(ctx context.Context, userID int64, seed store.Track, co
 				}
 				counts[key]++
 			}
+			keys[sk] = true
 			taken[s.t.ID] = true
 			out = append(out, s.t)
 		}
@@ -296,7 +314,9 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 		for _, s := range seeds {
 			for _, t := range e.registry.SearchAll(ctx, s, 12) {
 				e.store.UpsertTrack(&t)
-				pool = append(pool, t)
+				if t.Duration <= 1200 {
+					pool = append(pool, t)
+				}
 			}
 		}
 		if p.Cold() {
@@ -335,7 +355,9 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 		for _, a := range p.TopArtists(2) {
 			for _, t := range e.registry.SearchAll(ctx, a, 10) {
 				e.store.UpsertTrack(&t)
-				pool = append(pool, t)
+				if t.Duration <= 1200 {
+					pool = append(pool, t)
+				}
 			}
 		}
 	}
@@ -353,6 +375,12 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 			continue
 		}
 		used[t.ID] = true
+		// Warm profiles: no-genre, zero-affinity pool entries
+		// are search debris (talk content that shares a name
+		// with an artist), not music the listener wants.
+		if !p.Cold() && t.Genre == "" && p.scoreTrack(t) <= 0 {
+			continue
+		}
 		w := p.scoreTrack(t) + rng.Float64()*3.5
 		if mode == "discovery" && p.TrackPlays[t.ID] == 0 {
 			w += 2
@@ -361,16 +389,27 @@ func (e *Engine) Radio(ctx context.Context, userID int64, mode string, count int
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].w > items[j].w })
 	var out []store.Track
-	for _, it := range items {
-		if len(out) >= count {
-			break
+	songKeys := map[string]bool{}
+	// Pass 1 enforces the per-artist cap; pass 2 relaxes the
+	// cap for thin pools. The one-version-per-song rule holds
+	// in both — a shorter mix beats a repeated song.
+	for _, capped := range []bool{true, false} {
+		for _, it := range items {
+			if len(out) >= count {
+				break
+			}
+			sk := it.t.SongKey()
+			if songKeys[sk] {
+				continue
+			}
+			key := strings.ToLower(it.t.Artist)
+			if capped && artistCount[key] >= 3 {
+				continue
+			}
+			artistCount[key]++
+			songKeys[sk] = true
+			out = append(out, it.t)
 		}
-		key := strings.ToLower(it.t.Artist)
-		if artistCount[key] >= 3 {
-			continue
-		}
-		artistCount[key]++
-		out = append(out, it.t)
 	}
 	return out
 }
