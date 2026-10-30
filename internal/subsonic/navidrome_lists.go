@@ -29,58 +29,82 @@ func (a *API) ndSongList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	searchTerm := q.Get("title")
+
 	// A title search goes live, like the Subsonic search does:
-	// fan out to the sources (soft-deadline bounded), warm the
-	// results into the catalog, then answer from the catalog.
-	// Without this, the Navidrome-mode Tracks tab only ever
-	// finds what's already local and reads as "search is empty"
-	// for anything new.
-	if title := q.Get("title"); title != "" {
-		for _, t := range a.registry.SearchAll(r.Context(), title, 40) {
+	// fan out to the sources (soft-deadline bounded) and warm
+	// the results into the catalog. The sources' own relevance
+	// (YouTube search semantics) decides what comes back — those
+	// results are answers by construction and are NOT re-filtered
+	// by text matching: a track whose title is in another script
+	// (ヨルシカ - 言って。 for "say it yorushika") can never pass a
+	// latin substring test, yet it is exactly what the user
+	// searched for.
+	leadIDs := map[string]bool{}
+	if searchTerm != "" {
+		for _, t := range a.registry.SearchAll(r.Context(), searchTerm, 40) {
 			tt := t
 			a.store.UpsertTrack(&tt)
+			leadIDs[tt.ID] = true
 		}
 	}
 	tracks, _ := a.store.QueryTracks(store.Query{Limit: 4000})
-	// For a title search, relevance beats the requested sort:
-	// the original recording first, covers/instrumentals below.
-	// (Plain list browsing without a title filter keeps the
-	// client's sort.)
-	if q.Get("title") != "" {
-		rankByRelevance(tracks, q.Get("title"))
-	}
 	albumIDs := append(q["album_id"], q["albumId"]...)
 	artistIDs := append(append(q["artist_id"], q["album_artist_id"]...), q["artists_id"]...)
 	genreIDs := q["genre_id"]
-	title := strings.ToLower(q.Get("title"))
 	year := q.Get("year")
 	starredOnly := q.Get("starred") == "true"
+	words := strings.Fields(strings.ToLower(searchTerm))
 
-	out := []map[string]any{}
-	for _, t := range tracks {
+	// matches applies every filter. For the title dimension,
+	// local tracks must match word-wise across title+artist+
+	// album (every query word somewhere in the three fields);
+	// lead tracks from the live fan-out always match.
+	matches := func(t store.Track) bool {
 		if len(albumIDs) > 0 && !inSet(albumIDs, t.AlbumID()) {
-			continue
+			return false
 		}
 		if len(artistIDs) > 0 && !inSet(artistIDs, t.ArtistID()) {
-			continue
+			return false
 		}
 		if len(genreIDs) > 0 && !inSet(genreIDs, t.Genre) {
-			continue
-		}
-		if title != "" && !strings.Contains(strings.ToLower(t.Title), title) {
-			continue
+			return false
 		}
 		if year != "" {
 			if y, err := strconv.Atoi(year); err == nil && t.Year != y {
-				continue
+				return false
 			}
 		}
 		if starredOnly && !c.starred[t.ID] {
-			continue
+			return false
 		}
+		if searchTerm != "" && !leadIDs[t.ID] {
+			hay := strings.ToLower(t.Title + " " + t.Artist + " " + t.Album)
+			for _, word := range words {
+				if !strings.Contains(hay, word) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	var matched []store.Track
+	for _, t := range tracks {
+		if matches(t) {
+			matched = append(matched, t)
+		}
+	}
+	// For a search, relevance orders the results (originals
+	// first); plain browsing keeps the client's sort.
+	if searchTerm != "" {
+		rankByRelevance(matched, searchTerm)
+	}
+	out := []map[string]any{}
+	for _, t := range matched {
 		out = append(out, c.song(t))
 	}
-	if q.Get("title") == "" {
+	if searchTerm == "" {
 		ndSortSongs(out, q)
 	}
 	start, end := ndPage(w, r, len(out))

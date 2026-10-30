@@ -9,8 +9,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,7 +66,17 @@ func slug(s string) string {
 	}
 	out := strings.Trim(b.String(), "-")
 	if out == "" {
-		out = "unknown"
+		if s == "" {
+			return "unknown"
+		}
+		// No latin letters or digits at all (ヨルシカ, a fully
+		// Cyrillic name, ...): the name would collapse into the
+		// shared "unknown" bucket, merging unrelated artists.
+		// Fall back to a stable hash of the name instead —
+		// distinct names get distinct ids, repeatably.
+		h := fnv.New32a()
+		h.Write([]byte(s))
+		return "u" + strconv.FormatUint(uint64(h.Sum32()), 16)
 	}
 	return out
 }
@@ -301,9 +313,15 @@ func (s *Store) QueryTracks(q Query) ([]Track, error) {
 	var where []string
 	var args []any
 	if q.Text != "" {
-		where = append(where, `(title LIKE ? OR artist LIKE ? OR album LIKE ?)`)
-		like := "%" + q.Text + "%"
-		args = append(args, like, like, like)
+		// Word-wise AND across title/artist/album: a search for
+		// "say it yorushika" must match title="Say It" +
+		// artist="Yorushika" — a single full-phrase LIKE matches
+		// almost nothing real.
+		for _, word := range strings.Fields(q.Text) {
+			where = append(where, `(title LIKE ? OR artist LIKE ? OR album LIKE ?)`)
+			like := "%" + word + "%"
+			args = append(args, like, like, like)
+		}
 	}
 	if q.Artist != "" {
 		where = append(where, `artist=?`)
