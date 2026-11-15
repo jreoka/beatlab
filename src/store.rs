@@ -1,9 +1,10 @@
 use crate::models::{
-    constant_time_eq, err_msg, slug, validate_credentials, AlbumSummary, AppResult, ArtistSummary,
-    CacheEntry, Event, Mood, PlayQueueState, Playlist, RadioStation, Track, User, UserTrackStats,
+    constant_time_eq, err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
+    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, RadioStation, Track, User,
+    UserTrackStats,
 };
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, ToSql};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -55,7 +56,7 @@ impl Store {
     }
 
     fn init_schema(&self) -> AppResult<()> {
-        let conn = self.lock();
+        let mut conn = self.lock();
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS users (
@@ -236,6 +237,17 @@ impl Store {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS user_taste_links (
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                updated INTEGER NOT NULL,
+                PRIMARY KEY(user_id, kind, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_taste_links_user
+                ON user_taste_links(user_id, kind, updated DESC);
             ",
         )?;
 
@@ -258,6 +270,8 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_tracks_deezer ON tracks(deezer_id)",
             [],
         )?;
+
+        migrate_legacy_moods(&mut conn)?;
 
         Ok(())
     }
@@ -591,8 +605,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// Returns user-affinity tracks (starred, manual playlists, played, rated) unioned with
-    /// recent catalog tracks so recommendation pools never clip older favorites past offset limits.
+    /// Returns user-affinity tracks (starred, manual playlists, played, rated, expanded radio links,
+    /// same-artist/local/same-genre catalog matches) unioned with recent catalog tracks so personalized
+    /// mixes never lose taste candidates past recent-insert offset limits.
     pub fn candidate_tracks_for_user(&self, user_id: i64, limit: usize) -> AppResult<Vec<Track>> {
         let conn = self.lock();
         let tcols = prefixed_track_cols("t");
@@ -624,23 +639,193 @@ impl Store {
                     out.push(t);
                 }
             }
+
+            // Include related tracks discovered for this user's taste seeds before generic charts.
+            if out.len() < limit {
+                let rel_sql = format!(
+                    "SELECT {} FROM user_taste_links l
+                     JOIN tracks t ON t.id = l.key
+                     WHERE l.user_id = ?1 AND l.kind = 'related_track'
+                     ORDER BY l.updated DESC, l.weight DESC
+                     LIMIT ?2",
+                    tcols
+                );
+                let mut rstmt = conn.prepare(&rel_sql)?;
+                let rel_lim = (limit - out.len()).min(500) as i64;
+                for t in rstmt
+                    .query_map(params![user_id, rel_lim], row_to_track)?
+                    .collect::<Result<Vec<_>, _>>()?
+                {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    if seen.insert(t.id.clone()) {
+                        out.push(t);
+                    }
+                }
+            }
+
+            // Collect positive artists & genres (excluding disliked/skipped tracks) so catalog tracks
+            // by known/related/followed artists, local files, and matching genres beat recent charts.
+            if out.len() < limit {
+                let mut disliked_ids: HashSet<String> = HashSet::new();
+                {
+                    let mut dstmt = conn.prepare(
+                        "SELECT track_id FROM ratings WHERE user_id = ?1 AND rating <= 2
+                         UNION
+                         SELECT track_id FROM user_track_stats
+                           WHERE user_id = ?1 AND skip_count >= play_count + 2",
+                    )?;
+                    for id in dstmt.query_map(params![user_id], |r| r.get::<_, String>(0))?.flatten() {
+                        disliked_ids.insert(id);
+                    }
+                }
+
+                let mut artist_pats: Vec<String> = Vec::new();
+                let mut seen_art = HashSet::new();
+                let mut push_artist_pat = |raw: &str| {
+                    let clean = raw.trim().to_lowercase();
+                    if clean.len() >= 2 && clean != "unknown artist" && seen_art.insert(clean.clone()) {
+                        let escaped = clean
+                            .replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_");
+                        artist_pats.push(format!("%{}%", escaped));
+                    }
+                };
+
+                let mut genre_pats: Vec<String> = Vec::new();
+                let mut seen_gen = HashSet::new();
+                for t in &out {
+                    if disliked_ids.contains(&t.id) {
+                        continue;
+                    }
+                    let pa = primary_artist(&t.artist);
+                    if !pa.is_empty() {
+                        push_artist_pat(&pa);
+                    }
+                    for g in t.genre.split([',', ';', '/']) {
+                        let gl = g.trim().to_lowercase();
+                        if gl.len() >= 2 && seen_gen.insert(gl.clone()) {
+                            let escaped = gl
+                                .replace('\\', "\\\\")
+                                .replace('%', "\\%")
+                                .replace('_', "\\_");
+                            genre_pats.push(format!("%{}%", escaped));
+                        }
+                    }
+                }
+
+                {
+                    let mut fstmt = conn.prepare(
+                        "SELECT COALESCE(NULLIF(a.name, ''), f.artist_id)
+                         FROM followed_artists f
+                         LEFT JOIN artists_meta a ON a.id = f.artist_id
+                         WHERE f.user_id = ?1
+                         ORDER BY f.at DESC LIMIT 12",
+                    )?;
+                    for raw in fstmt.query_map(params![user_id], |r| r.get::<_, String>(0))?.flatten() {
+                        let clean = raw.trim_start_matches("ar:").replace('-', " ");
+                        push_artist_pat(&clean);
+                    }
+                }
+                {
+                    let mut rastmt = conn.prepare(
+                        "SELECT key FROM user_taste_links
+                         WHERE user_id = ?1 AND kind = 'related_artist'
+                         ORDER BY weight DESC, updated DESC LIMIT 16",
+                    )?;
+                    for k in rastmt.query_map(params![user_id], |r| r.get::<_, String>(0))?.flatten() {
+                        let words = k.trim_start_matches("ar:").replace('-', " ");
+                        push_artist_pat(&words);
+                    }
+                }
+
+                artist_pats.truncate(24);
+                genre_pats.truncate(12);
+
+                // Query 2a: same/related artists + user's local library
+                let rem = (limit - out.len()).min(limit / 2 + 200);
+                let mut clauses = Vec::with_capacity(artist_pats.len() + 1);
+                for idx in 0..artist_pats.len() {
+                    clauses.push(format!("lower(artist) LIKE ?{} ESCAPE '\\'", idx + 1));
+                }
+                clauses.push("source = 'local'".to_string());
+                let lim_param_idx = artist_pats.len() + 1;
+                let aff_sql = format!(
+                    "SELECT {} FROM tracks WHERE ({}) ORDER BY created DESC LIMIT ?{}",
+                    TRACK_COLS,
+                    clauses.join(" OR "),
+                    lim_param_idx
+                );
+                let mut values: Vec<Box<dyn ToSql>> = artist_pats
+                    .into_iter()
+                    .map(|p| Box::new(p) as Box<dyn ToSql>)
+                    .collect();
+                values.push(Box::new(rem as i64));
+                let mut astmt = conn.prepare(&aff_sql)?;
+                for t in astmt
+                    .query_map(params_from_iter(values.iter().map(|v| v.as_ref())), row_to_track)?
+                    .collect::<Result<Vec<_>, _>>()?
+                {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    if seen.insert(t.id.clone()) {
+                        out.push(t);
+                    }
+                }
+
+                // Query 2b: catalog tracks matching positive user genres
+                if out.len() < limit && !genre_pats.is_empty() {
+                    let rem_g = (limit - out.len()).min(limit / 3 + 150);
+                    let gclauses: Vec<String> = (0..genre_pats.len())
+                        .map(|idx| format!("lower(genre) LIKE ?{} ESCAPE '\\'", idx + 1))
+                        .collect();
+                    let gsql = format!(
+                        "SELECT {} FROM tracks WHERE ({}) ORDER BY created DESC LIMIT ?{}",
+                        TRACK_COLS,
+                        gclauses.join(" OR "),
+                        genre_pats.len() + 1
+                    );
+                    let mut gvals: Vec<Box<dyn ToSql>> = genre_pats
+                        .into_iter()
+                        .map(|p| Box::new(p) as Box<dyn ToSql>)
+                        .collect();
+                    gvals.push(Box::new(rem_g as i64));
+                    let mut gstmt = conn.prepare(&gsql)?;
+                    for t in gstmt
+                        .query_map(params_from_iter(gvals.iter().map(|v| v.as_ref())), row_to_track)?
+                        .collect::<Result<Vec<_>, _>>()?
+                    {
+                        if out.len() >= limit {
+                            break;
+                        }
+                        if seen.insert(t.id.clone()) {
+                            out.push(t);
+                        }
+                    }
+                }
+            }
         }
 
-        let remaining = limit.saturating_sub(out.len()).max(limit / 2);
-        let cat_sql = format!(
-            "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
-            TRACK_COLS
-        );
-        let mut cstmt = conn.prepare(&cat_sql)?;
-        for t in cstmt
-            .query_map(params![remaining as i64], row_to_track)?
-            .collect::<Result<Vec<_>, _>>()?
-        {
-            if out.len() >= limit {
-                break;
-            }
-            if seen.insert(t.id.clone()) {
-                out.push(t);
+        if out.len() < limit {
+            let remaining = limit - out.len();
+            let cat_sql = format!(
+                "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
+                TRACK_COLS
+            );
+            let mut cstmt = conn.prepare(&cat_sql)?;
+            for t in cstmt
+                .query_map(params![remaining as i64], row_to_track)?
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                if seen.insert(t.id.clone()) {
+                    out.push(t);
+                }
             }
         }
 
@@ -1113,9 +1298,15 @@ impl Store {
         offset: usize,
     ) -> AppResult<Vec<Track>> {
         let conn = self.lock();
-        let pat = format!("%{}%", mood.slug());
+        let pat = format!("%,{},%", mood.slug());
         let sql = format!(
-            "SELECT {} FROM tracks WHERE lower(moods) LIKE ?1 ORDER BY created DESC LIMIT ?2 OFFSET ?3",
+            "SELECT {} FROM tracks
+             WHERE (',' || lower(moods) || ',') LIKE ?1
+             ORDER BY
+               (CASE WHEN trim(genre) != '' THEN 2 ELSE 0 END)
+               + (CASE WHEN source = 'local' THEN 2 WHEN source = 'deezer' THEN 1 ELSE 0 END) DESC,
+               created DESC
+             LIMIT ?2 OFFSET ?3",
             TRACK_COLS
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1123,6 +1314,21 @@ impl Store {
             .query_map(params![pat, limit as i64, offset as i64], row_to_track)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Returns a comma-joined map of known non-empty genres keyed by lowercase `primary_artist`
+    /// for the requested artist names so mood validation can catch off-genre search tracks.
+    pub fn known_artist_genres_for(&self, artists: &[String]) -> AppResult<HashMap<String, String>> {
+        let wanted: HashSet<String> = artists
+            .iter()
+            .map(|a| primary_artist(a).to_lowercase())
+            .filter(|k| !k.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.lock();
+        artist_genre_index_locked(&conn, Some(&wanted))
     }
 
     pub fn search_tracks(
@@ -1500,6 +1706,83 @@ impl Store {
             map.insert(item.0, item.1);
         }
         Ok(map)
+    }
+
+    pub fn upsert_taste_links(&self, user_id: i64, links: &[(&str, &str, f64)]) -> AppResult<()> {
+        if user_id <= 0 || links.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO user_taste_links(user_id, kind, key, weight, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(user_id, kind, key) DO UPDATE SET
+                   weight = CASE WHEN excluded.weight > user_taste_links.weight THEN excluded.weight ELSE user_taste_links.weight END,
+                   updated = excluded.updated",
+            )?;
+            for &(kind, key, weight) in links {
+                let k = key.trim();
+                if k.is_empty() || !weight.is_finite() || weight <= 0.0 {
+                    continue;
+                }
+                stmt.execute(params![user_id, kind, k, weight, now])?;
+            }
+            let mut prune = tx.prepare(
+                "DELETE FROM user_taste_links
+                 WHERE user_id = ?1 AND kind = ?2 AND key NOT IN (
+                     SELECT key FROM user_taste_links
+                     WHERE user_id = ?1 AND kind = ?2
+                     ORDER BY updated DESC, weight DESC
+                     LIMIT ?3
+                 )",
+            )?;
+            prune.execute(params![user_id, "related_track", 450i64])?;
+            prune.execute(params![user_id, "related_artist", 250i64])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn user_taste_links(
+        &self,
+        user_id: i64,
+    ) -> AppResult<(HashMap<String, f64>, HashMap<String, f64>)> {
+        let mut rel_artists = HashMap::new();
+        let mut rel_tracks = HashMap::new();
+        if user_id <= 0 {
+            return Ok((rel_artists, rel_tracks));
+        }
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT kind, key, weight, updated FROM user_taste_links WHERE user_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![user_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (kind, key, weight, updated) = row;
+            let age_days = ((now - updated).max(0) as f64) / 86400.0;
+            let decayed = weight * (-age_days / 45.0).exp().max(0.35);
+            match kind.as_str() {
+                "related_artist" => {
+                    rel_artists.insert(key, decayed);
+                }
+                "related_track" => {
+                    rel_tracks.insert(key, decayed);
+                }
+                _ => {}
+            }
+        }
+        Ok((rel_artists, rel_tracks))
     }
 
     // -------------------------------------------------------------------------
@@ -2203,6 +2486,102 @@ pub fn search_match_score(t: &Track, query: &str) -> i32 {
     score.max(1)
 }
 
+fn artist_genre_index_locked(
+    conn: &Connection,
+    filter: Option<&HashSet<String>>,
+) -> AppResult<HashMap<String, String>> {
+    let mut by_artist: HashMap<String, Vec<String>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT artist, genre FROM tracks WHERE trim(genre) != ''
+         UNION ALL
+         SELECT artist, genre FROM albums_meta WHERE trim(genre) != ''",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let artist: String = row.get(0)?;
+        let genre: String = row.get(1)?;
+        let key = primary_artist(&artist).to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(wanted) = filter {
+            if !wanted.contains(&key) {
+                continue;
+            }
+        }
+        let g = genre.trim();
+        if !g.is_empty() {
+            let entry = by_artist.entry(key).or_default();
+            if !entry.iter().any(|existing| existing.eq_ignore_ascii_case(g)) {
+                entry.push(g.to_string());
+            }
+        }
+    }
+    Ok(by_artist
+        .into_iter()
+        .map(|(k, v)| (k, v.join(", ")))
+        .collect())
+}
+
+fn migrate_legacy_moods(conn: &mut Connection) -> AppResult<()> {
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'moods_classifier_v2'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
+    if count > 0 {
+        let artist_genres = artist_genre_index_locked(conn, None)?;
+        let mut updates: Vec<(String, String)> = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT id, title, artist, album, genre, moods FROM tracks")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let title: String = row.get(1)?;
+                let artist: String = row.get(2)?;
+                let album: String = row.get(3)?;
+                let genre: String = row.get(4)?;
+                let old_moods: String = row.get(5)?;
+                let extra_genres = if genre.trim().is_empty() {
+                    artist_genres
+                        .get(&primary_artist(&artist).to_lowercase())
+                        .map(|s| s.as_str())
+                        .unwrap_or("")
+                } else {
+                    ""
+                };
+                let new_moods = crate::taste::classify_moods_str(&title, &album, &genre, extra_genres);
+                if new_moods != old_moods {
+                    updates.push((new_moods, id));
+                }
+            }
+        }
+        if !updates.is_empty() {
+            let tx = conn.transaction()?;
+            {
+                let mut upd = tx.prepare("UPDATE tracks SET moods = ?1 WHERE id = ?2")?;
+                for (new_moods, id) in &updates {
+                    upd.execute(params![new_moods, id])?;
+                }
+            }
+            tx.commit()?;
+        }
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO kv(key, value) VALUES ('moods_classifier_v2', '1')",
+        [],
+    )?;
+    Ok(())
+}
+
 fn title_case(s: &str) -> String {
     s.split_whitespace()
         .map(|w| {
@@ -2337,5 +2716,139 @@ mod tests {
             search_match_score(&orig, q),
             search_match_score(&parody, q)
         );
+    }
+
+    #[test]
+    fn candidate_tracks_for_user_prioritizes_taste_links_and_local_before_recent_charts() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("niche", "pw").unwrap();
+
+        let mut seed = sample_track("ytm:seed1", "Dawn", "Niche Band", "Album One");
+        seed.source = "ytm".into();
+        seed.genre = String::new();
+        seed.moods = String::new();
+        seed.created = 100;
+
+        let mut same_artist = sample_track("ytm:same1", "Dusk", "Niche Band", "Album Two");
+        same_artist.source = "ytm".into();
+        same_artist.genre = String::new();
+        same_artist.moods = String::new();
+        same_artist.created = 101;
+
+        let mut related = sample_track("ytm:rel1", "Echoes", "Kindred Act", "Echo Album");
+        related.source = "ytm".into();
+        related.genre = String::new();
+        related.moods = String::new();
+        related.created = 102;
+
+        let mut local = sample_track("loc:1", "Basement Tape", "Local Friend", "Demos");
+        local.source = "local".into();
+        local.created = 103;
+
+        let mut old_batch = vec![seed.clone(), same_artist.clone(), related.clone(), local.clone()];
+        let mut chart_batch = Vec::new();
+        for i in 0..25 {
+            let mut pop = sample_track(
+                &format!("dz:chart{}", i),
+                &format!("Chart Hit {}", i),
+                &format!("Pop Star {}", i),
+                "Top 50",
+            );
+            pop.genre = "Pop".into();
+            pop.moods = "upbeat".into();
+            pop.created = 5000 + i;
+            chart_batch.push(pop);
+        }
+        old_batch.extend(chart_batch);
+        store.upsert_tracks(&old_batch).unwrap();
+
+        store.record_event(u.id, &seed.id, "play", 1.0).unwrap();
+        store
+            .upsert_taste_links(
+                u.id,
+                &[
+                    ("related_track", &related.id, 1.5),
+                    ("related_artist", "kindred-act", 1.4),
+                ],
+            )
+            .unwrap();
+
+        let pool = store.candidate_tracks_for_user(u.id, 12).unwrap();
+        let ids: HashSet<&str> = pool.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains("ytm:seed1"), "ids={:?}", ids);
+        assert!(ids.contains("ytm:rel1"), "ids={:?}", ids);
+        assert!(ids.contains("ytm:same1"), "ids={:?}", ids);
+        assert!(ids.contains("loc:1"), "ids={:?}", ids);
+    }
+
+    #[test]
+    fn legacy_dirty_moods_migrate_cleanly_on_store_open() {
+        let dir = std::env::temp_dir().join(format!("beatlab_mood_mig_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("beatlab.db");
+
+        {
+            let store = Store::open(&db_path).unwrap();
+            let mut waltz = sample_track("ytm:waltz", "Waltz for Zizi", "Seatbelts", "OST");
+            waltz.genre = String::new();
+            waltz.moods = "rock_indie,chill".into();
+
+            let mut untagged = sample_track("ytm:untagged", "Kurogane", "Nocturne", "Demo");
+            untagged.genre = String::new();
+            untagged.moods = "upbeat,chill".into();
+
+            let mut cover = sample_track("ytm:cover", "Hit Song (Instrumental)", "Covers", "Pop");
+            cover.genre = String::new();
+            cover.moods = "focus".into();
+
+            let mut eno_known = sample_track("dz:eno1", "An Ending (Ascent)", "Brian Eno", "Apollo");
+            eno_known.genre = "Ambient".into();
+            eno_known.moods = "".into();
+
+            let mut eno_ytm = sample_track("ytm:eno2", "1/1", "Brian Eno", "Music for Airports");
+            eno_ytm.genre = String::new();
+            eno_ytm.moods = "upbeat,chill".into();
+
+            store
+                .upsert_tracks(&[waltz, untagged, cover, eno_known, eno_ytm])
+                .unwrap();
+
+            // Simulate upgrading a legacy pre-v2 database where kv flag does not yet exist.
+            let conn = store.lock();
+            conn.execute("DELETE FROM kv WHERE key = 'moods_classifier_v2'", [])
+                .unwrap();
+        }
+
+        let reopened = Store::open(&db_path).unwrap();
+        assert_eq!(reopened.get_track("ytm:waltz").unwrap().unwrap().moods, "");
+        assert_eq!(reopened.get_track("ytm:untagged").unwrap().unwrap().moods, "");
+        assert_eq!(reopened.get_track("ytm:cover").unwrap().unwrap().moods, "");
+        assert!(
+            reopened
+                .get_track("dz:eno1")
+                .unwrap()
+                .unwrap()
+                .moods
+                .split(',')
+                .any(|m| m == "focus")
+        );
+        assert!(
+            reopened
+                .get_track("ytm:eno2")
+                .unwrap()
+                .unwrap()
+                .moods
+                .split(',')
+                .any(|m| m == "focus")
+        );
+
+        let by_focus = reopened.tracks_by_mood(Mood::Focus, 20, 0).unwrap();
+        let focus_ids: Vec<&str> = by_focus.iter().map(|t| t.id.as_str()).collect();
+        assert!(focus_ids.contains(&"dz:eno1"), "{:?}", focus_ids);
+        assert!(focus_ids.contains(&"ytm:eno2"), "{:?}", focus_ids);
+        assert!(!focus_ids.contains(&"ytm:cover"), "{:?}", focus_ids);
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

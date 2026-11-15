@@ -427,11 +427,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
 
     // Ensure auto-mixes exist and refresh cleanly whenever user feedback/playlists changed them.
     if state.store.count_tracks().unwrap_or(0) > 0 {
-        let taste = state.taste.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            taste.refresh_auto_playlists_if_stale(uid, 900);
-        })
-        .await;
+        state.taste.refresh_auto_playlists_if_stale_async(uid, 900).await;
     }
     let playlists = state.store.list_playlists(uid, false).unwrap_or_default();
 
@@ -584,14 +580,7 @@ pub async fn mood_mix(
     let Some(mood) = Mood::from_slug(&slug_str) else {
         return err_res(StatusCode::NOT_FOUND, "Mood not found");
     };
-    let mut tracks = state.store.tracks_by_mood(mood, 35, 0).unwrap_or_default();
-    if tracks.len() < 12 {
-        let remote = state.sources.deezer.search_tracks(mood.label(), 25).await;
-        if !remote.is_empty() {
-            let _ = state.store.upsert_tracks(&remote);
-            tracks.extend(remote);
-        }
-    }
+    let tracks = state.taste.mood_mix_tracks(user.id, mood, 35).await;
     let (c1, c2) = mood.gradient();
     json_res(json!({
         "mood": {
@@ -898,6 +887,12 @@ pub async fn get_playlist(
     if !pl.public && pl.user_id != user.id {
         return err_res(StatusCode::FORBIDDEN, "Permission denied");
     }
+    let pl = if pl.is_auto && pl.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
+        state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
+        state.store.get_playlist(&id).ok().flatten().unwrap_or(pl)
+    } else {
+        pl
+    };
     let tracks = state.store.playlist_tracks(&id).unwrap_or_default();
     json_res(json!({
         "playlist": playlist_summary_json(&pl),

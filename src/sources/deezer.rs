@@ -28,9 +28,8 @@ impl DeezerSource {
         Self { http }
     }
 
-    pub async fn fetch_chart_tracks(&self, limit: usize) -> Vec<Track> {
-        let url = format!("https://api.deezer.com/chart/0/tracks?limit={}", limit.clamp(5, 100));
-        let Ok(resp) = self.http.get(&url).send().await else {
+    async fn fetch_track_list(&self, url: &str, fallback_genre: &str) -> Vec<Track> {
+        let Ok(resp) = self.http.get(url).send().await else {
             return vec![];
         };
         let Ok(parsed) = resp.json::<DzDataList<DzTrack>>().await else {
@@ -39,8 +38,13 @@ impl DeezerSource {
         parsed
             .data
             .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, ""))
+            .filter_map(|d| d.into_track(None, "", 0, fallback_genre))
             .collect()
+    }
+
+    pub async fn fetch_chart_tracks(&self, limit: usize) -> Vec<Track> {
+        let url = format!("https://api.deezer.com/chart/0/tracks?limit={}", limit.clamp(5, 100));
+        self.fetch_track_list(&url, "").await
     }
 
     pub async fn fetch_genre_chart_tracks(
@@ -54,17 +58,7 @@ impl DeezerSource {
             genre_id,
             limit.clamp(5, 50)
         );
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzTrack>>().await else {
-            return vec![];
-        };
-        parsed
-            .data
-            .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, genre_name))
-            .collect()
+        self.fetch_track_list(&url, genre_name).await
     }
 
     pub async fn fetch_chart_albums(&self, limit: usize) -> Vec<AlbumSummary> {
@@ -336,17 +330,16 @@ impl DeezerSource {
             "https://api.deezer.com/artist/{}/radio",
             urlencoding::encode(deezer_artist_id)
         );
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzTrack>>().await else {
-            return vec![];
-        };
-        parsed
-            .data
-            .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, ""))
-            .collect()
+        self.fetch_track_list(&url, "").await
+    }
+
+    pub async fn fetch_artist_top_tracks(&self, deezer_artist_id: &str, limit: usize) -> Vec<Track> {
+        let url = format!(
+            "https://api.deezer.com/artist/{}/top?limit={}",
+            urlencoding::encode(deezer_artist_id),
+            limit.clamp(3, 25)
+        );
+        self.fetch_track_list(&url, "").await
     }
 
     pub async fn search_playlists(&self, query: &str, limit: usize) -> Vec<DzPlaylist> {
@@ -440,7 +433,21 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         return false;
     }
     let title_low = p.title.to_lowercase();
-    for bad in ["karaoke", "tribute", "parody", "ringtone", "8-bit", "lullaby", "instrumental cover"] {
+    for bad in [
+        "karaoke",
+        "tribute",
+        "parody",
+        "ringtone",
+        "8-bit",
+        "8 bit",
+        "lullaby",
+        "instrumental cover",
+        "music box",
+        "type beat",
+        "slowed",
+        "nightcore",
+        "8d audio",
+    ] {
         if title_low.contains(bad) && !query_low.contains(bad) {
             return false;
         }

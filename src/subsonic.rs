@@ -802,6 +802,9 @@ pub async fn dispatch(
         }
 
         "getPlaylists" => {
+            if state.store.count_tracks().unwrap_or(0) > 0 {
+                state.taste.refresh_auto_playlists_if_stale_async(uid, 900).await;
+            }
             let playlists = state.store.list_playlists(uid, true).unwrap_or_default();
             let mut root = XmlElem::new("playlists");
             for p in playlists {
@@ -819,6 +822,12 @@ pub async fn dispatch(
             if !p.public && p.user_id != uid {
                 return error_resp(&params, 50, "Permission denied");
             }
+            let p = if p.is_auto && p.user_id == uid && state.store.count_tracks().unwrap_or(0) > 0 {
+                state.taste.refresh_auto_playlists_if_stale_async(uid, 900).await;
+                state.store.get_playlist(id).ok().flatten().unwrap_or(p)
+            } else {
+                p
+            };
             let tracks = state.store.playlist_tracks(id).unwrap_or_default();
             let starred = state.store.starred_ids(uid).unwrap_or_default();
             let stats = state.store.track_stats_map(uid).unwrap_or_default();

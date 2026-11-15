@@ -1436,7 +1436,15 @@
     state.radioLoading = true;
     renderQueuePanel();
     try {
-      const d = await api(`/api/web/radio?seed=${encodeURIComponent(seedId || '')}`);
+      const excludeIds = state.queue
+        .slice(-80)
+        .map((t) => t.id)
+        .filter(Boolean)
+        .join(',');
+      const params = new URLSearchParams();
+      if (seedId) params.set('seed', seedId);
+      if (excludeIds) params.set('exclude', excludeIds);
+      const d = await api(`/api/web/radio?${params.toString()}`);
       if (reqToken !== state.radioReqToken) return 0;
       const recs = cacheTracks(d.tracks || []);
       const existing = new Set(state.queue.map((t) => t.id));
@@ -1559,7 +1567,7 @@
     }
     if (state.queueIndex + 1 < state.queue.length) {
       const next = state.queueIndex + 1;
-      if (state.autoplay && state.queue.length - next <= 2 && cur) {
+      if (state.autoplay && !state.radioLoading && state.queue.length - next <= 2 && cur) {
         appendRadioTracks(cur.id);
       }
       return playQueueAt(next);

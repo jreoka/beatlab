@@ -547,6 +547,9 @@ pub async fn list_playlists(
         Ok(u) => u,
         Err(r) => return r,
     };
+    if state.store.count_tracks().unwrap_or(0) > 0 {
+        state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
+    }
     let q = parse_query(raw.as_deref());
     let (start, count) = slice_params(&q, 100);
     let list = state.store.list_playlists(user.id, true).unwrap_or_default();
@@ -575,6 +578,12 @@ pub async fn get_playlist(
     if !p.public && p.user_id != user.id {
         return json_err(StatusCode::FORBIDDEN, "Permission denied");
     }
+    let p = if p.is_auto && p.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
+        state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
+        state.store.get_playlist(&id).ok().flatten().unwrap_or(p)
+    } else {
+        p
+    };
     json_ok(playlist_to_nd(&p), None)
 }
 
@@ -671,6 +680,9 @@ pub async fn get_playlist_tracks(
     };
     if !p.public && p.user_id != user.id {
         return json_err(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    if p.is_auto && p.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
+        state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
     }
     let q = parse_query(raw.as_deref());
     let (start, count) = slice_params(&q, 500);
