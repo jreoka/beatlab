@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Beatlab — Hi-Res Self-Hosted Music</title>
+<style>
+  :root {
+    --bg: #0b0d12; --bg2: #121620; --bg3: #1a2030; --border: #252c3f;
+    --text: #eef1f8; --muted: #8b95b0; --accent: #6366f1; --accent2: #22d3ee;
+    --gold: #f59e0b; --green: #10b981;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+  aside { width: 230px; background: var(--bg2); border-right: 1px solid var(--border); padding: 20px 14px; display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+  .brand { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; padding: 6px 10px 18px; display: flex; align-items: center; gap: 10px; }
+  .brand span { background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .nav-btn { background: none; border: none; color: var(--muted); text-align: left; padding: 10px 12px; border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; transition: 0.15s; }
+  .nav-btn:hover, .nav-btn.active { background: var(--bg3); color: var(--text); }
+  .stats-box { margin-top: auto; background: var(--bg3); border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  main { flex: 1; overflow-y: auto; padding: 26px 32px 110px; }
+  h1 { font-size: 26px; font-weight: 800; margin-bottom: 18px; }
+  h2 { font-size: 18px; font-weight: 700; margin: 26px 0 14px; color: var(--text); }
+  .search-bar { display: flex; gap: 10px; margin-bottom: 22px; }
+  .search-bar input { flex: 1; background: var(--bg2); border: 1px solid var(--border); color: var(--text); padding: 12px 16px; border-radius: 12px; font-size: 15px; outline: none; }
+  .search-bar input:focus { border-color: var(--accent); }
+  .btn { background: var(--accent); color: #fff; border: none; padding: 10px 18px; border-radius: 10px; font-weight: 600; font-size: 14px; cursor: pointer; }
+  .btn:hover { opacity: 0.9; }
+  .btn-ghost { background: var(--bg3); color: var(--text); border: 1px solid var(--border); padding: 7px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; }
+  .btn-ghost:hover { border-color: var(--accent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; }
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 14px; cursor: pointer; transition: transform 0.15s, border-color 0.15s; }
+  .card:hover { transform: translateY(-2px); border-color: var(--accent); }
+  .card img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; margin-bottom: 10px; background: var(--bg3); }
+  .card-title { font-weight: 700; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .mood-card { border-radius: 14px; padding: 18px; cursor: pointer; border: 1px solid rgba(255,255,255,0.08); transition: transform 0.15s; background: linear-gradient(135deg, #1e293b, #0f172a); }
+  .mood-card:hover { transform: translateY(-2px); border-color: var(--accent2); }
+  .track-list { display: flex; flex-direction: column; gap: 6px; }
+  .track-row { display: grid; grid-template-columns: 44px 1fr 140px 80px 130px; align-items: center; gap: 12px; padding: 8px 12px; border-radius: 10px; background: var(--bg2); border: 1px solid transparent; }
+  .track-row:hover { background: var(--bg3); border-color: var(--border); }
+  .track-row.playing { border-color: var(--accent); background: rgba(99, 102, 241, 0.12); }
+  .track-row img { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; cursor: pointer; }
+  .t-meta { min-width: 0; cursor: pointer; }
+  .t-title { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .t-artist { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+  .badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; text-align: center; }
+  .badge-hires { background: rgba(245, 158, 11, 0.18); color: var(--gold); border: 1px solid rgba(245, 158, 11, 0.35); }
+  .badge-lossless { background: rgba(16, 185, 129, 0.18); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.35); }
+  .badge-hq { background: rgba(34, 211, 238, 0.15); color: var(--accent2); }
+  .badge-std { background: rgba(139, 149, 176, 0.15); color: var(--muted); }
+  .t-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .player-bar { position: fixed; bottom: 0; left: 0; right: 0; height: 84px; background: rgba(18, 22, 32, 0.96); backdrop-filter: blur(12px); border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; gap: 20px; z-index: 50; }
+  .now-info { display: flex; align-items: center; gap: 12px; width: 280px; min-width: 0; }
+  .now-info img { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; background: var(--bg3); }
+  .controls { flex: 1; max-width: 580px; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .ctrl-btns { display: flex; align-items: center; gap: 14px; }
+  .ctrl-btns button { background: none; border: none; color: var(--text); font-size: 18px; cursor: pointer; padding: 4px 8px; }
+  .ctrl-btns .play-btn { background: var(--text); color: var(--bg); width: 36px; height: 36px; border-radius: 50%; font-size: 15px; display: flex; align-items: center; justify-content: center; }
+  .seek-row { width: 100%; display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--muted); }
+  .seek-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .vol-box { display: flex; align-items: center; gap: 10px; width: 200px; justify-content: flex-end; }
+  .vol-box input[type=range] { width: 90px; accent-color: var(--accent); }
+  .admin-panel { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 18px; }
+  .src-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  @media (max-width: 780px) {
+    aside { width: 70px; padding: 14px 8px; }
+    aside .nav-label, .stats-box, .brand span { display: none; }
+    .track-row { grid-template-columns: 44px 1fr 90px; }
+    .track-row .badge, .track-row .t-dur { display: none; }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <div class="brand">🎵 <span>Beatlab</span></div>
+  <button class="nav-btn active" onclick="showView('home', this)">🏠 <span class="nav-label">For You</span></button>
+  <button class="nav-btn" onclick="showView('moods', this)">🎭 <span class="nav-label">Moods</span></button>
+  <button class="nav-btn" onclick="showView('search', this)">🔍 <span class="nav-label">Search</span></button>
+  <button class="nav-btn" onclick="showView('queue', this)">📜 <span class="nav-label">Queue</span></button>
+  <button class="nav-btn" onclick="showView('admin', this)">⚙️ <span class="nav-label">Sources & Admin</span></button>
+  <div class="stats-box" id="statsBox">Loading catalog...</div>
+</aside>
+
+<main id="main"></main>
+
+<div class="player-bar">
+  <div class="now-info">
+    <img id="pCover" src="" alt="" onerror="this.style.visibility='hidden'">
+    <div style="min-width:0">
+      <div id="pTitle" class="t-title">Nothing playing</div>
+      <div id="pArtist" class="t-artist">Pick a mix, mood, or search</div>
+    </div>
+  </div>
+  <div class="controls">
+    <div class="ctrl-btns">
+      <button onclick="prevTrack()" title="Previous">⏮</button>
+      <button class="play-btn" id="playBtn" onclick="togglePlay()">▶</button>
+      <button onclick="nextTrack(true)" title="Next">⏭</button>
+      <button onclick="startRadioFromCurrent()" title="Start Smart Radio" style="font-size:13px">📻</button>
+    </div>
+    <div class="seek-row">
+      <span id="pCur">0:00</span>
+      <input type="range" id="seekBar" min="0" max="100" value="0" oninput="seekTo(this.value)">
+      <span id="pDur">0:00</span>
+    </div>
+  </div>
+  <div class="vol-box">
+    <span id="pQuality" class="badge badge-std">—</span>
+    <input type="range" min="0" max="1" step="0.02" value="0.9" oninput="audio.volume = this.value">
+  </div>
+</div>
+
+<audio id="audio" preload="auto"></audio>
+
+<script>
+let homeData = null;
+let queue = [];
+let qIndex = -1;
+let currentView = 'home';
+let scrobbled = false;
+const audio = document.getElementById('audio');
+
+function fmtTime(sec) {
+  if (!sec || isNaN(sec)) return '0:00';
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function qualityBadgeClass(t) {
+  if (t.is_lossless && (t.bit_depth >= 24 || t.sample_rate > 48000)) return 'badge-hires';
+  if (t.is_lossless) return 'badge-lossless';
+  if (t.bitrate >= 256) return 'badge-hq';
+  return 'badge-std';
+}
+
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadHome() {
+  const res = await fetch('/player/api/home');
+  homeData = await res.json();
+  document.getElementById('statsBox').innerHTML =
+    `<div><b>${homeData.stats.total_tracks}</b> tracks</div>` +
+    `<div><b>${homeData.stats.lossless_tracks}</b> lossless FLAC/WAV</div>` +
+    `<div>🧠 Net: <b>${homeData.stats.nn_updates}</b> steps</div>` +
+    `<div style="margin-top:6px;color:var(--accent2)">Subsonic API: /rest</div>`;
+  if (currentView === 'home') renderHome();
+}
+
+function showView(view, btn) {
+  currentView = view;
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  if (view === 'home') renderHome();
+  else if (view === 'moods') renderMoods();
+  else if (view === 'search') renderSearch();
+  else if (view === 'queue') renderQueue();
+  else if (view === 'admin') renderAdmin();
+}
+
+function renderHome() {
+  if (!homeData) return;
+  let html = `<h1>Personal Mixes & Auto Playlists</h1><div class="grid">`;
+  homeData.mixes.forEach((m, idx) => {
+    const img = m.cover_track_id ? `/player/api/cover/${encodeURIComponent(m.cover_track_id)}` : '';
+    html += `<div class="card" onclick="openMix(${idx})">
+      <img src="${img}" alt="">
+      <div class="card-title">${esc(m.name)}</div>
+      <div class="card-sub">${esc(m.subtitle)} • ${m.tracks.length} tracks</div>
+    </div>`;
+  });
+  html += `</div><h2>Smart Recommendations For You</h2>` + renderTrackList(homeData.recommended, 'homeRecs');
+  document.getElementById('main').innerHTML = html;
+  window._lists = window._lists || {};
+  window._lists.homeRecs = homeData.recommended;
+}
+
+function openMix(idx) {
+  const m = homeData.mixes[idx];
+  window._lists = window._lists || {};
+  window._lists.mixView = m.tracks;
+  document.getElementById('main').innerHTML =
+    `<button class="btn-ghost" onclick="renderHome()">← Back</button>
+     <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 18px">
+       <div><h1>${esc(m.name)}</h1><p style="color:var(--muted)">${esc(m.subtitle)}</p></div>
+       <button class="btn" onclick="playList('mixView', 0)">▶ Play Mix</button>
+     </div>` + renderTrackList(m.tracks, 'mixView');
+}
+
+function renderMoods() {
+  if (!homeData) return;
+  let html = `<h1>Moods & Vibes</h1><div class="grid">`;
+  homeData.moods.forEach(m => {
+    html += `<div class="mood-card" onclick="openMood('${m.slug}')">
+      <div class="card-title" style="font-size:17px">${esc(m.label)}</div>
+      <div class="card-sub" style="margin-top:8px">${esc(m.description)}</div>
+    </div>`;
+  });
+  html += `</div>`;
+  document.getElementById('main').innerHTML = html;
+}
+
+async function openMood(slug) {
+  document.getElementById('main').innerHTML = `<h1>Loading mood radio...</h1>`;
+  const res = await fetch('/player/api/mood/' + encodeURIComponent(slug));
+  const data = await res.json();
+  window._lists = window._lists || {};
+  window._lists.moodView = data.tracks;
+  document.getElementById('main').innerHTML =
+    `<button class="btn-ghost" onclick="renderMoods()">← All Moods</button>
+     <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 18px">
+       <div><h1>${esc(data.mood.label)}</h1><p style="color:var(--muted)">${esc(data.mood.description)}</p></div>
+       <button class="btn" onclick="playList('moodView', 0)">▶ Play Mood</button>
+     </div>` + renderTrackList(data.tracks, 'moodView');
+}
+
+function renderSearch() {
+  document.getElementById('main').innerHTML =
+    `<h1>Search Hi-Res & Online Sources</h1>
+     <div class="search-bar">
+       <input id="qInput" placeholder="Search artist, song, album, or genre (e.g. Miles Davis, FLAC, ambient)..." onkeydown="if(event.key==='Enter')doSearch()">
+       <button class="btn" onclick="doSearch()">Search</button>
+     </div>
+     <div id="searchResults"><p style="color:var(--muted)">Local lossless files, Archive.org FLACs, Bandcamp, SoundCloud & YouTube fallback are searched in parallel — highest quality wins.</p></div>`;
+  document.getElementById('qInput').focus();
+}
+
+async function doSearch() {
+  const q = document.getElementById('qInput').value;
+  document.getElementById('searchResults').innerHTML = `<p style="color:var(--muted)">Searching sources for highest quality...</p>`;
+  const res = await fetch('/player/api/search?q=' + encodeURIComponent(q));
+  const data = await res.json();
+  window._lists = window._lists || {};
+  window._lists.searchRes = data.tracks;
+  document.getElementById('searchResults').innerHTML = renderTrackList(data.tracks, 'searchRes');
+}
+
+function renderQueue() {
+  window._lists = window._lists || {};
+  window._lists.curQueue = queue;
+  document.getElementById('main').innerHTML =
+    `<h1>Play Queue (${queue.length})</h1>` +
+    (queue.length ? renderTrackList(queue, 'curQueue') : `<p style="color:var(--muted)">Queue is empty.</p>`);
+}
+
+async function renderAdmin() {
+  const res = await fetch('/player/api/admin/status');
+  const d = await res.json();
+  let html = `<h1>Sources & Server Admin</h1>
+    <div class="admin-panel">
+      <h3>Catalog & Quality</h3>
+      <p style="margin:8px 0;color:var(--muted)">Version: ${esc(d.version)} • Total Tracks: <b>${d.tracks}</b> • Lossless: <b>${d.lossless_tracks}</b> • FFmpeg: <b>${d.ffmpeg ? 'Ready' : 'Not found'}</b></p>
+      <p style="margin:8px 0;color:var(--muted)">Audio Cache: <b>${(d.cache_bytes / (1024*1024)).toFixed(1)} MB</b> / ${(d.cache_budget_bytes / (1024*1024*1024)).toFixed(1)} GB
+        <button class="btn-ghost" style="margin-left:10px" onclick="clearCache()">Clear Cache</button></p>
+    </div>
+    <div class="admin-panel">
+      <h3>Local Music Folders (FLAC / WAV / ALAC / MP3)</h3>
+      <div style="display:flex;gap:10px;margin:12px 0">
+        <input id="dirInput" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:8px" placeholder="C:\\Users\\you\\Music">
+        <button class="btn" onclick="addLocalDir()">Add & Scan</button>
+        <button class="btn-ghost" onclick="scanLocal()">Rescan</button>
+      </div>
+      <div style="font-size:13px;color:var(--muted)">${d.local_dirs.length ? d.local_dirs.map(esc).join('<br>') : 'No local folders added yet.'}</div>
+    </div>
+    <div class="admin-panel"><h3>Active Sources</h3>`;
+  d.sources.forEach(s => {
+    html += `<div class="src-row"><b>${esc(s.name)}</b><span style="color:${s.available ? 'var(--green)' : 'var(--muted)'}">${esc(s.status)}</span></div>`;
+  });
+  html += `</div>`;
+  document.getElementById('main').innerHTML = html;
+}
+
+async function addLocalDir() {
+  const path = document.getElementById('dirInput').value;
+  const res = await fetch('/player/api/admin/dirs', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path})});
+  if (res.ok) { renderAdmin(); loadHome(); } else { alert('Folder not found'); }
+}
+async function scanLocal() {
+  await fetch('/player/api/admin/scan', {method:'POST'});
+  renderAdmin(); loadHome();
+}
+async function clearCache() {
+  await fetch('/player/api/admin/cache/clear', {method:'POST'});
+  renderAdmin();
+}
+
+function renderTrackList(tracks, listKey) {
+  if (!tracks || !tracks.length) return `<p style="color:var(--muted)">No tracks found.</p>`;
+  const curId = queue[qIndex]?.id;
+  return `<div class="track-list">` + tracks.map((t, i) => `
+    <div class="track-row ${t.id === curId ? 'playing' : ''}">
+      <img src="/player/api/cover/${encodeURIComponent(t.id)}" onclick="playList('${listKey}', ${i})">
+      <div class="t-meta" onclick="playList('${listKey}', ${i})">
+        <div class="t-title">${esc(t.title)}</div>
+        <div class="t-artist">${esc(t.artist)} • ${esc(t.album)}</div>
+      </div>
+      <span class="badge ${qualityBadgeClass(t)}">${esc(t.quality_badge)}</span>
+      <span class="t-dur" style="font-size:12px;color:var(--muted);text-align:right">${fmtTime(t.duration)}</span>
+      <div class="t-actions">
+        <button class="btn-ghost" onclick="toggleStar('${esc(t.id)}', ${!t.starred}, this)">${t.starred ? '★' : '☆'}</button>
+        <button class="btn-ghost" onclick="startRadio('${esc(t.id)}')">📻</button>
+      </div>
+    </div>
+  `).join('') + `</div>`;
+}
+
+function playList(listKey, idx) {
+  queue = [...(window._lists[listKey] || [])];
+  playAt(idx);
+}
+
+function playAt(idx) {
+  if (idx < 0 || idx >= queue.length) return;
+  qIndex = idx;
+  scrobbled = false;
+  const t = queue[qIndex];
+  audio.src = '/player/api/stream/' + encodeURIComponent(t.id);
+  audio.play().catch(() => {});
+  document.getElementById('playBtn').textContent = '⏸';
+  document.getElementById('pTitle').textContent = t.title;
+  document.getElementById('pArtist').textContent = t.artist + (t.album ? ' • ' + t.album : '');
+  const cov = document.getElementById('pCover');
+  cov.style.visibility = 'visible';
+  cov.src = '/player/api/cover/' + encodeURIComponent(t.id);
+  const qb = document.getElementById('pQuality');
+  qb.textContent = t.quality_badge;
+  qb.className = 'badge ' + qualityBadgeClass(t);
+  sendEvent(t.id, 'play');
+}
+
+function togglePlay() {
+  if (!audio.src) return;
+  if (audio.paused) { audio.play(); document.getElementById('playBtn').textContent = '⏸'; }
+  else { audio.pause(); document.getElementById('playBtn').textContent = '▶'; }
+}
+
+function nextTrack(manual = false) {
+  if (manual && queue[qIndex] && audio.duration > 20 && audio.currentTime < audio.duration * 0.25) {
+    sendEvent(queue[qIndex].id, 'skip');
+  }
+  if (qIndex + 1 < queue.length) playAt(qIndex + 1);
+}
+
+function prevTrack() {
+  if (audio.currentTime > 4) { audio.currentTime = 0; return; }
+  if (qIndex > 0) playAt(qIndex - 1);
+}
+
+function seekTo(val) {
+  if (audio.duration) audio.currentTime = (val / 100) * audio.duration;
+}
+
+async function startRadio(trackId) {
+  const res = await fetch('/player/api/radio/track/' + encodeURIComponent(trackId));
+  const data = await res.json();
+  if (data.tracks && data.tracks.length) {
+    queue = data.tracks;
+    playAt(0);
+  }
+}
+
+function startRadioFromCurrent() {
+  if (queue[qIndex]) startRadio(queue[qIndex].id);
+}
+
+async function toggleStar(id, star, btn) {
+  await sendEvent(id, star ? 'star' : 'unstar');
+  btn.textContent = star ? '★' : '☆';
+}
+
+function sendEvent(track_id, kind) {
+  return fetch('/player/api/event', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({track_id, kind})
+  });
+}
+
+audio.addEventListener('timeupdate', () => {
+  document.getElementById('pCur').textContent = fmtTime(audio.currentTime);
+  document.getElementById('pDur').textContent = fmtTime(audio.duration);
+  if (audio.duration) {
+    document.getElementById('seekBar').value = (audio.currentTime / audio.duration) * 100;
+    if (!scrobbled && (audio.currentTime > 30 || audio.currentTime > audio.duration * 0.5)) {
+      scrobbled = true;
+      if (queue[qIndex]) sendEvent(queue[qIndex].id, 'complete');
+    }
+  }
+});
+
+audio.addEventListener('ended', () => nextTrack(false));
+
+loadHome();
+</script>
+</body>
+</html>
