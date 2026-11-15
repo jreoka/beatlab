@@ -253,14 +253,16 @@ pub struct SearchQuery {
 #[derive(Deserialize)]
 pub struct RadioQuery {
     pub seed: Option<String>,
+    pub playlist: Option<String>,
+    pub exclude: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct StreamQuery {
     pub token: Option<String>,
-    pub quality: Option<String>,
     #[serde(rename = "t")]
     pub offset: Option<f64>,
+    pub compat: Option<String>,
 }
 
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -386,12 +388,15 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     };
     let uid = user.id;
 
-    // Ensure auto-mixes exist cleanly when user visits home.
-    let mut playlists = state.store.list_playlists(uid, false).unwrap_or_default();
-    if playlists.iter().all(|p| !p.is_auto) && state.store.count_tracks().unwrap_or(0) > 0 {
-        state.taste.rebuild_auto_playlists(uid);
-        playlists = state.store.list_playlists(uid, false).unwrap_or_default();
+    // Ensure auto-mixes exist and refresh cleanly whenever user feedback/playlists changed them.
+    if state.store.count_tracks().unwrap_or(0) > 0 {
+        let taste = state.taste.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            taste.refresh_auto_playlists_if_stale(uid, 900);
+        })
+        .await;
     }
+    let playlists = state.store.list_playlists(uid, false).unwrap_or_default();
 
     let auto_mixes: Vec<Value> = playlists
         .into_iter()
@@ -793,9 +798,36 @@ pub async fn create_playlist(
         .store
         .create_playlist(user.id, name, &req.comment, req.public, &req.track_ids)
     {
-        Ok(pl) => json_res(json!({ "playlist": playlist_summary_json(&pl) })),
+        Ok(pl) => {
+            if !req.track_ids.is_empty() {
+                state.taste.record_playlist_additions(user.id, &req.track_ids);
+            }
+            json_res(json!({ "playlist": playlist_summary_json(&pl) }))
+        }
         Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
     }
+}
+
+pub async fn playlist_recommendations(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(pl) = state.store.get_playlist(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Playlist not found");
+    };
+    if !pl.public && pl.user_id != user.id {
+        return err_res(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let tracks = state.taste.recommend_for_playlist(user.id, &id, 15).await;
+    json_res(json!({
+        "playlistId": id,
+        "tracks": to_web_tracks(&state, user.id, &tracks),
+    }))
 }
 
 pub async fn update_playlist(
@@ -820,7 +852,9 @@ pub async fn update_playlist(
         req.comment.as_deref(),
         req.public,
     );
-    let updated = state.store.get_playlist(&id).unwrap().unwrap();
+    let Some(updated) = state.store.get_playlist(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Playlist not found");
+    };
     json_res(json!({ "playlist": playlist_summary_json(&updated) }))
 }
 
@@ -840,6 +874,9 @@ pub async fn delete_playlist(
         return err_res(StatusCode::FORBIDDEN, "Permission denied");
     }
     let _ = state.store.delete_playlist(&id);
+    if !pl.is_auto {
+        state.taste.mark_taste_dirty(user.id);
+    }
     json_res(json!({ "ok": true }))
 }
 
@@ -859,8 +896,14 @@ pub async fn add_playlist_tracks(
     if pl.user_id != user.id {
         return err_res(StatusCode::FORBIDDEN, "Permission denied");
     }
-    let _ = state.store.add_tracks_to_playlist(&id, &req.track_ids);
-    json_res(json!({ "ok": true }))
+    let added = state
+        .store
+        .add_unique_tracks_to_playlist(&id, &req.track_ids)
+        .unwrap_or_default();
+    if !pl.is_auto && !added.is_empty() {
+        state.taste.record_playlist_additions(user.id, &added);
+    }
+    json_res(json!({ "ok": true, "added": added.len() }))
 }
 
 pub async fn remove_playlist_track(
@@ -878,7 +921,14 @@ pub async fn remove_playlist_track(
     if pl.user_id != user.id {
         return err_res(StatusCode::FORBIDDEN, "Permission denied");
     }
+    let current = state.store.playlist_tracks(&id).unwrap_or_default();
+    let removed_id = current.get(pos).map(|t| t.id.clone());
     let _ = state.store.remove_playlist_positions(&id, &[pos]);
+    if !pl.is_auto {
+        if let Some(tid) = removed_id {
+            state.taste.record_playlist_removals(user.id, &[tid]);
+        }
+    }
     json_res(json!({ "ok": true }))
 }
 
@@ -920,6 +970,7 @@ pub async fn toggle_star(
             } else {
                 let _ = state.store.unsave_album(user.id, &req.id);
             }
+            state.taste.record_album_save(user.id, &req.id, req.starred);
         }
         "artist" => {
             if req.starred {
@@ -927,14 +978,15 @@ pub async fn toggle_star(
             } else {
                 let _ = state.store.unfollow_artist(user.id, &req.id);
             }
+            state.taste.record_artist_follow(user.id, &req.id, req.starred);
         }
         _ => {
             if req.starred {
                 let _ = state.store.star_track(user.id, &req.id);
-                state.taste.record_event(user.id, &req.id, "star", 1.0);
+                state.taste.learn_signal(user.id, &req.id, "star", 1.0);
             } else {
                 let _ = state.store.unstar_track(user.id, &req.id);
-                state.taste.record_event(user.id, &req.id, "unstar", 0.0);
+                state.taste.learn_signal(user.id, &req.id, "unstar", 0.0);
             }
         }
     }
@@ -950,11 +1002,16 @@ pub async fn set_rating(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let _ = state.store.set_rating(user.id, &req.id, req.rating);
-    state
-        .taste
-        .record_event(user.id, &req.id, "rate", req.rating as f64);
-    json_res(json!({ "ok": true }))
+    let rating = req.rating.clamp(0, 5);
+    let _ = state.store.set_rating(user.id, &req.id, rating);
+    if rating > 0 {
+        state
+            .taste
+            .learn_signal(user.id, &req.id, "rate", rating as f64);
+    } else {
+        state.taste.mark_taste_dirty(user.id);
+    }
+    json_res(json!({ "ok": true, "rating": rating }))
 }
 
 pub async fn record_event(
@@ -971,7 +1028,7 @@ pub async fn record_event(
         .record_event(user.id, &req.track_id, &req.kind, req.value);
     if let Ok(Some(t)) = state.store.get_track(&req.track_id) {
         if req.kind == "play" {
-            let mut np = state.now_playing.lock().unwrap();
+            let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
             np.insert(user.id, (t, Utc::now().timestamp(), user.username));
         }
     }
@@ -1002,14 +1059,39 @@ pub async fn radio(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let seed = q
-        .seed
+    let exclude: HashSet<String> = q
+        .exclude
         .as_deref()
-        .and_then(|id| state.store.get_track(id).ok().flatten());
-    let next = state
-        .taste
-        .radio_next_tracks(user.id, seed.as_ref(), 18)
-        .await;
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let next = if let Some(pid) = q.playlist.as_deref().filter(|s| !s.trim().is_empty()) {
+        let Some(pl) = state.store.get_playlist(pid).ok().flatten() else {
+            return err_res(StatusCode::NOT_FOUND, "Playlist not found");
+        };
+        if !pl.public && pl.user_id != user.id {
+            return err_res(StatusCode::FORBIDDEN, "Permission denied");
+        }
+        state
+            .taste
+            .playlist_radio_tracks(user.id, pid, &exclude, 18)
+            .await
+    } else {
+        let seed = q
+            .seed
+            .as_deref()
+            .and_then(|id| state.store.get_track(id).ok().flatten());
+        state
+            .taste
+            .radio_next_tracks_with_exclusions(user.id, seed.as_ref(), &exclude, 18)
+            .await
+    };
     json_res(json!({
         "tracks": to_web_tracks(&state, user.id, &next)
     }))
@@ -1101,15 +1183,11 @@ pub async fn stream_track(
     let Some(track) = state.store.get_track(&id).ok().flatten() else {
         return err_res(StatusCode::NOT_FOUND, "Track not found");
     };
-    let (max_br, fmt) = match q.quality.as_deref() {
-        Some("low") => (Some(96), Some("mp3")),
-        Some("medium") => (Some(160), Some("mp3")),
-        _ => (None, None),
-    };
     let offset = q.offset.unwrap_or(0.0);
+    let force_compat = matches!(q.compat.as_deref(), Some("1" | "true"));
     state
         .engine
-        .serve_track_stream(&track, &headers, max_br, fmt, offset)
+        .serve_web_stream(&track, &headers, offset, force_compat)
         .await
 }
 
@@ -1177,4 +1255,116 @@ fn playlist_summary_json(p: &Playlist) -> Value {
         "coverUrl": cover,
         "changed": p.changed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    #[test]
+    fn stream_query_parses_auto_quality_and_compat_params() {
+        let uri: Uri = "/api/web/stream/tr1?token=tok123".parse().unwrap();
+        let Query(q) = Query::<StreamQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.token.as_deref(), Some("tok123"));
+        assert!(q.offset.is_none());
+        assert!(q.compat.is_none());
+
+        let uri2: Uri = "/api/web/stream/tr1?token=tok123&t=42.5&compat=1".parse().unwrap();
+        let Query(q2) = Query::<StreamQuery>::try_from_uri(&uri2).unwrap();
+        assert_eq!(q2.offset, Some(42.5));
+        assert_eq!(q2.compat.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn radio_query_accepts_playlist_and_exclusions() {
+        let uri: Uri = "/api/web/radio?playlist=pl-123&exclude=t1,t2".parse().unwrap();
+        let Query(q) = Query::<RadioQuery>::try_from_uri(&uri).unwrap();
+        assert!(q.seed.is_none());
+        assert_eq!(q.playlist.as_deref(), Some("pl-123"));
+        assert_eq!(q.exclude.as_deref(), Some("t1,t2"));
+    }
+
+    #[tokio::test]
+    async fn playlist_add_dedups_and_triggers_learning_events() {
+        use crate::engine::StreamEngine;
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use crate::store::Store;
+        use crate::taste::TasteEngine;
+        use axum::body::to_bytes;
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-web-{}", uuid::Uuid::new_v4()));
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+        let t1 = Track {
+            id: "dz:1".into(),
+            source: "deezer".into(),
+            title: "Midnight Groove".into(),
+            artist: "Parcels".into(),
+            genre: "Funk, Electronic".into(),
+            moods: "groove,party".into(),
+            year: 2021,
+            duration: 210,
+            bitrate: 256,
+            ..Default::default()
+        };
+        store.upsert_tracks(&[t1.clone()]).unwrap();
+        let (u, _) = store.authenticate_or_create_user("webuser", "pw123").unwrap();
+        let tok = store.create_session(u.id, "web", 3600).unwrap();
+        let pl = store.create_playlist(u.id, "Funky Cuts", "", false, &[]).unwrap();
+
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+        };
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
+
+        let r1 = add_playlist_tracks(
+            State(state.clone()),
+            Path(pl.id.clone()),
+            hdrs.clone(),
+            Json(PlaylistAddReq {
+                track_ids: vec!["dz:1".into(), "dz:1".into()],
+            }),
+        )
+        .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        let b1: Value = serde_json::from_slice(&to_bytes(r1.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert_eq!(b1["added"], 1);
+
+        let r2 = add_playlist_tracks(
+            State(state.clone()),
+            Path(pl.id.clone()),
+            hdrs,
+            Json(PlaylistAddReq {
+                track_ids: vec!["dz:1".into()],
+            }),
+        )
+        .await;
+        let b2: Value = serde_json::from_slice(&to_bytes(r2.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert_eq!(b2["added"], 0);
+
+        let events = store.user_recent_events(u.id, 10).unwrap();
+        assert_eq!(events.iter().filter(|e| e.kind == "playlist_add").count(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

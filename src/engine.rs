@@ -353,8 +353,9 @@ impl StreamEngine {
             }
         };
 
+        let safe_offset = sanitize_time_offset(time_offset);
         let need_transcode = self.ffmpeg_available
-            && (time_offset > 0.5
+            && (safe_offset > 0.5
                 || want_fmt.is_some()
                 || max_bitrate.map(|b| b > 0).unwrap_or(false));
 
@@ -365,10 +366,56 @@ impl StreamEngine {
                 track,
             );
             return self
-                .serve_ffmpeg_transcode(track, &resolved, &fmt, br, time_offset)
+                .serve_ffmpeg_transcode(track, &resolved, &fmt, br, safe_offset)
                 .await;
         }
 
+        self.serve_play_target_range(track, resolved, req_headers)
+            .await
+    }
+
+    /// Streams a track for the web player at the highest browser-compatible quality:
+    /// passes through the original audio untouched when natively playable, or automatically
+    /// transcodes unsupported formats (lossless -> FLAC, lossy -> 320k MP3).
+    pub async fn serve_web_stream(
+        &self,
+        track: &Track,
+        req_headers: &HeaderMap,
+        time_offset: f64,
+        force_compat: bool,
+    ) -> Response {
+        let resolved = match self.resolve_target(track).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(track_id = %track.id, error = %e, "stream resolution failed");
+                return (StatusCode::BAD_GATEWAY, format!("Stream error: {}", e)).into_response();
+            }
+        };
+
+        let resolved_ext = play_target_ext(&resolved, track);
+        let needs_compat = force_compat
+            || !is_browser_native_ext(&resolved_ext)
+            || (is_alac_m4a(&resolved_ext, track) && !is_safari_ua(req_headers))
+            || (is_safari_ua(req_headers) && is_safari_unfriendly_ext(&resolved_ext));
+
+        let safe_offset = sanitize_time_offset(time_offset);
+        if self.ffmpeg_available && (safe_offset > 0.5 || needs_compat) {
+            let (fmt, br) = choose_web_transcode_params(&resolved_ext, track);
+            return self
+                .serve_ffmpeg_transcode(track, &resolved, &fmt, br, safe_offset)
+                .await;
+        }
+
+        self.serve_play_target_range(track, resolved, req_headers)
+            .await
+    }
+
+    async fn serve_play_target_range(
+        &self,
+        track: &Track,
+        resolved: PlayTarget,
+        req_headers: &HeaderMap,
+    ) -> Response {
         let range_hdr = req_headers
             .get(header::RANGE)
             .and_then(|v| v.to_str().ok())
@@ -496,25 +543,8 @@ impl StreamEngine {
             "-o",
             "-",
             watch_url,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-        let Ok(mut child) = cmd.spawn() else {
-            return (StatusCode::BAD_GATEWAY, "Failed to spawn yt-dlp pipe").into_response();
-        };
-        let Some(stdout) = child.stdout.take() else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
-        tokio::spawn(async move {
-            let _ = child.wait().await;
-        });
-        let stream = ReaderStream::new(stdout);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "audio/mp4")
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        ]);
+        stream_child_stdout(cmd, "audio/mp4", "Failed to spawn yt-dlp pipe")
     }
 
     async fn serve_ffmpeg_transcode(
@@ -547,8 +577,9 @@ impl StreamEngine {
 
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-hide_banner", "-loglevel", "error"]);
-        if time_offset > 0.5 {
-            cmd.args(["-ss", &format!("{:.2}", time_offset)]);
+        let safe_offset = sanitize_time_offset(time_offset);
+        if safe_offset > 0.5 {
+            cmd.args(["-ss", &format!("{:.2}", safe_offset)]);
         }
         if input_arg.starts_with("http://") || input_arg.starts_with("https://") {
             let mut ua = String::new();
@@ -619,23 +650,7 @@ impl StreamEngine {
             }
         }
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-        let Ok(mut child) = cmd.spawn() else {
-            return (StatusCode::BAD_GATEWAY, "Failed to launch ffmpeg").into_response();
-        };
-        let Some(stdout) = child.stdout.take() else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
-        tokio::spawn(async move {
-            let _ = child.wait().await;
-        });
-
-        let stream = ReaderStream::new(stdout);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, ct)
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        stream_child_stdout(cmd, ct, "Failed to launch ffmpeg")
     }
 
     pub fn spawn_background_cache(
@@ -1138,6 +1153,12 @@ async fn serve_local_file_range(
                 .header(header::CACHE_CONTROL, "private, max-age=86400")
                 .body(Body::from_stream(stream))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        } else if r_str.trim().starts_with("bytes=") {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::RANGE_NOT_SATISFIABLE.into_response());
         }
     }
 
@@ -1179,14 +1200,148 @@ pub fn parse_byte_range(header_val: &str, total: u64) -> Option<(u64, u64)> {
     (start <= end).then_some((start, end))
 }
 
+fn sanitize_time_offset(t: f64) -> f64 {
+    if t.is_finite() && t > 0.5 {
+        t.min(86_400.0)
+    } else {
+        0.0
+    }
+}
+
+struct ChildStdoutStream {
+    reader: ReaderStream<tokio::process::ChildStdout>,
+    _child: tokio::process::Child,
+}
+
+impl futures::Stream for ChildStdoutStream {
+    type Item = <ReaderStream<tokio::process::ChildStdout> as futures::Stream>::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.reader).poll_next(cx)
+    }
+}
+
+/// Spawns a subprocess with `kill_on_drop(true)` and ties its lifetime to the HTTP response stream
+/// so aborted or seeked client connections never orphan `ffmpeg` or `yt-dlp` processes.
+fn stream_child_stdout(
+    mut cmd: Command,
+    content_type: &str,
+    spawn_err: &'static str,
+) -> Response {
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return (StatusCode::BAD_GATEWAY, spawn_err).into_response();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let stream = ChildStdoutStream {
+        reader: ReaderStream::new(stdout),
+        _child: child,
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn play_target_ext(target: &PlayTarget, track: &Track) -> String {
+    let raw = match target {
+        PlayTarget::LocalFile { path, .. } => path
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&track.format),
+        PlayTarget::RemoteHttp { ext, .. } => {
+            if ext.is_empty() {
+                &track.format
+            } else {
+                ext
+            }
+        }
+    };
+    raw.trim().trim_start_matches('.').to_lowercase()
+}
+
+fn is_lossless_ext(ext: &str) -> bool {
+    matches!(
+        ext.trim().trim_start_matches('.').to_lowercase().as_str(),
+        "flac" | "alac" | "wav" | "aiff" | "aif" | "ape" | "wv" | "dsf" | "dff" | "tta" | "shn"
+    )
+}
+
+fn is_browser_native_ext(ext: &str) -> bool {
+    let norm = ext.trim().trim_start_matches('.').to_lowercase();
+    norm.is_empty()
+        || matches!(
+            norm.as_str(),
+            "mp3" | "flac" | "wav" | "m4a" | "mp4" | "aac" | "ogg" | "oga" | "opus" | "webm"
+        )
+}
+
+fn is_safari_unfriendly_ext(ext: &str) -> bool {
+    matches!(
+        ext.trim().trim_start_matches('.').to_lowercase().as_str(),
+        "ogg" | "oga" | "opus" | "webm"
+    )
+}
+
+fn is_safari_ua(headers: &HeaderMap) -> bool {
+    let Some(ua) = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    ua.contains("Safari/")
+        && !ua.contains("Chrome/")
+        && !ua.contains("Chromium/")
+        && !ua.contains("CriOS/")
+        && !ua.contains("FxiOS/")
+        && !ua.contains("Edg")
+        && !ua.contains("OPR/")
+        && !ua.contains("Android")
+}
+
+fn is_alac_m4a(resolved_ext: &str, track: &Track) -> bool {
+    let ext = resolved_ext.trim().trim_start_matches('.').to_lowercase();
+    ext == "m4a" && (track.bit_depth > 0 || track.bitrate > 450)
+}
+
+fn choose_web_transcode_params(resolved_ext: &str, track: &Track) -> (String, i32) {
+    let ext = resolved_ext.trim().trim_start_matches('.').to_lowercase();
+    let lossless = is_lossless_ext(&ext)
+        || is_alac_m4a(&ext, track)
+        || (ext.is_empty() && track.is_lossless());
+    if lossless {
+        return ("flac".to_string(), 0);
+    }
+    let br = if track.bitrate > 0 {
+        track.bitrate.clamp(256, 320)
+    } else {
+        320
+    };
+    ("mp3".to_string(), br)
+}
+
 fn choose_transcode_params(
     want_fmt: Option<&str>,
     max_bitrate: Option<i32>,
     track: &Track,
 ) -> (String, i32) {
+    let has_cap = max_bitrate.map(|b| b > 0).unwrap_or(false);
     let fmt = want_fmt.unwrap_or_else(|| {
         if track.format.is_empty() {
             "mp3"
+        } else if is_lossless_ext(&track.format) {
+            if has_cap {
+                "mp3"
+            } else {
+                "flac"
+            }
         } else if track.format == "m4a" || track.format == "mp4" {
             "aac"
         } else {
@@ -1404,5 +1559,138 @@ mod tests {
         ];
         assert_eq!(image_dimensions(&hd_jpeg), Some((1080, 1080)));
         assert!(!is_low_res_cover(&hd_jpeg));
+    }
+
+    #[test]
+    fn web_compat_detects_native_vs_unsupported_formats() {
+        for ext in ["mp3", "flac", "wav", "m4a", "mp4", "aac", "ogg", "opus", "webm", ""] {
+            assert!(is_browser_native_ext(ext), "expected native: {}", ext);
+        }
+        for ext in ["alac", "ape", "wv", "aiff", "aif", "dsf", "wma"] {
+            assert!(!is_browser_native_ext(ext), "expected unsupported: {}", ext);
+        }
+    }
+
+    #[test]
+    fn web_transcode_preserves_lossless_as_flac_and_lossy_as_high_mp3() {
+        let alac = Track {
+            format: "alac".to_string(),
+            bitrate: 900,
+            ..Default::default()
+        };
+        assert_eq!(choose_web_transcode_params("alac", &alac), ("flac".to_string(), 0));
+
+        // ALAC inside .m4a container detected via bit depth / high bitrate
+        let alac_m4a = Track {
+            format: "m4a".to_string(),
+            bitrate: 950,
+            bit_depth: 16,
+            ..Default::default()
+        };
+        assert_eq!(choose_web_transcode_params("m4a", &alac_m4a), ("flac".to_string(), 0));
+
+        // Streaming track upgraded to local APE sibling
+        let ytm_upgraded = Track {
+            format: "m4a".to_string(),
+            bitrate: 192,
+            ..Default::default()
+        };
+        assert_eq!(choose_web_transcode_params("ape", &ytm_upgraded), ("flac".to_string(), 0));
+
+        // Lossy incompatible format (e.g. WMA or Safari Opus fallback) -> high bitrate MP3
+        let wma = Track {
+            format: "wma".to_string(),
+            bitrate: 192,
+            ..Default::default()
+        };
+        assert_eq!(choose_web_transcode_params("wma", &wma), ("mp3".to_string(), 256));
+        assert_eq!(choose_web_transcode_params("opus", &ytm_upgraded), ("mp3".to_string(), 256));
+    }
+
+    #[test]
+    fn safari_ua_detection_excludes_chromium_and_firefox() {
+        let mut safari_hdrs = HeaderMap::new();
+        safari_hdrs.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"),
+        );
+        assert!(is_safari_ua(&safari_hdrs));
+
+        let mut chrome_hdrs = HeaderMap::new();
+        chrome_hdrs.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+        );
+        assert!(!is_safari_ua(&chrome_hdrs));
+
+        let mut edge_hdrs = HeaderMap::new();
+        edge_hdrs.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"),
+        );
+        assert!(!is_safari_ua(&edge_hdrs));
+    }
+
+    #[test]
+    fn play_target_ext_prefers_resolved_extension() {
+        let track = Track {
+            format: "m4a".to_string(),
+            ..Default::default()
+        };
+        let local = PlayTarget::LocalFile {
+            path: PathBuf::from("/music/01.ALAC"),
+            content_type: "audio/mp4".to_string(),
+        };
+        assert_eq!(play_target_ext(&local, &track), "alac");
+
+        let remote = PlayTarget::RemoteHttp {
+            url: "https://example.com/audio".to_string(),
+            headers: vec![],
+            content_type: "audio/webm".to_string(),
+            ext: "webm".to_string(),
+            webpage_url: String::new(),
+            cacheable: false,
+        };
+        assert_eq!(play_target_ext(&remote, &track), "webm");
+    }
+
+    #[test]
+    fn sanitize_time_offset_rejects_nan_inf_and_negatives() {
+        assert_eq!(sanitize_time_offset(f64::NAN), 0.0);
+        assert_eq!(sanitize_time_offset(f64::INFINITY), 0.0);
+        assert_eq!(sanitize_time_offset(-12.0), 0.0);
+        assert_eq!(sanitize_time_offset(0.2), 0.0);
+        assert_eq!(sanitize_time_offset(42.5), 42.5);
+        assert_eq!(sanitize_time_offset(999_999.0), 86_400.0);
+    }
+
+    #[tokio::test]
+    async fn serve_local_file_range_returns_416_on_unsatisfiable_bytes_range() {
+        let dir = std::env::temp_dir().join(format!("beatlab_range_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("sample.mp3");
+        std::fs::write(&file_path, b"0123456789").unwrap();
+
+        let bad_resp = serve_local_file_range(&file_path, "audio/mpeg", Some("bytes=999-")).await;
+        assert_eq!(bad_resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            bad_resp
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes */10")
+        );
+
+        let ok_resp = serve_local_file_range(&file_path, "audio/mpeg", Some("bytes=2-5")).await;
+        assert_eq!(ok_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            ok_resp
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 2-5/10")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

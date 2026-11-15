@@ -1,0 +1,12 @@
+target/
+data/
+beatlab-data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.git/
+.github/
+.vscode/
+.DS_Store
+Thumbs.db

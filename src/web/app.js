@@ -44,7 +44,7 @@
     autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
     radioReqToken: 0,
     radioLoading: false,
-    quality: localStorage.getItem('beatlab_quality') || 'high',
+    compatAttemptedId: '',
     volume: parseFloat(localStorage.getItem('beatlab_vol') || '0.9'),
     muted: false,
     isPlaying: false,
@@ -258,7 +258,7 @@
     const bar = $('player-bar');
     if (!bar) return;
     let pointerDownIgnored = false;
-    const interactiveSel = 'button, a, input, select, option, label, .pb-title, .pb-artist, .pb-progress-row';
+    const interactiveSel = 'button, a, input, label, .pb-title, .pb-artist, .pb-progress-row';
     bar.addEventListener('pointerdown', (e) => {
       pointerDownIgnored = !!e.target.closest(interactiveSel);
     });
@@ -274,7 +274,7 @@
     audio.volume = state.volume;
     $('pb-volume').value = String(state.volume);
     updateVolumeIcon();
-    $('quality-select').value = state.quality;
+    localStorage.removeItem('beatlab_quality');
     $('autoplay-toggle').checked = state.autoplay;
     $('fs-autoplay-toggle').checked = state.autoplay;
     wirePlayerBarToggle();
@@ -731,6 +731,7 @@
           <div class="hero-actions">
             ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>` : ''}
             ${tracks.length > 1 ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
+            ${tracks.length ? `<button class="btn-secondary" onclick="App.startPlaylistRadio(${esc(JSON.stringify(pl.id))})">Start Radio</button>` : ''}
             ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" onclick="App.promptRenamePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))})">Rename</button>` : ''}
             ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" style="color:#fda4af" onclick="App.deletePlaylist(${esc(JSON.stringify(pl.id))})">Delete</button>` : ''}
           </div>
@@ -739,12 +740,78 @@
 
       html += tracks.length
         ? `<div class="track-table">${renderTrackRows(tracks, tracks, d.isOwner && !pl.isAuto ? pl.id : null)}</div>`
-        : `<p class="muted-center">This playlist is empty. Click "..." on any song to add tracks here.</p>`;
+        : `<p class="muted-center">This playlist is empty. Click "..." on any song or pick from recommendations below to start curating.</p>`;
+
+      if (d.isOwner && !pl.isAuto) {
+        html += `<section class="section pl-recs-section" id="pl-recs-section">
+          <div class="section-head">
+            <div>
+              <h2>Recommended for this playlist</h2>
+              <p style="font-size:12.5px;color:var(--text-muted);margin-top:2px">Matched to this playlist's sound and your listening taste</p>
+            </div>
+            <button class="btn-secondary" onclick="App.loadPlaylistRecs(${esc(JSON.stringify(pl.id))})">Refresh</button>
+          </div>
+          <div id="pl-recs-body"><p style="color:var(--text-muted);font-size:13px;padding:8px 0">Finding matching tracks...</p></div>
+        </section>`;
+      }
 
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
+
+      if (d.isOwner && !pl.isAuto) {
+        loadPlaylistRecs(pl.id);
+      }
     } catch (e) {
       $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function loadPlaylistRecs(pid) {
+    const box = $('pl-recs-body');
+    if (!box) return;
+    box.innerHTML = `<p style="color:var(--text-muted);font-size:13px;padding:8px 0">Finding matching tracks...</p>`;
+    try {
+      const d = await api(`/api/web/playlist/${encodeURIComponent(pid)}/recommendations`);
+      const targetBox = $('pl-recs-body');
+      const curPlHash = location.hash.startsWith('#playlist/')
+        ? decodeURIComponent(location.hash.slice('#playlist/'.length))
+        : '';
+      if (!targetBox || curPlHash !== pid) return;
+      const recs = cacheTracks(d.tracks || []);
+      if (!recs.length) {
+        targetBox.innerHTML = `<p style="color:var(--text-muted);font-size:13px;padding:8px 0">No extra matches found yet. Try searching or playing a few songs first.</p>`;
+        return;
+      }
+      const listJson = esc(JSON.stringify(recs.map((t) => t.id)));
+      targetBox.innerHTML = `<div class="track-table">${recs
+        .map((t, idx) => {
+          const metaSub = t.genre ? `${t.artist} · ${t.genre}` : t.artist;
+          return `
+            <div class="track-row" data-tid="${esc(t.id)}">
+              <div class="tr-idx" onclick="App.playListByIds(${listJson}, ${idx})">
+                <span class="tr-num">${idx + 1}</span>
+                <span class="tr-play-icon">${ICONS.play}</span>
+              </div>
+              <div class="tr-main" onclick="App.playListByIds(${listJson}, ${idx})">
+                <img class="tr-art" src="${esc(t.coverUrl)}" loading="lazy" alt="" />
+                <div class="tr-meta">
+                  <div class="tr-title">${esc(t.title)}</div>
+                  <div class="tr-sub">${esc(metaSub)}</div>
+                </div>
+              </div>
+              <div class="tr-album clickable" onclick="App.navigate('album/${encodeURIComponent(t.albumId)}')">${esc(t.album)}</div>
+              <div class="tr-actions">
+                <span class="tr-dur">${fmtTime(t.duration)}</span>
+                <button class="rec-add-btn" onclick="event.stopPropagation();App.quickAddToPlaylist(${esc(JSON.stringify(pid))}, ${esc(JSON.stringify(t.id))}, this)">+ Add</button>
+              </div>
+            </div>`;
+        })
+        .join('')}</div>`;
+    } catch {
+      const targetBox = $('pl-recs-body');
+      if (targetBox) {
+        targetBox.innerHTML = `<p style="color:var(--text-muted);font-size:13px;padding:8px 0">Couldn't load recommendations right now.</p>`;
+      }
     }
   }
 
@@ -977,8 +1044,33 @@
   // ---------------------------------------------------------------------------
   // Playback, Queue & Autoplay Engine
   // ---------------------------------------------------------------------------
-  function buildStreamUrl(trackId) {
-    return `/api/web/stream/${encodeURIComponent(trackId)}?token=${encodeURIComponent(state.token)}&quality=${encodeURIComponent(state.quality)}`;
+  function canBrowserPlayFormat(fmt) {
+    const f = String(fmt || '').trim().toLowerCase();
+    if (!f) return true;
+    const probes = {
+      mp3: ['audio/mpeg'],
+      flac: ['audio/flac', 'audio/x-flac'],
+      wav: ['audio/wav', 'audio/wave', 'audio/x-wav'],
+      m4a: ['audio/mp4; codecs="mp4a.40.2"', 'audio/mp4'],
+      mp4: ['audio/mp4; codecs="mp4a.40.2"', 'audio/mp4'],
+      aac: ['audio/aac', 'audio/mp4; codecs="mp4a.40.2"'],
+      ogg: ['audio/ogg; codecs="vorbis"', 'audio/ogg; codecs="opus"', 'audio/ogg'],
+      oga: ['audio/ogg; codecs="vorbis"', 'audio/ogg; codecs="opus"', 'audio/ogg'],
+      opus: ['audio/ogg; codecs="opus"', 'audio/webm; codecs="opus"', 'audio/opus'],
+      webm: ['audio/webm; codecs="opus"', 'audio/webm; codecs="vorbis"', 'audio/webm'],
+    };
+    const mimes = probes[f];
+    if (!mimes) return false;
+    return mimes.some((m) => audio.canPlayType(m) !== '');
+  }
+
+  function buildStreamUrl(track, forceCompat = false, offsetSec = 0) {
+    const trackId = typeof track === 'string' ? track : track.id;
+    const needCompat = forceCompat || (typeof track === 'object' && track && !canBrowserPlayFormat(track.format));
+    let url = `/api/web/stream/${encodeURIComponent(trackId)}?token=${encodeURIComponent(state.token)}`;
+    if (needCompat) url += '&compat=1';
+    if (offsetSec > 0.5) url += `&t=${encodeURIComponent(offsetSec.toFixed(2))}`;
+    return url;
   }
 
   async function playQueueAt(index) {
@@ -986,9 +1078,10 @@
     state.queueIndex = index;
     const track = state.queue[index];
     state.lastScrobbleCompleteId = '';
+    state.compatAttemptedId = '';
 
     ensureAudioGraph();
-    audio.src = buildStreamUrl(track.id);
+    audio.src = buildStreamUrl(track);
     audio.play().catch((e) => {
       console.warn('Playback prevented or error:', e);
     });
@@ -1160,6 +1253,29 @@
     }
   }
 
+  async function startPlaylistRadio(pid) {
+    const reqToken = ++state.radioReqToken;
+    state.radioLoading = true;
+    showToast('Starting playlist radio...');
+    try {
+      const d = await api(`/api/web/radio?playlist=${encodeURIComponent(pid || '')}`);
+      if (reqToken !== state.radioReqToken) return;
+      state.radioLoading = false;
+      const tracks = cacheTracks(d.tracks || []);
+      if (tracks.length) {
+        state.queue = tracks;
+        playQueueAt(0);
+      } else {
+        showToast('No radio tracks found for this playlist yet');
+      }
+    } catch (e) {
+      if (reqToken === state.radioReqToken) {
+        state.radioLoading = false;
+      }
+      showToast(e.message);
+    }
+  }
+
   async function startRadioForId(seedId) {
     const seed = state.trackMap.get(seedId);
     const reqToken = ++state.radioReqToken;
@@ -1256,6 +1372,21 @@
   function wireAudioEvents() {
     audio.addEventListener('play', () => updatePlayButton(true));
     audio.addEventListener('pause', () => updatePlayButton(false));
+    audio.addEventListener('error', () => {
+      const cur = currentTrack();
+      if (!cur || !audio.error || !audio.getAttribute('src')) return;
+      const code = audio.error.code;
+      if (
+        (code === 3 || code === 4) &&
+        state.compatAttemptedId !== cur.id &&
+        !audio.src.includes('compat=1')
+      ) {
+        state.compatAttemptedId = cur.id;
+        const pos = audio.currentTime || 0;
+        audio.src = buildStreamUrl(cur, true, pos);
+        audio.play().catch(() => {});
+      }
+    });
     audio.addEventListener('ended', () => {
       const cur = currentTrack();
       if (state.repeat === 'one') {
@@ -1709,18 +1840,6 @@
       if (svg) svg.innerHTML = state.repeat === 'one' ? ICONS.repeatOne : ICONS.repeatAll;
       showToast(`Repeat: ${state.repeat}`);
     },
-    setQuality: (val) => {
-      state.quality = val;
-      localStorage.setItem('beatlab_quality', val);
-      const cur = currentTrack();
-      if (cur && !audio.paused) {
-        const pos = audio.currentTime || 0;
-        audio.src = buildStreamUrl(cur.id);
-        audio.currentTime = pos;
-        audio.play().catch(() => {});
-      }
-      showToast(`Audio quality: ${val.toUpperCase()}`);
-    },
     toggleMute: () => {
       state.muted = !state.muted;
       audio.muted = state.muted;
@@ -1788,13 +1907,36 @@
       navigate(`playlist/${encodeURIComponent(res.playlist.id)}`);
     },
     addTrackToPlaylist: async (pid, tid) => {
-      await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks`, {
+      const res = await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks`, {
         method: 'POST',
         body: JSON.stringify({ trackIds: [tid] }),
       });
       refreshSidebarPlaylists();
-      showToast('Added to playlist');
+      showToast(res.added === 0 ? 'Already in playlist' : 'Added to playlist');
+      const curPlHash = location.hash.startsWith('#playlist/')
+        ? decodeURIComponent(location.hash.slice('#playlist/'.length))
+        : '';
+      if (curPlHash === pid) {
+        renderPlaylist(pid);
+      }
     },
+    quickAddToPlaylist: async (pid, tid, btn) => {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks`, {
+          method: 'POST',
+          body: JSON.stringify({ trackIds: [tid] }),
+        });
+        refreshSidebarPlaylists();
+        showToast(res.added === 0 ? 'Already in playlist' : 'Added to playlist');
+        renderPlaylist(pid);
+      } catch (e) {
+        if (btn) btn.disabled = false;
+        showToast(e.message);
+      }
+    },
+    loadPlaylistRecs,
+    startPlaylistRadio,
     removePlaylistItem: async (pid, pos) => {
       await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks/${pos}`, { method: 'DELETE' });
       renderPlaylist(pid);

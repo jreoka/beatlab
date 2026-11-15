@@ -756,26 +756,30 @@ pub async fn dispatch(
         "star" => {
             for id in multi_vals(&pairs, "id") {
                 let _ = state.store.star_track(uid, &id);
-                state.taste.record_event(uid, &id, "star", 1.0);
+                state.taste.learn_signal(uid, &id, "star", 1.0);
             }
             for aid in multi_vals(&pairs, "albumId") {
                 let _ = state.store.save_album(uid, &aid);
+                state.taste.record_album_save(uid, &aid, true);
             }
             for arid in multi_vals(&pairs, "artistId") {
                 let _ = state.store.follow_artist(uid, &arid);
+                state.taste.record_artist_follow(uid, &arid, true);
             }
             respond(&params, true, None)
         }
         "unstar" => {
             for id in multi_vals(&pairs, "id") {
                 let _ = state.store.unstar_track(uid, &id);
-                state.taste.record_event(uid, &id, "unstar", 0.0);
+                state.taste.learn_signal(uid, &id, "unstar", 0.0);
             }
             for aid in multi_vals(&pairs, "albumId") {
                 let _ = state.store.unsave_album(uid, &aid);
+                state.taste.record_album_save(uid, &aid, false);
             }
             for arid in multi_vals(&pairs, "artistId") {
                 let _ = state.store.unfollow_artist(uid, &arid);
+                state.taste.record_artist_follow(uid, &arid, false);
             }
             respond(&params, true, None)
         }
@@ -785,10 +789,15 @@ pub async fn dispatch(
             };
             let rating: i32 = params
                 .get("rating")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0)
+                .clamp(0, 5);
             let _ = state.store.set_rating(uid, id, rating);
-            state.taste.record_event(uid, id, "rate", rating as f64);
+            if rating > 0 {
+                state.taste.learn_signal(uid, id, "rate", rating as f64);
+            } else {
+                state.taste.mark_taste_dirty(uid);
+            }
             respond(&params, true, None)
         }
 
@@ -842,7 +851,12 @@ pub async fn dispatch(
                     None,
                 );
                 let _ = state.store.replace_playlist_tracks(pid, &song_ids);
-                let updated = state.store.get_playlist(pid).unwrap().unwrap();
+                if !existing.is_auto && !song_ids.is_empty() {
+                    state.taste.record_playlist_additions(uid, &song_ids);
+                }
+                let Some(updated) = state.store.get_playlist(pid).ok().flatten() else {
+                    return error_resp(&params, 70, "Playlist not found");
+                };
                 respond(&params, true, Some(playlist_to_xml(&updated)))
             } else {
                 let name = params
@@ -851,7 +865,12 @@ pub async fn dispatch(
                     .filter(|s| !s.is_empty())
                     .unwrap_or("New Playlist");
                 match state.store.create_playlist(uid, name, "", false, &song_ids) {
-                    Ok(p) => respond(&params, true, Some(playlist_to_xml(&p))),
+                    Ok(p) => {
+                        if !song_ids.is_empty() {
+                            state.taste.record_playlist_additions(uid, &song_ids);
+                        }
+                        respond(&params, true, Some(playlist_to_xml(&p)))
+                    }
                     Err(e) => error_resp(&params, 0, &e.to_string()),
                 }
             }
@@ -878,11 +897,22 @@ pub async fn dispatch(
                 .filter_map(|s| s.parse().ok())
                 .collect();
             if !remove_idxs.is_empty() {
+                let current = state.store.playlist_tracks(pid).unwrap_or_default();
+                let removed_ids: Vec<String> = remove_idxs
+                    .iter()
+                    .filter_map(|&idx| current.get(idx).map(|t| t.id.clone()))
+                    .collect();
                 let _ = state.store.remove_playlist_positions(pid, &remove_idxs);
+                if !existing.is_auto && !removed_ids.is_empty() {
+                    state.taste.record_playlist_removals(uid, &removed_ids);
+                }
             }
             let add_ids = multi_vals(&pairs, "songIdToAdd");
             if !add_ids.is_empty() {
                 let _ = state.store.add_tracks_to_playlist(pid, &add_ids);
+                if !existing.is_auto {
+                    state.taste.record_playlist_additions(uid, &add_ids);
+                }
             }
             respond(&params, true, None)
         }
@@ -897,6 +927,9 @@ pub async fn dispatch(
                 return error_resp(&params, 50, "Permission denied");
             }
             let _ = state.store.delete_playlist(pid);
+            if !existing.is_auto {
+                state.taste.mark_taste_dirty(uid);
+            }
             respond(&params, true, None)
         }
 
@@ -910,7 +943,7 @@ pub async fn dispatch(
                 let kind = if submission { "complete" } else { "play" };
                 state.taste.record_event(uid, id, kind, 1.0);
                 if let Ok(Some(t)) = state.store.get_track(id) {
-                    let mut np = state.now_playing.lock().unwrap();
+                    let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
                     np.insert(uid, (t, Utc::now().timestamp(), user.username.clone()));
                 }
             }
@@ -919,7 +952,7 @@ pub async fn dispatch(
         "getNowPlaying" => {
             let cutoff = Utc::now().timestamp() - 600;
             let active: Vec<(Track, i64, String)> = {
-                let np = state.now_playing.lock().unwrap();
+                let np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
                 np.values()
                     .filter(|(_, ts, _)| *ts >= cutoff)
                     .cloned()
@@ -1120,7 +1153,7 @@ pub async fn dispatch(
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             {
-                let mut np = state.now_playing.lock().unwrap();
+                let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
                 np.insert(uid, (t.clone(), Utc::now().timestamp(), user.username.clone()));
             }
             state

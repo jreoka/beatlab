@@ -12,6 +12,14 @@ use uuid::Uuid;
 const TRACK_COLS: &str = "id, source, title, artist, album, genre, moods, year, track_no, disc_no, \
     duration, bitrate, sample_rate, bit_depth, format, size, stream_url, cover_url, meta, deezer_id, created";
 
+fn prefixed_track_cols(alias: &str) -> String {
+    TRACK_COLS
+        .split(',')
+        .map(|c| format!("{}.{}", alias, c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -583,6 +591,62 @@ impl Store {
         Ok(rows)
     }
 
+    /// Returns user-affinity tracks (starred, manual playlists, played, rated) unioned with
+    /// recent catalog tracks so recommendation pools never clip older favorites past offset limits.
+    pub fn candidate_tracks_for_user(&self, user_id: i64, limit: usize) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let tcols = prefixed_track_cols("t");
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        if user_id > 0 {
+            let user_sql = format!(
+                "SELECT {} FROM tracks t
+                 WHERE t.id IN (
+                     SELECT track_id FROM stars WHERE user_id = ?1
+                     UNION
+                     SELECT pt.track_id FROM playlist_tracks pt
+                       JOIN playlists p ON p.id = pt.playlist_id
+                       WHERE p.user_id = ?1 AND p.is_auto = 0
+                     UNION
+                     SELECT track_id FROM user_track_stats WHERE user_id = ?1
+                     UNION
+                     SELECT track_id FROM ratings WHERE user_id = ?1
+                 )",
+                tcols
+            );
+            let mut ustmt = conn.prepare(&user_sql)?;
+            for t in ustmt
+                .query_map(params![user_id], row_to_track)?
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                if seen.insert(t.id.clone()) {
+                    out.push(t);
+                }
+            }
+        }
+
+        let remaining = limit.saturating_sub(out.len()).max(limit / 2);
+        let cat_sql = format!(
+            "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
+            TRACK_COLS
+        );
+        let mut cstmt = conn.prepare(&cat_sql)?;
+        for t in cstmt
+            .query_map(params![remaining as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            if out.len() >= limit {
+                break;
+            }
+            if seen.insert(t.id.clone()) {
+                out.push(t);
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn newest_tracks(&self, limit: usize, offset: usize) -> AppResult<Vec<Track>> {
         self.all_tracks(limit, offset)
     }
@@ -1139,10 +1203,11 @@ impl Store {
         value: f64,
     ) -> AppResult<()> {
         let now = Utc::now().timestamp();
+        let safe_val = if value.is_finite() { value } else { 0.0 };
         let conn = self.lock();
         conn.execute(
             "INSERT INTO events(user_id, track_id, kind, value, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![user_id, track_id, kind, value, now],
+            params![user_id, track_id, kind, safe_val, now],
         )?;
         match kind {
             "play" | "complete" => {
@@ -1229,11 +1294,7 @@ impl Store {
              WHERE uts.user_id = ?1 AND uts.play_count > 0
              ORDER BY uts.last_played DESC
              LIMIT ?2 OFFSET ?3",
-            TRACK_COLS
-                .split(',')
-                .map(|c| format!("t.{}", c.trim()))
-                .collect::<Vec<_>>()
-                .join(", ")
+            prefixed_track_cols("t")
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -1264,11 +1325,7 @@ impl Store {
              WHERE uts.user_id = ?1 AND uts.play_count > 0
              ORDER BY uts.play_count DESC, uts.last_played DESC
              LIMIT ?2 OFFSET ?3",
-            TRACK_COLS
-                .split(',')
-                .map(|c| format!("t.{}", c.trim()))
-                .collect::<Vec<_>>()
-                .join(", ")
+            prefixed_track_cols("t")
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -1344,11 +1401,7 @@ impl Store {
         let conn = self.lock();
         let sql = format!(
             "SELECT {}, s.at FROM stars s JOIN tracks t ON t.id = s.track_id WHERE s.user_id = ?1 ORDER BY s.at DESC",
-            TRACK_COLS
-                .split(',')
-                .map(|c| format!("t.{}", c.trim()))
-                .collect::<Vec<_>>()
-                .join(", ")
+            prefixed_track_cols("t")
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
@@ -1470,10 +1523,10 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, 0, 'user', ?6, ?6)",
             params![id, user_id, name.trim(), comment, if public { 1 } else { 0 }, now],
         )?;
-        for (idx, tid) in track_ids.iter().enumerate() {
+        for (idx, tid) in track_ids.iter().filter(|s| !s.trim().is_empty()).enumerate() {
             tx.execute(
                 "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
-                params![id, idx as i64, tid, now],
+                params![id, idx as i64, tid.trim(), now],
             )?;
         }
         tx.commit()?;
@@ -1508,10 +1561,10 @@ impl Store {
             "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
             params![id],
         )?;
-        for (idx, tid) in track_ids.iter().enumerate() {
+        for (idx, tid) in track_ids.iter().filter(|s| !s.trim().is_empty()).enumerate() {
             tx.execute(
                 "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
-                params![id, idx as i64, tid, now],
+                params![id, idx as i64, tid.trim(), now],
             )?;
         }
         tx.commit()?;
@@ -1570,15 +1623,35 @@ impl Store {
         let conn = self.lock();
         let sql = format!(
             "SELECT {} FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = ?1 ORDER BY pt.pos ASC",
-            TRACK_COLS
-                .split(',')
-                .map(|c| format!("t.{}", c.trim()))
-                .collect::<Vec<_>>()
-                .join(", ")
+            prefixed_track_cols("t")
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![playlist_id], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Returns `(playlist_id, playlist_name, track)` across all non-auto playlists owned by `user_id`.
+    pub fn user_manual_playlist_tracks(&self, user_id: i64) -> AppResult<Vec<(String, String, Track)>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, p.id, p.name
+             FROM playlist_tracks pt
+             JOIN playlists p ON p.id = pt.playlist_id
+             JOIN tracks t ON t.id = pt.track_id
+             WHERE p.user_id = ?1 AND p.is_auto = 0
+             ORDER BY p.changed DESC, pt.pos ASC",
+            prefixed_track_cols("t")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                let t = row_to_track(r)?;
+                let pid: String = r.get(21)?;
+                let pname: String = r.get(22)?;
+                Ok((pid, pname, t))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1626,7 +1699,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let mut pos = max_pos + 1;
-        for tid in track_ids {
+        for tid in track_ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
             tx.execute(
                 "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
                 params![id, pos, tid, now],
@@ -1641,6 +1714,49 @@ impl Store {
         Ok(())
     }
 
+    /// Appends `track_ids` not already present in playlist `id` and returns the newly added IDs.
+    pub fn add_unique_tracks_to_playlist(&self, id: &str, track_ids: &[String]) -> AppResult<Vec<String>> {
+        if track_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut existing = HashSet::new();
+        {
+            let mut stmt = tx.prepare("SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1")?;
+            for tid in stmt.query_map(params![id], |r| r.get::<_, String>(0))?.flatten() {
+                existing.insert(tid);
+            }
+        }
+        let max_pos: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(pos), -1) FROM playlist_tracks WHERE playlist_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let mut pos = max_pos + 1;
+        let mut added = Vec::new();
+        for tid in track_ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !existing.insert(tid.to_string()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
+                params![id, pos, tid, now],
+            )?;
+            pos += 1;
+            added.push(tid.to_string());
+        }
+        if !added.is_empty() {
+            tx.execute(
+                "UPDATE playlists SET changed = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
     pub fn replace_playlist_tracks(&self, id: &str, track_ids: &[String]) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let mut conn = self.lock();
@@ -1649,10 +1765,10 @@ impl Store {
             "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
             params![id],
         )?;
-        for (idx, tid) in track_ids.iter().enumerate() {
+        for (idx, tid) in track_ids.iter().filter(|s| !s.trim().is_empty()).enumerate() {
             tx.execute(
                 "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
-                params![id, idx as i64, tid, now],
+                params![id, idx as i64, tid.trim(), now],
             )?;
         }
         tx.execute(

@@ -172,6 +172,7 @@ impl YtmSource {
     ) -> Option<String> {
         let search_arg = format!("ytsearch4:{} audio", query);
         let mut cmd = Command::new(&self.ytdlp_bin);
+        cmd.kill_on_drop(true);
         cmd.args([
             "-j",
             "--flat-playlist",
@@ -257,6 +258,7 @@ impl YtmSource {
         format_sel: &str,
     ) -> AppResult<ResolvedStream> {
         let mut cmd = Command::new(&self.ytdlp_bin);
+        cmd.kill_on_drop(true);
         cmd.arg("-j").arg("--no-playlist").arg("--no-warnings");
         if !extractor_args.is_empty() {
             cmd.arg("--extractor-args").arg(extractor_args);

@@ -596,7 +596,12 @@ pub async fn create_playlist(
         .store
         .create_playlist(user.id, name, &req.comment, req.public, &req.songs)
     {
-        Ok(p) => json_ok(playlist_to_nd(&p), None),
+        Ok(p) => {
+            if !req.songs.is_empty() {
+                state.taste.record_playlist_additions(user.id, &req.songs);
+            }
+            json_ok(playlist_to_nd(&p), None)
+        }
         Err(e) => json_err(StatusCode::BAD_REQUEST, &e.to_string()),
     }
 }
@@ -623,7 +628,9 @@ pub async fn update_playlist(
         req.comment.as_deref(),
         req.public,
     );
-    let updated = state.store.get_playlist(&id).unwrap().unwrap();
+    let Some(updated) = state.store.get_playlist(&id).ok().flatten() else {
+        return json_err(StatusCode::NOT_FOUND, "Playlist not found");
+    };
     json_ok(playlist_to_nd(&updated), None)
 }
 
@@ -643,6 +650,9 @@ pub async fn delete_playlist(
         return json_err(StatusCode::FORBIDDEN, "Permission denied");
     }
     let _ = state.store.delete_playlist(&id);
+    if !p.is_auto {
+        state.taste.mark_taste_dirty(user.id);
+    }
     json_ok(json!({ "id": id }), None)
 }
 
@@ -719,9 +729,14 @@ pub async fn add_playlist_tracks(
             to_add.push(t.id);
         }
     }
-    let added = to_add.len();
-    let _ = state.store.add_tracks_to_playlist(&id, &to_add);
-    json_ok(json!({ "added": added }), None)
+    let added = state
+        .store
+        .add_unique_tracks_to_playlist(&id, &to_add)
+        .unwrap_or_default();
+    if !p.is_auto && !added.is_empty() {
+        state.taste.record_playlist_additions(user.id, &added);
+    }
+    json_ok(json!({ "added": added.len() }), None)
 }
 
 pub async fn remove_playlist_tracks(
@@ -750,13 +765,18 @@ pub async fn remove_playlist_tracks(
         .map(|(_, v)| v)
         .collect();
     let current = state.store.playlist_tracks(&id).unwrap_or_default();
-    let positions: Vec<usize> = current
-        .iter()
-        .enumerate()
-        .filter(|(idx, t)| target_ids.contains(&t.id) || target_ids.contains(&(idx + 1).to_string()))
-        .map(|(idx, _)| idx)
-        .collect();
+    let mut positions = Vec::new();
+    let mut removed_ids = Vec::new();
+    for (idx, t) in current.iter().enumerate() {
+        if target_ids.contains(&t.id) || target_ids.contains(&(idx + 1).to_string()) {
+            positions.push(idx);
+            removed_ids.push(t.id.clone());
+        }
+    }
     let _ = state.store.remove_playlist_positions(&id, &positions);
+    if !p.is_auto && !removed_ids.is_empty() {
+        state.taste.record_playlist_removals(user.id, &removed_ids);
+    }
     json_ok(json!({ "ids": target_ids.into_iter().collect::<Vec<_>>() }), None)
 }
 

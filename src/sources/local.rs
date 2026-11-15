@@ -41,7 +41,7 @@ impl LocalSource {
     }
 
     pub fn dirs(&self) -> Vec<PathBuf> {
-        self.dirs.read().unwrap().clone()
+        self.dirs.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Scans all configured directories and upserts tracks into SQLite.
@@ -98,7 +98,7 @@ impl MusicSource for LocalSource {
     }
 
     fn available(&self) -> bool {
-        !self.dirs.read().unwrap().is_empty()
+        !self.dirs.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     fn status(&self) -> String {

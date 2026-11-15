@@ -45,7 +45,8 @@ async fn main() -> models::AppResult<()> {
     );
     let max_cache_gb: f64 = std::env::var("BEATLAB_CACHE_GB")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
         .unwrap_or(5.0);
     let music_dirs: Vec<PathBuf> = std::env::var_os("BEATLAB_MUSIC_DIRS")
         .map(|raw| std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()).collect())
@@ -147,6 +148,10 @@ async fn main() -> models::AppResult<()> {
         .route(
             "/api/web/playlist/{id}",
             get(webapp::get_playlist),
+        )
+        .route(
+            "/api/web/playlist/{id}/recommendations",
+            get(webapp::playlist_recommendations),
         )
         .route(
             "/api/web/playlists/{id}",
