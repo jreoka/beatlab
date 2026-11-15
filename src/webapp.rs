@@ -57,6 +57,7 @@ pub struct WebTrack {
     pub album: String,
     pub album_id: String,
     pub genre: String,
+    pub moods: String,
     pub year: i32,
     pub track_no: i32,
     pub disc_no: i32,
@@ -64,6 +65,8 @@ pub struct WebTrack {
     pub format: String,
     pub bitrate: i32,
     pub is_lossless: bool,
+    pub is_popular: bool,
+    pub is_taste_match: bool,
     pub quality_badge: String,
     pub cover_url: String,
     pub is_starred: bool,
@@ -72,6 +75,15 @@ pub struct WebTrack {
 }
 
 fn to_web_tracks(state: &AppState, user_id: i64, tracks: &[Track]) -> Vec<WebTrack> {
+    to_web_tracks_with_taste(state, user_id, tracks, &HashSet::new())
+}
+
+fn to_web_tracks_with_taste(
+    state: &AppState,
+    user_id: i64,
+    tracks: &[Track],
+    taste_match_ids: &HashSet<String>,
+) -> Vec<WebTrack> {
     let starred = if user_id > 0 {
         state.store.starred_ids(user_id).unwrap_or_default()
     } else {
@@ -99,6 +111,7 @@ fn to_web_tracks(state: &AppState, user_id: i64, tracks: &[Track]) -> Vec<WebTra
             album: t.album.clone(),
             album_id: t.album_id(),
             genre: t.genre.clone(),
+            moods: t.moods.clone(),
             year: t.year,
             track_no: t.track_no,
             disc_no: t.disc_no,
@@ -106,6 +119,8 @@ fn to_web_tracks(state: &AppState, user_id: i64, tracks: &[Track]) -> Vec<WebTra
             format: t.format.clone(),
             bitrate: t.bitrate,
             is_lossless: t.is_lossless(),
+            is_popular: track_is_popular(&t.meta),
+            is_taste_match: taste_match_ids.contains(&t.id),
             quality_badge: t.quality_badge(),
             cover_url: cover_api_url(&t.id),
             is_starred: starred.contains(&t.id),
@@ -113,6 +128,17 @@ fn to_web_tracks(state: &AppState, user_id: i64, tracks: &[Track]) -> Vec<WebTra
             rating: ratings.get(&t.id).copied().unwrap_or(0),
         })
         .collect()
+}
+
+fn track_is_popular(meta: &str) -> bool {
+    if meta.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<Value>(meta)
+        .ok()
+        .and_then(|v| v.get("rank").and_then(|r| r.as_u64()))
+        .map(|r| r >= 300_000)
+        .unwrap_or(false)
 }
 
 fn cover_api_url(id: &str) -> String {
@@ -210,6 +236,8 @@ pub struct EventReq {
     pub kind: String,
     #[serde(default = "default_one")]
     pub value: f64,
+    #[serde(default)]
+    pub query: Option<String>,
 }
 
 fn default_one() -> f64 {
@@ -624,15 +652,63 @@ pub async fn search(
             "tracks": [],
             "albums": [],
             "artists": [],
+            "instantMix": Value::Null,
+            "refinements": Value::Null,
         }));
     }
 
-    let (all_tracks, (dz_tracks, dz_albums, dz_artists)) = tokio::join!(
-        state.sources.search_all(&query, 20),
-        state.sources.deezer.search_all(&query, 12),
+    let intent = crate::taste::parse_search_intent(&query);
+    let mix_future = async {
+        if !intent.is_mix_query {
+            return (Vec::new(), Vec::new());
+        }
+        let pl_queries = intent.playlist_search_queries();
+        let tr_queries = intent.expanded_track_queries();
+
+        let pl_futs = pl_queries
+            .iter()
+            .map(|pq| state.sources.deezer.fetch_curated_mix_tracks(pq, 2, 24));
+        let dz_extra_futs = tr_queries
+            .iter()
+            .map(|tq| state.sources.deezer.search_tracks(tq, 18));
+        let ytm_extra_futs = tr_queries.iter().map(|tq| {
+            use crate::sources::MusicSource;
+            state.sources.ytm.search(tq, 15)
+        });
+
+        let (pl_batches, dz_extra, ytm_extra) = tokio::join!(
+            futures::future::join_all(pl_futs),
+            futures::future::join_all(dz_extra_futs),
+            futures::future::join_all(ytm_extra_futs),
+        );
+        let curated: Vec<(String, Vec<Track>)> = pl_batches.into_iter().flatten().collect();
+        let extra_tracks: Vec<Track> = dz_extra
+            .into_iter()
+            .chain(ytm_extra)
+            .flatten()
+            .collect();
+        (curated, extra_tracks)
+    };
+
+    let ((all_tracks, (dz_tracks, dz_albums, dz_artists)), mix_res) = tokio::join!(
+        async {
+            tokio::join!(
+                state.sources.search_all(&query, 20),
+                state.sources.deezer.search_all(&query, 12),
+            )
+        },
+        tokio::time::timeout(std::time::Duration::from_secs(4), mix_future)
     );
-    let combined = [all_tracks.clone(), dz_tracks].concat();
-    let _ = state.store.upsert_tracks(&combined);
+
+    let (curated_batches, extra_tracks) = mix_res.unwrap_or_default();
+    let combined = [all_tracks, dz_tracks, extra_tracks].concat();
+    let mut to_upsert = combined.clone();
+    for (_, batch) in &curated_batches {
+        to_upsert.extend(batch.iter().cloned());
+    }
+    if !to_upsert.is_empty() {
+        let _ = state.store.upsert_tracks(&to_upsert);
+    }
     for a in &dz_albums {
         let _ = state.store.upsert_album_meta(a);
     }
@@ -640,16 +716,44 @@ pub async fn search(
         let _ = state.store.upsert_artist_meta(ar);
     }
 
-    let ranked_tracks = crate::sources::dedup_and_rank_search(combined, &query);
-    let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
-    let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
+    build_search_response(
+        state,
+        user.id,
+        query,
+        combined,
+        curated_batches,
+        dz_albums,
+        dz_artists,
+    )
+    .await
+}
+
+async fn build_search_response(
+    state: AppState,
+    uid: i64,
+    query: String,
+    mut combined: Vec<Track>,
+    curated_batches: Vec<(String, Vec<Track>)>,
+    dz_albums: Vec<AlbumSummary>,
+    dz_artists: Vec<ArtistSummary>,
+) -> Response {
+    let taste = state.taste.clone();
+    let q_clone = query.clone();
+    let refined = tokio::task::spawn_blocking(move || {
+        taste.search_and_refine(uid, &q_clone, std::mem::take(&mut combined), curated_batches)
+    })
+    .await
+    .unwrap_or_else(|_| state.taste.search_and_refine(uid, &query, vec![], vec![]));
+
+    let saved = state.store.saved_album_ids(uid).unwrap_or_default();
+    let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
 
     let albums = if !dz_albums.is_empty() {
         dz_albums
     } else {
         state
             .store
-            .search_albums(user.id, &query, 12, 0)
+            .search_albums(uid, &query, 12, 0)
             .unwrap_or_default()
     };
     let artists = if !dz_artists.is_empty() {
@@ -658,11 +762,24 @@ pub async fn search(
         state.store.search_artists(&query, 12, 0).unwrap_or_default()
     };
 
+    let instant_mix_json = refined.instant_mix.as_ref().map(|mix| {
+        json!({
+            "title": mix.title,
+            "subtitle": mix.subtitle,
+            "query": mix.query,
+            "isThemeMix": mix.is_theme_mix,
+            "totalDuration": mix.total_duration,
+            "tracks": to_web_tracks_with_taste(&state, uid, &mix.tracks, &refined.taste_match_ids),
+        })
+    });
+
     json_res(json!({
         "query": query,
-        "tracks": to_web_tracks(&state, user.id, &ranked_tracks),
+        "tracks": to_web_tracks_with_taste(&state, uid, &refined.tracks, &refined.taste_match_ids),
         "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
+        "instantMix": instant_mix_json,
+        "refinements": refined.refinements,
     }))
 }
 
@@ -1032,9 +1149,13 @@ pub async fn record_event(
         Ok(u) => u,
         Err(r) => return r,
     };
-    state
-        .taste
-        .record_event(user.id, &req.track_id, &req.kind, req.value);
+    state.taste.record_event_with_query(
+        user.id,
+        &req.track_id,
+        &req.kind,
+        req.value,
+        req.query.as_deref(),
+    );
     if let Ok(Some(t)) = state.store.get_track(&req.track_id) {
         if req.kind == "play" {
             let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
@@ -1374,6 +1495,117 @@ mod tests {
 
         let events = store.user_recent_events(u.id, 10).unwrap();
         assert_eq!(events.iter().filter(|e| e.kind == "playlist_add").count(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn search_and_query_event_refine_and_never_save_playlists() {
+        use crate::engine::StreamEngine;
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use crate::store::Store;
+        use crate::taste::TasteEngine;
+        use axum::body::to_bytes;
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-web-mix-{}", uuid::Uuid::new_v4()));
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+
+        let t1 = Track {
+            id: "loc:80s-1".into(),
+            source: "local".into(),
+            title: "Take On Me".into(),
+            artist: "a-ha".into(),
+            album: "Hunting High and Low".into(),
+            genre: "Synth-Pop, 80s, Pop".into(),
+            moods: "energetic,happy".into(),
+            year: 1985,
+            duration: 225,
+            bitrate: 900,
+            format: "flac".into(),
+            meta: "{\"rank\":880000}".into(),
+            ..Default::default()
+        };
+        let t2 = Track {
+            id: "loc:80s-2".into(),
+            source: "local".into(),
+            title: "Blue Monday".into(),
+            artist: "New Order".into(),
+            album: "Power, Corruption & Lies".into(),
+            genre: "New Wave, Electronic, 80s".into(),
+            moods: "groove,night".into(),
+            year: 1983,
+            duration: 449,
+            bitrate: 900,
+            format: "flac".into(),
+            meta: "{\"rank\":810000}".into(),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[t1, t2]).unwrap();
+        let (u, _) = store.authenticate_or_create_user("mixuser", "pw123").unwrap();
+        let tok = store.create_session(u.id, "web", 3600).unwrap();
+
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+        };
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
+
+        let ev_res = record_event(
+            State(state.clone()),
+            hdrs,
+            Json(EventReq {
+                track_id: "loc:80s-1".into(),
+                kind: "search_pick".into(),
+                value: 1.0,
+                query: Some("80s".into()),
+            }),
+        )
+        .await;
+        assert_eq!(ev_res.status(), StatusCode::OK);
+        let events = store.user_recent_events(u.id, 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "search_pick" && e.track_id == "loc:80s-1"));
+
+        let resp = build_search_response(
+            state.clone(),
+            u.id,
+            "80s".into(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 128).await.unwrap()).unwrap();
+        assert_eq!(body["instantMix"]["title"], "80s Hits Mix");
+        assert_eq!(body["instantMix"]["isThemeMix"], true);
+        assert!(body["instantMix"]["tracks"].as_array().unwrap().len() >= 2);
+        assert!(!body["refinements"]["filterChips"].as_array().unwrap().is_empty());
+        assert!(!body["refinements"]["querySuggestions"].as_array().unwrap().is_empty());
+        assert!(body["tracks"][0]["isPopular"].as_bool().unwrap());
+
+        // Ephemeral custom mix must NOT persist any playlist to SQLite
+        let playlists = store.list_playlists(u.id, false).unwrap();
+        assert!(playlists.is_empty(), "expected no saved playlists, found {}", playlists.len());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

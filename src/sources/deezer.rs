@@ -348,6 +348,104 @@ impl DeezerSource {
             .filter_map(|d| d.into_track(None, "", 0, ""))
             .collect()
     }
+
+    pub async fn search_playlists(&self, query: &str, limit: usize) -> Vec<DzPlaylist> {
+        let q = query.trim();
+        if q.is_empty() {
+            return vec![];
+        }
+        let url = format!(
+            "https://api.deezer.com/search/playlist?q={}&limit={}",
+            urlencoding::encode(q),
+            limit.clamp(3, 25)
+        );
+        let Ok(resp) = self.http.get(&url).send().await else {
+            return vec![];
+        };
+        let Ok(parsed) = resp.json::<DzDataList<DzPlaylist>>().await else {
+            return vec![];
+        };
+        parsed
+            .data
+            .into_iter()
+            .filter(|p| p.id > 0 && !p.title.trim().is_empty())
+            .collect()
+    }
+
+    pub async fn fetch_playlist_tracks(&self, playlist_id: u64, limit: usize) -> Vec<Track> {
+        if playlist_id == 0 {
+            return vec![];
+        }
+        let url = format!(
+            "https://api.deezer.com/playlist/{}/tracks?limit={}",
+            playlist_id,
+            limit.clamp(5, 60)
+        );
+        let Ok(resp) = self.http.get(&url).send().await else {
+            return vec![];
+        };
+        let Ok(parsed) = resp.json::<DzDataList<DzTrack>>().await else {
+            return vec![];
+        };
+        parsed
+            .data
+            .into_iter()
+            .filter_map(|d| d.into_track(None, "", 0, ""))
+            .collect()
+    }
+
+    /// Searches public Deezer playlists matching `query` and concurrently fetches their tracks
+    /// to fuel ephemeral on-the-fly thematic/era mixes.
+    pub async fn fetch_curated_mix_tracks(
+        &self,
+        query: &str,
+        max_playlists: usize,
+        per_playlist: usize,
+    ) -> Vec<(String, Vec<Track>)> {
+        let playlists = self.search_playlists(query, 10).await;
+        let q_low = query.to_lowercase();
+        let chosen: Vec<DzPlaylist> = playlists
+            .into_iter()
+            .filter(|p| is_usable_mix_playlist(&p, &q_low))
+            .take(max_playlists.max(1))
+            .collect();
+        if chosen.is_empty() {
+            return vec![];
+        }
+        let futs = chosen
+            .iter()
+            .map(|p| self.fetch_playlist_tracks(p.id, per_playlist));
+        let batches = futures::future::join_all(futs).await;
+        chosen
+            .into_iter()
+            .zip(batches)
+            .filter(|(_, tracks)| !tracks.is_empty())
+            .map(|(p, tracks)| (p.title, tracks))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DzPlaylist {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub nb_tracks: usize,
+}
+
+fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
+    if p.nb_tracks > 0 && p.nb_tracks < 5 {
+        return false;
+    }
+    let title_low = p.title.to_lowercase();
+    for bad in ["karaoke", "tribute", "parody", "ringtone", "8-bit", "lullaby", "instrumental cover"] {
+        if title_low.contains(bad) && !query_low.contains(bad) {
+            return false;
+        }
+    }
+    true
 }
 
 #[async_trait]

@@ -109,8 +109,8 @@ impl SourceRegistry {
 }
 
 /// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality
-/// and clean metadata, while sorting by relevance + quality.
-pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
+/// and clean metadata.
+pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
     let mut best_by_key: HashMap<String, Track> = HashMap::new();
     for t in tracks {
         let key = t.song_key();
@@ -133,6 +133,9 @@ pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
                 if winner.deezer_id.is_empty() && !loser.deezer_id.is_empty() {
                     winner.deezer_id = loser.deezer_id;
                 }
+                if winner.meta.is_empty() && !loser.meta.is_empty() {
+                    winner.meta = loser.meta;
+                }
                 if (winner.album.is_empty() || winner.album == winner.title) && !loser.album.is_empty() {
                     winner.album = loser.album;
                 }
@@ -143,9 +146,15 @@ pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
             }
         }
     }
+    best_by_key.into_values().collect()
+}
 
-    let mut ranked: Vec<(i32, Track)> = best_by_key
-        .into_values()
+/// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality
+/// and clean metadata, while sorting by relevance + quality.
+pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
+    let deduped = dedup_tracks_prefer_quality(tracks);
+    let mut ranked: Vec<(i32, Track)> = deduped
+        .into_iter()
         .map(|t| {
             let s = crate::store::search_match_score(&t, query);
             let rel = if s > 0 { s } else { t.quality_score() / 20 };

@@ -58,6 +58,8 @@
     eqGains: JSON.parse(localStorage.getItem('beatlab_eq_gains') || '[0,0,0,0,0,0,0,0,0,0]'),
     searchTimer: null,
     libTab: 'playlists',
+    searchState: null,
+    activeSearchQuery: '',
   };
 
   const $ = (id) => document.getElementById(id);
@@ -560,23 +562,149 @@
       const tracks = cacheTracks(d.tracks || []);
       const albums = d.albums || [];
       const artists = d.artists || [];
+      const instantMix = d.instantMix
+        ? {
+            ...d.instantMix,
+            tracks: cacheTracks(d.instantMix.tracks || []),
+          }
+        : null;
+      const refinements = d.refinements || null;
 
-      if (!tracks.length && !albums.length && !artists.length) {
+      if (!tracks.length && !albums.length && !artists.length && !instantMix) {
         $('main-view').innerHTML = `<p class="muted-center">No matches found for "${esc(query)}".</p>`;
         return;
       }
 
-      const topTrack = tracks[0];
-      let html = `<div class="search-hero-row">`;
+      state.searchState = {
+        query,
+        tracks,
+        albums,
+        artists,
+        instantMix,
+        refinements,
+        activeFilter: 'all',
+        mixExpanded: false,
+      };
+      renderSearchView();
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  function applySearchFilter(tracks, filterKey) {
+    if (!filterKey || filterKey === 'all') return tracks;
+    if (filterKey === 'taste') return tracks.filter((t) => t.isTasteMatch);
+    if (filterKey === 'hits') return tracks.filter((t) => t.isPopular);
+    if (filterKey === 'lossless') return tracks.filter((t) => t.isLossless || t.source === 'local');
+    if (filterKey.startsWith('mood:')) {
+      const want = filterKey.slice(5);
+      return tracks.filter((t) => String(t.moods || '').split(',').includes(want));
+    }
+    return tracks;
+  }
+
+  function renderInstantMixCard(mix, refinements, query, expanded) {
+    const covers = [];
+    for (const t of mix.tracks) {
+      if (t.coverUrl && !covers.includes(t.coverUrl)) {
+        covers.push(t.coverUrl);
+        if (covers.length === 4) break;
+      }
+    }
+    const artHtml =
+      covers.length >= 4
+        ? `<div class="mix-mosaic">${covers.map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`
+        : `<img class="mix-single-art" src="${esc(covers[0] || '')}" alt="" />`;
+    const previewCount = expanded ? mix.tracks.length : Math.min(6, mix.tracks.length);
+    const intentTag = refinements?.detectedIntent ? ` · ${esc(refinements.detectedIntent)}` : '';
+
+    return `<section class="instant-mix-card ${mix.isThemeMix ? 'prominent' : ''}">
+      <div class="instant-mix-head">
+        ${artHtml}
+        <div class="instant-mix-info">
+          <div class="hero-kicker">INSTANT CUSTOM MIX · EPHEMERAL${intentTag}</div>
+          <h2 class="instant-mix-title">${esc(mix.title)}</h2>
+          <p class="instant-mix-sub">${esc(mix.subtitle)} · ${mix.tracks.length} tracks · ${fmtTotalDur(mix.totalDuration)}</p>
+          <div class="hero-actions">
+            <button class="btn-primary" onclick="App.playInstantMix(false, 0)">${ICONS.play} Play Mix</button>
+            <button class="btn-secondary" onclick="App.playInstantMix(true, 0)">Shuffle</button>
+            <button class="btn-secondary" onclick="App.queueInstantMix()">Add to Queue</button>
+          </div>
+        </div>
+      </div>
+      <div class="track-table instant-mix-tracks">
+        ${renderTrackRows(mix.tracks.slice(0, previewCount), mix.tracks, null, false, query)}
+      </div>
+      ${
+        mix.tracks.length > 6
+          ? `<div class="instant-mix-footer">
+              <button class="mini-btn" onclick="App.toggleMixExpand()">${
+                expanded ? 'Show fewer tracks' : `Show all ${mix.tracks.length} tracks in mix`
+              }</button>
+            </div>`
+          : ''
+      }
+    </section>`;
+  }
+
+  function renderSearchView() {
+    const s = state.searchState;
+    if (!s) return;
+    const { query, albums, artists, instantMix, refinements, activeFilter, mixExpanded } = s;
+    const tracks = applySearchFilter(s.tracks, activeFilter);
+
+    let html = '';
+
+    // Neural Refinement & Sub-Query Bar
+    const chips = refinements?.filterChips || [];
+    const suggestions = refinements?.querySuggestions || [];
+    if (chips.length > 0 || suggestions.length > 0) {
+      html += `<div class="search-refine-bar">`;
+      if (chips.length > 0) {
+        html += `<div class="refine-group">
+          <button class="tab-chip ${activeFilter === 'all' ? 'active' : ''}" onclick="App.setSearchFilter('all')">All (${s.tracks.length})</button>
+          ${chips
+            .map(
+              (c) =>
+                `<button class="tab-chip ${activeFilter === c.key ? 'active' : ''}" onclick="App.setSearchFilter(${esc(JSON.stringify(c.key))})">${esc(c.label)} (${c.count})</button>`
+            )
+            .join('')}
+        </div>`;
+      }
+      if (suggestions.length > 0) {
+        html += `<div class="refine-group refine-suggestions">
+          <span class="refine-label">Refine mix:</span>
+          ${suggestions
+            .map(
+              (sg) =>
+                `<button class="refine-query-pill" onclick="App.runRefinedSearch(${esc(JSON.stringify(sg))})">${esc(sg)}</button>`
+            )
+            .join('')}
+        </div>`;
+      }
+      html += `</div>`;
+    }
+
+    if (instantMix && instantMix.isThemeMix && activeFilter === 'all') {
+      html += renderInstantMixCard(instantMix, refinements, query, mixExpanded);
+    }
+
+    const topTrack = tracks[0];
+    if (tracks.length > 0) {
+      html += `<div class="search-hero-row">`;
       if (topTrack) {
         html += `<section>
           <div class="section-head"><h2>Top Result</h2></div>
-          <div class="top-result-card" onclick="App.playSingle(${esc(JSON.stringify(topTrack.id))})">
+          <div class="top-result-card" onclick="App.playSearchTrack(${esc(JSON.stringify(topTrack.id))}, ${esc(JSON.stringify(query))})">
             <img src="${esc(topTrack.coverUrl)}" alt="" />
             <div class="top-result-title">${esc(topTrack.title)}</div>
             <div class="card-sub">${esc(topTrack.artist)} · ${esc(topTrack.album)}</div>
-            <span class="top-result-type">SONG · ${esc(topTrack.qualityBadge)}</span>
-            <button class="card-play-fab" style="opacity:1;transform:none;" onclick="event.stopPropagation();App.playSingle(${esc(JSON.stringify(topTrack.id))})">${ICONS.play}</button>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+              <span class="top-result-type">SONG · ${esc(topTrack.qualityBadge)}</span>
+              ${topTrack.isTasteMatch ? `<span class="taste-pill">For You</span>` : ''}
+            </div>
+            <button class="card-play-fab" style="opacity:1;transform:none;" onclick="event.stopPropagation();App.playSearchTrack(${esc(JSON.stringify(topTrack.id))}, ${esc(JSON.stringify(query))})">${ICONS.play}</button>
           </div>
         </section>`;
       } else {
@@ -584,34 +712,39 @@
       }
 
       html += `<section>
-        <div class="section-head"><h2>Songs</h2>${tracks.length ? `<button class="mini-btn" onclick="App.startRadioForId(${esc(JSON.stringify(tracks[0].id))})">Start Radio</button>` : ''}</div>
-        <div class="track-table">${renderTrackRows(tracks.slice(0, 8), null, null, true)}</div>
+        <div class="section-head"><h2>${activeFilter === 'all' ? 'Songs' : 'Refined Songs'}</h2>${
+        tracks.length ? `<button class="mini-btn" onclick="App.startRadioForId(${esc(JSON.stringify(tracks[0].id))})">Start Radio</button>` : ''
+      }</div>
+        <div class="track-table">${renderTrackRows(tracks.slice(0, 8), null, null, true, query)}</div>
       </section></div>`;
-
-      if (artists.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>Artists</h2></div>
-          <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
-        </section>`;
-      }
-      if (albums.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>Albums</h2></div>
-          <div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>
-        </section>`;
-      }
-      if (tracks.length > 8) {
-        html += `<section class="section">
-          <div class="section-head"><h2>More Tracks</h2></div>
-          <div class="track-table">${renderTrackRows(tracks.slice(8), null, null, true)}</div>
-        </section>`;
-      }
-
-      $('main-view').innerHTML = html;
-      $('main-view').scrollTop = 0;
-    } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    } else if (activeFilter !== 'all') {
+      html += `<p class="muted-center" style="margin:24px 0">No tracks matched this filter. <button class="mini-btn" onclick="App.setSearchFilter('all')">Reset filter</button></p>`;
     }
+
+    if (instantMix && !instantMix.isThemeMix && activeFilter === 'all') {
+      html += renderInstantMixCard(instantMix, refinements, query, mixExpanded);
+    }
+
+    if (artists.length > 0 && activeFilter === 'all') {
+      html += `<section class="section">
+        <div class="section-head"><h2>Artists</h2></div>
+        <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
+      </section>`;
+    }
+    if (albums.length > 0 && activeFilter === 'all') {
+      html += `<section class="section">
+        <div class="section-head"><h2>Albums</h2></div>
+        <div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>
+      </section>`;
+    }
+    if (tracks.length > 8) {
+      html += `<section class="section">
+        <div class="section-head"><h2>More Tracks</h2></div>
+        <div class="track-table">${renderTrackRows(tracks.slice(8), null, null, true, query)}</div>
+      </section>`;
+    }
+
+    $('main-view').innerHTML = html;
   }
 
   async function renderAlbum(id) {
@@ -995,7 +1128,7 @@
     </div>`;
   }
 
-  function renderTrackRows(tracks, fullContext = null, editablePlaylistId = null, singleRadio = false) {
+  function renderTrackRows(tracks, fullContext = null, editablePlaylistId = null, singleRadio = false, searchQuery = '') {
     const queueList = fullContext || tracks;
     const idsJson = singleRadio ? '' : esc(JSON.stringify(queueList.map((t) => t.id)));
     const cur = currentTrack();
@@ -1004,9 +1137,16 @@
       .map((t, i) => {
         const ctxIdx = queueList.findIndex((x) => x.id === t.id);
         const isCur = cur && cur.id === t.id;
-        const playClick = singleRadio
-          ? `App.playSingle(${esc(JSON.stringify(t.id))})`
-          : `App.playListByIds(${idsJson}, ${Math.max(0, ctxIdx)})`;
+        let playClick;
+        if (searchQuery) {
+          playClick = singleRadio
+            ? `App.playSearchTrack(${esc(JSON.stringify(t.id))}, ${esc(JSON.stringify(searchQuery))})`
+            : `App.playInstantMixAt(${Math.max(0, ctxIdx)})`;
+        } else {
+          playClick = singleRadio
+            ? `App.playSingle(${esc(JSON.stringify(t.id))})`
+            : `App.playListByIds(${idsJson}, ${Math.max(0, ctxIdx)})`;
+        }
         return `<div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
           <div class="tr-idx" onclick="${playClick}">${isCur ? ICONS.nowPlaying : t.trackNo > 0 && fullContext ? t.trackNo : i + 1}</div>
           <div class="tr-main" onclick="${playClick}">
@@ -1019,6 +1159,7 @@
               </div>
             </div>
           </div>
+          ${searchQuery && t.isTasteMatch ? '<span class="taste-pill">For You</span>' : ''}
           <span class="quality-badge ${t.isLossless ? 'lossless' : ''}">${esc(t.qualityBadge)}</span>
           <div class="tr-dur">${fmtTime(t.duration)}</div>
           <div class="tr-actions">
@@ -1088,10 +1229,7 @@
     saveServerQueue();
     loadLyricsForTrack(track.id);
 
-    api('/api/web/event', {
-      method: 'POST',
-      body: JSON.stringify({ trackId: track.id, kind: 'play', value: 1 }),
-    }).catch(() => {});
+    sendTrackEvent(track.id, 'play', 1);
 
     // Pre-warm next track so transitions feel instant!
     const next = state.queue[index + 1];
@@ -1154,16 +1292,26 @@
       : '<path d="M8 4.5v15l12-7.5z"/>';
   }
 
-  function playListByIds(ids, startIndex = 0) {
+  function sendTrackEvent(trackId, kind, value = 1, query = state.activeSearchQuery) {
+    const body = { trackId, kind, value };
+    if (query) body.query = query;
+    api('/api/web/event', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }).catch(() => {});
+  }
+
+  function playListByIds(ids, startIndex = 0, queryContext = '') {
     const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
     if (!tracks.length) return;
     state.radioReqToken++;
     state.radioLoading = false;
+    state.activeSearchQuery = queryContext || '';
     state.queue = tracks;
     playQueueAt(Math.max(0, Math.min(startIndex, tracks.length - 1)));
   }
 
-  function playShuffledIds(ids) {
+  function playShuffledIds(ids, queryContext = '') {
     const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
     if (!tracks.length) return;
     for (let i = tracks.length - 1; i > 0; i--) {
@@ -1172,15 +1320,17 @@
     }
     state.radioReqToken++;
     state.radioLoading = false;
+    state.activeSearchQuery = queryContext || '';
     state.queue = tracks;
     playQueueAt(0);
   }
 
-  function playSingle(id) {
+  function playSingle(id, queryContext = '') {
     const t = state.trackMap.get(id);
     if (!t) return;
     state.radioReqToken++;
     state.radioLoading = !!state.autoplay;
+    state.activeSearchQuery = queryContext || '';
     state.queue = [t];
     playQueueAt(0);
     if (state.autoplay) {
@@ -1195,6 +1345,7 @@
       if (tracks.length) {
         state.radioReqToken++;
         state.radioLoading = false;
+        state.activeSearchQuery = '';
         state.queue = tracks;
         playQueueAt(0);
       }
@@ -1210,12 +1361,74 @@
       if (tracks.length) {
         state.radioReqToken++;
         state.radioLoading = false;
+        state.activeSearchQuery = '';
         state.queue = tracks;
         playQueueAt(0);
       }
     } catch (e) {
       showToast(e.message);
     }
+  }
+
+  function playSearchTrack(id, query) {
+    sendTrackEvent(id, 'search_pick', 1, query);
+    playSingle(id, query);
+  }
+
+  function playInstantMix(shuffled = false, startIndex = 0) {
+    const s = state.searchState;
+    const mix = s && s.instantMix;
+    if (!mix || !mix.tracks || !mix.tracks.length) return;
+    const ids = mix.tracks.map((t) => t.id);
+    const idx = shuffled ? 0 : Math.max(0, Math.min(startIndex, ids.length - 1));
+    const pickedId = ids[idx];
+    if (pickedId) sendTrackEvent(pickedId, 'mix_play', 1, s.query);
+    if (shuffled) {
+      playShuffledIds(ids, s.query);
+    } else {
+      playListByIds(ids, idx, s.query);
+    }
+  }
+
+  function playInstantMixAt(idx) {
+    playInstantMix(false, idx);
+  }
+
+  function queueInstantMix() {
+    const s = state.searchState;
+    const mix = s && s.instantMix;
+    if (!mix || !mix.tracks || !mix.tracks.length) return;
+    const tracks = mix.tracks.map((t) => state.trackMap.get(t.id) || t);
+    if (!state.queue.length) {
+      state.activeSearchQuery = s.query || '';
+      state.queue = tracks;
+      playQueueAt(0);
+    } else {
+      state.queue.push(...tracks);
+      renderQueuePanel();
+      saveServerQueue();
+    }
+    sendTrackEvent(tracks[0].id, 'mix_play', 1, s.query);
+    showToast(`Added ${tracks.length} tracks from "${mix.title}"`);
+  }
+
+  function setSearchFilter(key) {
+    if (!state.searchState) return;
+    state.searchState.activeFilter = key || 'all';
+    renderSearchView();
+  }
+
+  function toggleMixExpand() {
+    if (!state.searchState) return;
+    state.searchState.mixExpanded = !state.searchState.mixExpanded;
+    renderSearchView();
+  }
+
+  function runRefinedSearch(query) {
+    const q = String(query || '').trim();
+    if (!q) return;
+    $('global-search').value = q;
+    navigate(`search/${encodeURIComponent(q)}`);
   }
 
   async function appendRadioTracks(seedId) {
@@ -1336,10 +1549,7 @@
   async function nextTrack(manual = false) {
     const cur = currentTrack();
     if (manual && cur && audio.currentTime < 25 && state.lastScrobbleCompleteId !== cur.id) {
-      api('/api/web/event', {
-        method: 'POST',
-        body: JSON.stringify({ trackId: cur.id, kind: 'skip', value: 1 }),
-      }).catch(() => {});
+      sendTrackEvent(cur.id, 'skip', 1);
     }
     if (!state.queue.length) return;
 
@@ -1393,10 +1603,7 @@
       }
       if (cur && state.lastScrobbleCompleteId !== cur.id) {
         state.lastScrobbleCompleteId = cur.id;
-        api('/api/web/event', {
-          method: 'POST',
-          body: JSON.stringify({ trackId: cur.id, kind: 'complete', value: 1 }),
-        }).catch(() => {});
+        sendTrackEvent(cur.id, 'complete', 1);
       }
       nextTrack(false);
     });
@@ -1413,10 +1620,7 @@
       }
       if (cur && total > 20 && pos / total >= 0.75 && state.lastScrobbleCompleteId !== cur.id) {
         state.lastScrobbleCompleteId = cur.id;
-        api('/api/web/event', {
-          method: 'POST',
-          body: JSON.stringify({ trackId: cur.id, kind: 'complete', value: 1 }),
-        }).catch(() => {});
+        sendTrackEvent(cur.id, 'complete', 1);
       }
       syncActiveLyricLine(pos * 1000);
     });
@@ -1934,6 +2138,13 @@
     },
     loadPlaylistRecs,
     startPlaylistRadio,
+    setSearchFilter,
+    toggleMixExpand,
+    runRefinedSearch,
+    playSearchTrack,
+    playInstantMix,
+    playInstantMixAt,
+    queueInstantMix,
     removePlaylistItem: async (pid, pos) => {
       await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks/${pos}`, { method: 'DELETE' });
       renderPlaylist(pid);

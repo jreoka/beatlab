@@ -5,21 +5,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// Rich 40-dimensional transferable track+context feature vector:
+/// Rich 48-dimensional transferable track+context feature vector:
 /// - `[0..10]`  mood one-hot / multi-hot indicators
 /// - `[10..18]` broad genre family indicators
 /// - `[18..22]` lossless flag, normalized bitrate, normalized duration, local-file flag
-/// - `[22..25]` era buckets (<1990, 1990-2009, 2010+)
-/// - `[25..27]` cyclical time of day `(sin, cos)`
-/// - `[27..30]` artist affinity, genre affinity, mood affinity (`tanh`-compressed)
-/// - `[30..33]` curated playlist artist / genre / mood overlap affinities
-/// - `[33..35]` followed-artist & saved-album indicators
-/// - `[35..38]` track novelty, skip-risk ratio, popularity/rank prior
-/// - `[38..40]` artist-mood synergy interaction & bias term
-pub const INPUT_DIM: usize = 40;
+/// - `[22..28]` era buckets (<1970, 1970s, 1980s, 1990s, 2000s, 2010+)
+/// - `[28..30]` cyclical time of day `(sin, cos)`
+/// - `[30..33]` artist affinity, genre affinity, mood affinity (`tanh`-compressed)
+/// - `[33..36]` curated playlist artist / genre / mood overlap affinities
+/// - `[36..38]` followed-artist & saved-album indicators
+/// - `[38..41]` track novelty, skip-risk ratio, popularity/rank prior
+/// - `[41..46]` active search/mix query context (active flag, lexical fit, era match, theme match, hits synergy)
+/// - `[46..48]` artist-mood synergy interaction & bias term
+pub const INPUT_DIM: usize = 48;
 const H1_DIM: usize = 32;
 const H2_DIM: usize = 16;
-const NET_VERSION: u32 = 2;
+const NET_VERSION: u32 = 3;
 const REPLAY_CAP: usize = 96;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +44,11 @@ pub struct FeatureContext {
     pub track_skips: i32,
     pub popularity_prior: f64,
     pub hour_override: Option<u32>,
+    pub query_active: bool,
+    pub query_lexical_fit: f64,
+    pub query_era_match: f64,
+    pub query_theme_match: f64,
+    pub query_popularity_intent: f64,
 }
 
 /// Per-user compact 3-layer neural preference model (`40 -> 32 -> 16 -> 1`)
@@ -404,13 +410,13 @@ pub fn extract_features_ctx(track: &Track, ctx: &FeatureContext) -> [f64; INPUT_
     // 10..18 broad genre buckets
     let g = track.genre.to_lowercase();
     let genre_buckets: [&[&str]; 8] = [
-        &["rock", "alt", "punk", "grunge"],
-        &["pop", "synthpop", "dance"],
-        &["electronic", "house", "techno", "edm", "ambient", "trance", "dnb"],
+        &["rock", "alt", "punk", "grunge", "new wave"],
+        &["pop", "synthpop", "dance", "disco"],
+        &["electronic", "house", "techno", "edm", "ambient", "trance", "dnb", "synthwave"],
         &["hip hop", "hip-hop", "rap", "trap", "r&b", "soul", "funk"],
-        &["jazz", "blues", "bossanova"],
+        &["jazz", "blues", "bossanova", "swing", "vocal"],
         &["classical", "orchestra", "piano", "soundtrack", "score"],
-        &["indie", "folk", "acoustic", "singer"],
+        &["indie", "folk", "acoustic", "singer", "country"],
         &["metal", "hardcore", "industrial"],
     ];
     for (idx, keys) in genre_buckets.iter().enumerate() {
@@ -431,53 +437,63 @@ pub fn extract_features_ctx(track: &Track, ctx: &FeatureContext) -> [f64; INPUT_
     f[20] = (track.duration.max(0) as f64 / 600.0).clamp(0.0, 1.0);
     f[21] = if track.source == "local" { 1.0 } else { 0.0 };
 
-    // 22..25 era buckets
+    // 22..28 era buckets (<1970, 70s, 80s, 90s, 2000s, 2010+)
     if track.year > 0 {
-        if track.year < 1990 {
-            f[22] = 1.0;
-        } else if track.year < 2010 {
-            f[23] = 1.0;
-        } else {
-            f[24] = 1.0;
-        }
+        let idx = match track.year {
+            ..=1969 => 22,
+            1970..=1979 => 23,
+            1980..=1989 => 24,
+            1990..=1999 => 25,
+            2000..=2009 => 26,
+            _ => 27,
+        };
+        f[idx] = 1.0;
     }
 
-    // 25..27 time of day cyclical features
+    // 28..30 time of day cyclical features
     let hour = ctx
         .hour_override
         .unwrap_or_else(|| Utc::now().hour())
         .min(23) as f64;
     let angle = 2.0 * std::f64::consts::PI * (hour / 24.0);
-    f[25] = angle.sin();
-    f[26] = angle.cos();
+    f[28] = angle.sin();
+    f[29] = angle.cos();
 
-    // 27..30 taste affinities
+    // 30..33 taste affinities
     let a_aff = (clean_finite(ctx.artist_affinity) / 3.0).tanh();
     let g_aff = (clean_finite(ctx.genre_affinity) / 3.0).tanh();
     let m_aff = (clean_finite(ctx.mood_affinity) / 2.5).tanh();
-    f[27] = a_aff;
-    f[28] = g_aff;
-    f[29] = m_aff;
+    f[30] = a_aff;
+    f[31] = g_aff;
+    f[32] = m_aff;
 
-    // 30..33 playlist curation context affinities
-    f[30] = (clean_finite(ctx.playlist_artist_affinity) / 2.5).tanh();
-    f[31] = (clean_finite(ctx.playlist_genre_affinity) / 2.5).tanh();
-    f[32] = (clean_finite(ctx.playlist_mood_affinity) / 2.0).tanh();
+    // 33..36 playlist curation context affinities
+    f[33] = (clean_finite(ctx.playlist_artist_affinity) / 2.5).tanh();
+    f[34] = (clean_finite(ctx.playlist_genre_affinity) / 2.5).tanh();
+    f[35] = (clean_finite(ctx.playlist_mood_affinity) / 2.0).tanh();
 
-    // 33..35 explicit entity affinity flags
-    f[33] = if ctx.followed_artist { 1.0 } else { 0.0 };
-    f[34] = if ctx.saved_album { 1.0 } else { 0.0 };
+    // 36..38 explicit entity affinity flags
+    f[36] = if ctx.followed_artist { 1.0 } else { 0.0 };
+    f[37] = if ctx.saved_album { 1.0 } else { 0.0 };
 
-    // 35..38 behavioral & popularity priors
+    // 38..41 behavioral & popularity priors
     let plays = ctx.track_plays.max(0) as f64;
     let skips = ctx.track_skips.max(0) as f64;
-    f[35] = (-plays * 0.4).exp(); // novelty
-    f[36] = skips / (plays + skips + 1.5); // skip ratio
-    f[37] = clean_finite(ctx.popularity_prior).clamp(0.0, 1.0);
+    let pop = clean_finite(ctx.popularity_prior).clamp(0.0, 1.0);
+    f[38] = (-plays * 0.4).exp(); // novelty
+    f[39] = skips / (plays + skips + 1.5); // skip ratio
+    f[40] = pop;
 
-    // 38..40 interaction & bias
-    f[38] = (a_aff * m_aff).clamp(-1.0, 1.0);
-    f[39] = 1.0;
+    // 41..46 active search/mix query context features
+    f[41] = if ctx.query_active { 1.0 } else { 0.0 };
+    f[42] = clean_finite(ctx.query_lexical_fit).clamp(0.0, 1.0);
+    f[43] = clean_finite(ctx.query_era_match).clamp(-1.0, 1.0);
+    f[44] = clean_finite(ctx.query_theme_match).clamp(0.0, 1.0);
+    f[45] = (clean_finite(ctx.query_popularity_intent).clamp(0.0, 1.0) * pop).clamp(0.0, 1.0);
+
+    // 46..48 interaction & bias
+    f[46] = (a_aff * m_aff).clamp(-1.0, 1.0);
+    f[47] = 1.0;
 
     f
 }
@@ -488,7 +504,9 @@ pub fn event_target(kind: &str, value: f64) -> Option<(f64, f64)> {
     match kind {
         "star" => Some((0.98, 2.5)),
         "playlist_add" => Some((0.93, 2.0)),
+        "search_pick" => Some((0.91, 1.7)),
         "complete" => Some((0.90, 1.5)),
+        "mix_play" => Some((0.86, 1.3)),
         "play" => Some((0.68, 0.7)),
         "skip" => Some((0.06, 1.8)),
         "unstar" => Some((0.12, 1.5)),
@@ -670,7 +688,62 @@ mod tests {
     fn playlist_events_map_to_strong_training_signals() {
         let (t_add, w_add) = event_target("playlist_add", 1.0).unwrap();
         let (t_rem, w_rem) = event_target("playlist_remove", 1.0).unwrap();
+        let (t_pick, w_pick) = event_target("search_pick", 1.0).unwrap();
+        let (t_mix, w_mix) = event_target("mix_play", 1.0).unwrap();
         assert!(t_add > 0.85 && w_add >= 1.5);
         assert!(t_rem < 0.3 && w_rem >= 1.0);
+        assert!(t_pick > 0.85 && w_pick >= 1.5);
+        assert!(t_mix > 0.8 && w_mix >= 1.0);
+    }
+
+    #[test]
+    fn query_context_training_separates_on_era_and_search_picks() {
+        let mut net = UserNet::new(11);
+        let mut eighties_hit = test_track("e80", "a-ha", "Synthpop", "upbeat,party");
+        eighties_hit.year = 1985;
+        let mut modern_cover = test_track("m22", "Modern Remake", "Pop", "upbeat");
+        modern_cover.year = 2022;
+
+        let x_hit = extract_features_ctx(
+            &eighties_hit,
+            &FeatureContext {
+                popularity_prior: 0.9,
+                query_active: true,
+                query_era_match: 1.0,
+                query_theme_match: 0.8,
+                query_popularity_intent: 1.0,
+                hour_override: Some(20),
+                ..Default::default()
+            },
+        );
+        let x_miss = extract_features_ctx(
+            &modern_cover,
+            &FeatureContext {
+                popularity_prior: 0.1,
+                query_active: true,
+                query_era_match: -1.0,
+                query_theme_match: 0.1,
+                query_popularity_intent: 1.0,
+                track_skips: 2,
+                hour_override: Some(20),
+                ..Default::default()
+            },
+        );
+
+        let (t_pick, w_pick) = event_target("search_pick", 1.0).unwrap();
+        let (t_skip, w_skip) = event_target("skip", 1.0).unwrap();
+        for _ in 0..16 {
+            net.train_step(&x_hit, t_pick, w_pick);
+            net.train_step(&x_miss, t_skip, w_skip);
+        }
+
+        assert!(net.predict(&x_hit) > net.predict(&x_miss) + 0.35);
+    }
+
+    #[test]
+    fn incompatible_old_version_fails_compatibility_cleanly() {
+        let mut old = UserNet::new(4);
+        old.version = 2;
+        assert!(!old.is_compatible());
     }
 }
