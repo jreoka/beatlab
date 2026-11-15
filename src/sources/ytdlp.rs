@@ -109,27 +109,25 @@ impl MusicSource for YtDlpSource {
 
         let mut tracks = Vec::new();
         for e in parsed.entries {
-            if e.id.is_empty() || e.duration > 1200.0 {
+            if e.id.is_empty() || e.duration > 1200.0 || (e.duration > 0.0 && e.duration < 45.0) {
                 continue;
             }
             if e.title == "[Deleted video]" || e.title == "[Private video]" {
                 continue;
             }
-            let channel = if !e.uploader.is_empty() {
+            let channel_raw = if !e.uploader.is_empty() {
                 e.uploader
             } else {
                 e.channel
             };
-            let channel = channel.trim().trim_end_matches(" - Topic").to_string();
+            let channel = crate::models::primary_artist(channel_raw.trim());
             let (artist, title) = parse_yt_title(&e.title, &channel);
-            if artist.is_empty() || is_junk_title(&title) {
+            if artist.is_empty() || title.is_empty() || is_junk_title(&title) {
                 continue;
             }
-            let album = if channel.is_empty() || channel.eq_ignore_ascii_case(&artist) {
-                artist.clone()
-            } else {
-                channel
-            };
+            // Treat YouTube/SoundCloud videos without album tags as singles so channel names
+            // don't pollute the artist's "Appears on" discography.
+            let album = title.clone();
             let page = if !e.webpage_url.is_empty() {
                 e.webpage_url
             } else if matches!(self.mode, YtDlpMode::YouTube) {
@@ -153,7 +151,7 @@ impl MusicSource for YtDlpSource {
 
             let (format, bitrate) = match self.mode {
                 YtDlpMode::SoundCloud => ("mp3".to_string(), 256),
-                YtDlpMode::YouTube => ("opus".to_string(), 160),
+                YtDlpMode::YouTube => ("m4a".to_string(), 128),
             };
             let moods = classify_moods_str(&title, &album, "", "");
 
@@ -213,8 +211,11 @@ pub async fn resolve_ytdlp_url(bin: &str, page: &str) -> Option<String> {
         Command::new(bin)
             .args([
                 "-g",
+                "--no-playlist",
+                "--user-agent",
+                "Beatlab/0.2",
                 "-f",
-                "bestaudio[acodec=flac]/bestaudio[abr>=256]/bestaudio/best",
+                "bestaudio[protocol!=m3u8][protocol!=m3u8_native][ext=m4a]/bestaudio[protocol!=m3u8][protocol!=m3u8_native][ext=mp3]/bestaudio[protocol!=m3u8][protocol!=m3u8_native]/bestaudio/best",
                 "--no-warnings",
                 page,
             ])
@@ -234,22 +235,48 @@ pub async fn resolve_ytdlp_url(bin: &str, page: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn yt_junk_regex() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(\s*[\(\[][^\)\]]*(official|lyric|audio|video|mv|hd|4k|remaster|visualizer)[^\)\]]*[\)\]]|\s*[-–—]?\s*(official\s+)?music\s+video\s*[-–—]?)",
+        )
+        .unwrap()
+    })
+}
+
 fn parse_yt_title(raw: &str, channel: &str) -> (String, String) {
-    let re_junk = Regex::new(
-        r"(?i)\s*[\(\[][^\)\]]*(official|lyric|audio|video|mv|hd|4k|remaster|visualizer)[^\)\]]*[\)\]]",
-    )
-    .unwrap();
     let norm = raw.replace(" – ", " - ").replace(" — ", " - ");
-    let cleaned = re_junk.replace_all(norm.trim(), "");
+    let cleaned = yt_junk_regex().replace_all(norm.trim(), "");
     let mut title = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut artist = String::new();
 
     if let Some((a, t)) = title.split_once(" - ") {
-        artist = a.trim().trim_end_matches(" - Topic").to_string();
-        title = t.trim().to_string();
+        artist = crate::models::primary_artist(a);
+        title = crate::models::strip_release_tags(t);
+    } else if !channel.is_empty() {
+        // Handle Japanese title formatting like `ReoNa『ANIMA』` when prefix matches cleaned channel
+        let ch_low = channel.to_lowercase();
+        for (open, close) in [('『', '』'), ('「', '」')] {
+            if let Some(s) = title.find(open) {
+                if let Some(e_rel) = title[s + open.len_utf8()..].find(close) {
+                    let prefix = crate::models::primary_artist(&title[..s]);
+                    let quoted = title[s + open.len_utf8()..s + open.len_utf8() + e_rel].trim();
+                    let p_low = prefix.to_lowercase();
+                    if !prefix.is_empty()
+                        && !quoted.is_empty()
+                        && (p_low == ch_low || ch_low.contains(&p_low) || p_low.contains(&ch_low))
+                    {
+                        artist = prefix;
+                        title = quoted.to_string();
+                        break;
+                    }
+                }
+            }
+        }
     }
     if artist.is_empty() {
-        artist = channel.to_string();
+        artist = crate::models::primary_artist(channel);
     }
     if title.is_empty() {
         title = raw.trim().to_string();
@@ -304,4 +331,18 @@ struct YtThumb {
     url: String,
     #[serde(default)]
     width: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_yt_title;
+
+    #[test]
+    fn parse_yt_title_cleans_channel_and_japanese_brackets() {
+        let ch = crate::models::primary_artist("ReoNa official YouTube channel");
+        assert_eq!(ch, "ReoNa");
+        let (a, t) = parse_yt_title("ReoNa『ANIMA』-Music Video-", &ch);
+        assert_eq!(a, "ReoNa");
+        assert_eq!(t, "ANIMA");
+    }
 }

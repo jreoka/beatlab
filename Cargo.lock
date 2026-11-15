@@ -145,6 +145,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "flate2",
  "futures",
  "hex",
  "http-range-header",
@@ -1630,7 +1631,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 

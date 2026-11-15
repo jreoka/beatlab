@@ -13,6 +13,7 @@ use crate::sources::SourceRegistry;
 use crate::sources::archive::ArchiveSource;
 use crate::sources::bandcamp::BandcampSource;
 use crate::sources::local::LocalSource;
+use crate::sources::soulseek::SoulseekSource;
 use crate::sources::ytdlp::{YtDlpMode, YtDlpSource};
 use crate::store::Store;
 use crate::subsonic::AppState;
@@ -22,7 +23,7 @@ use axum::response::Json;
 use axum::routing::{get, post};
 use rand::RngCore;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
@@ -84,6 +85,10 @@ async fn main() {
         .max(1);
 
     let store = Store::open(&data_dir).expect("failed to open SQLite store");
+    let repaired = store.repair_source_metadata();
+    if repaired > 0 {
+        info!(repaired, "cleaned legacy source metadata");
+    }
     let password = admin_password(&data_dir);
 
     if store.user_count() == 0 {
@@ -95,18 +100,19 @@ async fn main() {
     }
 
     let ytdlp_bin = YtDlpSource::find_binary(std::env::var("BEATLAB_YTDLP").ok().as_deref());
-    let has_ytdlp = ytdlp_bin.is_some();
 
     let local = Arc::new(LocalSource::new(store.clone(), parse_music_dirs()));
     let archive = Arc::new(ArchiveSource::new());
-    let bandcamp = Arc::new(BandcampSource::new(has_ytdlp));
+    let bandcamp = Arc::new(BandcampSource::new(ytdlp_bin.clone()));
     let soundcloud = Arc::new(YtDlpSource::new(ytdlp_bin.clone(), YtDlpMode::SoundCloud));
     let youtube = Arc::new(YtDlpSource::new(ytdlp_bin, YtDlpMode::YouTube));
+    let soulseek = SoulseekSource::new(store.clone(), data_dir.join("cache").join("soulseek"));
 
     let registry = Arc::new(SourceRegistry::new(
         store.clone(),
         vec![
             local.clone(),
+            soulseek.clone(),
             archive.clone(),
             bandcamp.clone(),
             soundcloud.clone(),
@@ -128,7 +134,10 @@ async fn main() {
         engine: engine.clone(),
         taste: taste.clone(),
         local: local.clone(),
+        soulseek: soulseek.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
+        admin_password: password,
+        admin_sessions: Arc::new(Mutex::new(HashSet::new())),
     };
 
     // Background local scan + catalog warming
@@ -141,24 +150,35 @@ async fn main() {
         taste_bg.warm_catalog().await;
     });
 
+    let admin_api = Router::new()
+        .route("/status", get(webui::api_admin_status))
+        .route("/dirs", post(webui::api_admin_add_dir))
+        .route("/scan", post(webui::api_admin_scan))
+        .route("/cache/clear", post(webui::api_admin_clear_cache))
+        .route("/soulseek/connect", post(webui::api_admin_soulseek_connect))
+        .route("/soulseek/disconnect", post(webui::api_admin_soulseek_disconnect))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            webui::require_admin_auth,
+        ));
+
     let app = Router::new()
-        .route("/", get(webui::index_page))
-        .route("/admin", get(webui::index_page))
-        .route("/player/api/home", get(webui::api_home))
-        .route("/player/api/search", get(webui::api_search))
-        .route("/player/api/mood/{slug}", get(webui::api_mood_radio))
-        .route("/player/api/radio/track/{id}", get(webui::api_track_radio))
-        .route("/player/api/stream/{id}", get(webui::api_stream))
-        .route("/player/api/cover/{id}", get(webui::api_cover))
-        .route("/player/api/event", post(webui::api_event))
-        .route("/player/api/admin/status", get(webui::api_admin_status))
-        .route("/player/api/admin/dirs", post(webui::api_admin_add_dir))
-        .route("/player/api/admin/scan", post(webui::api_admin_scan))
-        .route("/player/api/admin/cache/clear", post(webui::api_admin_clear_cache))
+        .route("/", get(webui::admin_page))
+        .route("/admin", get(webui::admin_page))
+        .route("/admin/api/login", post(webui::api_admin_login))
+        .route("/admin/api/logout", post(webui::api_admin_logout))
+        .nest("/admin/api", admin_api)
         .route("/rest/{action}", get(subsonic::dispatch).post(subsonic::dispatch))
         .route("/auth/login", post(navidrome::nd_login))
+        .route("/api/keepalive/keepalive", get(navidrome::nd_keepalive))
         .route("/api/song", get(navidrome::nd_song_list))
+        .route("/api/album", get(navidrome::nd_album_list))
+        .route("/api/album/{id}", get(navidrome::nd_album_get))
+        .route("/api/artist", get(navidrome::nd_artist_list))
+        .route("/api/artist/{id}", get(navidrome::nd_artist_get))
+        .route("/api/genre", get(navidrome::nd_genre_list))
         .route("/api/playlist", get(navidrome::nd_playlist_list))
+        .route("/api/playlist/{id}", get(navidrome::nd_playlist_get))
         .route("/api/playlist/{id}/tracks", get(navidrome::nd_playlist_tracks))
         .route("/api/radio", get(navidrome::nd_radio_list))
         .route(
@@ -173,7 +193,7 @@ async fn main() {
     for s in registry.all() {
         info!(source = s.name(), status = %s.status(), "source");
     }
-    info!(url = %format!("http://{}", addr), "Web Player & Subsonic API listening");
+    info!(url = %format!("http://{}", addr), "Admin Panel & Subsonic API listening");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

@@ -1,212 +1,112 @@
-use crate::models::{Mood, Track};
 use crate::subsonic::AppState;
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
+use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const PLAYER_HTML: &str = include_str!("player.html");
+const ADMIN_HTML: &str = include_str!("admin.html");
+const ADMIN_COOKIE_NAME: &str = "beatlab_admin_session";
 
-pub async fn index_page() -> Html<&'static str> {
-    Html(PLAYER_HTML)
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
-fn default_user_id(state: &AppState) -> i64 {
-    state
-        .store
-        .list_users()
-        .first()
-        .map(|u| u.id)
-        .unwrap_or(1)
-}
-
-fn track_dto(state: &AppState, user_id: i64, t: &Track) -> serde_json::Value {
-    json!({
-        "id": t.id,
-        "source": t.source,
-        "title": t.title,
-        "artist": t.artist,
-        "album": t.album,
-        "genre": t.genre,
-        "moods": t.moods,
-        "year": t.year,
-        "duration": t.duration,
-        "bitrate": t.bitrate,
-        "sample_rate": t.sample_rate,
-        "bit_depth": t.bit_depth,
-        "format": t.format,
-        "quality_badge": t.quality_badge(),
-        "quality_score": t.quality_score(),
-        "is_lossless": t.is_lossless(),
-        "starred": state.store.is_starred(user_id, &t.id),
-        "rating": state.store.user_rating(user_id, &t.id),
-        "play_count": t.play_count,
-    })
-}
-
-pub async fn api_home(State(state): State<AppState>) -> Response {
-    let uid = default_user_id(&state);
-    let mixes = state.taste.generate_auto_playlists(uid);
-    let recs = state.taste.recommend_for_user(uid, 24);
-
-    let mixes_json: Vec<_> = mixes
-        .into_iter()
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "name": m.name,
-                "subtitle": m.subtitle,
-                "kind": m.kind,
-                "cover_track_id": m.tracks.first().map(|t| t.id.clone()),
-                "tracks": m.tracks.iter().map(|t| track_dto(&state, uid, t)).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-
-    let moods_json: Vec<_> = Mood::ALL
-        .iter()
-        .map(|m| {
-            json!({
-                "slug": m.slug(),
-                "label": m.label(),
-                "description": m.description(),
-            })
-        })
-        .collect();
-
-    let recs_json: Vec<_> = recs.iter().map(|t| track_dto(&state, uid, t)).collect();
-    let (nn_updates, nn_loss) = state.taste.neural_stats(uid);
-
-    Json(json!({
-        "mixes": mixes_json,
-        "moods": moods_json,
-        "recommended": recs_json,
-        "stats": {
-            "total_tracks": state.store.track_count(),
-            "lossless_tracks": state.store.lossless_count(),
-            "nn_updates": nn_updates,
-            "nn_loss": (nn_loss * 1000.0).round() / 1000.0,
+fn extract_session_token(headers: &HeaderMap) -> Option<String> {
+    let prefix = format!("{ADMIN_COOKIE_NAME}=");
+    for val in headers.get_all(header::COOKIE) {
+        let Ok(s) = val.to_str() else { continue };
+        for part in s.split(';') {
+            let part = part.trim();
+            if let Some(token) = part.strip_prefix(&prefix) {
+                let token = token.trim();
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
         }
-    }))
-    .into_response()
+    }
+    None
 }
 
-pub async fn api_search(
-    State(state): State<AppState>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
-    let uid = default_user_id(&state);
-    let query = q.get("q").map(|s| s.as_str()).unwrap_or("").trim();
-    if query.is_empty() {
-        let all = state.store.all_tracks(40);
-        let items: Vec<_> = all.iter().map(|t| track_dto(&state, uid, t)).collect();
-        return Json(json!({ "tracks": items })).into_response();
-    }
-
-    let mut tracks = state.store.search_tracks(query, 30);
-    if tracks.len() < 15 {
-        let remote = state.registry.search_all(query, 25).await;
-        tracks.extend(remote);
-        tracks = crate::sources::dedup_best_quality(tracks, 30);
-    }
-    state.engine.warm_resolve(tracks.clone(), 4);
-    let items: Vec<_> = tracks.iter().map(|t| track_dto(&state, uid, t)).collect();
-    Json(json!({ "tracks": items })).into_response()
-}
-
-pub async fn api_mood_radio(
-    State(state): State<AppState>,
-    Path(slug_str): Path<String>,
-) -> Response {
-    let uid = default_user_id(&state);
-    let Some(mood) = Mood::from_slug(&slug_str) else {
-        return (StatusCode::NOT_FOUND, "unknown mood").into_response();
+fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = extract_session_token(headers) else {
+        return false;
     };
-    let tracks = state.taste.mood_radio(mood, uid, 30).await;
-    state.engine.warm_resolve(tracks.clone(), 5);
-    let items: Vec<_> = tracks.iter().map(|t| track_dto(&state, uid, t)).collect();
-    Json(json!({
-        "mood": {
-            "slug": mood.slug(),
-            "label": mood.label(),
-            "description": mood.description(),
-        },
-        "tracks": items
-    }))
-    .into_response()
+    state.admin_sessions.lock().unwrap().contains(&token)
 }
 
-pub async fn api_track_radio(
+pub async fn require_admin_auth(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    req: Request,
+    next: Next,
 ) -> Response {
-    let uid = default_user_id(&state);
-    let tracks = if let Some(seed) = state.store.track(&id) {
-        let mut list = state.taste.similar_songs(&seed, uid, 25);
-        if list.len() < 8 {
-            let extra = state.taste.artist_radio(&seed.artist, uid, 15).await;
-            list.extend(extra);
-            list = crate::sources::dedup_best_quality(list, 25);
-        }
-        list
+    if is_authenticated(&state, req.headers()) {
+        next.run(req).await
     } else {
-        state.taste.recommend_for_user(uid, 25)
-    };
-    state.engine.warm_resolve(tracks.clone(), 5);
-    let items: Vec<_> = tracks.iter().map(|t| track_dto(&state, uid, t)).collect();
-    Json(json!({ "tracks": items })).into_response()
-}
-
-pub async fn api_stream(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    let Some(track) = state.store.track(&id) else {
-        return (StatusCode::NOT_FOUND, "track not found").into_response();
-    };
-    state.engine.serve_track(&track, &headers, None, None).await
-}
-
-pub async fn api_cover(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
-    state.engine.serve_cover(&id).await
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unauthorized" })),
+        )
+            .into_response()
+    }
 }
 
 #[derive(Deserialize)]
-pub struct EventReq {
-    pub track_id: String,
-    pub kind: String, // "play", "complete", "skip", "star", "unstar"
+pub struct AdminLoginReq {
+    pub password: String,
 }
 
-pub async fn api_event(
+pub async fn api_admin_login(
     State(state): State<AppState>,
-    Json(req): Json<EventReq>,
+    Json(req): Json<AdminLoginReq>,
 ) -> Response {
-    let uid = default_user_id(&state);
-    match req.kind.as_str() {
-        "star" => state.store.star_track(uid, &req.track_id),
-        "unstar" => state.store.unstar_track(uid, &req.track_id),
-        "complete" => {
-            state.store.increment_play(&req.track_id);
-            state.store.record_event(uid, &req.track_id, "complete", 1.0);
-        }
-        "play" | "skip" => {
-            state.store.record_event(uid, &req.track_id, &req.kind, 1.0);
-        }
-        _ => {}
+    if !constant_time_eq(&req.password, &state.admin_password) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "Invalid admin password" })),
+        )
+            .into_response();
     }
-    if let Some(tr) = state.store.track(&req.track_id) {
-        state.taste.learn_event(uid, &tr, &req.kind, 1.0);
+    let mut buf = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut buf);
+    let token = hex::encode(buf);
+    state.admin_sessions.lock().unwrap().insert(token.clone());
+    let cookie = format!("{ADMIN_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/");
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+pub async fn api_admin_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = extract_session_token(&headers) {
+        state.admin_sessions.lock().unwrap().remove(&token);
     }
-    Json(json!({ "ok": true })).into_response()
+    let clear_cookie = format!("{ADMIN_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, clear_cookie)],
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+pub async fn admin_page() -> Html<&'static str> {
+    Html(ADMIN_HTML)
 }
 
 pub async fn api_admin_status(State(state): State<AppState>) -> Response {
@@ -239,6 +139,7 @@ pub async fn api_admin_status(State(state): State<AppState>) -> Response {
         "ffmpeg": state.engine.has_ffmpeg(),
         "local_dirs": dirs,
         "sources": sources,
+        "soulseek": state.soulseek.connection_info(),
         "users": state.store.list_users().into_iter().map(|u| json!({"id": u.id, "username": u.username, "is_admin": u.is_admin})).collect::<Vec<_>>(),
     }))
     .into_response()
@@ -280,4 +181,201 @@ pub async fn api_admin_scan(State(state): State<AppState>) -> Response {
 pub async fn api_admin_clear_cache(State(state): State<AppState>) -> Response {
     state.engine.clear_audio_cache();
     Json(json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SoulseekConnectReq {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+pub async fn api_admin_soulseek_connect(
+    State(state): State<AppState>,
+    Json(req): Json<SoulseekConnectReq>,
+) -> Response {
+    match state
+        .soulseek
+        .connect(&req.username, &req.password, req.server.as_deref())
+        .await
+    {
+        Ok(()) => {
+            let taste = Arc::clone(&state.taste);
+            tokio::spawn(async move {
+                taste.warm_popular_on_connect().await;
+            });
+            Json(json!({
+                "ok": true,
+                "soulseek": state.soulseek.connection_info(),
+            }))
+            .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "ok": false,
+                "error": err,
+                "soulseek": state.soulseek.connection_info(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn api_admin_soulseek_disconnect(State(state): State<AppState>) -> Response {
+    state.soulseek.disconnect().await;
+    Json(json!({
+        "ok": true,
+        "soulseek": state.soulseek.connection_info(),
+    }))
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+    use crate::sources::SourceRegistry;
+    use crate::sources::local::LocalSource;
+    use crate::sources::soulseek::SoulseekSource;
+    use crate::store::Store;
+    use crate::taste::TasteEngine;
+    use axum::Router;
+    use axum::routing::{get, post};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    fn test_state(password: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!("beatlab-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        let local = Arc::new(LocalSource::new(store.clone(), vec![]));
+        let soulseek = SoulseekSource::new(store.clone(), dir.join("cache").join("soulseek"));
+        let registry = Arc::new(SourceRegistry::new(store.clone(), vec![local.clone()]));
+        let engine = Arc::new(Engine::new(store.clone(), registry.clone(), &dir, 1));
+        let taste = Arc::new(TasteEngine::new(store.clone(), registry.clone()));
+        AppState {
+            store,
+            registry,
+            engine,
+            taste,
+            local,
+            soulseek,
+            now_playing: Arc::new(Mutex::new(HashMap::new())),
+            admin_password: password.to_string(),
+            admin_sessions: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_panel_requires_password_and_supports_logout() {
+        let state = test_state("secret-admin-pw");
+        let admin_api = Router::new()
+            .route("/status", get(api_admin_status))
+            .route("/scan", post(api_admin_scan))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_auth,
+            ));
+        let app = Router::new()
+            .route("/admin", get(admin_page))
+            .route("/admin/api/login", post(api_admin_login))
+            .route("/admin/api/logout", post(api_admin_logout))
+            .nest("/admin/api", admin_api)
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // 1. Admin HTML page loads and includes the login/logout UI
+        let page = client.get(format!("{base}/admin")).send().await.unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        let html = page.text().await.unwrap();
+        assert!(html.contains("logoutAdmin()"));
+        assert!(html.contains("loginAdmin(event)"));
+
+        // 2. Unauthenticated API calls are rejected
+        let unauth = client
+            .get(format!("{base}/admin/api/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let unauth_scan = client
+            .post(format!("{base}/admin/api/scan"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth_scan.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 3. Wrong password fails
+        let bad_login = client
+            .post(format!("{base}/admin/api/login"))
+            .json(&json!({ "password": "wrong" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_login.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // 4. Correct password sets session cookie
+        let good_login = client
+            .post(format!("{base}/admin/api/login"))
+            .json(&json!({ "password": "secret-admin-pw" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(good_login.status(), reqwest::StatusCode::OK);
+        let set_cookie = good_login
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+        assert!(cookie_pair.starts_with("beatlab_admin_session="));
+
+        // 5. Authenticated request succeeds
+        let authed = client
+            .get(format!("{base}/admin/api/status"))
+            .header(reqwest::header::COOKIE, &cookie_pair)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), reqwest::StatusCode::OK);
+
+        // 6. Logout invalidates session and clears cookie
+        let logout = client
+            .post(format!("{base}/admin/api/logout"))
+            .header(reqwest::header::COOKIE, &cookie_pair)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), reqwest::StatusCode::OK);
+        let clear_cookie = logout
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(clear_cookie.contains("Max-Age=0"));
+
+        // 7. Old session cookie is no longer accepted
+        let after_logout = client
+            .get(format!("{base}/admin/api/status"))
+            .header(reqwest::header::COOKIE, &cookie_pair)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(after_logout.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
 }

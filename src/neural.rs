@@ -14,7 +14,6 @@ const H2_DIM: usize = 12;
 pub struct UserNet {
     pub user_id: i64,
     pub updates: u64,
-    pub avg_loss: f64,
     w1: Vec<f64>, // H1_DIM * INPUT_DIM
     b1: Vec<f64>, // H1_DIM
     w2: Vec<f64>, // H2_DIM * H1_DIM
@@ -33,7 +32,6 @@ impl UserNet {
         Self {
             user_id,
             updates: 0,
-            avg_loss: 0.5,
             w1: (0..H1_DIM * INPUT_DIM)
                 .map(|_| rng.gen_range(-s1..s1))
                 .collect(),
@@ -104,13 +102,6 @@ impl UserNet {
     pub fn train_step(&mut self, x: &[f64; INPUT_DIM], target: f64, sample_weight: f64) {
         let target = target.clamp(0.01, 0.99);
         let (h1, h2, pred) = self.forward(x);
-
-        let loss = -(target * pred.max(1e-7).ln() + (1.0 - target) * (1.0 - pred).max(1e-7).ln());
-        self.avg_loss = if self.updates == 0 {
-            loss
-        } else {
-            self.avg_loss * 0.95 + loss * 0.05
-        };
         self.updates += 1;
 
         let lr = (0.045 / (1.0 + (self.updates as f64) * 0.0005)).max(0.008) * sample_weight;

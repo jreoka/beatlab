@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod bandcamp;
 pub mod local;
+pub mod soulseek;
 pub mod ytdlp;
 
 use crate::models::Track;
@@ -45,6 +46,16 @@ impl SourceRegistry {
     /// Sources that finish later still feed into the SQLite catalog in the background.
     /// Results are deduplicated by `song_key`, keeping the HIGHEST quality version!
     pub async fn search_all(&self, query: &str, limit: usize) -> Vec<Track> {
+        self.search_all_inner(query, limit, true).await
+    }
+
+    /// Searches all available sources in parallel without automatically inserting
+    /// unverified results into SQLite.
+    pub async fn search_all_raw(&self, query: &str, limit: usize) -> Vec<Track> {
+        self.search_all_inner(query, limit, false).await
+    }
+
+    async fn search_all_inner(&self, query: &str, limit: usize, upsert: bool) -> Vec<Track> {
         let query = query.trim().to_string();
         if query.is_empty() || limit == 0 {
             return vec![];
@@ -77,7 +88,7 @@ impl SourceRegistry {
                 .await;
                 match res {
                     Ok(tracks) => {
-                        if !tracks.is_empty() {
+                        if upsert && !tracks.is_empty() {
                             store_clone.upsert_tracks(&tracks);
                         }
                         let _ = tx.send(tracks).await;
@@ -104,20 +115,22 @@ impl SourceRegistry {
                     }
                 }
                 _ = &mut deadline => {
-                    // Drain any remaining late results into the store in the background
-                    tokio::spawn(async move {
-                        while let Some(batch) = rx.recv().await {
-                            if !batch.is_empty() {
-                                store_bg.upsert_tracks(&batch);
+                    if upsert {
+                        // Drain any remaining late results into the store in the background
+                        tokio::spawn(async move {
+                            while let Some(batch) = rx.recv().await {
+                                if !batch.is_empty() {
+                                    store_bg.upsert_tracks(&batch);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                     break;
                 }
             }
         }
 
-        dedup_best_quality(collected, limit)
+        dedup_and_rank_search(collected, &query, limit)
     }
 
     pub async fn resolve_stream(&self, source_name: &str, stream_ref: &str) -> Option<String> {
@@ -126,8 +139,9 @@ impl SourceRegistry {
     }
 }
 
-/// Deduplicates tracks sharing the same `song_key()`, always keeping the highest `quality_score()`.
-pub fn dedup_best_quality(tracks: Vec<Track>, limit: usize) -> Vec<Track> {
+/// Deduplicates tracks sharing the same `song_key()`, keeping the highest `quality_score()`,
+/// then ranks by query relevance + quality score.
+pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str, limit: usize) -> Vec<Track> {
     let mut best_by_key: HashMap<String, Track> = HashMap::new();
     for t in tracks {
         let key = t.song_key();
@@ -139,7 +153,14 @@ pub fn dedup_best_quality(tracks: Vec<Track>, limit: usize) -> Vec<Track> {
         }
     }
     let mut out: Vec<Track> = best_by_key.into_values().collect();
-    out.sort_by(|a, b| b.quality_score().cmp(&a.quality_score()));
+    let q = query.trim();
+    if q.is_empty() {
+        out.sort_by_key(|a| std::cmp::Reverse(a.quality_score()));
+    } else {
+        out.sort_by_key(|a| {
+            std::cmp::Reverse(crate::store::search_match_score(a, q) * 10000 + a.quality_score())
+        });
+    }
     out.truncate(limit);
     out
 }

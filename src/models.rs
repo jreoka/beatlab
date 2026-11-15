@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -69,30 +68,9 @@ impl Mood {
         }
     }
 
-    pub fn description(&self) -> &'static str {
-        match self {
-            Mood::Chill => "Laid-back beats, downtempo & warm textures",
-            Mood::Focus => "Instrumental, ambient & steady rhythms for concentration",
-            Mood::Energy => "Driving tempo, powerful riffs & adrenaline",
-            Mood::LateNight => "Atmospheric, nocturnal & smooth after-hours tracks",
-            Mood::Upbeat => "Bright, uplifting melodies & positive energy",
-            Mood::Melancholy => "Reflective, emotional & bittersweet songs",
-            Mood::Party => "Club grooves, electronic & dancefloor anthems",
-            Mood::Acoustic => "Unplugged, folk, singer-songwriter & intimate sessions",
-            Mood::Groove => "Funk, R&B, jazz & pocket rhythms",
-            Mood::RockIndie => "Guitars, alternative, classic & indie rock",
-        }
-    }
-
     pub fn from_slug(s: &str) -> Option<Mood> {
         let low = s.trim().to_lowercase().replace('-', "_");
         Self::ALL.iter().copied().find(|m| m.slug() == low)
-    }
-}
-
-impl fmt::Display for Mood {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
     }
 }
 
@@ -188,50 +166,24 @@ impl Track {
         base + source_bonus + br_bonus
     }
 
-    pub fn quality_badge(&self) -> String {
-        let fmt = if self.format.is_empty() {
-            "AUDIO".to_string()
-        } else {
-            self.format.to_uppercase()
-        };
-        if self.is_lossless() {
-            if self.bit_depth >= 24 || self.sample_rate > 48000 {
-                let khz = if self.sample_rate > 0 {
-                    format!(" {:.1}kHz", self.sample_rate as f64 / 1000.0)
-                } else {
-                    String::new()
-                };
-                let bd = if self.bit_depth > 0 {
-                    format!(" {}-bit", self.bit_depth)
-                } else {
-                    String::new()
-                };
-                return format!("{}{}{}", fmt, bd, khz);
-            }
-            return format!("{} Lossless", fmt);
-        }
-        if self.bitrate > 0 {
-            format!("{} {}k", fmt, self.bitrate)
-        } else {
-            fmt
-        }
-    }
-
     pub fn mood_list(&self) -> Vec<Mood> {
         self.moods
             .split(',')
-            .filter_map(|s| Mood::from_slug(s))
+            .filter_map(Mood::from_slug)
             .collect()
     }
 
-    /// Canonical song key ignoring upload/version/source: `artist_slug|core_title`.
+    /// Canonical song key ignoring upload/version/source: `primary_artist_slug|core_title`.
     pub fn song_key(&self) -> String {
-        format!("{}|{}", slug(&self.artist), core_song_title(&self.title))
+        let pa = primary_artist(&self.artist);
+        let a = if pa.is_empty() { &self.artist } else { &pa };
+        format!("{}|{}", slug(a), core_song_title(&self.title))
     }
 
     pub fn song_aliases(&self) -> Vec<String> {
         let primary = self.song_key();
-        let a_slug = slug(&self.artist);
+        let pa = primary_artist(&self.artist);
+        let a_slug = slug(if pa.is_empty() { &self.artist } else { &pa });
         let mut out = Vec::new();
         for seg in bracket_segments(&self.title) {
             let core = core_song_title(&seg);
@@ -262,10 +214,8 @@ pub struct Playlist {
     pub cover_track_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Event {
-    pub id: i64,
-    pub user_id: i64,
     pub track_id: String,
     pub kind: String, // "play", "complete", "skip", "star", "unstar", "rate"
     pub value: f64,
@@ -280,21 +230,11 @@ pub struct RadioStation {
     pub home_page_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub track_id: String,
     pub path: String,
     pub bytes: i64,
-    pub last_hit: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoMixSummary {
-    pub id: String,
-    pub name: String,
-    pub subtitle: String,
-    pub kind: String,
-    pub tracks: Vec<Track>,
 }
 
 /// Deterministic URL-safe slug for artist/album/title keys.
@@ -350,18 +290,190 @@ pub fn bracket_segments(s: &str) -> Vec<String> {
     segs
 }
 
-/// Strips bracketed suffixes, punctuation, and trailing version words ("remaster", "live", "radio edit", year).
+/// Returns true for common Soulseek share root/bucket folder names that are not artist names.
+pub fn is_generic_folder_name(s: &str) -> bool {
+    let clean = strip_release_tags(s).trim().to_lowercase();
+    if clean.is_empty() {
+        return true;
+    }
+    matches!(
+        clean.as_str(),
+        "complete"
+            | "incomplete"
+            | "downloads"
+            | "download"
+            | "incoming"
+            | "music"
+            | "shared"
+            | "share"
+            | "shares"
+            | "audio"
+            | "song"
+            | "songs"
+            | "track"
+            | "tracks"
+            | "mp3"
+            | "flac"
+            | "lossless"
+            | "alac"
+            | "wav"
+            | "albums"
+            | "album"
+            | "singles"
+            | "single"
+            | "hi-res"
+            | "hires"
+            | "rips"
+            | "cd"
+            | "temp"
+            | "tmp"
+            | "new"
+            | "sorted"
+            | "unsorted"
+            | "library"
+            | "collection"
+            | "media"
+            | "users"
+            | "soulseek"
+            | "slsk"
+            | "slskd"
+            | "v0"
+            | "320"
+            | "ost"
+            | "soundtrack"
+            | "anime"
+            | "jpop"
+            | "j-pop"
+            | "kpop"
+            | "k-pop"
+            | "discography"
+            | "complete discography"
+            | "unknown artist"
+            | "unknown"
+            | "various"
+            | "various artists"
+            | "va"
+            | "love"
+            | "misc"
+            | "other"
+            | "favorites"
+            | "favourites"
+    )
+}
+
+/// Strips release/codec/hash bracket tags (e.g. `[2020.07.22]`, `[FLAC]`, `[9a149]`, `(24bit-48kHz)`).
+pub fn strip_release_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '[' || ch == '(' {
+            let close = if ch == '[' { ']' } else { ')' };
+            let mut j = i + 1;
+            let mut depth = 1i32;
+            while j < chars.len() && depth > 0 {
+                if chars[j] == ch {
+                    depth += 1;
+                } else if chars[j] == close {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let inner: String = chars[i + 1..j - 1].iter().collect();
+                if is_release_tag(&inner) {
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .trim_matches(|c: char| matches!(c, ' ' | '-' | '_' | '|' | '•'))
+        .trim()
+        .to_string()
+}
+
+fn is_release_tag(inner: &str) -> bool {
+    let t = inner.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let low = t.to_lowercase();
+    // Short hex/hash or release codes like "9a149", "XW", "JP", "WEB", "FLAC"
+    if (2..=8).contains(&low.len()) && low.chars().all(|c| c.is_ascii_hexdigit()) && low.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if matches!(
+        low.as_str(),
+        "flac" | "alac" | "mp3" | "wav" | "aiff" | "aac" | "m4a" | "opus" | "ogg"
+            | "web" | "cd" | "v0" | "320" | "320kbps" | "hq" | "hi-res" | "hires"
+            | "lossless" | "jp" | "xw" | "us" | "uk" | "eu" | "mv" | "pv"
+            | "single" | "ep" | "album"
+    ) {
+        return true;
+    }
+    // Dates like 2020.07.22, 2020-07-22, 190123, 2023
+    let digits_and_sep = low.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '/'));
+    if digits_and_sep && low.chars().filter(|c| c.is_ascii_digit()).count() >= 4 {
+        return true;
+    }
+    const RELEASE_WORDS: &[&str] = &[
+        "flac", "24bit", "24-bit", "16bit", "16-bit", "khz", "kbps", "320k",
+        "web", "cd", "vinyl", "official", "lyric", "audio", "video", "visualizer",
+        "hi-res", "hires", "remaster",
+    ];
+    RELEASE_WORDS.iter().any(|w| low.contains(w))
+}
+
+/// Extracts primary artist display name by stripping release tags, channel suffixes, and collab trailers.
+pub fn primary_artist(s: &str) -> String {
+    let mut cleaned = strip_release_tags(s);
+    for suffix in [
+        " official youtube channel",
+        " official channel",
+        " youtube channel",
+        " - topic",
+        " official",
+        " vevo",
+    ] {
+        if cleaned.to_ascii_lowercase().ends_with(suffix) {
+            let keep = cleaned.len().saturating_sub(suffix.len());
+            if cleaned.is_char_boundary(keep) {
+                cleaned = cleaned[..keep].trim().to_string();
+            }
+        }
+    }
+    let low = cleaned.to_ascii_lowercase();
+    for sep in [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " vs. ", " vs "] {
+        if let Some(pos) = low.find(sep) {
+            if cleaned.is_char_boundary(pos) {
+                cleaned = cleaned[..pos].trim().to_string();
+                break;
+            }
+        }
+    }
+    cleaned.trim().to_string()
+}
+
+/// Strips parenthetical suffixes, punctuation, and trailing version words ("remaster", "live", "radio edit", year).
 pub fn core_song_title(s: &str) -> String {
     let mut stripped = String::with_capacity(s.len());
     let mut depth = 0i32;
     for ch in s.chars() {
         match ch {
-            '(' | '[' | '\u{3010}' | '\u{300e}' | '\u{300c}' => depth += 1,
-            ')' | ']' | '\u{3011}' | '\u{300f}' | '\u{300d}' => {
+            '(' | '[' | '\u{3010}' => depth += 1,
+            ')' | ']' | '\u{3011}' => {
                 if depth > 0 {
                     depth -= 1;
                 }
             }
+            // Strip Japanese quotation brackets around the title itself, keeping their contents!
+            '\u{300c}' | '\u{300d}' | '\u{300e}' | '\u{300f}' => stripped.push(' '),
             _ => {
                 if depth == 0 {
                     stripped.push(ch);
@@ -403,6 +515,9 @@ pub fn core_song_title(s: &str) -> String {
         "mv",
         "pv",
         "ver",
+        "tv",
+        "size",
+        "short",
     ]
     .into_iter()
     .collect();

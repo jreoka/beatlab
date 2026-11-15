@@ -4,6 +4,7 @@ use crate::taste::classify_moods_str;
 use async_trait::async_trait;
 use regex::Regex;
 use sha1::{Digest, Sha1};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// BandcampSource queries Bandcamp's public search page for music-only tracks
@@ -11,17 +12,20 @@ use std::time::Duration;
 /// Beatlab resolves the Bandcamp track page URL to its highest-quality audio stream.
 pub struct BandcampSource {
     http: reqwest::Client,
-    has_ytdlp: bool,
+    ytdlp_bin: String,
 }
 
 impl BandcampSource {
-    pub fn new(has_ytdlp: bool) -> Self {
+    pub fn new(ytdlp_bin: Option<String>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(12))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .build()
             .unwrap_or_default();
-        Self { http, has_ytdlp }
+        Self {
+            http,
+            ytdlp_bin: ytdlp_bin.unwrap_or_default(),
+        }
     }
 }
 
@@ -32,11 +36,11 @@ impl MusicSource for BandcampSource {
     }
 
     fn available(&self) -> bool {
-        self.has_ytdlp
+        !self.ytdlp_bin.is_empty()
     }
 
     fn status(&self) -> String {
-        if self.has_ytdlp {
+        if !self.ytdlp_bin.is_empty() {
             "bandcamp — music-only discovery + yt-dlp stream resolve".to_string()
         } else {
             "bandcamp disabled (requires yt-dlp for stream resolution)".to_string()
@@ -44,7 +48,7 @@ impl MusicSource for BandcampSource {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
-        if !self.has_ytdlp {
+        if self.ytdlp_bin.is_empty() {
             return vec![];
         }
         let url = format!(
@@ -63,21 +67,44 @@ impl MusicSource for BandcampSource {
     }
 
     async fn resolve_stream(&self, stream_ref: &str) -> Option<String> {
+        if self.ytdlp_bin.is_empty() {
+            return None;
+        }
         let page = stream_ref.strip_prefix("ytdlp:")?;
-        crate::sources::ytdlp::resolve_ytdlp_url("yt-dlp", page).await
+        crate::sources::ytdlp::resolve_ytdlp_url(&self.ytdlp_bin, page).await
     }
 }
 
+struct BcRegexes {
+    item: Regex,
+    title: Regex,
+    sub: Regex,
+    art: Regex,
+    tags: Regex,
+    tag_strip: Regex,
+}
+
+fn bc_regexes() -> &'static BcRegexes {
+    static RE: OnceLock<BcRegexes> = OnceLock::new();
+    RE.get_or_init(|| BcRegexes {
+        item: Regex::new(r#"(?s)<li class="searchresult data-search"[^>]*>(.*?)</li>"#).unwrap(),
+        title: Regex::new(r#"(?s)<div class="heading">\s*<a href="([^"]+)"[^>]*>(.*?)</a>"#)
+            .unwrap(),
+        sub: Regex::new(r#"(?s)<div class="subhead">(.*?)</div>"#).unwrap(),
+        art: Regex::new(r#"(?s)<div class="art">\s*<img src="([^"]+)""#).unwrap(),
+        tags: Regex::new(r#"(?s)tags:\s*(.*?)</div>"#).unwrap(),
+        tag_strip: Regex::new(r#"<[^>]+>"#).unwrap(),
+    })
+}
+
 fn parse_bandcamp_search(html: &str, limit: usize) -> Vec<Track> {
-    let re_item = Regex::new(
-        r#"(?s)<li class="searchresult data-search"[^>]*>(.*?)</li>"#,
-    )
-    .unwrap();
-    let re_title = Regex::new(r#"(?s)<div class="heading">\s*<a href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap();
-    let re_sub = Regex::new(r#"(?s)<div class="subhead">(.*?)</div>"#).unwrap();
-    let re_art = Regex::new(r#"(?s)<div class="art">\s*<img src="([^"]+)""#).unwrap();
-    let re_tags = Regex::new(r#"(?s)tags:\s*(.*?)</div>"#).unwrap();
-    let re_tag_strip = Regex::new(r#"<[^>]+>"#).unwrap();
+    let re = bc_regexes();
+    let re_item = &re.item;
+    let re_title = &re.title;
+    let re_sub = &re.sub;
+    let re_art = &re.art;
+    let re_tags = &re.tags;
+    let re_tag_strip = &re.tag_strip;
 
     let mut tracks = Vec::new();
     for cap in re_item.captures_iter(html) {

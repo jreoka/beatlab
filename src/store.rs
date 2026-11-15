@@ -292,8 +292,20 @@ impl Store {
 
     const TRACK_COLS: &'static str = "id, source, title, artist, album, genre, moods, year, track_no, duration, bitrate, sample_rate, bit_depth, format, size, stream_url, cover_url, meta, play_count, last_played, created";
 
-    pub fn upsert_track(&self, t: &Track) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+    pub fn upsert_tracks(&self, tracks: &[Track]) {
+        if tracks.is_empty() {
+            return;
+        }
+        let mut conn = self.conn.lock().unwrap();
+        if let Ok(tx) = conn.transaction() {
+            for t in tracks {
+                let _ = Self::upsert_track_conn(&tx, t);
+            }
+            let _ = tx.commit();
+        };
+    }
+
+    fn upsert_track_conn(conn: &Connection, t: &Track) -> Result<()> {
         let now = if t.created > 0 {
             t.created
         } else {
@@ -328,12 +340,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn upsert_tracks(&self, tracks: &[Track]) {
-        for t in tracks {
-            let _ = self.upsert_track(t);
-        }
-    }
-
     pub fn track(&self, id: &str) -> Option<Track> {
         let conn = self.conn.lock().unwrap();
         let sql = format!("SELECT {} FROM tracks WHERE id = ?1", Self::TRACK_COLS);
@@ -341,6 +347,51 @@ impl Store {
             .optional()
             .ok()
             .flatten()
+    }
+
+    pub fn tracks_by_ids(&self, ids: &[String]) -> std::collections::HashMap<String, Track> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return out;
+        }
+        let conn = self.conn.lock().unwrap();
+        for chunk in ids.chunks(400) {
+            let placeholders: String = (1..=chunk.len())
+                .map(|i| format!("?{}", i))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT {} FROM tracks WHERE id IN ({})",
+                Self::TRACK_COLS,
+                placeholders
+            );
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let params_vec: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                if let Ok(rows) = stmt.query_map(params_vec.as_slice(), Self::row_to_track) {
+                    for r in rows.flatten() {
+                        out.insert(r.id.clone(), r);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn update_track_cover_and_genre(&self, id: &str, cover_url: Option<&str>, genre: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        if let Some(c) = cover_url.filter(|s| !s.is_empty()) {
+            let _ = conn.execute(
+                "UPDATE tracks SET cover_url = ?1 WHERE id = ?2 AND (cover_url = '' OR cover_url IS NULL)",
+                params![c, id],
+            );
+        }
+        if let Some(g) = genre.filter(|s| !s.is_empty()) {
+            let _ = conn.execute(
+                "UPDATE tracks SET genre = ?1 WHERE id = ?2 AND (genre = '' OR genre IS NULL)",
+                params![g, id],
+            );
+        }
     }
 
     pub fn all_tracks(&self, limit: usize) -> Vec<Track> {
@@ -366,18 +417,35 @@ impl Store {
         if q.is_empty() {
             return self.all_tracks(limit);
         }
-        let pattern = format!("%{}%", q);
+        let tokens: Vec<String> = q
+            .split_whitespace()
+            .filter(|w| !w.is_empty())
+            .take(6)
+            .map(|w| format!("%{}%", w))
+            .collect();
         let conn = self.conn.lock().unwrap();
+        let haystack = "(lower(title) || ' ' || lower(artist) || ' ' || lower(album) || ' ' || lower(genre))";
+        let where_clause = (1..=tokens.len())
+            .map(|i| format!("{} LIKE ?{}", haystack, i))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let limit_param = tokens.len() + 1;
         let sql = format!(
-            "SELECT {} FROM tracks WHERE lower(title) LIKE ?1 OR lower(artist) LIKE ?1 OR lower(album) LIKE ?1 OR lower(genre) LIKE ?1 LIMIT ?2",
-            Self::TRACK_COLS
+            "SELECT {} FROM tracks WHERE {} LIMIT ?{}",
+            Self::TRACK_COLS,
+            where_clause,
+            limit_param
         );
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
+        let row_limit = (limit * 4).max(100) as i64;
+        let mut sql_params: Vec<&dyn rusqlite::ToSql> =
+            tokens.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        sql_params.push(&row_limit);
         let mut tracks: Vec<Track> = stmt
-            .query_map(params![pattern, (limit * 4).max(100) as i64], Self::row_to_track)
+            .query_map(sql_params.as_slice(), Self::row_to_track)
             .ok()
             .into_iter()
             .flatten()
@@ -385,11 +453,7 @@ impl Store {
             .collect();
 
         // Rank by relevance + quality score (lossless/local wins ties!)
-        tracks.sort_by(|a, b| {
-            let sa = search_match_score(a, &q) * 10000 + a.quality_score();
-            let sb = search_match_score(b, &q) * 10000 + b.quality_score();
-            sb.cmp(&sa)
-        });
+        tracks.sort_by_key(|a| std::cmp::Reverse(search_match_score(a, &q) * 10000 + a.quality_score()));
         tracks.truncate(limit);
         tracks
     }
@@ -406,25 +470,6 @@ impl Store {
             Err(_) => return vec![],
         };
         stmt.query_map(params![pattern, limit as i64, offset as i64], Self::row_to_track)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .collect()
-    }
-
-    pub fn tracks_by_mood(&self, mood_slug: &str, limit: usize) -> Vec<Track> {
-        let conn = self.conn.lock().unwrap();
-        let pattern = format!("%{}%", mood_slug.to_lowercase());
-        let sql = format!(
-            "SELECT {} FROM tracks WHERE lower(moods) LIKE ?1 ORDER BY play_count DESC, created DESC LIMIT ?2",
-            Self::TRACK_COLS
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(params![pattern, limit as i64], Self::row_to_track)
             .ok()
             .into_iter()
             .flatten()
@@ -456,6 +501,16 @@ impl Store {
             .unwrap_or(0) as usize
     }
 
+    pub fn count_by_source(&self, source: &str) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM tracks WHERE source = ?1",
+            params![source],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
+    }
+
     pub fn lossless_count(&self) -> usize {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -484,7 +539,7 @@ impl Store {
         let tracks = self.all_tracks(5000);
         let mut map: HashMap<String, (String, usize)> = HashMap::new();
         for t in tracks {
-            if t.artist.trim().is_empty() {
+            if crate::models::is_generic_folder_name(&t.artist) {
                 continue;
             }
             let aid = t.artist_id();
@@ -493,8 +548,136 @@ impl Store {
         }
         let mut out: Vec<(String, String, usize)> =
             map.into_iter().map(|(id, (name, c))| (id, name, c)).collect();
-        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        out.sort_by_key(|a| a.1.to_lowercase());
         out
+    }
+
+    pub fn latest_user_event_at(&self, user_id: i64) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(MAX(at), 0) FROM events WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Re-cleans previously indexed Soulseek/YouTube/SoundCloud metadata in SQLite so old
+    /// polluted folder names (`complete`, `[9a149]`, channel suffixes) stop breaking artist
+    /// pages, cover lookups, and mix deduplication.
+    pub fn repair_source_metadata(&self) -> usize {
+        struct RawMetaRow {
+            id: String,
+            source: String,
+            title: String,
+            artist: String,
+            album: String,
+            format: String,
+            stream_url: String,
+            meta: String,
+            track_no: i32,
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let rows: Vec<RawMetaRow> = {
+            let mut stmt = match conn.prepare(
+                "SELECT id, source, title, artist, album, format, stream_url, meta, track_no
+                 FROM tracks WHERE source IN ('soulseek', 'youtube', 'soundcloud')",
+            ) {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            let collected: Vec<_> = stmt
+                .query_map([], |r| {
+                    Ok(RawMetaRow {
+                        id: r.get(0)?,
+                        source: r.get(1)?,
+                        title: r.get(2)?,
+                        artist: r.get(3)?,
+                        album: r.get(4)?,
+                        format: r.get(5)?,
+                        stream_url: r.get(6)?,
+                        meta: r.get(7)?,
+                        track_no: r.get(8)?,
+                    })
+                })
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.ok())
+                .collect();
+            collected
+        };
+
+        let mut updated = 0usize;
+        if let Ok(tx) = conn.transaction() {
+            for RawMetaRow {
+                id,
+                source,
+                title,
+                artist,
+                album,
+                format,
+                stream_url,
+                meta,
+                track_no,
+            } in rows
+            {
+                let (new_artist, new_album, new_title, new_tno, new_fmt) = if source == "soulseek"
+                    && !meta.is_empty()
+                {
+                    let (a, alb, t, tno) = crate::sources::soulseek::parse_slsk_path(&meta);
+                    let final_tno = if track_no > 0 { track_no } else { tno };
+                    (a, alb, t, final_tno, format.clone())
+                } else {
+                    let clean_a = {
+                        let pa = crate::models::primary_artist(&artist);
+                        if pa.is_empty() { artist.clone() } else { pa }
+                    };
+                    let clean_t = {
+                        let st = crate::models::strip_release_tags(&title);
+                        if st.is_empty() { title.clone() } else { st }
+                    };
+                    let alb_low = album.to_ascii_lowercase();
+                    let dirty_album = source == "youtube"
+                        && (alb_low.contains("channel")
+                            || alb_low.contains("official")
+                            || alb_low.contains(" - topic")
+                            || crate::models::is_generic_folder_name(&album)
+                            || album == artist);
+                    let clean_alb = if dirty_album {
+                        clean_t.clone()
+                    } else {
+                        let s = crate::models::strip_release_tags(&album);
+                        if s.is_empty() { album.clone() } else { s }
+                    };
+                    let fmt = if source == "youtube"
+                        && format == "opus"
+                        && stream_url.starts_with("ytdlp:")
+                    {
+                        "m4a".to_string()
+                    } else {
+                        format.clone()
+                    };
+                    (clean_a, clean_alb, clean_t, track_no, fmt)
+                };
+
+                if new_artist != artist
+                    || new_album != album
+                    || new_title != title
+                    || new_tno != track_no
+                    || new_fmt != format
+                {
+                    let _ = tx.execute(
+                        "UPDATE tracks SET artist = ?1, album = ?2, title = ?3, track_no = ?4, format = ?5 WHERE id = ?6",
+                        params![new_artist, new_album, new_title, new_tno, new_fmt, id],
+                    );
+                    updated += 1;
+                }
+            }
+            let _ = tx.commit();
+        };
+        updated
     }
 
     pub fn artist_name_from_id(&self, artist_id: &str) -> Option<String> {
@@ -529,19 +712,17 @@ impl Store {
     pub fn user_events(&self, user_id: i64, limit: usize) -> Vec<Event> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, user_id, track_id, kind, value, at FROM events WHERE user_id = ?1 ORDER BY at DESC LIMIT ?2",
+            "SELECT track_id, kind, value, at FROM events WHERE user_id = ?1 ORDER BY at DESC LIMIT ?2",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
         stmt.query_map(params![user_id, limit as i64], |r| {
             Ok(Event {
-                id: r.get(0)?,
-                user_id: r.get(1)?,
-                track_id: r.get(2)?,
-                kind: r.get(3)?,
-                value: r.get(4)?,
-                at: r.get(5)?,
+                track_id: r.get(0)?,
+                kind: r.get(1)?,
+                value: r.get(2)?,
+                at: r.get(3)?,
             })
         })
         .ok()
@@ -637,7 +818,29 @@ impl Store {
 
     // ---------- Playlists ----------
 
-    pub fn create_playlist(
+    pub fn create_user_playlist(
+        &self,
+        user_id: i64,
+        name: &str,
+        public: bool,
+        track_ids: &[String],
+    ) -> Result<Playlist> {
+        self.save_playlist_internal(user_id, name, "", public, false, "user", track_ids)
+    }
+
+    pub fn upsert_auto_playlist(
+        &self,
+        user_id: i64,
+        name: &str,
+        comment: &str,
+        kind: &str,
+        track_ids: &[String],
+    ) -> Result<Playlist> {
+        self.save_playlist_internal(user_id, name, comment, false, true, kind, track_ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_playlist_internal(
         &self,
         user_id: i64,
         name: &str,
@@ -676,23 +879,57 @@ impl Store {
     }
 
     pub fn set_playlist_tracks(&self, playlist_id: &str, track_ids: &[String]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
             params![playlist_id],
         )?;
         for (idx, tid) in track_ids.iter().enumerate() {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO playlist_tracks(playlist_id, pos, track_id) VALUES(?1,?2,?3)",
                 params![playlist_id, idx as i64, tid],
             )?;
         }
         let now = Utc::now().timestamp();
-        conn.execute(
+        tx.execute(
             "UPDATE playlists SET changed = ?1 WHERE id = ?2",
             params![now, playlist_id],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    pub fn update_playlist_tracks(
+        &self,
+        playlist_id: &str,
+        to_add: &[String],
+        to_remove_indices: &[usize],
+    ) -> Result<()> {
+        if to_add.is_empty() && to_remove_indices.is_empty() {
+            return Ok(());
+        }
+        let mut ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY pos ASC",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map(params![playlist_id], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        let mut remove_sorted = to_remove_indices.to_vec();
+        remove_sorted.sort_unstable();
+        remove_sorted.dedup();
+        for idx in remove_sorted.into_iter().rev() {
+            if idx < ids.len() {
+                ids.remove(idx);
+            }
+        }
+        ids.extend_from_slice(to_add);
+        self.set_playlist_tracks(playlist_id, &ids)
     }
 
     pub fn playlist_tracks(&self, playlist_id: &str) -> Vec<Track> {
@@ -866,14 +1103,13 @@ impl Store {
     pub fn cache_get(&self, track_id: &str) -> Option<CacheEntry> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT track_id, path, bytes, last_hit FROM cache_entries WHERE track_id = ?1",
+            "SELECT track_id, path, bytes FROM cache_entries WHERE track_id = ?1",
             params![track_id],
             |r| {
                 Ok(CacheEntry {
                     track_id: r.get(0)?,
                     path: r.get(1)?,
                     bytes: r.get(2)?,
-                    last_hit: r.get(3)?,
                 })
             },
         )
@@ -915,7 +1151,7 @@ impl Store {
 
     pub fn cache_entries_oldest(&self) -> Vec<CacheEntry> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT track_id, path, bytes, last_hit FROM cache_entries ORDER BY last_hit ASC") {
+        let mut stmt = match conn.prepare("SELECT track_id, path, bytes FROM cache_entries ORDER BY last_hit ASC") {
             Ok(s) => s,
             Err(_) => return vec![],
         };
@@ -924,7 +1160,6 @@ impl Store {
                 track_id: r.get(0)?,
                 path: r.get(1)?,
                 bytes: r.get(2)?,
-                last_hit: r.get(3)?,
             })
         })
         .ok()
@@ -953,27 +1188,113 @@ impl Store {
     }
 }
 
-fn search_match_score(t: &Track, q: &str) -> i32 {
+pub fn search_match_score(t: &Track, q: &str) -> i32 {
+    let q = q.trim().to_lowercase();
+    if q.is_empty() {
+        return 0;
+    }
     let title = t.title.to_lowercase();
     let artist = t.artist.to_lowercase();
     let album = t.album.to_lowercase();
     let mut score = 0;
+
     if title == q {
-        score += 100;
-    } else if title.starts_with(q) {
-        score += 60;
-    } else if title.contains(q) {
-        score += 35;
+        score += 120;
+    } else if title.starts_with(&q) {
+        score += 75;
+    } else if title.contains(&q) {
+        score += 45;
     }
     if artist == q {
-        score += 90;
-    } else if artist.starts_with(q) {
-        score += 55;
-    } else if artist.contains(q) {
-        score += 30;
+        score += 100;
+    } else if artist.starts_with(&q) {
+        score += 60;
+    } else if artist.contains(&q) {
+        score += 35;
     }
-    if album.contains(q) {
+    if album.contains(&q) {
         score += 15;
     }
+
+    // Multi-word queries like "artist title" rarely match title or artist as a single substring.
+    let tokens: Vec<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .collect();
+    if tokens.len() > 1 {
+        let matched = tokens
+            .iter()
+            .filter(|tok| title.contains(*tok) || artist.contains(*tok) || album.contains(*tok))
+            .count();
+        if matched == tokens.len() {
+            score += 55;
+        } else {
+            score += (matched as i32) * 10;
+        }
+    }
+
+    // Demote covers, remixes, karaoke, TV-size edits, and slowed/nightcore unless explicitly searched.
+    const VARIANT_PENALTIES: &[&str] = &[
+        "remix",
+        "cover",
+        "karaoke",
+        "instrumental",
+        "tv size",
+        "slowed",
+        "reverb",
+        "nightcore",
+        "8d audio",
+        "guitar",
+        "piano",
+        "tribute",
+    ];
+    for kw in VARIANT_PENALTIES {
+        if title.contains(kw) && !q.contains(kw) {
+            score -= 45;
+        }
+    }
+
+    // Strongly demote <45s previews/clips so full tracks always appear first.
+    if t.duration > 0 && t.duration < 45 {
+        score -= 200;
+    }
+
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_tracks_matches_multi_word_across_artist_and_title() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_tracks(&[
+                Track {
+                    id: "t1".into(),
+                    source: "local".into(),
+                    title: "Espresso".into(),
+                    artist: "Sabrina Carpenter".into(),
+                    album: "Short n' Sweet".into(),
+                    genre: "Pop".into(),
+                    duration: 175,
+                    ..Default::default()
+                },
+                Track {
+                    id: "t2".into(),
+                    source: "local".into(),
+                    title: "Coffee".into(),
+                    artist: "Other Artist".into(),
+                    album: "Morning".into(),
+                    genre: "Pop".into(),
+                    duration: 180,
+                    ..Default::default()
+                },
+            ]);
+
+        let hits = store.search_tracks("Sabrina Carpenter Espresso", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "t1");
+    }
 }

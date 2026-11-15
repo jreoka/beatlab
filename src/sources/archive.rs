@@ -64,8 +64,8 @@ impl ArchiveSource {
         let mut tracks = Vec::new();
         for (_, (f, _, ext)) in best_by_stem {
             let duration = parse_length(&f.length);
-            if duration > 1500 {
-                // Skip full-concert single-file rips > 25 min when searching for songs
+            if duration > 1500 || (duration > 0 && duration < 45) {
+                // Skip full-concert single-file rips > 25 min and short clips < 45s
                 continue;
             }
             let title = if !f.title.trim().is_empty() {
@@ -181,7 +181,12 @@ impl MusicSource for ArchiveSource {
         }
         let results = futures::future::join_all(futs).await;
         let mut out: Vec<Track> = results.into_iter().flatten().collect();
-        out.sort_by(|a, b| b.quality_score().cmp(&a.quality_score()));
+        out.sort_by_key(|a| {
+            std::cmp::Reverse((
+                crate::store::search_match_score(a, query),
+                a.quality_score(),
+            ))
+        });
         out.truncate(limit);
         out
     }
