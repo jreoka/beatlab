@@ -1,8 +1,8 @@
 [package]
 name = "beatlab"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "High-quality self-hosted music streaming server in Rust with auto-playlists, smart recommendations, personal mixes, moods, and Subsonic/OpenSubsonic API"
+description = "Self-hosted music streaming platform in Rust with open sign-up, Subsonic/OpenSubsonic & Navidrome APIs, smart mixes, synced lyrics, and a full web music player"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
@@ -21,14 +21,12 @@ sha1 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 rand = "0.8"
-regex = "1"
 urlencoding = "2"
 bytes = "1"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
-http-range-header = "0.4"
 flate2 = "1"
 
 [profile.release]

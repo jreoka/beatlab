@@ -6,6 +6,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct ArchiveSource {
     http: reqwest::Client,
 }
@@ -30,116 +31,138 @@ impl ArchiveSource {
             Ok(m) => m,
             Err(_) => return vec![],
         };
-        if is_junk_item(&md) {
-            return vec![];
-        }
-
-        let album = md.metadata.title.trim().to_string();
-        let artist = extract_creator(&md.metadata.creator).unwrap_or_else(|| "Unknown Artist".to_string());
-        let year = md
-            .metadata
-            .date
-            .as_str()
-            .get(..4)
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
-        let genre = canonical_genre(&md.metadata.subject);
-        let cover_url = pick_cover(identifier, &md.files);
-
-        // Group audio files by normalized stem so we pick FLAC/ALAC/WAV over MP3/OGG
-        let mut best_by_stem: HashMap<String, (&IaFile, i32, &'static str)> = HashMap::new();
-        for f in &md.files {
-            let Some((prio, ext)) = audio_format_priority(&f.format, &f.name) else {
-                continue;
-            };
-            let stem = file_stem(&f.name);
-            match best_by_stem.get(&stem) {
-                Some((_, existing_prio, _)) if *existing_prio >= prio => {}
-                _ => {
-                    best_by_stem.insert(stem, (f, prio, ext));
-                }
-            }
-        }
-
-        let mut tracks = Vec::new();
-        for (_, (f, _, ext)) in best_by_stem {
-            let duration = parse_length(&f.length);
-            if duration > 1500 || (duration > 0 && duration < 45) {
-                // Skip full-concert single-file rips > 25 min and short clips < 45s
-                continue;
-            }
-            let title = if !f.title.trim().is_empty() {
-                f.title.trim().to_string()
-            } else {
-                file_stem_display(&f.name)
-            };
-            let track_artist = if !f.artist.trim().is_empty() {
-                f.artist.trim().to_string()
-            } else if !f.creator.trim().is_empty() {
-                f.creator.trim().to_string()
-            } else {
-                artist.clone()
-            };
-            let track_album = if !f.album.trim().is_empty() {
-                f.album.trim().to_string()
-            } else if !album.is_empty() {
-                album.clone()
-            } else {
-                track_artist.clone()
-            };
-
-            let size = f.size.trim().parse::<i64>().unwrap_or(0);
-            let bitrate = if duration > 0 && size > 0 {
-                ((size * 8) / (duration as i64 * 1000)) as i32
-            } else if ext == "flac" || ext == "wav" || ext == "alac" {
-                900
-            } else {
-                256
-            };
-            let bit_depth = if f.format.to_lowercase().contains("24bit") {
-                24
-            } else if ext == "flac" || ext == "wav" || ext == "alac" {
-                16
-            } else {
-                0
-            };
-            let sample_rate = if ext == "flac" || ext == "wav" || ext == "alac" {
-                44100
-            } else {
-                0
-            };
-
-            let encoded_name = urlencoding::encode(&f.name);
-            let stream_url = format!("https://archive.org/download/{}/{}", identifier, encoded_name);
-            let moods = classify_moods_str(&title, &track_album, &genre, "");
-
-            tracks.push(Track {
-                id: format!("archive:{}:{}", identifier, f.name),
-                source: "archive".to_string(),
-                title,
-                artist: track_artist,
-                album: track_album,
-                genre: genre.clone(),
-                moods,
-                year,
-                track_no: f.track.trim().parse::<i32>().unwrap_or(0),
-                duration,
-                bitrate,
-                sample_rate,
-                bit_depth,
-                format: ext.to_string(),
-                size,
-                stream_url,
-                cover_url: cover_url.clone(),
-                meta: format!("https://archive.org/details/{}", identifier),
-                play_count: 0,
-                last_played: 0,
-                created: chrono::Utc::now().timestamp(),
-            });
-        }
-        tracks.sort_by_key(|t| t.track_no);
-        tracks
+        parse_item_tracks(identifier, &md)
     }
+}
+
+fn parse_item_tracks(identifier: &str, md: &IaMetadata) -> Vec<Track> {
+    if is_junk_item(md) {
+        return vec![];
+    }
+
+    let album = decode_ia_text(&md.metadata.title);
+    let artist = extract_creator(&md.metadata.creator)
+        .map(|s| decode_ia_text(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Unknown Artist".to_string());
+    let year = md
+        .metadata
+        .date
+        .as_str()
+        .get(..4)
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0);
+    let genre = canonical_genre(&md.metadata.subject);
+    let cover_url = pick_cover(identifier, &md.files);
+
+    // Group audio files by normalized stem so we pick FLAC/ALAC/WAV over MP3/OGG
+    let mut best_by_stem: HashMap<String, (&IaFile, i32, &'static str)> = HashMap::new();
+    for f in &md.files {
+        let Some((prio, ext)) = audio_format_priority(&f.format, &f.name) else {
+            continue;
+        };
+        let stem = file_stem(&f.name);
+        match best_by_stem.get(&stem) {
+            Some((_, existing_prio, _)) if *existing_prio >= prio => {}
+            _ => {
+                best_by_stem.insert(stem, (f, prio, ext));
+            }
+        }
+    }
+
+    let mut tracks = Vec::new();
+    for (_, (f, _, ext)) in best_by_stem {
+        let duration = parse_length(&f.length);
+        if duration < 45 || duration > 1500 {
+            // Skip unindexed 0s files, short clips < 45s, and full-concert single-file rips > 25 min
+            continue;
+        }
+        let decoded_file_title = decode_ia_text(&f.title);
+        let decoded_file_artist = decode_ia_text(&f.artist);
+        let decoded_file_creator = decode_ia_text(&f.creator);
+        let decoded_file_album = decode_ia_text(&f.album);
+
+        let title = if !decoded_file_title.is_empty() {
+            decoded_file_title.clone()
+        } else {
+            decode_ia_text(&file_stem_display(&f.name))
+        };
+        let track_artist = if !decoded_file_artist.is_empty() {
+            decoded_file_artist.clone()
+        } else if !decoded_file_creator.is_empty() {
+            decoded_file_creator.clone()
+        } else {
+            artist.clone()
+        };
+        let track_album = if !decoded_file_album.is_empty() {
+            decoded_file_album.clone()
+        } else if !album.is_empty() {
+            album.clone()
+        } else {
+            track_artist.clone()
+        };
+
+        let has_file_tags = !decoded_file_title.is_empty()
+            || !decoded_file_artist.is_empty()
+            || !decoded_file_creator.is_empty()
+            || !decoded_file_album.is_empty();
+        if title.is_empty()
+            || (track_artist.eq_ignore_ascii_case("Unknown Artist") && !has_file_tags)
+        {
+            continue;
+        }
+
+        let size = f.size.trim().parse::<i64>().unwrap_or(0);
+        let bitrate = if duration > 0 && size > 0 {
+            ((size * 8) / (duration as i64 * 1000)) as i32
+        } else if ext == "flac" || ext == "wav" || ext == "alac" {
+            900
+        } else {
+            256
+        };
+        let bit_depth = if f.format.to_lowercase().contains("24bit") {
+            24
+        } else if ext == "flac" || ext == "wav" || ext == "alac" {
+            16
+        } else {
+            0
+        };
+        let sample_rate = if ext == "flac" || ext == "wav" || ext == "alac" {
+            44100
+        } else {
+            0
+        };
+
+        let encoded_name = urlencoding::encode(&f.name);
+        let stream_url = format!("https://archive.org/download/{}/{}", identifier, encoded_name);
+        let moods = classify_moods_str(&title, &track_album, &genre, "");
+
+        tracks.push(Track {
+            id: format!("archive:{}:{}", identifier, f.name),
+            source: "archive".to_string(),
+            title,
+            artist: track_artist,
+            album: track_album,
+            genre: genre.clone(),
+            moods,
+            year,
+            track_no: f.track.trim().parse::<i32>().unwrap_or(0),
+            disc_no: 1,
+            duration,
+            bitrate,
+            sample_rate,
+            bit_depth,
+            format: ext.to_string(),
+            size,
+            stream_url,
+            cover_url: cover_url.clone(),
+            meta: format!("https://archive.org/details/{}", identifier),
+            deezer_id: String::new(),
+            created: chrono::Utc::now().timestamp(),
+        });
+    }
+    tracks.sort_by_key(|t| t.track_no);
+    tracks
 }
 
 #[async_trait]
@@ -157,9 +180,13 @@ impl MusicSource for ArchiveSource {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() || (trimmed.is_ascii() && trimmed.len() < 3) {
+            return vec![];
+        }
         let q = format!(
             "({}) AND mediatype:audio AND -collection:librivoxaudio AND -collection:podcasts",
-            query.replace('"', "")
+            trimmed.replace('"', "")
         );
         let url = format!(
             "https://archive.org/advancedsearch.php?q={}&fl[]=identifier,title,creator&rows=8&output=json",
@@ -180,7 +207,11 @@ impl MusicSource for ArchiveSource {
             futs.push(self.item_tracks(&doc.identifier));
         }
         let results = futures::future::join_all(futs).await;
-        let mut out: Vec<Track> = results.into_iter().flatten().collect();
+        let mut out: Vec<Track> = results
+            .into_iter()
+            .flatten()
+            .filter(|t| crate::store::search_match_score(t, query) > 0)
+            .collect();
         out.sort_by_key(|a| {
             std::cmp::Reverse((
                 crate::store::search_match_score(a, query),
@@ -275,12 +306,112 @@ fn is_junk_item(md: &IaMetadata) -> bool {
     let coll = serde_json::to_string(&md.metadata.collection)
         .unwrap_or_default()
         .to_lowercase();
-    for bad in ["librivox", "podcasts", "audio_bookspoetry", "opensource_audio"] {
+    for bad in [
+        "librivox",
+        "podcasts",
+        "audio_bookspoetry",
+        "opensource_audio",
+        "community_audio",
+        "spokenword",
+    ] {
         if coll.contains(bad) {
             return true;
         }
     }
     false
+}
+
+/// Decodes percent-encoded UTF-8 strings (including Archive.org titles where spaces were inserted
+/// between `%` and hex digits, e.g. `% D 8% AA...`), while leaving normal `%` text untouched.
+fn decode_ia_text(s: &str) -> String {
+    let trimmed = s.trim();
+    if !trimmed.contains('%') {
+        return trimmed.to_string();
+    }
+    let step1 = decode_percent_runs(trimmed, false);
+    if step1.contains('%') {
+        decode_percent_runs(&step1, true)
+    } else {
+        step1
+    }
+}
+
+fn decode_percent_runs(s: &str, allow_spaces: bool) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let mut cur = i;
+            let mut decoded = Vec::new();
+            let mut tokens = 0usize;
+
+            while let Some((b, next)) = parse_percent_byte(bytes, cur, allow_spaces) {
+                decoded.push(b);
+                tokens += 1;
+                cur = next;
+                if allow_spaces {
+                    let mut peek = cur;
+                    while peek < bytes.len() && bytes[peek] == b' ' {
+                        peek += 1;
+                    }
+                    if peek < bytes.len() && bytes[peek] == b'%' {
+                        cur = peek;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let valid_utf8 = std::str::from_utf8(&decoded).ok();
+            let no_ctrl = !decoded.iter().any(|&b| b < 0x20);
+            let enough_signal = !allow_spaces || (tokens >= 2 && decoded.iter().any(|&b| b >= 0x80));
+            if tokens > 0 && no_ctrl && enough_signal {
+                if let Some(text) = valid_utf8 {
+                    out.push_str(text);
+                    i = cur;
+                    continue;
+                }
+            }
+        }
+
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out.trim().to_string()
+}
+
+fn parse_percent_byte(bytes: &[u8], pos: usize, allow_spaces: bool) -> Option<(u8, usize)> {
+    if bytes.get(pos) != Some(&b'%') {
+        return None;
+    }
+    let mut p = pos + 1;
+    if allow_spaces {
+        while bytes.get(p) == Some(&b' ') {
+            p += 1;
+        }
+    }
+    let h1 = hex_nibble(*bytes.get(p)?)?;
+    p += 1;
+    if allow_spaces {
+        while bytes.get(p) == Some(&b' ') {
+            p += 1;
+        }
+    }
+    let h2 = hex_nibble(*bytes.get(p)?)?;
+    Some(((h1 << 4) | h2, p + 1))
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn extract_creator(val: &serde_json::Value) -> Option<String> {
@@ -408,4 +539,97 @@ where
         serde_json::Value::Number(n) => n.to_string(),
         _ => String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_file(name: &str, format: &str, length: &str) -> IaFile {
+        IaFile {
+            name: name.to_string(),
+            format: format.to_string(),
+            length: length.to_string(),
+            size: "1234567".to_string(),
+            track: "1".to_string(),
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            creator: String::new(),
+        }
+    }
+
+    #[test]
+    fn decodes_percent_and_spaced_percent_utf8_without_corrupting_normal_text() {
+        assert_eq!(
+            decode_ia_text("%D8%AA%D8%B3%D8%AC%D9%8A%D9%84%D9%8A #48"),
+            "تسجيلي #48"
+        );
+        assert_eq!(
+            decode_ia_text("% D 8% AA% D 8% B 3% D 8% AC% D 9% 8 A% D 9% 84% D 9% 8 A% 20% 2348"),
+            "تسجيلي #48"
+        );
+        assert_eq!(
+            decode_ia_text("%E3%83%8F%E3%83%AC%E3%81%AE%E6%97%A5%E3%81%AB"),
+            "ハレの日に"
+        );
+        assert_eq!(decode_ia_text("100% Pure & 50% 2024"), "100% Pure & 50% 2024");
+    }
+
+    #[test]
+    fn rejects_zero_duration_and_unlabelled_unknown_artist_uploads() {
+        let md = IaMetadata {
+            metadata: IaMetaInner {
+                title: "% D 8% AA% D 8% B 3% D 8% AC% D 9% 8 A% D 9% 84% D 9% 8 A% 20% 2348".into(),
+                creator: serde_json::Value::Null,
+                date: "2013-02-01".into(),
+                subject: serde_json::Value::Null,
+                collection: serde_json::json!(["audio"]),
+            },
+            files: vec![
+                sample_file("%D8%AA%D8%B3%D8%AC%D9%8A%D9%84%D9%8A #48.wav", "WAVE", ""),
+                sample_file("recording_with_length.wav", "WAVE", "120"),
+            ],
+        };
+        assert!(parse_item_tracks("D8AAD8B3D8ACD98AD984D98A202348_201302", &md).is_empty());
+    }
+
+    #[test]
+    fn accepts_valid_music_and_decodes_percent_encoded_metadata() {
+        let mut f = sample_file("%E3%83%8F%E3%83%AC%E3%81%AE%E6%97%A5%E3%81%AB.flac", "Flac", "245");
+        f.title = "%E3%83%8F%E3%83%AC%E3%81%AE%E6%97%A5%E3%81%AB".into();
+        let md = IaMetadata {
+            metadata: IaMetaInner {
+                title: "Live%20Session".into(),
+                creator: serde_json::json!("Reira%20Ushio"),
+                date: "2025-01-01".into(),
+                subject: serde_json::json!("indie"),
+                collection: serde_json::json!(["netlabels"]),
+            },
+            files: vec![f],
+        };
+        let tracks = parse_item_tracks("valid-music-item", &md);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "ハレの日に");
+        assert_eq!(tracks[0].album, "Live Session");
+        assert_eq!(tracks[0].artist, "Reira Ushio");
+        assert_eq!(tracks[0].duration, 245);
+    }
+
+    #[test]
+    fn rejects_community_audio_and_spokenword_collections() {
+        let mut f = sample_file("track.flac", "Flac", "180");
+        f.title = "Track".into();
+        let md = IaMetadata {
+            metadata: IaMetaInner {
+                title: "Album".into(),
+                creator: serde_json::json!("Someone"),
+                date: "2020".into(),
+                subject: serde_json::Value::Null,
+                collection: serde_json::json!(["community_audio"]),
+            },
+            files: vec![f],
+        };
+        assert!(parse_item_tracks("comm-1", &md).is_empty());
+    }
 }

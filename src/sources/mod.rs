@@ -1,17 +1,21 @@
 pub mod archive;
-pub mod bandcamp;
+pub mod deezer;
 pub mod local;
 pub mod soulseek;
-pub mod ytdlp;
+pub mod ytm;
 
 use crate::models::Track;
-use crate::store::Store;
 use async_trait::async_trait;
+use futures::future::join_all;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::warn;
+
+use archive::ArchiveSource;
+use deezer::DeezerSource;
+use local::LocalSource;
+use soulseek::SoulseekSource;
+use ytm::YtmSource;
 
 #[async_trait]
 pub trait MusicSource: Send + Sync {
@@ -24,143 +28,130 @@ pub trait MusicSource: Send + Sync {
     }
 }
 
+#[derive(Clone, Serialize)]
+pub struct SourceStatus {
+    pub name: String,
+    pub available: bool,
+    pub status: String,
+}
+
+#[derive(Clone)]
 pub struct SourceRegistry {
-    sources: Vec<Arc<dyn MusicSource>>,
-    store: Store,
+    pub deezer: DeezerSource,
+    pub ytm: YtmSource,
+    pub archive: ArchiveSource,
+    pub local: Arc<LocalSource>,
+    pub soulseek: Arc<SoulseekSource>,
 }
 
 impl SourceRegistry {
-    pub fn new(store: Store, sources: Vec<Arc<dyn MusicSource>>) -> Self {
-        Self { sources, store }
+    pub fn new(
+        deezer: DeezerSource,
+        ytm: YtmSource,
+        archive: ArchiveSource,
+        local: Arc<LocalSource>,
+        soulseek: Arc<SoulseekSource>,
+    ) -> Self {
+        Self {
+            deezer,
+            ytm,
+            archive,
+            local,
+            soulseek,
+        }
     }
 
-    pub fn all(&self) -> &[Arc<dyn MusicSource>] {
-        &self.sources
+    pub fn sources_info(&self) -> Vec<SourceStatus> {
+        let all: [&dyn MusicSource; 5] = [
+            &*self.local as &dyn MusicSource,
+            &self.deezer,
+            &self.ytm,
+            &self.archive,
+            &*self.soulseek,
+        ];
+        all.into_iter()
+            .map(|s| SourceStatus {
+                name: s.name().to_string(),
+                available: s.available(),
+                status: s.status(),
+            })
+            .collect()
     }
 
-    pub fn get(&self, name: &str) -> Option<Arc<dyn MusicSource>> {
-        self.sources.iter().find(|s| s.name() == name).cloned()
-    }
-
-    /// Searches all available sources in parallel with a soft deadline (5.5s).
-    /// Sources that finish later still feed into the SQLite catalog in the background.
-    /// Results are deduplicated by `song_key`, keeping the HIGHEST quality version!
-    pub async fn search_all(&self, query: &str, limit: usize) -> Vec<Track> {
-        self.search_all_inner(query, limit, true).await
-    }
-
-    /// Searches all available sources in parallel without automatically inserting
-    /// unverified results into SQLite.
-    pub async fn search_all_raw(&self, query: &str, limit: usize) -> Vec<Track> {
-        self.search_all_inner(query, limit, false).await
-    }
-
-    async fn search_all_inner(&self, query: &str, limit: usize, upsert: bool) -> Vec<Track> {
-        let query = query.trim().to_string();
-        if query.is_empty() || limit == 0 {
+    /// Queries all active sources concurrently and returns a deduplicated, quality-ranked list.
+    pub async fn search_all(&self, query: &str, per_source: usize) -> Vec<Track> {
+        let q = query.trim();
+        if q.is_empty() {
             return vec![];
         }
-
-        let avail: Vec<Arc<dyn MusicSource>> = self
-            .sources
-            .iter()
-            .filter(|s| s.available())
-            .cloned()
-            .collect();
-
-        if avail.is_empty() {
-            return vec![];
-        }
-
-        let (tx, mut rx) = mpsc::channel::<Vec<Track>>(avail.len());
-        let store_bg = self.store.clone();
-
-        for src in &avail {
-            let src = src.clone();
-            let q = query.clone();
-            let tx = tx.clone();
-            let store_clone = store_bg.clone();
-            tokio::spawn(async move {
-                let res = tokio::time::timeout(
-                    Duration::from_secs(25),
-                    src.search(&q, limit),
-                )
-                .await;
-                match res {
-                    Ok(tracks) => {
-                        if upsert && !tracks.is_empty() {
-                            store_clone.upsert_tracks(&tracks);
-                        }
-                        let _ = tx.send(tracks).await;
-                    }
-                    Err(_) => {
-                        warn!(source = src.name(), query = %q, "source search timed out");
-                        let _ = tx.send(vec![]).await;
-                    }
-                }
-            });
-        }
-        drop(tx);
-
-        let mut collected = Vec::new();
-        let deadline = tokio::time::sleep(Duration::from_millis(5500));
-        tokio::pin!(deadline);
-
-        loop {
-            tokio::select! {
-                maybe = rx.recv() => {
-                    match maybe {
-                        Some(batch) => collected.extend(batch),
-                        None => break,
-                    }
-                }
-                _ = &mut deadline => {
-                    if upsert {
-                        // Drain any remaining late results into the store in the background
-                        tokio::spawn(async move {
-                            while let Some(batch) = rx.recv().await {
-                                if !batch.is_empty() {
-                                    store_bg.upsert_tracks(&batch);
-                                }
-                            }
-                        });
-                    }
-                    break;
-                }
+        let sources: Vec<&dyn MusicSource> = {
+            let mut v: Vec<&dyn MusicSource> = vec![
+                &*self.local,
+                &self.deezer,
+                &self.ytm,
+                &self.archive,
+            ];
+            if self.soulseek.available() {
+                v.push(&*self.soulseek);
             }
-        }
+            v
+        };
 
-        dedup_and_rank_search(collected, &query, limit)
-    }
-
-    pub async fn resolve_stream(&self, source_name: &str, stream_ref: &str) -> Option<String> {
-        let src = self.get(source_name)?;
-        src.resolve_stream(stream_ref).await
+        let futs = sources.into_iter().map(|s| s.search(q, per_source));
+        let batches = join_all(futs).await;
+        let combined: Vec<Track> = batches
+            .into_iter()
+            .flatten()
+            .filter(|t| !t.stream_url.contains("/preview/"))
+            .collect();
+        dedup_and_rank_search(combined, q)
     }
 }
 
-/// Deduplicates tracks sharing the same `song_key()`, keeping the highest `quality_score()`,
-/// then ranks by query relevance + quality score.
-pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str, limit: usize) -> Vec<Track> {
+/// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality
+/// and clean metadata, while sorting by relevance + quality.
+pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
     let mut best_by_key: HashMap<String, Track> = HashMap::new();
     for t in tracks {
         let key = t.song_key();
-        match best_by_key.get(&key) {
-            Some(existing) if existing.quality_score() >= t.quality_score() => {}
-            _ => {
+        match best_by_key.remove(&key) {
+            Some(existing) => {
+                let (mut winner, loser) = if t.quality_score() > existing.quality_score() {
+                    (t, existing)
+                } else {
+                    (existing, t)
+                };
+                if winner.cover_url.is_empty() && !loser.cover_url.is_empty() {
+                    winner.cover_url = loser.cover_url;
+                }
+                if winner.genre.is_empty() && !loser.genre.is_empty() {
+                    winner.genre = loser.genre;
+                }
+                if winner.year == 0 && loser.year > 0 {
+                    winner.year = loser.year;
+                }
+                if winner.deezer_id.is_empty() && !loser.deezer_id.is_empty() {
+                    winner.deezer_id = loser.deezer_id;
+                }
+                if (winner.album.is_empty() || winner.album == winner.title) && !loser.album.is_empty() {
+                    winner.album = loser.album;
+                }
+                best_by_key.insert(key, winner);
+            }
+            None => {
                 best_by_key.insert(key, t);
             }
         }
     }
-    let mut out: Vec<Track> = best_by_key.into_values().collect();
-    let q = query.trim();
-    if q.is_empty() {
-        out.sort_by_key(|a| std::cmp::Reverse(a.quality_score()));
-    } else {
-        out.sort_by_key(|a| {
-            std::cmp::Reverse(crate::store::search_match_score(a, q) * 10000 + a.quality_score())
-        });
-    }
-    out.truncate(limit);
-    out
+
+    let mut ranked: Vec<(i32, Track)> = best_by_key
+        .into_values()
+        .map(|t| {
+            let s = crate::store::search_match_score(&t, query);
+            let rel = if s > 0 { s } else { t.quality_score() / 20 };
+            (rel, t)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.quality_score().cmp(&a.1.quality_score())));
+    ranked.into_iter().map(|(_, t)| t).collect()
 }

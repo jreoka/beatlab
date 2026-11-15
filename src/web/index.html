@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0d12" />
+  <title>Beatlab — Stream Everything</title>
+  <link rel="stylesheet" href="/web/styles.css" />
+</head>
+<body>
+  <!-- Sign In / Sign Up Screen -->
+  <div id="auth-screen" class="auth-screen hidden">
+    <div class="auth-backdrop"></div>
+    <div class="auth-card">
+      <div class="auth-brand">
+        <div class="brand-mark">
+          <svg viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="15" fill="url(#blgrad)"/><path d="M12 10.5v11l9-5.5-9-5.5z" fill="#08120c"/><defs><linearGradient id="blgrad" x1="0" y1="0" x2="32" y2="32"><stop stop-color="#1ed760"/><stop offset="1" stop-color="#0ea5e9"/></linearGradient></defs></svg>
+        </div>
+        <div>
+          <h1>Beatlab</h1>
+          <p class="auth-tag">Open Music Streaming & Personal Radio</p>
+        </div>
+      </div>
+
+      <p class="auth-desc">
+        Enter any username &amp; password to sign in or automatically create a brand-new account. Your account also works directly in <strong>Subsonic</strong> &amp; <strong>Navidrome</strong> apps.
+      </p>
+
+      <form id="auth-form" class="auth-form">
+        <label>
+          <span>Username</span>
+          <input id="auth-username" type="text" autocomplete="username" placeholder="e.g. alex" required maxlength="64" />
+        </label>
+        <label>
+          <span>Password</span>
+          <input id="auth-password" type="password" autocomplete="current-password" placeholder="Choose or enter password" required maxlength="256" />
+        </label>
+        <div id="auth-error" class="auth-error hidden"></div>
+        <button id="auth-submit" type="submit" class="btn-primary btn-full">Continue to Beatlab</button>
+      </form>
+
+      <div class="auth-clients-note">
+        Compatible clients: <span>Symfonium</span> · <span>Feishin</span> · <span>Supersonic</span> · <span>Tempo</span> · <span>DSub</span> · <span>Amperfy</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main App Shell -->
+  <div id="app-shell" class="app-shell hidden">
+    <!-- Left Navigation Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <div class="brand-row" onclick="App.navigate('home')">
+          <div class="brand-mark small">
+            <svg viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="15" fill="#1ed760"/><path d="M12 10.5v11l9-5.5-9-5.5z" fill="#08120c"/></svg>
+          </div>
+          <span class="brand-name">Beatlab</span>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-item active" data-route="home" onclick="App.navigate('home')">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.5 3.1a1 1 0 0 0-1 0L4 7.5A1 1 0 0 0 3.5 8.3V20a1 1 0 0 0 1 1h5v-6.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V21h5a1 1 0 0 0 1-1V8.3a1 1 0 0 0-.5-.8l-7.5-4.4z"/></svg>
+            <span>Home</span>
+          </button>
+          <button class="nav-item" data-route="explore" onclick="App.navigate('explore')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" fill="currentColor"/></svg>
+            <span>Explore</span>
+          </button>
+          <button class="nav-item" data-route="search" onclick="App.focusSearch()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <span>Search</span>
+          </button>
+          <button class="nav-item" data-route="library" onclick="App.navigate('library')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5V4.5m5 15V4.5m5 15L20 6"/></svg>
+            <span>Your Library</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="sidebar-library">
+        <div class="sidebar-section-head">
+          <span>PLAYLISTS &amp; MIXES</span>
+          <button class="icon-btn" title="Create playlist" onclick="App.promptCreatePlaylist()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M12 4.5v15M4.5 12h15"/></svg>
+          </button>
+        </div>
+
+        <div class="quick-lib-links">
+          <button class="lib-row" onclick="App.navigate('liked')">
+            <span class="lib-badge heart-bg">
+              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+            </span>
+            <span>Liked Songs</span>
+          </button>
+          <button class="lib-row" onclick="App.navigate('history')">
+            <span class="lib-badge history-bg">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
+            </span>
+            <span>Listening History</span>
+          </button>
+        </div>
+
+        <div id="sidebar-playlists" class="sidebar-playlists"></div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="connect-btn" onclick="App.openConnectModal()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
+          <span>Connect Apps &amp; API Key</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Center Workspace -->
+    <div class="main-column">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="circle-btn" title="Back" onclick="history.back()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 19 8.5 12l7-7"/></svg>
+          </button>
+          <button class="circle-btn" title="Forward" onclick="history.forward()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 19l7-7-7-7"/></svg>
+          </button>
+          <div class="search-box">
+            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="global-search" type="search" placeholder="Search songs, artists, albums, moods... (Press /)" autocomplete="off" />
+            <button id="clear-search-btn" class="icon-btn hidden" title="Clear search" onclick="App.clearSearch()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="topbar-right">
+          <button class="pill-btn" onclick="App.openEqModal()" title="10-Band Audio Equalizer">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M1 14h6m2-6h6m2 8h6"/></svg>
+            <span>EQ</span>
+          </button>
+          <div class="user-pill" onclick="App.openConnectModal()" title="Account &amp; Client Apps">
+            <span id="user-avatar" class="avatar-dot">B</span>
+            <span id="user-name">User</span>
+          </div>
+          <button class="text-btn" onclick="App.signOut()">Sign out</button>
+        </div>
+      </header>
+
+      <main id="main-view" class="main-view"></main>
+    </div>
+
+    <!-- Right Docked Panel (Queue & Synced Lyrics) -->
+    <aside id="right-panel" class="right-panel">
+      <div class="rp-tabs">
+        <button id="tab-queue" class="rp-tab active" onclick="App.setRightTab('queue')">Queue</button>
+        <button id="tab-lyrics" class="rp-tab" onclick="App.setRightTab('lyrics')">Lyrics</button>
+        <button class="icon-btn rp-close" title="Close panel" onclick="App.toggleRightPanel(false)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <div id="rp-queue-body" class="rp-body">
+        <div class="queue-controls">
+          <label class="toggle-row" title="Automatically play related songs when queue ends">
+            <span>Autoplay Radio</span>
+            <input id="autoplay-toggle" type="checkbox" checked onchange="App.toggleAutoplay(this.checked)" />
+          </label>
+          <button class="mini-btn" onclick="App.startRadioFromCurrent()">Track Radio</button>
+          <button class="mini-btn ghost" onclick="App.clearQueue()">Clear</button>
+        </div>
+        <div id="queue-now-playing" class="queue-section"></div>
+        <div id="queue-up-next" class="queue-section"></div>
+      </div>
+
+      <div id="rp-lyrics-body" class="rp-body hidden">
+        <div id="lyrics-container" class="lyrics-container">
+          <p class="muted-center">Play a song to view synced lyrics</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Mobile Bottom Navigation -->
+    <nav class="mobile-nav">
+      <button onclick="App.navigate('home')">Home</button>
+      <button onclick="App.navigate('explore')">Explore</button>
+      <button onclick="App.focusSearch()">Search</button>
+      <button onclick="App.navigate('library')">Library</button>
+    </nav>
+  </div>
+
+  <!-- Bottom Persistent Player Bar -->
+  <footer id="player-bar" class="player-bar hidden">
+    <div class="pb-left">
+      <img id="pb-cover" class="pb-cover" src="/api/web/cover/default" alt="Cover" onclick="event.stopPropagation();App.toggleFullscreen()" />
+      <div class="pb-meta">
+        <div id="pb-title" class="pb-title" onclick="event.stopPropagation();App.goCurrentAlbum()">Ready to play</div>
+        <div id="pb-artist" class="pb-artist" onclick="event.stopPropagation();App.goCurrentArtist()">Select any track</div>
+      </div>
+      <button id="pb-like" class="icon-btn" title="Like track (L)" onclick="App.toggleCurrentLike()">
+        <svg class="heart-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+      </button>
+      <span id="pb-quality" class="quality-badge hidden">AAC</span>
+    </div>
+
+    <div class="pb-center">
+      <div class="pb-transport">
+        <button id="btn-shuffle" class="icon-btn" title="Shuffle" onclick="App.toggleShuffle()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="3" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="3" y1="4" x2="9" y2="10"/></svg>
+        </button>
+        <button class="icon-btn" title="Previous track (Shift+Left)" onclick="App.prevTrack()">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 4.5h2.5v15H5zm4 7.5L19.5 4.5v15z"/></svg>
+        </button>
+        <button id="btn-play" class="play-main-btn" title="Play / Pause (Space)" onclick="App.togglePlay()">
+          <svg id="play-icon-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>
+        </button>
+        <button class="icon-btn" title="Next track (Shift+Right)" onclick="App.nextTrack(true)">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4.5 4.5 15 12 4.5 19.5zm12 0H19v15h-2.5z"/></svg>
+        </button>
+        <button id="btn-repeat" class="icon-btn" title="Repeat mode" onclick="App.cycleRepeat()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/></svg>
+        </button>
+      </div>
+      <div class="pb-progress-row">
+        <span id="pb-elapsed" class="time-lbl">0:00</span>
+        <input id="pb-seek" class="seek-slider" type="range" min="0" max="100" value="0" step="0.1" />
+        <span id="pb-duration" class="time-lbl">0:00</span>
+      </div>
+    </div>
+
+    <div class="pb-right">
+      <select id="quality-select" class="quality-select" title="Audio Quality" onchange="App.setQuality(this.value)">
+        <option value="high">Ultra / Orig</option>
+        <option value="medium">High (160k)</option>
+        <option value="low">Saver (96k)</option>
+      </select>
+      <button class="icon-btn" title="Lyrics" onclick="App.openPanelTab('lyrics')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M9 17.5V5l12-2v12.5"/><circle cx="6" cy="17.5" r="3"/><circle cx="18" cy="15.5" r="3"/></svg>
+      </button>
+      <button class="icon-btn" title="Queue" onclick="App.openPanelTab('queue')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="3.75" cy="5.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="3.75" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="3.75" cy="18.5" r="1.3" fill="currentColor" stroke="none"/><line x1="8.5" y1="5.5" x2="20.5" y2="5.5"/><line x1="8.5" y1="12" x2="20.5" y2="12"/><line x1="8.5" y1="18.5" x2="20.5" y2="18.5"/></svg>
+      </button>
+      <button class="icon-btn" title="Mute (M)" onclick="App.toggleMute()">
+        <svg id="vol-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/></svg>
+      </button>
+      <input id="pb-volume" class="vol-slider" type="range" min="0" max="1" step="0.01" value="0.9" />
+      <button id="btn-expand-player" class="icon-btn" title="Expand player" onclick="App.toggleFullscreen()">
+        <svg class="expand-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 15.5 7-7 7 7"/></svg>
+      </button>
+    </div>
+  </footer>
+
+  <!-- Expanded Slide-Up Now Playing Sheet -->
+  <div id="fullscreen-player" class="fs-player" aria-hidden="true">
+    <div id="fs-bg" class="fs-bg"></div>
+    <div class="fs-inner">
+      <div class="fs-topbar">
+        <span>NOW PLAYING ON BEATLAB</span>
+        <button class="circle-btn" title="Collapse player" onclick="App.toggleFullscreen(false)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8.5 7 7 7-7"/></svg>
+        </button>
+      </div>
+      <div class="fs-grid">
+        <div class="fs-art-col">
+          <img id="fs-cover" class="fs-cover" src="/api/web/cover/default" alt="Cover" />
+          <div class="fs-info">
+            <h2 id="fs-title" class="clickable" onclick="App.goCurrentAlbum()">Ready</h2>
+            <p id="fs-artist">Beatlab</p>
+          </div>
+          <canvas id="fs-visualizer" class="fs-visualizer" width="460" height="72"></canvas>
+        </div>
+        <div class="fs-panel-col">
+          <div class="fs-tabs">
+            <button id="fs-tab-queue" class="fs-tab active" onclick="App.setFsTab('queue')">Up Next</button>
+            <button id="fs-tab-lyrics" class="fs-tab" onclick="App.setFsTab('lyrics')">Lyrics</button>
+          </div>
+          <div id="fs-queue-panel" class="fs-panel-body">
+            <div class="queue-controls">
+              <label class="toggle-row" title="Automatically play related songs when queue ends">
+                <span>Autoplay Radio</span>
+                <input id="fs-autoplay-toggle" type="checkbox" checked onchange="App.toggleAutoplay(this.checked)" />
+              </label>
+              <div class="fs-queue-actions">
+                <button class="mini-btn" onclick="App.startRadioFromCurrent()">Track Radio</button>
+                <button class="mini-btn ghost" onclick="App.clearQueue()">Clear</button>
+              </div>
+            </div>
+            <div id="fs-queue-now-playing" class="queue-section"></div>
+            <div id="fs-queue-up-next" class="queue-section"></div>
+          </div>
+          <div id="fs-lyrics-panel" class="fs-panel-body hidden">
+            <div id="fs-lyrics-body" class="fs-lyrics-body">
+              <p class="muted-center">Play a song to view synced lyrics</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Generic Modal Container -->
+  <div id="modal-backdrop" class="modal-backdrop hidden" onclick="App.closeModal(event)">
+    <div id="modal-box" class="modal-box"></div>
+  </div>
+
+  <!-- Context Menu -->
+  <div id="context-menu" class="context-menu hidden"></div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast hidden"></div>
+
+  <audio id="audio-el" preload="auto"></audio>
+  <script src="/web/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1883 @@
+(() => {
+  'use strict';
+
+  const EQ_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+  const EQ_LABELS = ['32', '64', '125', '250', '500', '1k', '2k', '4k', '8k', '16k'];
+  const EQ_PRESETS = {
+    Flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    'Bass Boost': [6, 5, 4, 2, 0, 0, 0, 1, 2, 2],
+    Vocal: [-2, -1, 0, 2, 4, 5, 4, 2, 1, 0],
+    Electronic: [5, 4, 1, -2, -1, 1, 2, 4, 5, 4],
+    Rock: [4, 3, 1, -1, -2, 0, 2, 4, 5, 4],
+    'Late Night': [3, 2, 1, 0, 0, -1, -1, 0, 1, 2],
+  };
+
+  const audio = document.getElementById('audio-el');
+  let audioCtx = null;
+  let audioSource = null;
+  let eqFilters = [];
+  let analyser = null;
+  let rafVisualizer = null;
+
+  const ICONS = {
+    play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
+    heart: '<svg class="heart-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>',
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    arrowUp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
+    more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
+    nowPlaying: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="10" width="3" height="10" rx="1"/><rect x="10.5" y="4" width="3" height="16" rx="1"/><rect x="17" y="7" width="3" height="13" rx="1"/></svg>',
+    volOn: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>',
+    volMuted: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/>',
+    repeatAll: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/>',
+    repeatOne: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/><path d="M11 10.2 12.4 9.2V15"/>',
+  };
+
+  const state = {
+    token: localStorage.getItem('beatlab_token') || '',
+    user: null,
+    playlists: [],
+    trackMap: new Map(), // id -> track object for instant access
+    queue: [],
+    queueIndex: -1,
+    shuffle: false,
+    repeat: 'off', // off | all | one
+    autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
+    radioReqToken: 0,
+    radioLoading: false,
+    quality: localStorage.getItem('beatlab_quality') || 'high',
+    volume: parseFloat(localStorage.getItem('beatlab_vol') || '0.9'),
+    muted: false,
+    isPlaying: false,
+    seeking: false,
+    lastScrobbleCompleteId: '',
+    rightTab: 'queue',
+    fsTab: 'queue',
+    lyrics: { synced: false, plain: '', lines: [] },
+    activeLyricIdx: -1,
+    eqEnabled: localStorage.getItem('beatlab_eq_on') === 'true',
+    eqGains: JSON.parse(localStorage.getItem('beatlab_eq_gains') || '[0,0,0,0,0,0,0,0,0,0]'),
+    searchTimer: null,
+    libTab: 'playlists',
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  function esc(str) {
+    return String(str ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function fmtTime(sec) {
+    if (!Number.isFinite(sec) || sec < 0) return '0:00';
+    const s = Math.floor(sec);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${r < 10 ? '0' : ''}${r}`;
+  }
+
+  function fmtTotalDur(sec) {
+    if (!sec || sec <= 0) return '0 min';
+    const hrs = Math.floor(sec / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    return hrs > 0 ? `${hrs} hr ${mins} min` : `${mins} min`;
+  }
+
+  function showToast(msg) {
+    const el = $('toast');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.classList.add('hidden'), 2600);
+  }
+
+  async function api(path, opts = {}) {
+    const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    if (state.token) {
+      headers['Authorization'] = `Bearer ${state.token}`;
+    }
+    const resp = await fetch(path, { ...opts, headers });
+    if (resp.status === 401 && path !== '/api/web/auth/signin' && path !== '/api/web/auth/signup') {
+      showAuthScreen();
+      throw new Error('Unauthorized');
+    }
+    const text = await resp.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { error: text };
+    }
+    if (!resp.ok) {
+      throw new Error(data.error || `Request failed (${resp.status})`);
+    }
+    return data;
+  }
+
+  function cacheTracks(list) {
+    if (!Array.isArray(list)) return [];
+    for (const t of list) {
+      if (t && t.id) state.trackMap.set(t.id, t);
+    }
+    return list;
+  }
+
+  function currentTrack() {
+    if (state.queueIndex >= 0 && state.queueIndex < state.queue.length) {
+      return state.queue[state.queueIndex];
+    }
+    return null;
+  }
+
+  function greetingText() {
+    const h = new Date().getHours();
+    if (h < 12) return 'Good morning';
+    if (h < 18) return 'Good afternoon';
+    return 'Good evening';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Web Audio Equalizer & Visualizer
+  // ---------------------------------------------------------------------------
+  function ensureAudioGraph() {
+    if (audioCtx) {
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
+      }
+      return;
+    }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+      audioSource = audioCtx.createMediaElementSource(audio);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 128;
+
+      eqFilters = EQ_FREQS.map((freq, idx) => {
+        const f = audioCtx.createBiquadFilter();
+        f.type = idx === 0 ? 'lowshelf' : idx === EQ_FREQS.length - 1 ? 'highshelf' : 'peaking';
+        f.frequency.value = freq;
+        f.Q.value = 1.2;
+        f.gain.value = state.eqEnabled ? (state.eqGains[idx] || 0) : 0;
+        return f;
+      });
+
+      let node = audioSource;
+      for (const f of eqFilters) {
+        node.connect(f);
+        node = f;
+      }
+      node.connect(analyser);
+      analyser.connect(audioCtx.destination);
+    } catch (e) {
+      console.warn('WebAudio init skipped:', e);
+    }
+  }
+
+  function applyEqGains() {
+    localStorage.setItem('beatlab_eq_on', state.eqEnabled ? 'true' : 'false');
+    localStorage.setItem('beatlab_eq_gains', JSON.stringify(state.eqGains));
+    eqFilters.forEach((f, idx) => {
+      if (f) f.gain.value = state.eqEnabled ? (state.eqGains[idx] || 0) : 0;
+    });
+  }
+
+  function setExpandedPlayer(open) {
+    const fs = $('fullscreen-player');
+    if (!fs) return;
+    const next = typeof open === 'boolean' ? open : !fs.classList.contains('open');
+    fs.classList.toggle('open', next);
+    fs.setAttribute('aria-hidden', next ? 'false' : 'true');
+    const btn = $('btn-expand-player');
+    if (btn) {
+      btn.classList.toggle('active', next);
+      btn.title = next ? 'Collapse player' : 'Expand player';
+    }
+    if (next && !rafVisualizer) {
+      ensureAudioGraph();
+      drawVisualizer();
+    }
+  }
+
+  function updateVolumeIcon() {
+    const icon = $('vol-icon');
+    if (!icon) return;
+    icon.innerHTML = state.muted || state.volume === 0 ? ICONS.volMuted : ICONS.volOn;
+  }
+
+  function drawVisualizer() {
+    const fs = $('fullscreen-player');
+    if (!fs.classList.contains('open')) {
+      rafVisualizer = null;
+      return;
+    }
+    const canvas = $('fs-visualizer');
+    if (canvas && analyser) {
+      const ctx = canvas.getContext('2d');
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(data);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const bars = 40;
+      const bw = canvas.width / bars;
+      for (let i = 0; i < bars; i++) {
+        const val = data[i] / 255;
+        const h = Math.max(4, val * canvas.height);
+        const x = i * bw + 2;
+        const y = canvas.height - h;
+        const grad = ctx.createLinearGradient(0, y, 0, canvas.height);
+        grad.addColorStop(0, '#38bdf8');
+        grad.addColorStop(1, '#1ed760');
+        ctx.fillStyle = grad;
+        ctx.fillRect(x, y, Math.max(3, bw - 4), h);
+      }
+    }
+    rafVisualizer = requestAnimationFrame(drawVisualizer);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Authentication & Session Bootstrap
+  // ---------------------------------------------------------------------------
+  function showAuthScreen() {
+    setExpandedPlayer(false);
+    $('auth-screen').classList.remove('hidden');
+    $('app-shell').classList.add('hidden');
+    $('player-bar').classList.add('hidden');
+  }
+
+  function showAppShell() {
+    $('auth-screen').classList.add('hidden');
+    $('app-shell').classList.remove('hidden');
+    $('player-bar').classList.remove('hidden');
+  }
+
+  function wirePlayerBarToggle() {
+    const bar = $('player-bar');
+    if (!bar) return;
+    let pointerDownIgnored = false;
+    const interactiveSel = 'button, a, input, select, option, label, .pb-title, .pb-artist, .pb-progress-row';
+    bar.addEventListener('pointerdown', (e) => {
+      pointerDownIgnored = !!e.target.closest(interactiveSel);
+    });
+    bar.addEventListener('click', (e) => {
+      const ignored = pointerDownIgnored || !!e.target.closest(interactiveSel);
+      pointerDownIgnored = false;
+      if (ignored) return;
+      setExpandedPlayer();
+    });
+  }
+
+  async function init() {
+    audio.volume = state.volume;
+    $('pb-volume').value = String(state.volume);
+    updateVolumeIcon();
+    $('quality-select').value = state.quality;
+    $('autoplay-toggle').checked = state.autoplay;
+    $('fs-autoplay-toggle').checked = state.autoplay;
+    wirePlayerBarToggle();
+
+    $('auth-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const errBox = $('auth-error');
+      errBox.classList.add('hidden');
+      const username = $('auth-username').value.trim();
+      const password = $('auth-password').value;
+      try {
+        const res = await api('/api/web/auth/signin', {
+          method: 'POST',
+          body: JSON.stringify({ username, password }),
+        });
+        state.token = res.token;
+        state.user = res.user;
+        localStorage.setItem('beatlab_token', res.token);
+        showToast(res.created ? `Welcome, ${res.user.username}! Account created.` : `Welcome back, ${res.user.username}`);
+        await onSignedIn();
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('hidden');
+      }
+    });
+
+    $('global-search').addEventListener('input', (e) => {
+      const val = e.target.value;
+      $('clear-search-btn').classList.toggle('hidden', !val);
+      clearTimeout(state.searchTimer);
+      state.searchTimer = setTimeout(() => {
+        if (val.trim()) {
+          navigate(`search?q=${encodeURIComponent(val.trim())}`);
+        }
+      }, 320);
+    });
+
+    $('global-search').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        clearTimeout(state.searchTimer);
+        const val = e.target.value.trim();
+        if (val) navigate(`search?q=${encodeURIComponent(val)}`);
+      }
+    });
+
+    wireAudioEvents();
+    wireKeyboardShortcuts();
+    window.addEventListener('hashchange', renderCurrentHash);
+
+    if (state.token) {
+      try {
+        const res = await api('/api/web/me');
+        if (res.user) {
+          state.user = res.user;
+          await onSignedIn();
+          return;
+        }
+      } catch {
+        // fall through to auth screen
+      }
+    }
+    showAuthScreen();
+  }
+
+  async function onSignedIn() {
+    showAppShell();
+    $('user-name').textContent = state.user.username;
+    $('user-avatar').textContent = (state.user.username[0] || 'B').toUpperCase();
+    await Promise.all([refreshSidebarPlaylists(), restoreServerQueue()]);
+    renderCurrentHash();
+  }
+
+  async function refreshSidebarPlaylists() {
+    try {
+      const lib = await api('/api/web/library');
+      state.playlists = lib.playlists || [];
+      const box = $('sidebar-playlists');
+      box.innerHTML = state.playlists
+        .map(
+          (p) => `
+          <button class="pl-link" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
+            <span class="pl-link-name">${esc(p.name)}</span>
+            ${p.isAuto ? '<span class="pl-auto-pill">Mix</span>' : ''}
+          </button>`
+        )
+        .join('');
+    } catch {
+      // ignore background error
+    }
+  }
+
+  async function restoreServerQueue() {
+    try {
+      const q = await api('/api/web/queue');
+      if (q.tracks && q.tracks.length > 0) {
+        state.queue = cacheTracks(q.tracks);
+        state.queueIndex = Math.min(q.currentIndex || 0, state.queue.length - 1);
+        const cur = currentTrack();
+        updateNowPlayingUI(cur, false);
+        renderQueuePanel();
+        if (cur) loadLyricsForTrack(cur.id);
+      }
+    } catch {
+      // optional
+    }
+  }
+
+  function saveServerQueue() {
+    if (!state.token) return;
+    const cur = currentTrack();
+    api('/api/web/queue', {
+      method: 'PUT',
+      body: JSON.stringify({
+        currentId: cur ? cur.id : '',
+        currentIndex: Math.max(0, state.queueIndex),
+        positionMs: Math.floor((audio.currentTime || 0) * 1000),
+        trackIds: state.queue.map((t) => t.id),
+      }),
+    }).catch(() => {});
+  }
+
+  // ---------------------------------------------------------------------------
+  // Routing & Views
+  // ---------------------------------------------------------------------------
+  function navigate(route) {
+    setExpandedPlayer(false);
+    const clean = route.replace(/^#/, '');
+    if (location.hash.replace(/^#/, '') === clean) {
+      renderCurrentHash();
+    } else {
+      location.hash = `#${clean}`;
+    }
+  }
+
+  function renderCurrentHash() {
+    if (!state.user) return;
+    const hash = location.hash.replace(/^#/, '') || 'home';
+    document.querySelectorAll('.nav-item').forEach((el) => {
+      const r = el.dataset.route;
+      el.classList.toggle('active', hash === r || hash.startsWith(`${r}?`));
+    });
+
+    if (hash === 'home') return renderHome();
+    if (hash === 'explore') return renderExplore();
+    if (hash.startsWith('search')) {
+      const q = new URLSearchParams(hash.split('?')[1] || '').get('q') || '';
+      if ($('global-search').value !== q) {
+        $('global-search').value = q;
+        $('clear-search-btn').classList.toggle('hidden', !q);
+      }
+      return renderSearch(q);
+    }
+    if (hash.startsWith('album/')) return renderAlbum(decodeURIComponent(hash.slice(6)));
+    if (hash.startsWith('artist/')) return renderArtist(decodeURIComponent(hash.slice(7)));
+    if (hash.startsWith('playlist/')) return renderPlaylist(decodeURIComponent(hash.slice(9)));
+    if (hash.startsWith('mood/')) return renderMood(decodeURIComponent(hash.slice(5)));
+    if (hash.startsWith('genre/')) return renderGenre(decodeURIComponent(hash.slice(6)));
+    if (hash === 'library') return renderLibrary(state.libTab);
+    if (hash === 'liked') return renderLibrary('liked');
+    if (hash === 'history') return renderLibrary('history');
+    return renderHome();
+  }
+
+  function setMainLoading(label = 'Loading...') {
+    $('main-view').innerHTML = `<p class="muted-center">${esc(label)}</p>`;
+  }
+
+  async function renderHome() {
+    setMainLoading('Curating your feed...');
+    try {
+      const d = await api('/api/web/home');
+      const quickPicks = cacheTracks(d.quickPicks || []).slice(0, 6);
+      const trending = cacheTracks(d.trending || []);
+      const recent = cacheTracks(d.recent || []);
+      const mixes = d.madeForYou || [];
+      const albums = d.albums || [];
+      const artists = d.artists || [];
+      const moods = d.moods || [];
+
+      let html = `<h1 class="page-greeting">${greetingText()}, ${esc(state.user.username)}</h1>`;
+
+      if (quickPicks.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Quick Picks</h2></div>
+          <div class="quick-picks-grid">${quickPicks.map(renderQuickTile).join('')}</div>
+        </section>`;
+      }
+
+      if (mixes.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Made For You</h2></div>
+          <div class="card-grid">${mixes.map(renderPlaylistCard).join('')}</div>
+        </section>`;
+      }
+
+      if (recent.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Recently Played</h2></div>
+          <div class="card-grid">${recent.slice(0, 8).map(renderTrackCard).join('')}</div>
+        </section>`;
+      }
+
+      if (moods.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Moods &amp; Vibes</h2><button class="text-btn" onclick="App.navigate('explore')">See all</button></div>
+          <div class="mood-grid">${moods.slice(0, 5).map(renderMoodTile).join('')}</div>
+        </section>`;
+      }
+
+      if (trending.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Trending Now</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(trending.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="track-table">${renderTrackRows(trending.slice(0, 12))}</div>
+        </section>`;
+      }
+
+      if (albums.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Popular Albums</h2></div>
+          <div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>
+        </section>`;
+      }
+
+      if (artists.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Top Artists</h2></div>
+          <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
+        </section>`;
+      }
+
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderExplore() {
+    setMainLoading('Exploring charts & genres...');
+    try {
+      const d = await api('/api/web/explore');
+      const charts = cacheTracks(d.charts || []);
+      let html = `<h1 class="page-greeting">Explore</h1>`;
+      html += `<section class="section">
+        <div class="section-head"><h2>Moods &amp; Moments</h2></div>
+        <div class="mood-grid">${(d.moods || []).map(renderMoodTile).join('')}</div>
+      </section>`;
+      if ((d.genres || []).length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Genres</h2></div>
+          <div class="card-grid">${d.genres.slice(0, 18).map((g) => `
+            <div class="media-card" onclick="App.navigate('genre/${encodeURIComponent(g.name)}')">
+              <div class="card-art-wrap"><img src="${esc(g.coverUrl)}" loading="lazy" alt="${esc(g.name)}" /></div>
+              <div class="card-title">${esc(g.name)}</div>
+              <div class="card-sub">Genre Mix</div>
+            </div>`).join('')}</div>
+        </section>`;
+      }
+      if ((d.newAlbums || []).length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Chart Albums</h2></div>
+          <div class="card-grid">${d.newAlbums.map(renderAlbumCard).join('')}</div>
+        </section>`;
+      }
+      if (charts.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Top 30 Charts</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(charts.map((t) => t.id)))}, 0)">Play Charts</button></div>
+          <div class="track-table">${renderTrackRows(charts)}</div>
+        </section>`;
+      }
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderSearch(query) {
+    if (!query) {
+      return renderExplore();
+    }
+    setMainLoading(`Searching for "${query}" across all sources...`);
+    try {
+      const d = await api(`/api/web/search?q=${encodeURIComponent(query)}`);
+      const tracks = cacheTracks(d.tracks || []);
+      const albums = d.albums || [];
+      const artists = d.artists || [];
+
+      if (!tracks.length && !albums.length && !artists.length) {
+        $('main-view').innerHTML = `<p class="muted-center">No matches found for "${esc(query)}".</p>`;
+        return;
+      }
+
+      const topTrack = tracks[0];
+      let html = `<div class="search-hero-row">`;
+      if (topTrack) {
+        html += `<section>
+          <div class="section-head"><h2>Top Result</h2></div>
+          <div class="top-result-card" onclick="App.playSingle(${esc(JSON.stringify(topTrack.id))})">
+            <img src="${esc(topTrack.coverUrl)}" alt="" />
+            <div class="top-result-title">${esc(topTrack.title)}</div>
+            <div class="card-sub">${esc(topTrack.artist)} · ${esc(topTrack.album)}</div>
+            <span class="top-result-type">SONG · ${esc(topTrack.qualityBadge)}</span>
+            <button class="card-play-fab" style="opacity:1;transform:none;" onclick="event.stopPropagation();App.playSingle(${esc(JSON.stringify(topTrack.id))})">${ICONS.play}</button>
+          </div>
+        </section>`;
+      } else {
+        html += `<div></div>`;
+      }
+
+      html += `<section>
+        <div class="section-head"><h2>Songs</h2>${tracks.length ? `<button class="mini-btn" onclick="App.startRadioForId(${esc(JSON.stringify(tracks[0].id))})">Start Radio</button>` : ''}</div>
+        <div class="track-table">${renderTrackRows(tracks.slice(0, 8), null, null, true)}</div>
+      </section></div>`;
+
+      if (artists.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Artists</h2></div>
+          <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
+        </section>`;
+      }
+      if (albums.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Albums</h2></div>
+          <div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>
+        </section>`;
+      }
+      if (tracks.length > 8) {
+        html += `<section class="section">
+          <div class="section-head"><h2>More Tracks</h2></div>
+          <div class="track-table">${renderTrackRows(tracks.slice(8), null, null, true)}</div>
+        </section>`;
+      }
+
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderAlbum(id) {
+    setMainLoading('Loading album & tracklist...');
+    try {
+      const d = await api(`/api/web/album/${encodeURIComponent(id)}`);
+      const alb = d.album;
+      const tracks = cacheTracks(d.tracks || []);
+      const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+
+      let html = `<div class="hero-header">
+        <img class="hero-art" src="${esc(alb.coverUrl)}" alt="${esc(alb.name)}" />
+        <div class="hero-info">
+          <div class="hero-kicker">ALBUM</div>
+          <h1 class="hero-title">${esc(alb.name)}</h1>
+          <div class="hero-sub">
+            <a href="#artist/${encodeURIComponent(alb.artistId)}"><strong>${esc(alb.artist)}</strong></a>
+            ${alb.year ? ` · ${alb.year}` : ''}
+            ${alb.genre ? ` · ${esc(alb.genre)}` : ''}
+            · ${tracks.length} songs · ${fmtTotalDur(alb.duration)}
+            ${alb.label ? `<br><span style="opacity:.75">${esc(alb.label)}</span>` : ''}
+          </div>
+          <div class="hero-actions">
+            <button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>
+            <button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>
+            <button id="save-alb-btn" class="btn-secondary ${alb.isSaved ? 'active' : ''}" onclick="App.toggleSaveAlbum(${esc(JSON.stringify(alb.id))}, ${!alb.isSaved})">${ICONS.heart} ${alb.isSaved ? 'Saved' : 'Save Album'}</button>
+          </div>
+        </div>
+      </div>`;
+
+      // Group multi-disc albums cleanly
+      const discs = [...new Set(tracks.map((t) => t.discNo || 1))].sort((a, b) => a - b);
+      html += `<div class="track-table">`;
+      if (discs.length > 1) {
+        for (const dn of discs) {
+          html += `<div class="disc-divider">Disc ${dn}</div>`;
+          html += renderTrackRows(tracks.filter((t) => (t.discNo || 1) === dn), tracks);
+        }
+      } else {
+        html += renderTrackRows(tracks);
+      }
+      html += `</div>`;
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderArtist(id) {
+    setMainLoading('Loading artist profile...');
+    try {
+      const d = await api(`/api/web/artist/${encodeURIComponent(id)}`);
+      const art = d.artist;
+      const top = cacheTracks(d.topTracks || []);
+      const albums = d.albums || [];
+      const related = d.related || [];
+      const idsJson = esc(JSON.stringify(top.map((t) => t.id)));
+
+      let html = `<div class="hero-header">
+        <img class="hero-art round" src="${esc(art.coverUrl)}" alt="${esc(art.name)}" />
+        <div class="hero-info">
+          <div class="hero-kicker">ARTIST</div>
+          <h1 class="hero-title">${esc(art.name)}</h1>
+          <div class="hero-sub">${art.bio ? esc(art.bio) : `${albums.length} albums · ${top.length} popular tracks`}</div>
+          <div class="hero-actions">
+            ${top.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Top Tracks</button>` : ''}
+            ${top[0] ? `<button class="btn-secondary" onclick="App.startRadioForId(${esc(JSON.stringify(top[0].id))})">Artist Radio</button>` : ''}
+            <button class="btn-secondary ${art.isFollowed ? 'active' : ''}" onclick="App.toggleFollowArtist(${esc(JSON.stringify(art.id))}, ${!art.isFollowed})">${art.isFollowed ? '✓ Following' : '+ Follow'}</button>
+          </div>
+        </div>
+      </div>`;
+
+      if (top.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Popular</h2></div>
+          <div class="track-table">${renderTrackRows(top.slice(0, 10), top)}</div>
+        </section>`;
+      }
+      if (albums.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Discography</h2></div>
+          <div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>
+        </section>`;
+      }
+      if (related.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Fans Also Like</h2></div>
+          <div class="card-grid">${related.map(renderArtistCard).join('')}</div>
+        </section>`;
+      }
+
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderPlaylist(id) {
+    setMainLoading('Loading playlist...');
+    try {
+      const d = await api(`/api/web/playlist/${encodeURIComponent(id)}`);
+      const pl = d.playlist;
+      const tracks = cacheTracks(d.tracks || []);
+      const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+
+      let html = `<div class="hero-header">
+        <img class="hero-art" src="${esc(pl.coverUrl)}" alt="${esc(pl.name)}" />
+        <div class="hero-info">
+          <div class="hero-kicker">${pl.isAuto ? 'MADE FOR YOU' : 'PLAYLIST'}</div>
+          <h1 class="hero-title">${esc(pl.name)}</h1>
+          <div class="hero-sub">By <strong>${esc(pl.ownerName)}</strong>${pl.comment ? ` · ${esc(pl.comment)}` : ''} · ${tracks.length} songs · ${fmtTotalDur(pl.duration)}</div>
+          <div class="hero-actions">
+            ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>` : ''}
+            ${tracks.length > 1 ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
+            ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" onclick="App.promptRenamePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))})">Rename</button>` : ''}
+            ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" style="color:#fda4af" onclick="App.deletePlaylist(${esc(JSON.stringify(pl.id))})">Delete</button>` : ''}
+          </div>
+        </div>
+      </div>`;
+
+      html += tracks.length
+        ? `<div class="track-table">${renderTrackRows(tracks, tracks, d.isOwner && !pl.isAuto ? pl.id : null)}</div>`
+        : `<p class="muted-center">This playlist is empty. Click "..." on any song to add tracks here.</p>`;
+
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderMood(slug) {
+    setMainLoading('Building mood mix...');
+    try {
+      const d = await api(`/api/web/mood/${encodeURIComponent(slug)}`);
+      const m = d.mood;
+      const tracks = cacheTracks(d.tracks || []);
+      const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+      let html = `<div class="hero-header" style="background:linear-gradient(135deg, ${m.c1}aa, ${m.c2}dd);">
+        <div class="hero-info">
+          <div class="hero-kicker" style="color:#fff">MOOD MIX</div>
+          <h1 class="hero-title">${esc(m.label)}</h1>
+          <div class="hero-sub" style="color:rgba(255,255,255,0.88)">${esc(m.subtitle)} · ${tracks.length} tracks</div>
+          <div class="hero-actions">
+            <button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Mix</button>
+            <button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>
+          </div>
+        </div>
+      </div>
+      <div class="track-table">${renderTrackRows(tracks)}</div>`;
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderGenre(name) {
+    setMainLoading(`Loading ${name}...`);
+    try {
+      const d = await api(`/api/web/genre/${encodeURIComponent(name)}`);
+      const tracks = cacheTracks(d.tracks || []);
+      const artists = d.artists || [];
+      const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+      let html = `<div class="hero-header">
+        <div class="hero-info">
+          <div class="hero-kicker">GENRE</div>
+          <h1 class="hero-title">${esc(d.genre)}</h1>
+          <div class="hero-sub">${tracks.length} tracks ready to stream</div>
+          <div class="hero-actions">
+            ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play ${esc(d.genre)}</button>` : ''}
+          </div>
+        </div>
+      </div>`;
+      if (artists.length) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Featured Artists</h2></div>
+          <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
+        </section>`;
+      }
+      html += `<section class="section">
+        <div class="section-head"><h2>Tracks</h2></div>
+        <div class="track-table">${renderTrackRows(tracks)}</div>
+      </section>`;
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  async function renderLibrary(tab = 'playlists') {
+    state.libTab = tab;
+    setMainLoading('Loading your library...');
+    try {
+      const lib = await api('/api/web/library');
+      state.playlists = lib.playlists || [];
+      const liked = cacheTracks(lib.likedTracks || []);
+      const recent = cacheTracks(lib.recentTracks || []);
+      const frequent = cacheTracks(lib.frequentTracks || []);
+      const albums = lib.savedAlbums || [];
+      const artists = lib.followedArtists || [];
+
+      const tabs = [
+        ['playlists', `Playlists (${state.playlists.length})`],
+        ['liked', `Liked Songs (${liked.length})`],
+        ['albums', `Albums (${albums.length})`],
+        ['artists', `Artists (${artists.length})`],
+        ['history', `History (${recent.length})`],
+        ['frequent', `Most Played`],
+      ];
+
+      let html = `<div class="section-head"><h1>Your Library</h1><button class="btn-primary" onclick="App.promptCreatePlaylist()">+ New Playlist</button></div>`;
+      html += `<div class="tabs-bar">${tabs
+        .map(
+          ([k, lbl]) =>
+            `<button class="tab-chip ${tab === k ? 'active' : ''}" onclick="App.setLibTab('${k}')">${esc(lbl)}</button>`
+        )
+        .join('')}</div>`;
+
+      if (tab === 'playlists') {
+        html += `<div class="card-grid">${state.playlists.map(renderPlaylistCard).join('')}</div>`;
+      } else if (tab === 'liked') {
+        html += liked.length
+          ? `<div style="margin-bottom:14px"><button class="btn-primary" onclick="App.playListByIds(${esc(JSON.stringify(liked.map((t) => t.id)))}, 0)">${ICONS.play} Play Liked Songs</button></div><div class="track-table">${renderTrackRows(liked)}</div>`
+          : `<p class="muted-center">No liked songs yet. Tap the heart icon on any track!</p>`;
+      } else if (tab === 'albums') {
+        html += albums.length
+          ? `<div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>`
+          : `<p class="muted-center">No saved albums yet.</p>`;
+      } else if (tab === 'artists') {
+        html += artists.length
+          ? `<div class="card-grid">${artists.map(renderArtistCard).join('')}</div>`
+          : `<p class="muted-center">Not following any artists yet.</p>`;
+      } else if (tab === 'history') {
+        html += recent.length
+          ? `<div class="track-table">${renderTrackRows(recent, null, null, true)}</div>`
+          : `<p class="muted-center">Your listening history will appear here.</p>`;
+      } else if (tab === 'frequent') {
+        html += frequent.length
+          ? `<div class="track-table">${renderTrackRows(frequent, null, null, true)}</div>`
+          : `<p class="muted-center">Play tracks to see your most-spun favorites.</p>`;
+      }
+
+      $('main-view').innerHTML = html;
+    } catch (e) {
+      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reusable UI Renderers
+  // ---------------------------------------------------------------------------
+  function renderQuickTile(t) {
+    return `<div class="qp-tile" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
+      <img src="${esc(t.coverUrl)}" loading="lazy" alt="" />
+      <div class="qp-info">
+        <div class="qp-title">${esc(t.title)}</div>
+        <div class="qp-sub">${esc(t.artist)}</div>
+      </div>
+      <div class="qp-play">${ICONS.play}</div>
+    </div>`;
+  }
+
+  function renderTrackCard(t) {
+    return `<div class="media-card" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
+      <div class="card-art-wrap">
+        <img src="${esc(t.coverUrl)}" loading="lazy" alt="" />
+        <button class="card-play-fab">${ICONS.play}</button>
+      </div>
+      <div class="card-title">${esc(t.title)}</div>
+      <div class="card-sub">${esc(t.artist)}</div>
+    </div>`;
+  }
+
+  function renderAlbumCard(a) {
+    return `<div class="media-card" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
+      <div class="card-art-wrap">
+        <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
+        <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
+      </div>
+      <div class="card-title">${esc(a.name)}</div>
+      <div class="card-sub">${esc(a.artist)}${a.year ? ` · ${a.year}` : ''}</div>
+    </div>`;
+  }
+
+  function renderArtistCard(a) {
+    return `<div class="media-card" onclick="App.navigate('artist/${encodeURIComponent(a.id)}')">
+      <div class="card-art-wrap round">
+        <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
+      </div>
+      <div class="card-title" style="text-align:center">${esc(a.name)}</div>
+      <div class="card-sub" style="text-align:center">Artist</div>
+    </div>`;
+  }
+
+  function renderPlaylistCard(p) {
+    return `<div class="media-card" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
+      <div class="card-art-wrap">
+        <img src="${esc(p.coverUrl)}" loading="lazy" alt="" />
+        <button class="card-play-fab" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(p.id))})">${ICONS.play}</button>
+      </div>
+      <div class="card-title">${esc(p.name)}</div>
+      <div class="card-sub">${p.trackCount} tracks · ${esc(p.ownerName)}</div>
+    </div>`;
+  }
+
+  function renderMoodTile(m) {
+    return `<div class="mood-tile" style="background:linear-gradient(135deg, ${m.c1}, ${m.c2})" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">
+      <h3>${esc(m.label)}</h3>
+      <p>${esc(m.subtitle)}</p>
+    </div>`;
+  }
+
+  function renderTrackRows(tracks, fullContext = null, editablePlaylistId = null, singleRadio = false) {
+    const queueList = fullContext || tracks;
+    const idsJson = singleRadio ? '' : esc(JSON.stringify(queueList.map((t) => t.id)));
+    const cur = currentTrack();
+
+    return tracks
+      .map((t, i) => {
+        const ctxIdx = queueList.findIndex((x) => x.id === t.id);
+        const isCur = cur && cur.id === t.id;
+        const playClick = singleRadio
+          ? `App.playSingle(${esc(JSON.stringify(t.id))})`
+          : `App.playListByIds(${idsJson}, ${Math.max(0, ctxIdx)})`;
+        return `<div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
+          <div class="tr-idx" onclick="${playClick}">${isCur ? ICONS.nowPlaying : t.trackNo > 0 && fullContext ? t.trackNo : i + 1}</div>
+          <div class="tr-main" onclick="${playClick}">
+            <img class="tr-thumb" src="${esc(t.coverUrl)}" loading="lazy" alt="" />
+            <div class="tr-text">
+              <div class="tr-title">${esc(t.title)}</div>
+              <div class="tr-sub">
+                <span class="clickable" onclick="event.stopPropagation();App.navigate('artist/${encodeURIComponent(t.artistId)}')">${esc(t.artist)}</span>
+                ${t.album ? ` · <span class="clickable" onclick="event.stopPropagation();App.navigate('album/${encodeURIComponent(t.albumId)}')">${esc(t.album)}</span>` : ''}
+              </div>
+            </div>
+          </div>
+          <span class="quality-badge ${t.isLossless ? 'lossless' : ''}">${esc(t.qualityBadge)}</span>
+          <div class="tr-dur">${fmtTime(t.duration)}</div>
+          <div class="tr-actions">
+            <button class="icon-btn tr-like-btn ${t.isStarred ? 'active' : ''}" title="Like" onclick="App.toggleTrackLike(${esc(JSON.stringify(t.id))}, this)">
+              ${ICONS.heart}
+            </button>
+            ${
+              editablePlaylistId
+                ? `<button class="icon-btn" title="Move Up" onclick="App.movePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${i}, ${Math.max(0, i - 1)})">${ICONS.arrowUp}</button>
+                   <button class="icon-btn" title="Remove" onclick="App.removePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${i})">${ICONS.close}</button>`
+                : ''
+            }
+            <button class="icon-btn" title="More options" onclick="App.openTrackMenu(event, ${esc(JSON.stringify(t.id))})">${ICONS.more}</button>
+          </div>
+        </div>`;
+      })
+      .join('');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Playback, Queue & Autoplay Engine
+  // ---------------------------------------------------------------------------
+  function buildStreamUrl(trackId) {
+    return `/api/web/stream/${encodeURIComponent(trackId)}?token=${encodeURIComponent(state.token)}&quality=${encodeURIComponent(state.quality)}`;
+  }
+
+  async function playQueueAt(index) {
+    if (index < 0 || index >= state.queue.length) return;
+    state.queueIndex = index;
+    const track = state.queue[index];
+    state.lastScrobbleCompleteId = '';
+
+    ensureAudioGraph();
+    audio.src = buildStreamUrl(track.id);
+    audio.play().catch((e) => {
+      console.warn('Playback prevented or error:', e);
+    });
+
+    updateNowPlayingUI(track, true);
+    renderQueuePanel();
+    saveServerQueue();
+    loadLyricsForTrack(track.id);
+
+    api('/api/web/event', {
+      method: 'POST',
+      body: JSON.stringify({ trackId: track.id, kind: 'play', value: 1 }),
+    }).catch(() => {});
+
+    // Pre-warm next track so transitions feel instant!
+    const next = state.queue[index + 1];
+    if (next) {
+      api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
+    }
+
+    // Highlight playing track in current view if visible
+    document.querySelectorAll('.track-row').forEach((row) => {
+      row.classList.toggle('playing', row.dataset.tid === track.id);
+    });
+  }
+
+  function updateNowPlayingUI(track, active) {
+    if (!track) return;
+    $('pb-cover').src = track.coverUrl;
+    $('pb-title').textContent = track.title;
+    $('pb-artist').textContent = track.artist;
+    $('pb-like').classList.toggle('active', !!track.isStarred);
+    $('pb-quality').textContent = track.qualityBadge;
+    $('pb-quality').classList.remove('hidden');
+    $('pb-quality').classList.toggle('lossless', !!track.isLossless);
+    $('pb-duration').textContent = fmtTime(track.duration);
+
+    $('fs-cover').src = track.coverUrl;
+    $('fs-title').textContent = track.title;
+    $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(track.artist)}</span>${track.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(track.album)}</span>` : ''}`;
+    $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
+
+    document.title = `${track.title} · ${track.artist} — Beatlab`;
+    updatePlayButton(active);
+
+    if ('mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: track.title,
+          artist: track.artist,
+          album: track.album,
+          artwork: [{ src: `${location.origin}${track.coverUrl}`, sizes: '512x512', type: 'image/jpeg' }],
+        });
+        navigator.mediaSession.setActionHandler('play', () => togglePlay());
+        navigator.mediaSession.setActionHandler('pause', () => togglePlay());
+        navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
+        navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(true));
+        navigator.mediaSession.setActionHandler('seekto', (details) => {
+          if (details.seekTime != null && Number.isFinite(audio.duration)) {
+            audio.currentTime = details.seekTime;
+          }
+        });
+      } catch {
+        // unsupported in some browsers
+      }
+    }
+  }
+
+  function updatePlayButton(playing) {
+    state.isPlaying = playing;
+    $('play-icon-svg').innerHTML = playing
+      ? '<path d="M6.5 4.5h4v15h-4zm7 0h4v15h-4z"/>'
+      : '<path d="M8 4.5v15l12-7.5z"/>';
+  }
+
+  function playListByIds(ids, startIndex = 0) {
+    const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
+    if (!tracks.length) return;
+    state.radioReqToken++;
+    state.radioLoading = false;
+    state.queue = tracks;
+    playQueueAt(Math.max(0, Math.min(startIndex, tracks.length - 1)));
+  }
+
+  function playShuffledIds(ids) {
+    const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
+    if (!tracks.length) return;
+    for (let i = tracks.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+    }
+    state.radioReqToken++;
+    state.radioLoading = false;
+    state.queue = tracks;
+    playQueueAt(0);
+  }
+
+  function playSingle(id) {
+    const t = state.trackMap.get(id);
+    if (!t) return;
+    state.radioReqToken++;
+    state.radioLoading = !!state.autoplay;
+    state.queue = [t];
+    playQueueAt(0);
+    if (state.autoplay) {
+      appendRadioTracks(t.id);
+    }
+  }
+
+  async function playAlbumNow(id) {
+    try {
+      const d = await api(`/api/web/album/${encodeURIComponent(id)}`);
+      const tracks = cacheTracks(d.tracks || []);
+      if (tracks.length) {
+        state.radioReqToken++;
+        state.radioLoading = false;
+        state.queue = tracks;
+        playQueueAt(0);
+      }
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  async function playPlaylistNow(id) {
+    try {
+      const d = await api(`/api/web/playlist/${encodeURIComponent(id)}`);
+      const tracks = cacheTracks(d.tracks || []);
+      if (tracks.length) {
+        state.radioReqToken++;
+        state.radioLoading = false;
+        state.queue = tracks;
+        playQueueAt(0);
+      }
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  async function appendRadioTracks(seedId) {
+    const reqToken = ++state.radioReqToken;
+    state.radioLoading = true;
+    renderQueuePanel();
+    try {
+      const d = await api(`/api/web/radio?seed=${encodeURIComponent(seedId || '')}`);
+      if (reqToken !== state.radioReqToken) return 0;
+      const recs = cacheTracks(d.tracks || []);
+      const existing = new Set(state.queue.map((t) => t.id));
+      let added = 0;
+      for (const r of recs) {
+        if (!existing.has(r.id)) {
+          state.queue.push(r);
+          existing.add(r.id);
+          added++;
+        }
+      }
+      state.radioLoading = false;
+      renderQueuePanel();
+      if (added > 0) {
+        saveServerQueue();
+      }
+      return added;
+    } catch {
+      if (reqToken === state.radioReqToken) {
+        state.radioLoading = false;
+        renderQueuePanel();
+      }
+      return 0;
+    }
+  }
+
+  async function startRadioForId(seedId) {
+    const seed = state.trackMap.get(seedId);
+    const reqToken = ++state.radioReqToken;
+    const cur = currentTrack();
+    const keepingCurrent = !!(cur && cur.id === seedId);
+    state.radioLoading = true;
+    if (keepingCurrent) renderQueuePanel();
+    showToast('Starting track radio...');
+    try {
+      const d = await api(`/api/web/radio?seed=${encodeURIComponent(seedId || '')}`);
+      if (reqToken !== state.radioReqToken) return;
+      state.radioLoading = false;
+      const recs = cacheTracks(d.tracks || []);
+      const filtered = recs.filter((r) => r.id !== seedId);
+      if (keepingCurrent && currentTrack()?.id === seedId) {
+        state.queue = [cur, ...filtered];
+        state.queueIndex = 0;
+        renderQueuePanel();
+        saveServerQueue();
+        if (filtered[0]) {
+          api(`/api/web/warm/${encodeURIComponent(filtered[0].id)}`, { method: 'POST' }).catch(() => {});
+        }
+        return;
+      }
+      const queue = seed ? [seed, ...filtered] : filtered;
+      if (queue.length) {
+        state.queue = queue;
+        playQueueAt(0);
+      } else {
+        renderQueuePanel();
+      }
+    } catch (e) {
+      if (reqToken === state.radioReqToken) {
+        state.radioLoading = false;
+        renderQueuePanel();
+      }
+      showToast(e.message);
+    }
+  }
+
+  function togglePlay() {
+    if (!currentTrack()) return;
+    ensureAudioGraph();
+    if (audio.paused) {
+      audio.play().catch(() => {});
+    } else {
+      audio.pause();
+    }
+  }
+
+  function prevTrack() {
+    if (!state.queue.length) return;
+    if (audio.currentTime > 4) {
+      audio.currentTime = 0;
+      return;
+    }
+    const prev = state.queueIndex > 0 ? state.queueIndex - 1 : state.repeat === 'all' ? state.queue.length - 1 : 0;
+    playQueueAt(prev);
+  }
+
+  async function nextTrack(manual = false) {
+    const cur = currentTrack();
+    if (manual && cur && audio.currentTime < 25 && state.lastScrobbleCompleteId !== cur.id) {
+      api('/api/web/event', {
+        method: 'POST',
+        body: JSON.stringify({ trackId: cur.id, kind: 'skip', value: 1 }),
+      }).catch(() => {});
+    }
+    if (!state.queue.length) return;
+
+    if (state.shuffle && state.queue.length > 1) {
+      const nextIdx = Math.floor(Math.random() * state.queue.length);
+      return playQueueAt(nextIdx);
+    }
+    if (state.queueIndex + 1 < state.queue.length) {
+      const next = state.queueIndex + 1;
+      if (state.autoplay && state.queue.length - next <= 2 && cur) {
+        appendRadioTracks(cur.id);
+      }
+      return playQueueAt(next);
+    }
+    if (state.repeat === 'all') {
+      return playQueueAt(0);
+    }
+    if (state.autoplay && cur) {
+      const added = await appendRadioTracks(cur.id);
+      if (added > 0 && state.queueIndex + 1 < state.queue.length) {
+        return playQueueAt(state.queueIndex + 1);
+      }
+    }
+    updatePlayButton(false);
+  }
+
+  function wireAudioEvents() {
+    audio.addEventListener('play', () => updatePlayButton(true));
+    audio.addEventListener('pause', () => updatePlayButton(false));
+    audio.addEventListener('ended', () => {
+      const cur = currentTrack();
+      if (state.repeat === 'one') {
+        audio.currentTime = 0;
+        audio.play().catch(() => {});
+        return;
+      }
+      if (cur && state.lastScrobbleCompleteId !== cur.id) {
+        state.lastScrobbleCompleteId = cur.id;
+        api('/api/web/event', {
+          method: 'POST',
+          body: JSON.stringify({ trackId: cur.id, kind: 'complete', value: 1 }),
+        }).catch(() => {});
+      }
+      nextTrack(false);
+    });
+
+    audio.addEventListener('timeupdate', () => {
+      if (state.seeking) return;
+      const cur = currentTrack();
+      const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
+      const pos = audio.currentTime || 0;
+      $('pb-elapsed').textContent = fmtTime(pos);
+      if (total > 0) {
+        $('pb-duration').textContent = fmtTime(total);
+        $('pb-seek').value = String(Math.min(100, (pos / total) * 100));
+      }
+      if (cur && total > 20 && pos / total >= 0.75 && state.lastScrobbleCompleteId !== cur.id) {
+        state.lastScrobbleCompleteId = cur.id;
+        api('/api/web/event', {
+          method: 'POST',
+          body: JSON.stringify({ trackId: cur.id, kind: 'complete', value: 1 }),
+        }).catch(() => {});
+      }
+      syncActiveLyricLine(pos * 1000);
+    });
+
+    $('pb-seek').addEventListener('input', () => {
+      state.seeking = true;
+    });
+    $('pb-seek').addEventListener('change', (e) => {
+      state.seeking = false;
+      const cur = currentTrack();
+      const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
+      if (total > 0) {
+        audio.currentTime = (parseFloat(e.target.value) / 100) * total;
+      }
+    });
+
+    $('pb-volume').addEventListener('input', (e) => {
+      state.volume = parseFloat(e.target.value);
+      state.muted = state.volume === 0;
+      audio.muted = state.muted;
+      audio.volume = state.volume;
+      localStorage.setItem('beatlab_vol', String(state.volume));
+      updateVolumeIcon();
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Queue Panel & Synced Lyrics
+  // ---------------------------------------------------------------------------
+  function renderQueuePanel() {
+    const cur = currentTrack();
+    const nowHtml = cur
+      ? `<div class="queue-section-label">Now Playing</div>${renderQItem(cur, state.queueIndex, true)}`
+      : `<p class="muted-center">Queue is empty</p>`;
+
+    const upcoming = state.queue.slice(state.queueIndex + 1);
+    const upNextHtml = upcoming.length
+      ? `<div class="queue-section-label">Next Up (${upcoming.length})</div>` +
+        upcoming.map((t, i) => renderQItem(t, state.queueIndex + 1 + i, false)).join('')
+      : state.radioLoading
+        ? `<div class="queue-section-label">Next Up</div><p class="muted-center">Loading track radio...</p>`
+        : '';
+
+    $('queue-now-playing').innerHTML = nowHtml;
+    $('queue-up-next').innerHTML = upNextHtml;
+    if ($('fs-queue-now-playing')) $('fs-queue-now-playing').innerHTML = nowHtml;
+    if ($('fs-queue-up-next')) $('fs-queue-up-next').innerHTML = upNextHtml;
+  }
+
+  function renderQItem(t, idx, active) {
+    return `<div class="q-item ${active ? 'active' : ''}" onclick="App.playQueueAt(${idx})">
+      <img src="${esc(t.coverUrl)}" alt="" />
+      <div class="q-item-info">
+        <div class="q-item-title">${esc(t.title)}</div>
+        <div class="q-item-sub">${esc(t.artist)}</div>
+      </div>
+      ${!active ? `<button class="icon-btn" title="Remove from queue" onclick="event.stopPropagation();App.removeFromQueue(${idx})">${ICONS.close}</button>` : ''}
+    </div>`;
+  }
+
+  async function loadLyricsForTrack(id) {
+    $('lyrics-container').innerHTML = `<p class="muted-center">Fetching lyrics...</p>`;
+    $('fs-lyrics-body').innerHTML = `<p class="muted-center">Fetching lyrics...</p>`;
+    state.lyrics = { synced: false, plain: '', lines: [] };
+    state.activeLyricIdx = -1;
+    try {
+      const data = await api(`/api/web/lyrics/${encodeURIComponent(id)}`);
+      state.lyrics = data;
+      const lines = data.lines || [];
+      const html = lines.length
+        ? lines
+            .map(
+              (l, idx) =>
+                `<div class="lyric-line ${l.start_ms != null ? 'synced' : ''}" data-lidx="${idx}" ${
+                  l.start_ms != null ? `onclick="App.seekMs(${l.start_ms})"` : ''
+                }>${esc(l.text || '♪')}</div>`
+            )
+            .join('')
+        : `<p class="muted-center">No lyrics available for this track.</p>`;
+      $('lyrics-container').innerHTML = html;
+      $('fs-lyrics-body').innerHTML = html;
+    } catch {
+      $('lyrics-container').innerHTML = `<p class="muted-center">No lyrics available.</p>`;
+      $('fs-lyrics-body').innerHTML = `<p class="muted-center">No lyrics available.</p>`;
+    }
+  }
+
+  function syncActiveLyricLine(posMs) {
+    if (!state.lyrics.synced || !state.lyrics.lines.length) return;
+    let active = -1;
+    for (let i = 0; i < state.lyrics.lines.length; i++) {
+      const ms = state.lyrics.lines[i].start_ms;
+      if (ms != null && ms <= posMs + 150) {
+        active = i;
+      }
+    }
+    if (active === state.activeLyricIdx) return;
+    state.activeLyricIdx = active;
+
+    for (const containerId of ['lyrics-container', 'fs-lyrics-body']) {
+      const box = $(containerId);
+      if (!box) continue;
+      const isVisible =
+        containerId === 'fs-lyrics-body'
+          ? $('fullscreen-player').classList.contains('open') && state.fsTab === 'lyrics'
+          : box.offsetParent !== null;
+      box.querySelectorAll('.lyric-line').forEach((el, idx) => {
+        el.classList.toggle('active', idx === active);
+        if (idx === active && isVisible) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // User Actions: Likes, Playlists, Context Menu, Modals
+  // ---------------------------------------------------------------------------
+  async function toggleTrackLike(id, btnEl) {
+    const t = state.trackMap.get(id);
+    if (!t) return;
+    const next = !t.isStarred;
+    try {
+      await api('/api/web/star', {
+        method: 'POST',
+        body: JSON.stringify({ id, starred: next, kind: 'track' }),
+      });
+      t.isStarred = next;
+      if (btnEl) {
+        btnEl.classList.toggle('active', next);
+      }
+      document.querySelectorAll('.track-row').forEach((row) => {
+        if (row.dataset.tid === id) {
+          const b = row.querySelector('.tr-like-btn');
+          if (b) b.classList.toggle('active', next);
+        }
+      });
+      const cur = currentTrack();
+      if (cur && cur.id === id) {
+        $('pb-like').classList.toggle('active', next);
+      }
+      showToast(next ? 'Added to Liked Songs' : 'Removed from Liked Songs');
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  function openTrackMenu(event, trackId) {
+    event.stopPropagation();
+    const t = state.trackMap.get(trackId);
+    if (!t) return;
+    const menu = $('context-menu');
+    const userPls = state.playlists.filter((p) => !p.isAuto);
+
+    menu.innerHTML = `
+      <button class="ctx-item" onclick="App.playNext(${esc(JSON.stringify(trackId))})">Play Next</button>
+      <button class="ctx-item" onclick="App.addToQueue(${esc(JSON.stringify(trackId))})">Add to Queue</button>
+      <button class="ctx-item" onclick="App.startRadioForId(${esc(JSON.stringify(trackId))})">Start Song Radio</button>
+      <button class="ctx-item" onclick="App.navigate('album/${encodeURIComponent(t.albumId)}')">Go to Album</button>
+      <button class="ctx-item" onclick="App.navigate('artist/${encodeURIComponent(t.artistId)}')">Go to Artist</button>
+      <hr style="border:0;border-top:1px solid var(--border);margin:4px 0">
+      <button class="ctx-item" onclick="App.promptAddToNewPlaylist(${esc(JSON.stringify(trackId))})">+ New Playlist with Song</button>
+      ${userPls
+        .map(
+          (p) =>
+            `<button class="ctx-item" onclick="App.addTrackToPlaylist(${esc(JSON.stringify(p.id))}, ${esc(JSON.stringify(trackId))})">Add to: ${esc(p.name)}</button>`
+        )
+        .join('')}
+    `;
+    menu.classList.remove('hidden');
+    const x = Math.min(window.innerWidth - 220, event.clientX);
+    const y = Math.min(window.innerHeight - 280, event.clientY);
+    menu.style.left = `${Math.max(8, x)}px`;
+    menu.style.top = `${Math.max(8, y)}px`;
+
+    const closer = () => {
+      menu.classList.add('hidden');
+      window.removeEventListener('click', closer);
+    };
+    setTimeout(() => window.addEventListener('click', closer), 10);
+  }
+
+  function openModal(html) {
+    $('modal-box').innerHTML = html;
+    $('modal-backdrop').classList.remove('hidden');
+  }
+
+  function closeModal(event) {
+    if (!event || event.target === $('modal-backdrop')) {
+      $('modal-backdrop').classList.add('hidden');
+    }
+  }
+
+  function openEqModal() {
+    ensureAudioGraph();
+    openModal(`
+      <div class="modal-head">
+        <h3>10-Band Audio Equalizer</h3>
+        <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="toggle-row">
+          <input type="checkbox" ${state.eqEnabled ? 'checked' : ''} onchange="App.toggleEq(this.checked)" />
+          <span><strong>Enable Equalizer</strong></span>
+        </label>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${Object.keys(EQ_PRESETS)
+            .map((name) => `<button class="mini-btn" onclick="App.applyEqPreset('${name}')">${name}</button>`)
+            .join('')}
+        </div>
+      </div>
+      <div class="eq-bands">
+        ${EQ_LABELS.map(
+          (lbl, i) => `
+          <div class="eq-col">
+            <span id="eq-val-${i}">${state.eqGains[i] > 0 ? '+' : ''}${state.eqGains[i]}dB</span>
+            <input type="range" min="-12" max="12" step="1" value="${state.eqGains[i]}" oninput="App.setEqBand(${i}, this.value)" />
+            <span>${lbl}</span>
+          </div>`
+        ).join('')}
+      </div>
+    `);
+  }
+
+  async function openConnectModal() {
+    let srcData = { sources: [], totalTracks: 0, cacheMb: 0, ffmpeg: false };
+    try {
+      srcData = await api('/api/web/sources');
+    } catch {}
+    openModal(`
+      <div class="modal-head">
+        <h3>Account, Clients &amp; Sources</h3>
+        <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+      </div>
+      <div class="kv-card">
+        <div class="kv-label">SUBSONIC / NAVIDROME SERVER URL</div>
+        <div class="kv-val">${esc(location.origin)}</div>
+      </div>
+      <div class="kv-card">
+        <div class="kv-label">USERNAME (WORKS IN ANY SUBSONIC OR NAVIDROME CLIENT)</div>
+        <div class="kv-val">${esc(state.user.username)}</div>
+      </div>
+      <div class="kv-card">
+        <div class="kv-label">OPENSUBSONIC API KEY</div>
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+          <span id="modal-apikey" class="kv-val">${esc(state.user.apiKey || '')}</span>
+          <button class="mini-btn" onclick="App.regenApiKey()">Regenerate</button>
+        </div>
+      </div>
+      <div class="kv-card">
+        <div class="kv-label">CATALOG &amp; ENGINE (${srcData.totalTracks} TRACKS · ${srcData.cacheMb} MB CACHED · FFMPEG: ${srcData.ffmpeg ? 'ON' : 'OFF'})</div>
+        ${(srcData.sources || [])
+          .map(
+            (s) =>
+              `<div style="font-size:12px;margin-top:4px;color:${s.available ? 'var(--text)' : 'var(--text-dim)'}"><strong>${esc(s.name)}</strong>: ${esc(s.status)}</div>`
+          )
+          .join('')}
+      </div>
+      <form onsubmit="App.submitPasswordChange(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:14px">
+        <div class="kv-label">CHANGE PASSWORD</div>
+        <input id="pw-cur" type="password" placeholder="Current password" required />
+        <input id="pw-new" type="password" placeholder="New password" required />
+        <button type="submit" class="btn-secondary" style="width:fit-content">Update Password</button>
+      </form>
+    `);
+  }
+
+  function wireKeyboardShortcuts() {
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (!$('modal-backdrop').classList.contains('hidden')) {
+          closeModal();
+          return;
+        }
+        if ($('fullscreen-player').classList.contains('open')) {
+          setExpandedPlayer(false);
+          return;
+        }
+      }
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.key === '/') {
+        e.preventDefault();
+        setExpandedPlayer(false);
+        $('global-search').focus();
+      } else if (e.key === 'ArrowRight' && e.shiftKey) {
+        nextTrack(true);
+      } else if (e.key === 'ArrowLeft' && e.shiftKey) {
+        prevTrack();
+      } else if (e.key === 'ArrowRight') {
+        audio.currentTime = Math.min(audio.duration || 9999, (audio.currentTime || 0) + 5);
+      } else if (e.key === 'ArrowLeft') {
+        audio.currentTime = Math.max(0, (audio.currentTime || 0) - 5);
+      } else if (e.key.toLowerCase() === 'm') {
+        App.toggleMute();
+      } else if (e.key.toLowerCase() === 'l') {
+        App.toggleCurrentLike();
+      }
+    });
+  }
+
+  // Expose public handlers for template onclick attributes
+  window.App = {
+    navigate,
+    focusSearch: () => {
+      setExpandedPlayer(false);
+      $('global-search').focus();
+      $('global-search').select();
+    },
+    clearSearch: () => {
+      $('global-search').value = '';
+      $('clear-search-btn').classList.add('hidden');
+      navigate('explore');
+    },
+    signOut: async () => {
+      await api('/api/web/auth/signout', { method: 'POST' }).catch(() => {});
+      localStorage.removeItem('beatlab_token');
+      state.token = '';
+      state.user = null;
+      audio.pause();
+      showAuthScreen();
+    },
+    setLibTab: (tab) => renderLibrary(tab),
+    setRightTab: (tab) => {
+      state.rightTab = tab;
+      $('tab-queue').classList.toggle('active', tab === 'queue');
+      $('tab-lyrics').classList.toggle('active', tab === 'lyrics');
+      $('rp-queue-body').classList.toggle('hidden', tab !== 'queue');
+      $('rp-lyrics-body').classList.toggle('hidden', tab !== 'lyrics');
+    },
+    setFsTab: (tab) => {
+      state.fsTab = tab;
+      $('fs-tab-queue').classList.toggle('active', tab === 'queue');
+      $('fs-tab-lyrics').classList.toggle('active', tab === 'lyrics');
+      $('fs-queue-panel').classList.toggle('hidden', tab !== 'queue');
+      $('fs-lyrics-panel').classList.toggle('hidden', tab !== 'lyrics');
+      if (tab === 'lyrics' && state.activeLyricIdx >= 0) {
+        const activeLine = $('fs-lyrics-body')?.querySelector(`.lyric-line[data-lidx="${state.activeLyricIdx}"]`);
+        if (activeLine) activeLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    },
+    toggleRightPanel: (show) => {
+      $('right-panel').classList.toggle('hidden', show === false);
+    },
+    openPanelTab: (tab) => {
+      if ($('fullscreen-player').classList.contains('open')) {
+        window.App.setFsTab(tab);
+        return;
+      }
+      $('right-panel').classList.remove('hidden');
+      window.App.setRightTab(tab);
+    },
+    toggleAutoplay: (v) => {
+      state.autoplay = !!v;
+      $('autoplay-toggle').checked = state.autoplay;
+      if ($('fs-autoplay-toggle')) $('fs-autoplay-toggle').checked = state.autoplay;
+      localStorage.setItem('beatlab_autoplay', state.autoplay ? 'true' : 'false');
+    },
+    clearQueue: () => {
+      const cur = currentTrack();
+      state.queue = cur ? [cur] : [];
+      state.queueIndex = cur ? 0 : -1;
+      renderQueuePanel();
+      saveServerQueue();
+    },
+    removeFromQueue: (idx) => {
+      if (idx > state.queueIndex && idx < state.queue.length) {
+        state.queue.splice(idx, 1);
+        renderQueuePanel();
+        saveServerQueue();
+      }
+    },
+    startRadioFromCurrent: () => {
+      const cur = currentTrack();
+      startRadioForId(cur ? cur.id : '');
+    },
+    startRadioForId,
+    playListByIds,
+    playShuffledIds,
+    playSingle,
+    playQueueAt,
+    playAlbumNow,
+    playPlaylistNow,
+    playNext: (tid) => {
+      const t = state.trackMap.get(tid);
+      if (!t) return;
+      if (state.queue.length === 0) return playSingle(tid);
+      state.queue.splice(state.queueIndex + 1, 0, t);
+      renderQueuePanel();
+      saveServerQueue();
+      showToast('Will play next');
+    },
+    addToQueue: (tid) => {
+      const t = state.trackMap.get(tid);
+      if (!t) return;
+      if (state.queue.length === 0) return playSingle(tid);
+      state.queue.push(t);
+      renderQueuePanel();
+      saveServerQueue();
+      showToast('Added to queue');
+    },
+    togglePlay,
+    prevTrack,
+    nextTrack,
+    toggleShuffle: () => {
+      state.shuffle = !state.shuffle;
+      $('btn-shuffle').classList.toggle('active', state.shuffle);
+    },
+    cycleRepeat: () => {
+      const modes = ['off', 'all', 'one'];
+      state.repeat = modes[(modes.indexOf(state.repeat) + 1) % modes.length];
+      $('btn-repeat').classList.toggle('active', state.repeat !== 'off');
+      $('btn-repeat').title = `Repeat: ${state.repeat}`;
+      const svg = $('btn-repeat').querySelector('svg');
+      if (svg) svg.innerHTML = state.repeat === 'one' ? ICONS.repeatOne : ICONS.repeatAll;
+      showToast(`Repeat: ${state.repeat}`);
+    },
+    setQuality: (val) => {
+      state.quality = val;
+      localStorage.setItem('beatlab_quality', val);
+      const cur = currentTrack();
+      if (cur && !audio.paused) {
+        const pos = audio.currentTime || 0;
+        audio.src = buildStreamUrl(cur.id);
+        audio.currentTime = pos;
+        audio.play().catch(() => {});
+      }
+      showToast(`Audio quality: ${val.toUpperCase()}`);
+    },
+    toggleMute: () => {
+      state.muted = !state.muted;
+      audio.muted = state.muted;
+      updateVolumeIcon();
+    },
+    toggleCurrentLike: () => {
+      const cur = currentTrack();
+      if (cur) toggleTrackLike(cur.id, $('pb-like'));
+    },
+    toggleTrackLike,
+    goCurrentAlbum: () => {
+      const cur = currentTrack();
+      if (cur) navigate(`album/${encodeURIComponent(cur.albumId)}`);
+    },
+    goCurrentArtist: () => {
+      const cur = currentTrack();
+      if (cur) navigate(`artist/${encodeURIComponent(cur.artistId)}`);
+    },
+    toggleFullscreen: (open) => {
+      setExpandedPlayer(open);
+    },
+    seekMs: (ms) => {
+      if (Number.isFinite(ms)) {
+        audio.currentTime = ms / 1000;
+        if (audio.paused) audio.play().catch(() => {});
+      }
+    },
+    openTrackMenu,
+    toggleSaveAlbum: async (id, saved) => {
+      await api('/api/web/star', {
+        method: 'POST',
+        body: JSON.stringify({ id, starred: saved, kind: 'album' }),
+      });
+      renderAlbum(id);
+    },
+    toggleFollowArtist: async (id, followed) => {
+      await api('/api/web/star', {
+        method: 'POST',
+        body: JSON.stringify({ id, starred: followed, kind: 'artist' }),
+      });
+      renderArtist(id);
+    },
+    promptCreatePlaylist: (initialTrackId = null) => {
+      openModal(`
+        <div class="modal-head"><h3>Create Playlist</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
+        <form onsubmit="App.submitCreatePlaylist(event, ${initialTrackId ? esc(JSON.stringify(initialTrackId)) : 'null'})" style="display:flex;flex-direction:column;gap:12px">
+          <input id="new-pl-name" type="text" placeholder="Playlist name" required autofocus />
+          <input id="new-pl-desc" type="text" placeholder="Description (optional)" />
+          <button type="submit" class="btn-primary">Create</button>
+        </form>
+      `);
+    },
+    promptAddToNewPlaylist: (tid) => window.App.promptCreatePlaylist(tid),
+    submitCreatePlaylist: async (e, tid) => {
+      e.preventDefault();
+      const name = $('new-pl-name').value.trim();
+      const comment = $('new-pl-desc').value.trim();
+      const res = await api('/api/web/playlists', {
+        method: 'POST',
+        body: JSON.stringify({ name, comment, trackIds: tid ? [tid] : [] }),
+      });
+      closeModal();
+      await refreshSidebarPlaylists();
+      showToast(`Created "${name}"`);
+      navigate(`playlist/${encodeURIComponent(res.playlist.id)}`);
+    },
+    addTrackToPlaylist: async (pid, tid) => {
+      await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks`, {
+        method: 'POST',
+        body: JSON.stringify({ trackIds: [tid] }),
+      });
+      refreshSidebarPlaylists();
+      showToast('Added to playlist');
+    },
+    removePlaylistItem: async (pid, pos) => {
+      await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks/${pos}`, { method: 'DELETE' });
+      renderPlaylist(pid);
+    },
+    movePlaylistItem: async (pid, from, to) => {
+      await api(`/api/web/playlists/${encodeURIComponent(pid)}/reorder`, {
+        method: 'POST',
+        body: JSON.stringify({ from, to }),
+      });
+      renderPlaylist(pid);
+    },
+    promptRenamePlaylist: (pid, curName) => {
+      openModal(`
+        <div class="modal-head"><h3>Rename Playlist</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
+        <form onsubmit="App.submitRenamePlaylist(event, ${esc(JSON.stringify(pid))})" style="display:flex;flex-direction:column;gap:12px">
+          <input id="rename-pl-input" type="text" value="${esc(curName)}" required />
+          <button type="submit" class="btn-primary">Save</button>
+        </form>
+      `);
+    },
+    submitRenamePlaylist: async (e, pid) => {
+      e.preventDefault();
+      const name = $('rename-pl-input').value.trim();
+      await api(`/api/web/playlists/${encodeURIComponent(pid)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      });
+      closeModal();
+      await refreshSidebarPlaylists();
+      renderPlaylist(pid);
+    },
+    deletePlaylist: async (pid) => {
+      await api(`/api/web/playlists/${encodeURIComponent(pid)}`, { method: 'DELETE' });
+      await refreshSidebarPlaylists();
+      showToast('Playlist deleted');
+      navigate('library');
+    },
+    openEqModal,
+    closeModal,
+    toggleEq: (on) => {
+      state.eqEnabled = on;
+      applyEqGains();
+    },
+    setEqBand: (idx, val) => {
+      const n = parseInt(val, 10) || 0;
+      state.eqGains[idx] = n;
+      const lbl = $(`eq-val-${idx}`);
+      if (lbl) lbl.textContent = `${n > 0 ? '+' : ''}${n}dB`;
+      applyEqGains();
+    },
+    applyEqPreset: (name) => {
+      const vals = EQ_PRESETS[name];
+      if (!vals) return;
+      state.eqGains = [...vals];
+      state.eqEnabled = name !== 'Flat';
+      applyEqGains();
+      openEqModal();
+    },
+    openConnectModal,
+    regenApiKey: async () => {
+      const res = await api('/api/web/account/apikey', { method: 'POST' });
+      state.user.apiKey = res.apiKey;
+      const el = $('modal-apikey');
+      if (el) el.textContent = res.apiKey;
+      showToast('API Key regenerated');
+    },
+    submitPasswordChange: async (e) => {
+      e.preventDefault();
+      try {
+        await api('/api/web/account/password', {
+          method: 'POST',
+          body: JSON.stringify({
+            currentPassword: $('pw-cur').value,
+            newPassword: $('pw-new').value,
+          }),
+        });
+        showToast('Password updated');
+        closeModal();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+  };
+
+  init();
+})();

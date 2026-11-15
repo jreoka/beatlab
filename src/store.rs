@@ -1,16 +1,16 @@
-use crate::models::{CacheEntry, Event, Playlist, RadioStation, Track, User, slug};
-use anyhow_lite::Result;
+use crate::models::{
+    constant_time_eq, err_msg, slug, validate_credentials, AlbumSummary, AppResult, ArtistSummary,
+    CacheEntry, Event, Mood, PlayQueueState, Playlist, RadioStation, Track, User, UserTrackStats,
+};
 use chrono::Utc;
-use md5::{Digest, Md5};
-use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashMap;
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-pub mod anyhow_lite {
-    pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-}
+const TRACK_COLS: &str = "id, source, title, artist, album, genre, moods, year, track_no, disc_no, \
+    duration, bitrate, sample_rate, bit_depth, format, size, stream_url, cover_url, meta, deezer_id, created";
 
 #[derive(Clone)]
 pub struct Store {
@@ -18,52 +18,77 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(data_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_dir)?;
-        let db_path = data_dir.join("beatlab.db");
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA busy_timeout=5000;",
-        )?;
+    pub fn open(path: &Path) -> AppResult<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path).map_err(|e| err_msg(format!("open sqlite database: {}", e)))?;
+        configure_conn(&conn)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
-        store.migrate()?;
+        store.init_schema()?;
         Ok(store)
     }
 
     #[cfg(test)]
-    pub fn open_in_memory() -> Result<Self> {
+    pub fn open_memory() -> AppResult<Self> {
         let conn = Connection::open_in_memory()?;
+        configure_conn(&conn)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
-        store.migrate()?;
+        store.init_schema()?;
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn init_schema(&self) -> AppResult<()> {
+        let conn = self.lock();
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS users (
+            "
+            CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
+                username TEXT NOT NULL,
                 password TEXT NOT NULL,
-                is_admin INTEGER NOT NULL DEFAULT 0
+                created INTEGER NOT NULL
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower
+                ON users(lower(username));
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'web',
+                created INTEGER NOT NULL,
+                expires INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                key TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                label TEXT NOT NULL DEFAULT 'default',
+                created INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+
             CREATE TABLE IF NOT EXISTS tracks (
                 id TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
                 title TEXT NOT NULL,
                 artist TEXT NOT NULL,
-                album TEXT NOT NULL DEFAULT '',
+                album TEXT NOT NULL,
                 genre TEXT NOT NULL DEFAULT '',
                 moods TEXT NOT NULL DEFAULT '',
                 year INTEGER NOT NULL DEFAULT 0,
                 track_no INTEGER NOT NULL DEFAULT 0,
+                disc_no INTEGER NOT NULL DEFAULT 0,
                 duration INTEGER NOT NULL DEFAULT 0,
                 bitrate INTEGER NOT NULL DEFAULT 0,
                 sample_rate INTEGER NOT NULL DEFAULT 0,
@@ -73,25 +98,56 @@ impl Store {
                 stream_url TEXT NOT NULL,
                 cover_url TEXT NOT NULL DEFAULT '',
                 meta TEXT NOT NULL DEFAULT '',
-                play_count INTEGER NOT NULL DEFAULT 0,
-                last_played INTEGER NOT NULL DEFAULT 0,
-                created INTEGER NOT NULL DEFAULT 0
+                deezer_id TEXT NOT NULL DEFAULT '',
+                created INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist);
-            CREATE INDEX IF NOT EXISTS idx_tracks_genre ON tracks(genre);
             CREATE INDEX IF NOT EXISTS idx_tracks_source ON tracks(source);
+            CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist);
+            CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album);
+            CREATE INDEX IF NOT EXISTS idx_tracks_genre ON tracks(genre);
             CREATE INDEX IF NOT EXISTS idx_tracks_created ON tracks(created DESC);
+
+            CREATE TABLE IF NOT EXISTS albums_meta (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                cover_url TEXT NOT NULL DEFAULT '',
+                genre TEXT NOT NULL DEFAULT '',
+                year INTEGER NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '',
+                deezer_id TEXT NOT NULL DEFAULT '',
+                updated INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS artists_meta (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                cover_url TEXT NOT NULL DEFAULT '',
+                bio TEXT NOT NULL DEFAULT '',
+                deezer_id TEXT NOT NULL DEFAULT '',
+                updated INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS user_track_stats (
+                user_id INTEGER NOT NULL,
+                track_id TEXT NOT NULL,
+                play_count INTEGER NOT NULL DEFAULT 0,
+                skip_count INTEGER NOT NULL DEFAULT 0,
+                last_played INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, track_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_uts_recent ON user_track_stats(user_id, last_played DESC);
+            CREATE INDEX IF NOT EXISTS idx_uts_freq ON user_track_stats(user_id, play_count DESC);
 
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 track_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
-                value REAL NOT NULL DEFAULT 1.0,
+                value REAL NOT NULL DEFAULT 1,
                 at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, at DESC);
-            CREATE INDEX IF NOT EXISTS idx_events_track ON events(track_id);
+            CREATE INDEX IF NOT EXISTS idx_events_user_at ON events(user_id, at DESC);
 
             CREATE TABLE IF NOT EXISTS stars (
                 user_id INTEGER NOT NULL,
@@ -99,6 +155,21 @@ impl Store {
                 at INTEGER NOT NULL,
                 PRIMARY KEY(user_id, track_id)
             );
+
+            CREATE TABLE IF NOT EXISTS saved_albums (
+                user_id INTEGER NOT NULL,
+                album_id TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, album_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS followed_artists (
+                user_id INTEGER NOT NULL,
+                artist_id TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, artist_id)
+            );
+
             CREATE TABLE IF NOT EXISTS ratings (
                 user_id INTEGER NOT NULL,
                 track_id TEXT NOT NULL,
@@ -106,1195 +177,2049 @@ impl Store {
                 at INTEGER NOT NULL,
                 PRIMARY KEY(user_id, track_id)
             );
+
             CREATE TABLE IF NOT EXISTS playlists (
                 id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 comment TEXT NOT NULL DEFAULT '',
-                public INTEGER NOT NULL DEFAULT 1,
+                public INTEGER NOT NULL DEFAULT 0,
                 is_auto INTEGER NOT NULL DEFAULT 0,
                 kind TEXT NOT NULL DEFAULT 'user',
                 created INTEGER NOT NULL,
                 changed INTEGER NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_playlists_user ON playlists(user_id, changed DESC);
+
             CREATE TABLE IF NOT EXISTS playlist_tracks (
                 playlist_id TEXT NOT NULL,
                 pos INTEGER NOT NULL,
                 track_id TEXT NOT NULL,
+                added INTEGER NOT NULL,
                 PRIMARY KEY(playlist_id, pos)
             );
+
+            CREATE TABLE IF NOT EXISTS play_queues (
+                user_id INTEGER PRIMARY KEY,
+                current_id TEXT NOT NULL DEFAULT '',
+                current_index INTEGER NOT NULL DEFAULT 0,
+                position_ms INTEGER NOT NULL DEFAULT 0,
+                track_ids TEXT NOT NULL DEFAULT '[]',
+                changed_by TEXT NOT NULL DEFAULT '',
+                updated INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS radio_stations (
                 id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL,
                 stream_url TEXT NOT NULL,
                 home_page_url TEXT NOT NULL DEFAULT ''
             );
-            CREATE TABLE IF NOT EXISTS play_queues (
-                user_id INTEGER PRIMARY KEY,
-                current_id TEXT NOT NULL DEFAULT '',
-                position_ms INTEGER NOT NULL DEFAULT 0,
-                track_ids TEXT NOT NULL DEFAULT '[]',
-                changed_by TEXT NOT NULL DEFAULT '',
-                updated INTEGER NOT NULL
-            );
+
             CREATE TABLE IF NOT EXISTS cache_entries (
                 track_id TEXT PRIMARY KEY,
                 path TEXT NOT NULL,
                 bytes INTEGER NOT NULL,
-                last_hit INTEGER NOT NULL
+                last_accessed INTEGER NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS kv (
-                k TEXT PRIMARY KEY,
-                v TEXT NOT NULL
-            );",
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            ",
         )?;
+
+        // Forward-compatible column additions when upgrading an existing database.
+        ensure_column(&conn, "tracks", "disc_no", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "tracks", "deezer_id", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "tracks", "moods", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "tracks", "sample_rate", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "tracks", "bit_depth", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "playlists", "is_auto", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "playlists", "kind", "TEXT NOT NULL DEFAULT 'user'")?;
+        ensure_column(
+            &conn,
+            "play_queues",
+            "current_index",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "radio_stations", "user_id", "INTEGER NOT NULL DEFAULT 0")?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_deezer ON tracks(deezer_id)",
+            [],
+        )?;
+
         Ok(())
     }
 
-    // ---------- Users ----------
+    // -------------------------------------------------------------------------
+    // Users, Open Auto-Signup, Sessions & API Keys (zero admin concepts)
+    // -------------------------------------------------------------------------
 
-    pub fn user_count(&self) -> usize {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0) as usize
-    }
-
-    pub fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<User> {
-        let conn = self.conn.lock().unwrap();
+    pub fn create_user(&self, username: &str, password: &str) -> AppResult<User> {
+        let uname = validate_credentials(username, password).map_err(|e| err_msg(e))?;
+        let conn = self.lock();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM users WHERE lower(username) = lower(?1)",
+                params![uname],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if existing.is_some() {
+            return Err(err_msg(format!("Username '{}' is already taken", uname)));
+        }
+        let now = Utc::now().timestamp();
         conn.execute(
-            "INSERT INTO users(username, password, is_admin) VALUES(?1, ?2, ?3)",
-            params![username, password, if is_admin { 1 } else { 0 }],
+            "INSERT INTO users(username, password, created) VALUES (?1, ?2, ?3)",
+            params![uname, password, now],
         )?;
         let id = conn.last_insert_rowid();
         Ok(User {
             id,
-            username: username.to_string(),
+            username: uname,
             password: password.to_string(),
-            is_admin,
+            created: now,
         })
     }
 
-    pub fn get_user_by_name(&self, username: &str) -> Option<User> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, username, password, is_admin FROM users WHERE username = ?1",
-            params![username],
-            |r| {
-                Ok(User {
-                    id: r.get(0)?,
-                    username: r.get(1)?,
-                    password: r.get(2)?,
-                    is_admin: r.get::<_, i64>(3)? != 0,
-                })
-            },
-        )
-        .optional()
-        .ok()
-        .flatten()
-    }
-
-    pub fn get_user_by_id(&self, id: i64) -> Option<User> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, username, password, is_admin FROM users WHERE id = ?1",
-            params![id],
-            |r| {
-                Ok(User {
-                    id: r.get(0)?,
-                    username: r.get(1)?,
-                    password: r.get(2)?,
-                    is_admin: r.get::<_, i64>(3)? != 0,
-                })
-            },
-        )
-        .optional()
-        .ok()
-        .flatten()
-    }
-
-    pub fn list_users(&self) -> Vec<User> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn
-            .prepare("SELECT id, username, password, is_admin FROM users ORDER BY id ASC")
-        {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map([], |r| {
-            Ok(User {
-                id: r.get(0)?,
-                username: r.get(1)?,
-                password: r.get(2)?,
-                is_admin: r.get::<_, i64>(3)? != 0,
-            })
-        })
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .collect()
-    }
-
-    pub fn auth_subsonic(&self, username: &str, password: &str, token: &str, salt: &str) -> Option<User> {
-        let user = self.get_user_by_name(username)?;
-        if !token.is_empty() && !salt.is_empty() {
-            let mut hasher = Md5::new();
-            hasher.update(format!("{}{}", user.password, salt).as_bytes());
-            let expected = hex::encode(hasher.finalize());
-            if expected.eq_ignore_ascii_case(token) {
-                return Some(user);
+    /// Authenticate an existing user or automatically create a new user account if
+    /// the username does not exist yet. Returns `(User, created_new_account)`.
+    pub fn authenticate_or_create_user(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> AppResult<(User, bool)> {
+        let uname = validate_credentials(username, password).map_err(|e| err_msg(e))?;
+        let conn = self.lock();
+        let existing = conn
+            .query_row(
+                "SELECT id, username, password, created FROM users WHERE lower(username) = lower(?1)",
+                params![uname],
+                row_to_user,
+            )
+            .optional()?;
+        if let Some(u) = existing {
+            if constant_time_eq(&u.password, password) {
+                return Ok((u, false));
             }
-            return None;
+            return Err(err_msg("Invalid username or password"));
         }
-        if !password.is_empty() {
-            let decoded = if let Some(hex_part) = password.strip_prefix("enc:") {
-                hex::decode(hex_part)
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .unwrap_or_default()
-            } else {
-                password.to_string()
-            };
-            if decoded == user.password {
-                return Some(user);
+
+        let now = Utc::now().timestamp();
+        match conn.execute(
+            "INSERT INTO users(username, password, created) VALUES (?1, ?2, ?3)",
+            params![uname, password, now],
+        ) {
+            Ok(_) => {
+                let id = conn.last_insert_rowid();
+                Ok((
+                    User {
+                        id,
+                        username: uname,
+                        password: password.to_string(),
+                        created: now,
+                    },
+                    true,
+                ))
+            }
+            Err(_) => {
+                // Concurrent signup race on same username: verify against inserted row.
+                let u = conn
+                    .query_row(
+                        "SELECT id, username, password, created FROM users WHERE lower(username) = lower(?1)",
+                        params![uname],
+                        row_to_user,
+                    )
+                    .optional()?
+                    .ok_or_else(|| err_msg("Failed to create user"))?;
+                if constant_time_eq(&u.password, password) {
+                    Ok((u, false))
+                } else {
+                    Err(err_msg("Invalid username or password"))
+                }
             }
         }
-        None
     }
 
-    // ---------- Tracks ----------
-
-    fn row_to_track(r: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
-        Ok(Track {
-            id: r.get(0)?,
-            source: r.get(1)?,
-            title: r.get(2)?,
-            artist: r.get(3)?,
-            album: r.get(4)?,
-            genre: r.get(5)?,
-            moods: r.get(6)?,
-            year: r.get(7)?,
-            track_no: r.get(8)?,
-            duration: r.get(9)?,
-            bitrate: r.get(10)?,
-            sample_rate: r.get(11)?,
-            bit_depth: r.get(12)?,
-            format: r.get(13)?,
-            size: r.get(14)?,
-            stream_url: r.get(15)?,
-            cover_url: r.get(16)?,
-            meta: r.get(17)?,
-            play_count: r.get(18)?,
-            last_played: r.get(19)?,
-            created: r.get(20)?,
-        })
+    pub fn get_user_by_name(&self, name: &str) -> AppResult<Option<User>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, username, password, created FROM users WHERE lower(username) = lower(?1)",
+                params![name.trim()],
+                row_to_user,
+            )
+            .optional()?)
     }
 
-    const TRACK_COLS: &'static str = "id, source, title, artist, album, genre, moods, year, track_no, duration, bitrate, sample_rate, bit_depth, format, size, stream_url, cover_url, meta, play_count, last_played, created";
-
-    pub fn upsert_tracks(&self, tracks: &[Track]) {
-        if tracks.is_empty() {
-            return;
+    pub fn change_password(&self, user_id: i64, new_password: &str) -> AppResult<()> {
+        if new_password.is_empty() || new_password.len() > 256 {
+            return Err(err_msg("Password must be 1 to 256 characters"));
         }
-        let mut conn = self.conn.lock().unwrap();
-        if let Ok(tx) = conn.transaction() {
-            for t in tracks {
-                let _ = Self::upsert_track_conn(&tx, t);
-            }
-            let _ = tx.commit();
-        };
-    }
-
-    fn upsert_track_conn(conn: &Connection, t: &Track) -> Result<()> {
-        let now = if t.created > 0 {
-            t.created
-        } else {
-            Utc::now().timestamp()
-        };
+        let conn = self.lock();
         conn.execute(
-            "INSERT INTO tracks (id, source, title, artist, album, genre, moods, year, track_no, duration, bitrate, sample_rate, bit_depth, format, size, stream_url, cover_url, meta, play_count, last_played, created)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+            "UPDATE users SET password = ?1 WHERE id = ?2",
+            params![new_password, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn all_user_ids(&self) -> AppResult<Vec<i64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id FROM users ORDER BY id ASC")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn create_session(
+        &self,
+        user_id: i64,
+        kind: &str,
+        ttl_secs: i64,
+    ) -> AppResult<String> {
+        let token = format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
+        let now = Utc::now().timestamp();
+        let expires = now + ttl_secs.max(300);
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM sessions WHERE expires < ?1",
+            params![now],
+        )?;
+        conn.execute(
+            "INSERT INTO sessions(token, user_id, kind, created, expires) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![token, user_id, kind, now, expires],
+        )?;
+        Ok(token)
+    }
+
+    pub fn get_session_user(&self, token: &str) -> AppResult<Option<User>> {
+        if token.trim().is_empty() {
+            return Ok(None);
+        }
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        let user = conn
+            .query_row(
+                "SELECT u.id, u.username, u.password, u.created
+                 FROM sessions s JOIN users u ON u.id = s.user_id
+                 WHERE s.token = ?1 AND s.expires >= ?2",
+                params![token.trim(), now],
+                row_to_user,
+            )
+            .optional()?;
+        Ok(user)
+    }
+
+    pub fn delete_session(&self, token: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
+        Ok(())
+    }
+
+    pub fn get_or_create_api_key(&self, user_id: i64) -> AppResult<String> {
+        let conn = self.lock();
+        if let Some(key) = conn
+            .query_row(
+                "SELECT key FROM api_keys WHERE user_id = ?1 ORDER BY created ASC LIMIT 1",
+                params![user_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok(key);
+        }
+        let key = format!("bl_{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO api_keys(key, user_id, label, created) VALUES (?1, ?2, 'default', ?3)",
+            params![key, user_id, now],
+        )?;
+        Ok(key)
+    }
+
+    pub fn regenerate_api_key(&self, user_id: i64) -> AppResult<String> {
+        let key = format!("bl_{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute("DELETE FROM api_keys WHERE user_id = ?1", params![user_id])?;
+        conn.execute(
+            "INSERT INTO api_keys(key, user_id, label, created) VALUES (?1, ?2, 'default', ?3)",
+            params![key, user_id, now],
+        )?;
+        Ok(key)
+    }
+
+    pub fn get_user_by_api_key(&self, key: &str) -> AppResult<Option<User>> {
+        if key.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT u.id, u.username, u.password, u.created
+                 FROM api_keys k JOIN users u ON u.id = k.user_id
+                 WHERE k.key = ?1",
+                params![key.trim()],
+                row_to_user,
+            )
+            .optional()?)
+    }
+
+    // -------------------------------------------------------------------------
+    // Tracks, Albums Metadata & Artists Metadata
+    // -------------------------------------------------------------------------
+
+    pub fn upsert_tracks(&self, tracks: &[Track]) -> AppResult<()> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tracks (
+                    id, source, title, artist, album, genre, moods, year, track_no, disc_no,
+                    duration, bitrate, sample_rate, bit_depth, format, size, stream_url,
+                    cover_url, meta, deezer_id, created
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE tracks.title END,
+                    artist = CASE WHEN excluded.artist != '' THEN excluded.artist ELSE tracks.artist END,
+                    album = CASE WHEN excluded.album != '' THEN excluded.album ELSE tracks.album END,
+                    genre = CASE WHEN excluded.genre != '' THEN excluded.genre ELSE tracks.genre END,
+                    moods = CASE WHEN excluded.moods != '' THEN excluded.moods ELSE tracks.moods END,
+                    year = CASE WHEN excluded.year > 0 THEN excluded.year ELSE tracks.year END,
+                    track_no = CASE WHEN excluded.track_no > 0 THEN excluded.track_no ELSE tracks.track_no END,
+                    disc_no = CASE WHEN excluded.disc_no > 0 THEN excluded.disc_no ELSE tracks.disc_no END,
+                    duration = CASE WHEN excluded.duration > 0 THEN excluded.duration ELSE tracks.duration END,
+                    bitrate = CASE WHEN excluded.bitrate > 0 THEN excluded.bitrate ELSE tracks.bitrate END,
+                    sample_rate = CASE WHEN excluded.sample_rate > 0 THEN excluded.sample_rate ELSE tracks.sample_rate END,
+                    bit_depth = CASE WHEN excluded.bit_depth > 0 THEN excluded.bit_depth ELSE tracks.bit_depth END,
+                    format = CASE WHEN excluded.format != '' THEN excluded.format ELSE tracks.format END,
+                    size = CASE WHEN excluded.size > 0 THEN excluded.size ELSE tracks.size END,
+                    stream_url = CASE WHEN excluded.stream_url != '' THEN excluded.stream_url ELSE tracks.stream_url END,
+                    cover_url = CASE WHEN excluded.cover_url != '' THEN excluded.cover_url ELSE tracks.cover_url END,
+                    meta = CASE WHEN excluded.meta != '' THEN excluded.meta ELSE tracks.meta END,
+                    deezer_id = CASE WHEN excluded.deezer_id != '' THEN excluded.deezer_id ELSE tracks.deezer_id END",
+            )?;
+            let now = Utc::now().timestamp();
+            for t in tracks {
+                let created = if t.created > 0 { t.created } else { now };
+                stmt.execute(params![
+                    t.id,
+                    t.source,
+                    t.title,
+                    t.artist,
+                    t.album,
+                    t.genre,
+                    t.moods,
+                    t.year,
+                    t.track_no,
+                    t.disc_no,
+                    t.duration,
+                    t.bitrate,
+                    t.sample_rate,
+                    t.bit_depth,
+                    t.format,
+                    t.size,
+                    t.stream_url,
+                    t.cover_url,
+                    t.meta,
+                    t.deezer_id,
+                    created,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_track(&self, id: &str) -> AppResult<Option<Track>> {
+        let conn = self.lock();
+        let sql = format!("SELECT {} FROM tracks WHERE id = ?1", TRACK_COLS);
+        Ok(conn.query_row(&sql, params![id], row_to_track).optional()?)
+    }
+
+    pub fn get_tracks_by_ids(&self, ids: &[String]) -> AppResult<Vec<Track>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let sql = format!("SELECT {} FROM tracks WHERE id = ?1", TRACK_COLS);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(t) = stmt.query_row(params![id], row_to_track).optional()? {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn count_tracks(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        Ok(conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?)
+    }
+
+    pub fn all_tracks(&self, limit: usize, offset: usize) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1 OFFSET ?2",
+            TRACK_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![limit as i64, offset as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn newest_tracks(&self, limit: usize, offset: usize) -> AppResult<Vec<Track>> {
+        self.all_tracks(limit, offset)
+    }
+
+    pub fn random_tracks(&self, limit: usize, genre: Option<&str>) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let g = genre.map(|s| s.trim()).filter(|s| !s.is_empty());
+        if let Some(gen) = g {
+            let pat = format!("%{}%", gen.to_lowercase());
+            let sql = format!(
+                "SELECT {} FROM tracks WHERE lower(genre) LIKE ?1 ORDER BY RANDOM() LIMIT ?2",
+                TRACK_COLS
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![pat, limit as i64], row_to_track)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        } else {
+            let sql = format!(
+                "SELECT {} FROM tracks ORDER BY RANDOM() LIMIT ?1",
+                TRACK_COLS
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_track)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    }
+
+    pub fn upsert_album_meta(&self, meta: &AlbumSummary) -> AppResult<()> {
+        let conn = self.lock();
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO albums_meta(id, name, artist, cover_url, genre, year, label, deezer_id, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
-                title=excluded.title,
-                artist=excluded.artist,
-                album=CASE WHEN excluded.album != '' THEN excluded.album ELSE tracks.album END,
-                genre=CASE WHEN excluded.genre != '' THEN excluded.genre ELSE tracks.genre END,
-                moods=CASE WHEN excluded.moods != '' THEN excluded.moods ELSE tracks.moods END,
-                year=CASE WHEN excluded.year > 0 THEN excluded.year ELSE tracks.year END,
-                track_no=CASE WHEN excluded.track_no > 0 THEN excluded.track_no ELSE tracks.track_no END,
-                duration=CASE WHEN excluded.duration > 0 THEN excluded.duration ELSE tracks.duration END,
-                bitrate=CASE WHEN excluded.bitrate > 0 THEN excluded.bitrate ELSE tracks.bitrate END,
-                sample_rate=CASE WHEN excluded.sample_rate > 0 THEN excluded.sample_rate ELSE tracks.sample_rate END,
-                bit_depth=CASE WHEN excluded.bit_depth > 0 THEN excluded.bit_depth ELSE tracks.bit_depth END,
-                format=CASE WHEN excluded.format != '' THEN excluded.format ELSE tracks.format END,
-                size=CASE WHEN excluded.size > 0 THEN excluded.size ELSE tracks.size END,
-                stream_url=excluded.stream_url,
-                cover_url=CASE WHEN excluded.cover_url != '' THEN excluded.cover_url ELSE tracks.cover_url END,
-                meta=CASE WHEN excluded.meta != '' THEN excluded.meta ELSE tracks.meta END",
+               name = CASE WHEN excluded.name != '' THEN excluded.name ELSE albums_meta.name END,
+               artist = CASE WHEN excluded.artist != '' THEN excluded.artist ELSE albums_meta.artist END,
+               cover_url = CASE WHEN excluded.cover_url != '' THEN excluded.cover_url ELSE albums_meta.cover_url END,
+               genre = CASE WHEN excluded.genre != '' THEN excluded.genre ELSE albums_meta.genre END,
+               year = CASE WHEN excluded.year > 0 THEN excluded.year ELSE albums_meta.year END,
+               label = CASE WHEN excluded.label != '' THEN excluded.label ELSE albums_meta.label END,
+               deezer_id = CASE WHEN excluded.deezer_id != '' THEN excluded.deezer_id ELSE albums_meta.deezer_id END,
+               updated = excluded.updated",
             params![
-                t.id, t.source, t.title, t.artist, t.album, t.genre, t.moods, t.year, t.track_no,
-                t.duration, t.bitrate, t.sample_rate, t.bit_depth, t.format, t.size,
-                t.stream_url, t.cover_url, t.meta, t.play_count, t.last_played, now
+                meta.id,
+                meta.name,
+                meta.artist,
+                meta.cover_url,
+                meta.genre,
+                meta.year,
+                meta.label,
+                meta.deezer_id,
+                now
             ],
         )?;
         Ok(())
     }
 
-    pub fn track(&self, id: &str) -> Option<Track> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!("SELECT {} FROM tracks WHERE id = ?1", Self::TRACK_COLS);
-        conn.query_row(&sql, params![id], Self::row_to_track)
-            .optional()
-            .ok()
-            .flatten()
+    pub fn get_album_meta(&self, id: &str) -> AppResult<Option<AlbumSummary>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, name, artist, cover_url, genre, year, label, deezer_id FROM albums_meta WHERE id = ?1",
+                params![id],
+                |r| {
+                    let name: String = r.get(1)?;
+                    let artist: String = r.get(2)?;
+                    Ok(AlbumSummary {
+                        id: r.get(0)?,
+                        name,
+                        artist_id: format!("ar:{}", slug(&artist)),
+                        artist,
+                        cover_url: r.get(3)?,
+                        genre: r.get(4)?,
+                        year: r.get(5)?,
+                        label: r.get(6)?,
+                        deezer_id: r.get(7)?,
+                        ..Default::default()
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
-    pub fn tracks_by_ids(&self, ids: &[String]) -> std::collections::HashMap<String, Track> {
-        let mut out = std::collections::HashMap::new();
-        if ids.is_empty() {
-            return out;
+    pub fn upsert_artist_meta(&self, meta: &ArtistSummary) -> AppResult<()> {
+        let conn = self.lock();
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO artists_meta(id, name, cover_url, bio, deezer_id, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               name = CASE WHEN excluded.name != '' THEN excluded.name ELSE artists_meta.name END,
+               cover_url = CASE WHEN excluded.cover_url != '' THEN excluded.cover_url ELSE artists_meta.cover_url END,
+               bio = CASE WHEN excluded.bio != '' THEN excluded.bio ELSE artists_meta.bio END,
+               deezer_id = CASE WHEN excluded.deezer_id != '' THEN excluded.deezer_id ELSE artists_meta.deezer_id END,
+               updated = excluded.updated",
+            params![
+                meta.id,
+                meta.name,
+                meta.cover_url,
+                meta.bio,
+                meta.deezer_id,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_artist_meta(&self, id: &str) -> AppResult<Option<ArtistSummary>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, name, cover_url, bio, deezer_id FROM artists_meta WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(ArtistSummary {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        cover_url: r.get(2)?,
+                        bio: r.get(3)?,
+                        deezer_id: r.get(4)?,
+                        album_count: 0,
+                        song_count: 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    fn all_album_metas_map(&self) -> AppResult<HashMap<String, AlbumSummary>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, artist, cover_url, genre, year, label, deezer_id FROM albums_meta",
+        )?;
+        let mut map = HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            let name: String = r.get(1)?;
+            let artist: String = r.get(2)?;
+            Ok(AlbumSummary {
+                id: r.get(0)?,
+                name,
+                artist_id: format!("ar:{}", slug(&artist)),
+                artist,
+                cover_url: r.get(3)?,
+                genre: r.get(4)?,
+                year: r.get(5)?,
+                label: r.get(6)?,
+                deezer_id: r.get(7)?,
+                ..Default::default()
+            })
+        })?;
+        for r in rows.flatten() {
+            map.insert(r.id.clone(), r);
         }
-        let conn = self.conn.lock().unwrap();
-        for chunk in ids.chunks(400) {
-            let placeholders: String = (1..=chunk.len())
-                .map(|i| format!("?{}", i))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT {} FROM tracks WHERE id IN ({})",
-                Self::TRACK_COLS,
-                placeholders
-            );
-            if let Ok(mut stmt) = conn.prepare(&sql) {
-                let params_vec: Vec<&dyn rusqlite::ToSql> =
-                    chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-                if let Ok(rows) = stmt.query_map(params_vec.as_slice(), Self::row_to_track) {
-                    for r in rows.flatten() {
-                        out.insert(r.id.clone(), r);
-                    }
+        Ok(map)
+    }
+
+    fn all_artist_metas_map(&self) -> AppResult<HashMap<String, ArtistSummary>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, cover_url, bio, deezer_id FROM artists_meta",
+        )?;
+        let mut map = HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok(ArtistSummary {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                cover_url: r.get(2)?,
+                bio: r.get(3)?,
+                deezer_id: r.get(4)?,
+                album_count: 0,
+                song_count: 0,
+            })
+        })?;
+        for r in rows.flatten() {
+            map.insert(r.id.clone(), r);
+        }
+        Ok(map)
+    }
+
+    pub fn build_album_summaries(&self, user_id: i64) -> AppResult<Vec<AlbumSummary>> {
+        let tracks = self.all_tracks(8000, 0)?;
+        let stats = if user_id > 0 {
+            self.track_stats_map(user_id)?
+        } else {
+            HashMap::new()
+        };
+        let metas = self.all_album_metas_map()?;
+        let mut map: HashMap<String, AlbumSummary> = HashMap::new();
+
+        for t in tracks {
+            let aid = t.album_id();
+            let entry = map.entry(aid.clone()).or_insert_with(|| {
+                let name = if t.album.trim().is_empty() {
+                    t.title.clone()
+                } else {
+                    t.album.clone()
+                };
+                AlbumSummary {
+                    id: aid.clone(),
+                    name,
+                    artist: t.artist.clone(),
+                    artist_id: t.artist_id(),
+                    cover_id: t.id.clone(),
+                    cover_url: t.cover_url.clone(),
+                    genre: t.genre.clone(),
+                    year: t.year,
+                    label: String::new(),
+                    deezer_id: String::new(),
+                    song_count: 0,
+                    duration: 0,
+                    play_count: 0,
+                    last_played: 0,
+                    created: t.created,
+                }
+            });
+            entry.song_count += 1;
+            entry.duration += t.duration.max(0);
+            if entry.cover_url.is_empty() && !t.cover_url.is_empty() {
+                entry.cover_url = t.cover_url.clone();
+                entry.cover_id = t.id.clone();
+            }
+            if entry.genre.is_empty() && !t.genre.is_empty() {
+                entry.genre = t.genre.clone();
+            }
+            if entry.year == 0 && t.year > 0 {
+                entry.year = t.year;
+            }
+            if t.created > entry.created {
+                entry.created = t.created;
+            }
+            if let Some(st) = stats.get(&t.id) {
+                entry.play_count += st.play_count as i64;
+                if st.last_played > entry.last_played {
+                    entry.last_played = st.last_played;
                 }
             }
         }
-        out
+
+        for (id, meta) in metas {
+            let entry = map.entry(id.clone()).or_insert_with(|| AlbumSummary {
+                id: id.clone(),
+                name: meta.name.clone(),
+                artist: meta.artist.clone(),
+                artist_id: format!("ar:{}", slug(&meta.artist)),
+                cover_id: id,
+                cover_url: meta.cover_url.clone(),
+                genre: meta.genre.clone(),
+                year: meta.year,
+                label: meta.label.clone(),
+                deezer_id: meta.deezer_id.clone(),
+                ..Default::default()
+            });
+            if !meta.cover_url.is_empty() {
+                entry.cover_url = meta.cover_url;
+            }
+            if !meta.label.is_empty() {
+                entry.label = meta.label;
+            }
+            if !meta.deezer_id.is_empty() {
+                entry.deezer_id = meta.deezer_id;
+            }
+            if entry.genre.is_empty() && !meta.genre.is_empty() {
+                entry.genre = meta.genre;
+            }
+            if entry.year == 0 && meta.year > 0 {
+                entry.year = meta.year;
+            }
+        }
+
+        let mut list: Vec<AlbumSummary> = map.into_values().collect();
+        list.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.name.cmp(&b.name)));
+        Ok(list)
     }
 
-    pub fn update_track_cover_and_genre(&self, id: &str, cover_url: Option<&str>, genre: Option<&str>) {
-        let conn = self.conn.lock().unwrap();
-        if let Some(c) = cover_url.filter(|s| !s.is_empty()) {
-            let _ = conn.execute(
-                "UPDATE tracks SET cover_url = ?1 WHERE id = ?2 AND (cover_url = '' OR cover_url IS NULL)",
-                params![c, id],
-            );
-        }
-        if let Some(g) = genre.filter(|s| !s.is_empty()) {
-            let _ = conn.execute(
-                "UPDATE tracks SET genre = ?1 WHERE id = ?2 AND (genre = '' OR genre IS NULL)",
-                params![g, id],
-            );
-        }
-    }
-
-    pub fn all_tracks(&self, limit: usize) -> Vec<Track> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
-            Self::TRACK_COLS
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(params![limit as i64], Self::row_to_track)
-            .ok()
+    pub fn album_summary_by_id(
+        &self,
+        user_id: i64,
+        album_id: &str,
+    ) -> AppResult<Option<AlbumSummary>> {
+        Ok(self
+            .build_album_summaries(user_id)?
             .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .collect()
+            .find(|a| a.id == album_id || a.deezer_id == album_id))
     }
 
-    pub fn search_tracks(&self, query: &str, limit: usize) -> Vec<Track> {
+    pub fn album_tracks(&self, album_id: &str) -> AppResult<Vec<Track>> {
+        let mut tracks: Vec<Track> = self
+            .all_tracks(8000, 0)?
+            .into_iter()
+            .filter(|t| t.album_id() == album_id)
+            .collect();
+        tracks.sort_by(|a, b| {
+            a.disc_no
+                .cmp(&b.disc_no)
+                .then_with(|| a.track_no.cmp(&b.track_no))
+                .then_with(|| b.quality_score().cmp(&a.quality_score()))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+        // Collapse exact duplicate song_keys within the same album keeping highest quality.
+        let mut seen = HashSet::new();
+        let mut out = Vec::with_capacity(tracks.len());
+        for t in tracks {
+            let key = format!("{}:{}", t.disc_no, t.song_key());
+            if seen.insert(key) {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn build_artist_summaries(&self) -> AppResult<Vec<ArtistSummary>> {
+        let tracks = self.all_tracks(8000, 0)?;
+        let metas = self.all_artist_metas_map()?;
+        let mut albums_per_artist: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut map: HashMap<String, ArtistSummary> = HashMap::new();
+
+        for t in tracks {
+            let arid = t.artist_id();
+            albums_per_artist
+                .entry(arid.clone())
+                .or_default()
+                .insert(t.album_id());
+            let entry = map.entry(arid.clone()).or_insert_with(|| ArtistSummary {
+                id: arid.clone(),
+                name: crate::models::primary_artist(&t.artist),
+                cover_url: t.cover_url.clone(),
+                bio: String::new(),
+                deezer_id: String::new(),
+                album_count: 0,
+                song_count: 0,
+            });
+            if entry.name.is_empty() {
+                entry.name = t.artist.clone();
+            }
+            entry.song_count += 1;
+            if entry.cover_url.is_empty() && !t.cover_url.is_empty() {
+                entry.cover_url = t.cover_url.clone();
+            }
+        }
+
+        for (arid, set) in albums_per_artist {
+            if let Some(a) = map.get_mut(&arid) {
+                a.album_count = set.len();
+            }
+        }
+
+        for (id, meta) in metas {
+            let entry = map.entry(id.clone()).or_insert_with(|| ArtistSummary {
+                id,
+                name: meta.name.clone(),
+                cover_url: meta.cover_url.clone(),
+                bio: meta.bio.clone(),
+                deezer_id: meta.deezer_id.clone(),
+                album_count: 0,
+                song_count: 0,
+            });
+            if !meta.cover_url.is_empty() {
+                entry.cover_url = meta.cover_url;
+            }
+            if !meta.bio.is_empty() {
+                entry.bio = meta.bio;
+            }
+            if !meta.deezer_id.is_empty() {
+                entry.deezer_id = meta.deezer_id;
+            }
+        }
+
+        let mut list: Vec<ArtistSummary> = map.into_values().collect();
+        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(list)
+    }
+
+    pub fn artist_summary_by_id(&self, artist_id: &str) -> AppResult<Option<ArtistSummary>> {
+        Ok(self
+            .build_artist_summaries()?
+            .into_iter()
+            .find(|a| a.id == artist_id || a.deezer_id == artist_id))
+    }
+
+    pub fn artist_tracks(&self, artist_id: &str) -> AppResult<Vec<Track>> {
+        let mut tracks: Vec<Track> = self
+            .all_tracks(8000, 0)?
+            .into_iter()
+            .filter(|t| t.artist_id() == artist_id)
+            .collect();
+        tracks.sort_by(|a, b| {
+            b.quality_score()
+                .cmp(&a.quality_score())
+                .then_with(|| b.year.cmp(&a.year))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+        Ok(tracks)
+    }
+
+    pub fn artist_albums(
+        &self,
+        user_id: i64,
+        artist_id: &str,
+    ) -> AppResult<Vec<AlbumSummary>> {
+        let mut albums: Vec<AlbumSummary> = self
+            .build_album_summaries(user_id)?
+            .into_iter()
+            .filter(|a| a.artist_id == artist_id)
+            .collect();
+        albums.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
+        Ok(albums)
+    }
+
+    pub fn genres(&self) -> AppResult<Vec<(String, usize, usize)>> {
+        let tracks = self.all_tracks(8000, 0)?;
+        let mut song_counts: HashMap<String, usize> = HashMap::new();
+        let mut album_sets: HashMap<String, HashSet<String>> = HashMap::new();
+        for t in tracks {
+            for raw in t.genre.split(&[',', ';', '/'][..]) {
+                let g = raw.trim();
+                if g.is_empty() {
+                    continue;
+                }
+                let norm = title_case(g);
+                *song_counts.entry(norm.clone()).or_insert(0) += 1;
+                album_sets.entry(norm).or_default().insert(t.album_id());
+            }
+        }
+        let mut out: Vec<(String, usize, usize)> = song_counts
+            .into_iter()
+            .map(|(g, sc)| {
+                let ac = album_sets.get(&g).map(|s| s.len()).unwrap_or(0);
+                (g, sc, ac)
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    pub fn tracks_by_genre(
+        &self,
+        genre: &str,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let pat = format!("%{}%", genre.trim().to_lowercase());
+        let sql = format!(
+            "SELECT {} FROM tracks WHERE lower(genre) LIKE ?1 ORDER BY created DESC LIMIT ?2 OFFSET ?3",
+            TRACK_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![pat, limit as i64, offset as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn tracks_by_mood(
+        &self,
+        mood: Mood,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let pat = format!("%{}%", mood.slug());
+        let sql = format!(
+            "SELECT {} FROM tracks WHERE lower(moods) LIKE ?1 ORDER BY created DESC LIMIT ?2 OFFSET ?3",
+            TRACK_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![pat, limit as i64, offset as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn search_tracks(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<Track>> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
-            return self.all_tracks(limit);
+            return self.all_tracks(limit, offset);
         }
-        let tokens: Vec<String> = q
-            .split_whitespace()
-            .filter(|w| !w.is_empty())
-            .take(6)
-            .map(|w| format!("%{}%", w))
-            .collect();
-        let conn = self.conn.lock().unwrap();
-        let haystack = "(lower(title) || ' ' || lower(artist) || ' ' || lower(album) || ' ' || lower(genre))";
-        let where_clause = (1..=tokens.len())
-            .map(|i| format!("{} LIKE ?{}", haystack, i))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let limit_param = tokens.len() + 1;
-        let sql = format!(
-            "SELECT {} FROM tracks WHERE {} LIMIT ?{}",
-            Self::TRACK_COLS,
-            where_clause,
-            limit_param
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let row_limit = (limit * 4).max(100) as i64;
-        let mut sql_params: Vec<&dyn rusqlite::ToSql> =
-            tokens.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        sql_params.push(&row_limit);
-        let mut tracks: Vec<Track> = stmt
-            .query_map(sql_params.as_slice(), Self::row_to_track)
-            .ok()
+        let candidates = self.all_tracks(6000, 0)?;
+        let mut scored: Vec<(i32, Track)> = candidates
             .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .collect();
-
-        // Rank by relevance + quality score (lossless/local wins ties!)
-        tracks.sort_by_key(|a| std::cmp::Reverse(search_match_score(a, &q) * 10000 + a.quality_score()));
-        tracks.truncate(limit);
-        tracks
-    }
-
-    pub fn tracks_by_genre(&self, genre: &str, limit: usize, offset: usize) -> Vec<Track> {
-        let conn = self.conn.lock().unwrap();
-        let pattern = format!("%{}%", genre.to_lowercase());
-        let sql = format!(
-            "SELECT {} FROM tracks WHERE lower(genre) LIKE ?1 ORDER BY play_count DESC, created DESC LIMIT ?2 OFFSET ?3",
-            Self::TRACK_COLS
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(params![pattern, limit as i64, offset as i64], Self::row_to_track)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .collect()
-    }
-
-    pub fn tracks_by_artist(&self, artist: &str, limit: usize) -> Vec<Track> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM tracks WHERE lower(artist) = lower(?1) ORDER BY album ASC, track_no ASC LIMIT ?2",
-            Self::TRACK_COLS
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(params![artist, limit as i64], Self::row_to_track)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .collect()
-    }
-
-    pub fn track_count(&self) -> usize {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0) as usize
-    }
-
-    pub fn count_by_source(&self, source: &str) -> usize {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM tracks WHERE source = ?1",
-            params![source],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize
-    }
-
-    pub fn lossless_count(&self) -> usize {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM tracks WHERE lower(format) IN ('flac','alac','wav','aiff','aif')",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize
-    }
-
-    pub fn genres(&self) -> Vec<(String, usize)> {
-        let tracks = self.all_tracks(5000);
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for t in tracks {
-            let g = t.genre.trim();
-            if !g.is_empty() {
-                *counts.entry(g.to_string()).or_default() += 1;
-            }
-        }
-        let mut list: Vec<(String, usize)> = counts.into_iter().collect();
-        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        list
-    }
-
-    pub fn artists(&self) -> Vec<(String, String, usize)> {
-        let tracks = self.all_tracks(5000);
-        let mut map: HashMap<String, (String, usize)> = HashMap::new();
-        for t in tracks {
-            if crate::models::is_generic_folder_name(&t.artist) {
-                continue;
-            }
-            let aid = t.artist_id();
-            let entry = map.entry(aid).or_insert_with(|| (t.artist.clone(), 0));
-            entry.1 += 1;
-        }
-        let mut out: Vec<(String, String, usize)> =
-            map.into_iter().map(|(id, (name, c))| (id, name, c)).collect();
-        out.sort_by_key(|a| a.1.to_lowercase());
-        out
-    }
-
-    pub fn latest_user_event_at(&self, user_id: i64) -> i64 {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT COALESCE(MAX(at), 0) FROM events WHERE user_id = ?1",
-            params![user_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
-    }
-
-    /// Re-cleans previously indexed Soulseek/YouTube/SoundCloud metadata in SQLite so old
-    /// polluted folder names (`complete`, `[9a149]`, channel suffixes) stop breaking artist
-    /// pages, cover lookups, and mix deduplication.
-    pub fn repair_source_metadata(&self) -> usize {
-        struct RawMetaRow {
-            id: String,
-            source: String,
-            title: String,
-            artist: String,
-            album: String,
-            format: String,
-            stream_url: String,
-            meta: String,
-            track_no: i32,
-        }
-
-        let mut conn = self.conn.lock().unwrap();
-        let rows: Vec<RawMetaRow> = {
-            let mut stmt = match conn.prepare(
-                "SELECT id, source, title, artist, album, format, stream_url, meta, track_no
-                 FROM tracks WHERE source IN ('soulseek', 'youtube', 'soundcloud')",
-            ) {
-                Ok(s) => s,
-                Err(_) => return 0,
-            };
-            let collected: Vec<_> = stmt
-                .query_map([], |r| {
-                    Ok(RawMetaRow {
-                        id: r.get(0)?,
-                        source: r.get(1)?,
-                        title: r.get(2)?,
-                        artist: r.get(3)?,
-                        album: r.get(4)?,
-                        format: r.get(5)?,
-                        stream_url: r.get(6)?,
-                        meta: r.get(7)?,
-                        track_no: r.get(8)?,
-                    })
-                })
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r.ok())
-                .collect();
-            collected
-        };
-
-        let mut updated = 0usize;
-        if let Ok(tx) = conn.transaction() {
-            for RawMetaRow {
-                id,
-                source,
-                title,
-                artist,
-                album,
-                format,
-                stream_url,
-                meta,
-                track_no,
-            } in rows
-            {
-                let (new_artist, new_album, new_title, new_tno, new_fmt) = if source == "soulseek"
-                    && !meta.is_empty()
-                {
-                    let (a, alb, t, tno) = crate::sources::soulseek::parse_slsk_path(&meta);
-                    let final_tno = if track_no > 0 { track_no } else { tno };
-                    (a, alb, t, final_tno, format.clone())
-                } else {
-                    let clean_a = {
-                        let pa = crate::models::primary_artist(&artist);
-                        if pa.is_empty() { artist.clone() } else { pa }
-                    };
-                    let clean_t = {
-                        let st = crate::models::strip_release_tags(&title);
-                        if st.is_empty() { title.clone() } else { st }
-                    };
-                    let alb_low = album.to_ascii_lowercase();
-                    let dirty_album = source == "youtube"
-                        && (alb_low.contains("channel")
-                            || alb_low.contains("official")
-                            || alb_low.contains(" - topic")
-                            || crate::models::is_generic_folder_name(&album)
-                            || album == artist);
-                    let clean_alb = if dirty_album {
-                        clean_t.clone()
-                    } else {
-                        let s = crate::models::strip_release_tags(&album);
-                        if s.is_empty() { album.clone() } else { s }
-                    };
-                    let fmt = if source == "youtube"
-                        && format == "opus"
-                        && stream_url.starts_with("ytdlp:")
-                    {
-                        "m4a".to_string()
-                    } else {
-                        format.clone()
-                    };
-                    (clean_a, clean_alb, clean_t, track_no, fmt)
-                };
-
-                if new_artist != artist
-                    || new_album != album
-                    || new_title != title
-                    || new_tno != track_no
-                    || new_fmt != format
-                {
-                    let _ = tx.execute(
-                        "UPDATE tracks SET artist = ?1, album = ?2, title = ?3, track_no = ?4, format = ?5 WHERE id = ?6",
-                        params![new_artist, new_album, new_title, new_tno, new_fmt, id],
-                    );
-                    updated += 1;
-                }
-            }
-            let _ = tx.commit();
-        };
-        updated
-    }
-
-    pub fn artist_name_from_id(&self, artist_id: &str) -> Option<String> {
-        let target = artist_id.strip_prefix("ar:").unwrap_or(artist_id);
-        let tracks = self.all_tracks(5000);
-        tracks
-            .into_iter()
-            .find(|t| slug(&t.artist) == target)
-            .map(|t| t.artist)
-    }
-
-    pub fn increment_play(&self, track_id: &str) {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().timestamp();
-        let _ = conn.execute(
-            "UPDATE tracks SET play_count = play_count + 1, last_played = ?1 WHERE id = ?2",
-            params![now, track_id],
-        );
-    }
-
-    // ---------- Events, Stars & Ratings ----------
-
-    pub fn record_event(&self, user_id: i64, track_id: &str, kind: &str, value: f64) {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().timestamp();
-        let _ = conn.execute(
-            "INSERT INTO events(user_id, track_id, kind, value, at) VALUES(?1,?2,?3,?4,?5)",
-            params![user_id, track_id, kind, value, now],
-        );
-    }
-
-    pub fn user_events(&self, user_id: i64, limit: usize) -> Vec<Event> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            "SELECT track_id, kind, value, at FROM events WHERE user_id = ?1 ORDER BY at DESC LIMIT ?2",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(params![user_id, limit as i64], |r| {
-            Ok(Event {
-                track_id: r.get(0)?,
-                kind: r.get(1)?,
-                value: r.get(2)?,
-                at: r.get(3)?,
+            .filter_map(|t| {
+                let s = search_match_score(&t, &q);
+                (s > 0).then_some((s, t))
             })
-        })
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .collect()
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(scored
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, t)| t)
+            .collect())
     }
 
-    pub fn star_track(&self, user_id: i64, track_id: &str) {
+    pub fn search_albums(
+        &self,
+        user_id: i64,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<AlbumSummary>> {
+        let q = query.trim().to_lowercase();
+        let all = self.build_album_summaries(user_id)?;
+        let filtered: Vec<AlbumSummary> = if q.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|a| {
+                    a.name.to_lowercase().contains(&q) || a.artist.to_lowercase().contains(&q)
+                })
+                .collect()
+        };
+        Ok(filtered.into_iter().skip(offset).take(limit).collect())
+    }
+
+    pub fn search_artists(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<ArtistSummary>> {
+        let q = query.trim().to_lowercase();
+        let all = self.build_artist_summaries()?;
+        let filtered: Vec<ArtistSummary> = if q.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|a| a.name.to_lowercase().contains(&q))
+                .collect()
+        };
+        Ok(filtered.into_iter().skip(offset).take(limit).collect())
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-User Listening Stats, Events, Stars, Saved Albums, Followed Artists
+    // -------------------------------------------------------------------------
+
+    pub fn record_event(
+        &self,
+        user_id: i64,
+        track_id: &str,
+        kind: &str,
+        value: f64,
+    ) -> AppResult<()> {
         let now = Utc::now().timestamp();
-        {
-            let conn = self.conn.lock().unwrap();
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO stars(user_id, track_id, at) VALUES(?1,?2,?3)",
-                params![user_id, track_id, now],
-            );
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO events(user_id, track_id, kind, value, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user_id, track_id, kind, value, now],
+        )?;
+        match kind {
+            "play" | "complete" => {
+                conn.execute(
+                    "INSERT INTO user_track_stats(user_id, track_id, play_count, skip_count, last_played)
+                     VALUES (?1, ?2, 1, 0, ?3)
+                     ON CONFLICT(user_id, track_id) DO UPDATE SET
+                       play_count = play_count + 1,
+                       last_played = excluded.last_played",
+                    params![user_id, track_id, now],
+                )?;
+            }
+            "skip" => {
+                conn.execute(
+                    "INSERT INTO user_track_stats(user_id, track_id, play_count, skip_count, last_played)
+                     VALUES (?1, ?2, 0, 1, ?3)
+                     ON CONFLICT(user_id, track_id) DO UPDATE SET
+                       skip_count = skip_count + 1,
+                       last_played = CASE WHEN last_played < excluded.last_played THEN excluded.last_played ELSE last_played END",
+                    params![user_id, track_id, now],
+                )?;
+            }
+            _ => {}
         }
-        self.record_event(user_id, track_id, "star", 1.0);
+        Ok(())
     }
 
-    pub fn unstar_track(&self, user_id: i64, track_id: &str) {
-        {
-            let conn = self.conn.lock().unwrap();
-            let _ = conn.execute(
-                "DELETE FROM stars WHERE user_id = ?1 AND track_id = ?2",
+    pub fn track_stats_map(&self, user_id: i64) -> AppResult<HashMap<String, UserTrackStats>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT track_id, play_count, skip_count, last_played FROM user_track_stats WHERE user_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![user_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                UserTrackStats {
+                    play_count: r.get(1)?,
+                    skip_count: r.get(2)?,
+                    last_played: r.get(3)?,
+                },
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for item in rows.flatten() {
+            map.insert(item.0, item.1);
+        }
+        Ok(map)
+    }
+
+    pub fn get_user_track_stats(
+        &self,
+        user_id: i64,
+        track_id: &str,
+    ) -> AppResult<UserTrackStats> {
+        let conn = self.lock();
+        let st = conn
+            .query_row(
+                "SELECT play_count, skip_count, last_played FROM user_track_stats WHERE user_id = ?1 AND track_id = ?2",
                 params![user_id, track_id],
-            );
-        }
-        self.record_event(user_id, track_id, "unstar", 1.0);
+                |r| {
+                    Ok(UserTrackStats {
+                        play_count: r.get(0)?,
+                        skip_count: r.get(1)?,
+                        last_played: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(st)
     }
 
-    pub fn is_starred(&self, user_id: i64, track_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT 1 FROM stars WHERE user_id = ?1 AND track_id = ?2",
-            params![user_id, track_id],
-            |_| Ok(1),
-        )
-        .is_ok()
-    }
-
-    pub fn starred_tracks(&self, user_id: i64) -> Vec<Track> {
-        let conn = self.conn.lock().unwrap();
+    pub fn user_recent_tracks(
+        &self,
+        user_id: i64,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<(Track, UserTrackStats)>> {
+        let conn = self.lock();
         let sql = format!(
-            "SELECT {} FROM tracks t INNER JOIN stars s ON t.id = s.track_id WHERE s.user_id = ?1 ORDER BY s.at DESC",
-            Self::TRACK_COLS
-                .split(", ")
-                .map(|c| format!("t.{}", c))
+            "SELECT {}, uts.play_count, uts.skip_count, uts.last_played
+             FROM user_track_stats uts
+             JOIN tracks t ON t.id = uts.track_id
+             WHERE uts.user_id = ?1 AND uts.play_count > 0
+             ORDER BY uts.last_played DESC
+             LIMIT ?2 OFFSET ?3",
+            TRACK_COLS
+                .split(',')
+                .map(|c| format!("t.{}", c.trim()))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(params![user_id], Self::row_to_track)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .collect()
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id, limit as i64, offset as i64], |r| {
+                let t = row_to_track(r)?;
+                let st = UserTrackStats {
+                    play_count: r.get(21)?,
+                    skip_count: r.get(22)?,
+                    last_played: r.get(23)?,
+                };
+                Ok((t, st))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
-    pub fn set_rating(&self, user_id: i64, track_id: &str, rating: i32) {
+    pub fn user_frequent_tracks(
+        &self,
+        user_id: i64,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<(Track, UserTrackStats)>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, uts.play_count, uts.skip_count, uts.last_played
+             FROM user_track_stats uts
+             JOIN tracks t ON t.id = uts.track_id
+             WHERE uts.user_id = ?1 AND uts.play_count > 0
+             ORDER BY uts.play_count DESC, uts.last_played DESC
+             LIMIT ?2 OFFSET ?3",
+            TRACK_COLS
+                .split(',')
+                .map(|c| format!("t.{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id, limit as i64, offset as i64], |r| {
+                let t = row_to_track(r)?;
+                let st = UserTrackStats {
+                    play_count: r.get(21)?,
+                    skip_count: r.get(22)?,
+                    last_played: r.get(23)?,
+                };
+                Ok((t, st))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn user_recent_events(&self, user_id: i64, limit: usize) -> AppResult<Vec<Event>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT track_id, kind, value, at FROM events WHERE user_id = ?1 ORDER BY at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, limit as i64], |r| {
+                Ok(Event {
+                    track_id: r.get(0)?,
+                    kind: r.get(1)?,
+                    value: r.get(2)?,
+                    at: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn star_track(&self, user_id: i64, track_id: &str) -> AppResult<()> {
         let now = Utc::now().timestamp();
-        {
-            let conn = self.conn.lock().unwrap();
-            if rating <= 0 {
-                let _ = conn.execute(
-                    "DELETE FROM ratings WHERE user_id = ?1 AND track_id = ?2",
-                    params![user_id, track_id],
-                );
-            } else {
-                let _ = conn.execute(
-                    "INSERT OR REPLACE INTO ratings(user_id, track_id, rating, at) VALUES(?1,?2,?3,?4)",
-                    params![user_id, track_id, rating.clamp(1, 5), now],
-                );
-            }
-        }
-        self.record_event(user_id, track_id, "rate", rating as f64);
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO stars(user_id, track_id, at) VALUES (?1, ?2, ?3)",
+            params![user_id, track_id, now],
+        )?;
+        conn.execute(
+            "INSERT INTO events(user_id, track_id, kind, value, at) VALUES (?1, ?2, 'star', 1.0, ?3)",
+            params![user_id, track_id, now],
+        )?;
+        Ok(())
     }
 
-    pub fn user_rating(&self, user_id: i64, track_id: &str) -> i32 {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT rating FROM ratings WHERE user_id = ?1 AND track_id = ?2",
+    pub fn unstar_track(&self, user_id: i64, track_id: &str) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM stars WHERE user_id = ?1 AND track_id = ?2",
             params![user_id, track_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
+        )?;
+        conn.execute(
+            "INSERT INTO events(user_id, track_id, kind, value, at) VALUES (?1, ?2, 'unstar', 0.0, ?3)",
+            params![user_id, track_id, now],
+        )?;
+        Ok(())
     }
 
-    // ---------- Playlists ----------
+    pub fn starred_ids(&self, user_id: i64) -> AppResult<HashSet<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT track_id FROM stars WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map(params![user_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
 
-    pub fn create_user_playlist(
+    pub fn starred_tracks(&self, user_id: i64) -> AppResult<Vec<(Track, i64)>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, s.at FROM stars s JOIN tracks t ON t.id = s.track_id WHERE s.user_id = ?1 ORDER BY s.at DESC",
+            TRACK_COLS
+                .split(',')
+                .map(|c| format!("t.{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| Ok((row_to_track(r)?, r.get(21)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn save_album(&self, user_id: i64, album_id: &str) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO saved_albums(user_id, album_id, at) VALUES (?1, ?2, ?3)",
+            params![user_id, album_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn unsave_album(&self, user_id: i64, album_id: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM saved_albums WHERE user_id = ?1 AND album_id = ?2",
+            params![user_id, album_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn saved_album_ids(&self, user_id: i64) -> AppResult<HashSet<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT album_id FROM saved_albums WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map(params![user_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn follow_artist(&self, user_id: i64, artist_id: &str) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO followed_artists(user_id, artist_id, at) VALUES (?1, ?2, ?3)",
+            params![user_id, artist_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn unfollow_artist(&self, user_id: i64, artist_id: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM followed_artists WHERE user_id = ?1 AND artist_id = ?2",
+            params![user_id, artist_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn followed_artist_ids(&self, user_id: i64) -> AppResult<HashSet<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT artist_id FROM followed_artists WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map(params![user_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_rating(&self, user_id: i64, track_id: &str, rating: i32) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let clamped = rating.clamp(0, 5);
+        let conn = self.lock();
+        if clamped == 0 {
+            conn.execute(
+                "DELETE FROM ratings WHERE user_id = ?1 AND track_id = ?2",
+                params![user_id, track_id],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO ratings(user_id, track_id, rating, at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(user_id, track_id) DO UPDATE SET rating = excluded.rating, at = excluded.at",
+                params![user_id, track_id, clamped, now],
+            )?;
+            conn.execute(
+                "INSERT INTO events(user_id, track_id, kind, value, at) VALUES (?1, ?2, 'rate', ?3, ?4)",
+                params![user_id, track_id, clamped as f64, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn user_ratings(&self, user_id: i64) -> AppResult<HashMap<String, i32>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT track_id, rating FROM ratings WHERE user_id = ?1")?;
+        let rows = stmt.query_map(params![user_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?))
+        })?;
+        let mut map = HashMap::new();
+        for item in rows.flatten() {
+            map.insert(item.0, item.1);
+        }
+        Ok(map)
+    }
+
+    // -------------------------------------------------------------------------
+    // Playlists CRUD, Auto-Mixes & Play Queues
+    // -------------------------------------------------------------------------
+
+    pub fn create_playlist(
         &self,
         user_id: i64,
         name: &str,
+        comment: &str,
         public: bool,
         track_ids: &[String],
-    ) -> Result<Playlist> {
-        self.save_playlist_internal(user_id, name, "", public, false, "user", track_ids)
+    ) -> AppResult<Playlist> {
+        let id = format!("pl-{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO playlists(id, user_id, name, comment, public, is_auto, kind, created, changed)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 'user', ?6, ?6)",
+            params![id, user_id, name.trim(), comment, if public { 1 } else { 0 }, now],
+        )?;
+        for (idx, tid) in track_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
+                params![id, idx as i64, tid, now],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        self.get_playlist(&id)?
+            .ok_or_else(|| err_msg("Failed to load created playlist"))
     }
 
     pub fn upsert_auto_playlist(
         &self,
+        id: &str,
         user_id: i64,
         name: &str,
         comment: &str,
         kind: &str,
         track_ids: &[String],
-    ) -> Result<Playlist> {
-        self.save_playlist_internal(user_id, name, comment, false, true, kind, track_ids)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn save_playlist_internal(
-        &self,
-        user_id: i64,
-        name: &str,
-        comment: &str,
-        public: bool,
-        is_auto: bool,
-        kind: &str,
-        track_ids: &[String],
-    ) -> Result<Playlist> {
-        let id = if is_auto {
-            format!("auto:{}:{}", user_id, slug(kind))
-        } else {
-            format!("pl:{}", Uuid::new_v4())
-        };
+    ) -> AppResult<()> {
         let now = Utc::now().timestamp();
-        {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO playlists(id, user_id, name, comment, public, is_auto, kind, created, changed)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![
-                    id,
-                    user_id,
-                    name,
-                    comment,
-                    if public { 1 } else { 0 },
-                    if is_auto { 1 } else { 0 },
-                    kind,
-                    now,
-                    now
-                ],
-            )?;
-        }
-        self.set_playlist_tracks(&id, track_ids)?;
-        Ok(self.get_playlist(&id).unwrap())
-    }
-
-    pub fn set_playlist_tracks(&self, playlist_id: &str, track_ids: &[String]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx.execute(
+            "INSERT INTO playlists(id, user_id, name, comment, public, is_auto, kind, created, changed)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, ?5, ?6, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               comment = excluded.comment,
+               kind = excluded.kind,
+               changed = excluded.changed",
+            params![id, user_id, name, comment, kind, now],
+        )?;
+        tx.execute(
             "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
-            params![playlist_id],
+            params![id],
         )?;
         for (idx, tid) in track_ids.iter().enumerate() {
             tx.execute(
-                "INSERT INTO playlist_tracks(playlist_id, pos, track_id) VALUES(?1,?2,?3)",
-                params![playlist_id, idx as i64, tid],
+                "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
+                params![id, idx as i64, tid, now],
             )?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_playlist(&self, id: &str) -> AppResult<Option<Playlist>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT p.id, p.user_id, COALESCE(u.username, 'beatlab'), p.name, p.comment,
+                        p.public, p.is_auto, p.kind, p.created, p.changed,
+                        (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id),
+                        COALESCE((SELECT SUM(t.duration) FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = p.id), 0),
+                        (SELECT pt.track_id FROM playlist_tracks pt WHERE pt.playlist_id = p.id ORDER BY pt.pos ASC LIMIT 1)
+                 FROM playlists p
+                 LEFT JOIN users u ON u.id = p.user_id
+                 WHERE p.id = ?1",
+                params![id],
+                row_to_playlist,
+            )
+            .optional()?)
+    }
+
+    pub fn list_playlists(&self, user_id: i64, include_public: bool) -> AppResult<Vec<Playlist>> {
+        let conn = self.lock();
+        let sql = if include_public {
+            "SELECT p.id, p.user_id, COALESCE(u.username, 'beatlab'), p.name, p.comment,
+                    p.public, p.is_auto, p.kind, p.created, p.changed,
+                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id),
+                    COALESCE((SELECT SUM(t.duration) FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = p.id), 0),
+                    (SELECT pt.track_id FROM playlist_tracks pt WHERE pt.playlist_id = p.id ORDER BY pt.pos ASC LIMIT 1)
+             FROM playlists p
+             LEFT JOIN users u ON u.id = p.user_id
+             WHERE p.user_id = ?1 OR p.public = 1
+             ORDER BY p.is_auto ASC, p.changed DESC"
+        } else {
+            "SELECT p.id, p.user_id, COALESCE(u.username, 'beatlab'), p.name, p.comment,
+                    p.public, p.is_auto, p.kind, p.created, p.changed,
+                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id),
+                    COALESCE((SELECT SUM(t.duration) FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = p.id), 0),
+                    (SELECT pt.track_id FROM playlist_tracks pt WHERE pt.playlist_id = p.id ORDER BY pt.pos ASC LIMIT 1)
+             FROM playlists p
+             LEFT JOIN users u ON u.id = p.user_id
+             WHERE p.user_id = ?1
+             ORDER BY p.is_auto ASC, p.changed DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![user_id], row_to_playlist)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn playlist_tracks(&self, playlist_id: &str) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {} FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = ?1 ORDER BY pt.pos ASC",
+            TRACK_COLS
+                .split(',')
+                .map(|c| format!("t.{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![playlist_id], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_playlist(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        comment: Option<&str>,
+        public: Option<bool>,
+    ) -> AppResult<()> {
         let now = Utc::now().timestamp();
+        let conn = self.lock();
+        if let Some(n) = name {
+            conn.execute(
+                "UPDATE playlists SET name = ?1, changed = ?2 WHERE id = ?3",
+                params![n.trim(), now, id],
+            )?;
+        }
+        if let Some(c) = comment {
+            conn.execute(
+                "UPDATE playlists SET comment = ?1, changed = ?2 WHERE id = ?3",
+                params![c, now, id],
+            )?;
+        }
+        if let Some(p) = public {
+            conn.execute(
+                "UPDATE playlists SET public = ?1, changed = ?2 WHERE id = ?3",
+                params![if p { 1 } else { 0 }, now, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn add_tracks_to_playlist(&self, id: &str, track_ids: &[String]) -> AppResult<()> {
+        if track_ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let max_pos: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(pos), -1) FROM playlist_tracks WHERE playlist_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let mut pos = max_pos + 1;
+        for tid in track_ids {
+            tx.execute(
+                "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
+                params![id, pos, tid, now],
+            )?;
+            pos += 1;
+        }
         tx.execute(
             "UPDATE playlists SET changed = ?1 WHERE id = ?2",
-            params![now, playlist_id],
+            params![now, id],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn update_playlist_tracks(
-        &self,
-        playlist_id: &str,
-        to_add: &[String],
-        to_remove_indices: &[usize],
-    ) -> Result<()> {
-        if to_add.is_empty() && to_remove_indices.is_empty() {
+    pub fn replace_playlist_tracks(&self, id: &str, track_ids: &[String]) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
+            params![id],
+        )?;
+        for (idx, tid) in track_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
+                params![id, idx as i64, tid, now],
+            )?;
+        }
+        tx.execute(
+            "UPDATE playlists SET changed = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_playlist_positions(&self, id: &str, positions: &[usize]) -> AppResult<()> {
+        if positions.is_empty() {
             return Ok(());
         }
-        let mut ids: Vec<String> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY pos ASC",
-            )?;
-            let rows: Vec<String> = stmt
-                .query_map(params![playlist_id], |r| r.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
-        let mut remove_sorted = to_remove_indices.to_vec();
-        remove_sorted.sort_unstable();
-        remove_sorted.dedup();
-        for idx in remove_sorted.into_iter().rev() {
-            if idx < ids.len() {
-                ids.remove(idx);
-            }
-        }
-        ids.extend_from_slice(to_add);
-        self.set_playlist_tracks(playlist_id, &ids)
-    }
-
-    pub fn playlist_tracks(&self, playlist_id: &str) -> Vec<Track> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM tracks t INNER JOIN playlist_tracks pt ON t.id = pt.track_id WHERE pt.playlist_id = ?1 ORDER BY pt.pos ASC",
-            Self::TRACK_COLS
-                .split(", ")
-                .map(|c| format!("t.{}", c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map(params![playlist_id], Self::row_to_track)
-            .ok()
+        let current = self.playlist_tracks(id)?;
+        let drop_set: HashSet<usize> = positions.iter().copied().collect();
+        let kept: Vec<String> = current
             .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .collect()
+            .enumerate()
+            .filter(|(idx, _)| !drop_set.contains(idx))
+            .map(|(_, t)| t.id)
+            .collect();
+        self.replace_playlist_tracks(id, &kept)
     }
 
-    pub fn get_playlist(&self, id: &str) -> Option<Playlist> {
-        let conn = self.conn.lock().unwrap();
-        let mut pl = conn
+    pub fn move_playlist_track(
+        &self,
+        id: &str,
+        from_pos: usize,
+        to_pos: usize,
+    ) -> AppResult<()> {
+        let mut tracks: Vec<String> = self
+            .playlist_tracks(id)?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        if from_pos >= tracks.len() || to_pos >= tracks.len() {
+            return Err(err_msg("Track position out of range"));
+        }
+        let item = tracks.remove(from_pos);
+        tracks.insert(to_pos, item);
+        self.replace_playlist_tracks(id, &tracks)
+    }
+
+    pub fn delete_playlist(&self, id: &str) -> AppResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn save_play_queue(&self, user_id: i64, state: &PlayQueueState) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let json = serde_json::to_string(&state.track_ids)?;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO play_queues(user_id, current_id, current_index, position_ms, track_ids, changed_by, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(user_id) DO UPDATE SET
+               current_id = excluded.current_id,
+               current_index = excluded.current_index,
+               position_ms = excluded.position_ms,
+               track_ids = excluded.track_ids,
+               changed_by = excluded.changed_by,
+               updated = excluded.updated",
+            params![
+                user_id,
+                state.current_id,
+                state.current_index as i64,
+                state.position_ms,
+                json,
+                state.changed_by,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_play_queue(&self, user_id: i64) -> AppResult<Option<PlayQueueState>> {
+        let conn = self.lock();
+        let row = conn
             .query_row(
-                "SELECT id, user_id, name, comment, public, is_auto, kind, created, changed FROM playlists WHERE id = ?1",
-                params![id],
+                "SELECT current_id, current_index, position_ms, track_ids, changed_by, updated
+                 FROM play_queues WHERE user_id = ?1",
+                params![user_id],
                 |r| {
-                    Ok(Playlist {
-                        id: r.get(0)?,
-                        user_id: r.get(1)?,
-                        name: r.get(2)?,
-                        comment: r.get(3)?,
-                        public: r.get::<_, i64>(4)? != 0,
-                        is_auto: r.get::<_, i64>(5)? != 0,
-                        kind: r.get(6)?,
-                        created: r.get(7)?,
-                        changed: r.get(8)?,
-                        track_count: 0,
-                        duration: 0,
-                        cover_track_id: None,
+                    let ids_json: String = r.get(3)?;
+                    let track_ids: Vec<String> = serde_json::from_str(&ids_json).unwrap_or_default();
+                    let cur_idx: i64 = r.get(1)?;
+                    Ok(PlayQueueState {
+                        current_id: r.get(0)?,
+                        current_index: cur_idx.max(0) as usize,
+                        position_ms: r.get(2)?,
+                        track_ids,
+                        changed_by: r.get(4)?,
+                        updated: r.get(5)?,
                     })
                 },
             )
-            .optional()
-            .ok()
-            .flatten()?;
-        drop(conn);
-        let tracks = self.playlist_tracks(&pl.id);
-        pl.track_count = tracks.len();
-        pl.duration = tracks.iter().map(|t| t.duration).sum();
-        pl.cover_track_id = tracks.first().map(|t| t.id.clone());
-        Some(pl)
+            .optional()?;
+        Ok(row)
     }
 
-    pub fn list_playlists(&self, user_id: i64) -> Vec<Playlist> {
-        let ids: Vec<String> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = match conn.prepare(
-                "SELECT id FROM playlists WHERE user_id = ?1 OR public = 1 ORDER BY is_auto DESC, changed DESC",
-            ) {
-                Ok(s) => s,
-                Err(_) => return vec![],
-            };
-            stmt.query_map(params![user_id], |r| r.get(0))
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        ids.into_iter().filter_map(|id| self.get_playlist(&id)).collect()
-    }
+    // -------------------------------------------------------------------------
+    // Internet Radio Stations, Cache & KV
+    // -------------------------------------------------------------------------
 
-    pub fn update_playlist_meta(&self, id: &str, name: Option<&str>, comment: Option<&str>, public: Option<bool>) {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().timestamp();
-        if let Some(n) = name {
-            let _ = conn.execute("UPDATE playlists SET name = ?1, changed = ?2 WHERE id = ?3", params![n, now, id]);
-        }
-        if let Some(c) = comment {
-            let _ = conn.execute("UPDATE playlists SET comment = ?1, changed = ?2 WHERE id = ?3", params![c, now, id]);
-        }
-        if let Some(p) = public {
-            let _ = conn.execute("UPDATE playlists SET public = ?1, changed = ?2 WHERE id = ?3", params![if p {1} else {0}, now, id]);
-        }
-    }
-
-    pub fn delete_playlist(&self, id: &str) {
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", params![id]);
-        let _ = conn.execute("DELETE FROM playlists WHERE id = ?1", params![id]);
-    }
-
-    // ---------- Radio Stations ----------
-
-    pub fn list_radio_stations(&self) -> Vec<RadioStation> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT id, name, stream_url, home_page_url FROM radio_stations ORDER BY name ASC") {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map([], |r| {
-            Ok(RadioStation {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                stream_url: r.get(2)?,
-                home_page_url: r.get(3)?,
-            })
-        })
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .collect()
-    }
-
-    pub fn upsert_radio_station(&self, id: Option<&str>, name: &str, stream_url: &str, home_page_url: &str) -> RadioStation {
-        let sid = id.map(|s| s.to_string()).unwrap_or_else(|| format!("rad:{}", Uuid::new_v4()));
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO radio_stations(id, name, stream_url, home_page_url) VALUES(?1,?2,?3,?4)",
-            params![sid, name, stream_url, home_page_url],
-        );
-        RadioStation {
-            id: sid,
-            name: name.to_string(),
-            stream_url: stream_url.to_string(),
-            home_page_url: home_page_url.to_string(),
-        }
-    }
-
-    pub fn delete_radio_station(&self, id: &str) {
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("DELETE FROM radio_stations WHERE id = ?1", params![id]);
-    }
-
-    // ---------- Play Queue ----------
-
-    pub fn save_play_queue(&self, user_id: i64, current_id: &str, position_ms: i64, track_ids: &[String], changed_by: &str) {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().timestamp();
-        let json = serde_json::to_string(track_ids).unwrap_or_else(|_| "[]".into());
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO play_queues(user_id, current_id, position_ms, track_ids, changed_by, updated) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![user_id, current_id, position_ms, json, changed_by, now],
-        );
-    }
-
-    pub fn get_play_queue(&self, user_id: i64) -> Option<(String, i64, Vec<String>, String, i64)> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT current_id, position_ms, track_ids, changed_by, updated FROM play_queues WHERE user_id = ?1",
-            params![user_id],
-            |r| {
-                let ids_json: String = r.get(2)?;
-                let ids: Vec<String> = serde_json::from_str(&ids_json).unwrap_or_default();
-                Ok((r.get(0)?, r.get(1)?, ids, r.get(3)?, r.get(4)?))
-            },
-        )
-        .optional()
-        .ok()
-        .flatten()
-    }
-
-    // ---------- Cache Index ----------
-
-    pub fn cache_get(&self, track_id: &str) -> Option<CacheEntry> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT track_id, path, bytes FROM cache_entries WHERE track_id = ?1",
-            params![track_id],
-            |r| {
-                Ok(CacheEntry {
-                    track_id: r.get(0)?,
-                    path: r.get(1)?,
-                    bytes: r.get(2)?,
+    pub fn list_radio_stations(&self, user_id: i64) -> AppResult<Vec<RadioStation>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, stream_url, home_page_url FROM radio_stations
+             WHERE user_id = ?1 OR user_id = 0 ORDER BY name ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                Ok(RadioStation {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    stream_url: r.get(2)?,
+                    home_page_url: r.get(3)?,
                 })
-            },
-        )
-        .optional()
-        .ok()
-        .flatten()
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
-    pub fn cache_put(&self, track_id: &str, path: &str, bytes: i64) {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().timestamp();
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO cache_entries(track_id, path, bytes, last_hit) VALUES(?1,?2,?3,?4)",
-            params![track_id, path, bytes, now],
-        );
-    }
-
-    pub fn cache_touch(&self, track_id: &str) {
-        let conn = self.conn.lock().unwrap();
-        let now = Utc::now().timestamp();
-        let _ = conn.execute(
-            "UPDATE cache_entries SET last_hit = ?1 WHERE track_id = ?2",
-            params![now, track_id],
-        );
-    }
-
-    pub fn cache_delete(&self, track_id: &str) -> bool {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM cache_entries WHERE track_id = ?1", params![track_id])
-            .map(|n| n > 0)
-            .unwrap_or(false)
-    }
-
-    pub fn cache_bytes(&self) -> i64 {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COALESCE(SUM(bytes), 0) FROM cache_entries", [], |r| r.get(0))
-            .unwrap_or(0)
-    }
-
-    pub fn cache_entries_oldest(&self) -> Vec<CacheEntry> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT track_id, path, bytes FROM cache_entries ORDER BY last_hit ASC") {
-            Ok(s) => s,
-            Err(_) => return vec![],
+    pub fn upsert_radio_station(
+        &self,
+        user_id: i64,
+        station: &RadioStation,
+    ) -> AppResult<RadioStation> {
+        let id = if station.id.trim().is_empty() {
+            format!("rad-{}", Uuid::new_v4().simple())
+        } else {
+            station.id.clone()
         };
-        stmt.query_map([], |r| {
-            Ok(CacheEntry {
-                track_id: r.get(0)?,
-                path: r.get(1)?,
-                bytes: r.get(2)?,
-            })
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO radio_stations(id, user_id, name, stream_url, home_page_url)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               stream_url = excluded.stream_url,
+               home_page_url = excluded.home_page_url",
+            params![
+                id,
+                user_id,
+                station.name.trim(),
+                station.stream_url.trim(),
+                station.home_page_url.trim()
+            ],
+        )?;
+        Ok(RadioStation {
+            id,
+            name: station.name.trim().to_string(),
+            stream_url: station.stream_url.trim().to_string(),
+            home_page_url: station.home_page_url.trim().to_string(),
         })
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .collect()
     }
 
-    // ---------- KV ----------
+    pub fn delete_radio_station(&self, user_id: i64, id: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM radio_stations WHERE id = ?1 AND (user_id = ?2 OR user_id = 0)",
+            params![id, user_id],
+        )?;
+        Ok(())
+    }
 
-    pub fn kv_get(&self, k: &str) -> Option<String> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT v FROM kv WHERE k = ?1", params![k], |r| r.get(0))
+    pub fn upsert_cache_entry(&self, track_id: &str, path: &str, bytes: i64) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO cache_entries(track_id, path, bytes, last_accessed) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(track_id) DO UPDATE SET path = excluded.path, bytes = excluded.bytes, last_accessed = excluded.last_accessed",
+            params![track_id, path, bytes, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_cache_entry(&self, track_id: &str) -> AppResult<Option<CacheEntry>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT path FROM cache_entries WHERE track_id = ?1",
+                params![track_id],
+                |r| Ok(CacheEntry { path: r.get(0)? }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn touch_cache_entry(&self, track_id: &str) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE cache_entries SET last_accessed = ?1 WHERE track_id = ?2",
+            params![now, track_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_cache_entry(&self, track_id: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM cache_entries WHERE track_id = ?1",
+            params![track_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cache_total_bytes(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM cache_entries",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn prune_cache(&self, max_bytes: i64) -> AppResult<()> {
+        let mut total = self.cache_total_bytes()?;
+        if total <= max_bytes {
+            return Ok(());
+        }
+        let entries: Vec<(String, String, i64)> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT track_id, path, bytes FROM cache_entries ORDER BY last_accessed ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut removed = Vec::new();
+        for (tid, path, bytes) in entries {
+            if total <= max_bytes {
+                break;
+            }
+            let _ = std::fs::remove_file(&path);
+            removed.push(tid);
+            total -= bytes;
+        }
+        if !removed.is_empty() {
+            let mut conn = self.lock();
+            let tx = conn.transaction()?;
+            for tid in removed {
+                tx.execute(
+                    "DELETE FROM cache_entries WHERE track_id = ?1",
+                    params![tid],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn kv_get(&self, key: &str) -> Option<String> {
+        let conn = self.lock();
+        conn.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0))
             .optional()
             .ok()
             .flatten()
     }
 
-    pub fn kv_set(&self, k: &str, v: &str) {
-        let conn = self.conn.lock().unwrap();
+    pub fn kv_set(&self, key: &str, value: &str) {
+        let conn = self.lock();
         let _ = conn.execute(
-            "INSERT OR REPLACE INTO kv(k, v) VALUES(?1,?2)",
-            params![k, v],
+            "INSERT INTO kv(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
         );
     }
 }
 
-pub fn search_match_score(t: &Track, q: &str) -> i32 {
-    let q = q.trim().to_lowercase();
+fn configure_conn(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 5000;
+        ",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, col: &str, def: &str) -> AppResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !cols.iter().any(|c| c == col) {
+        conn.execute(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, col, def), [])?;
+    }
+    Ok(())
+}
+
+fn row_to_user(row: &Row) -> rusqlite::Result<User> {
+    Ok(User {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        password: row.get(2)?,
+        created: row.get(3)?,
+    })
+}
+
+fn row_to_track(row: &Row) -> rusqlite::Result<Track> {
+    Ok(Track {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        title: row.get(2)?,
+        artist: row.get(3)?,
+        album: row.get(4)?,
+        genre: row.get(5)?,
+        moods: row.get(6)?,
+        year: row.get(7)?,
+        track_no: row.get(8)?,
+        disc_no: row.get(9)?,
+        duration: row.get(10)?,
+        bitrate: row.get(11)?,
+        sample_rate: row.get(12)?,
+        bit_depth: row.get(13)?,
+        format: row.get(14)?,
+        size: row.get(15)?,
+        stream_url: row.get(16)?,
+        cover_url: row.get(17)?,
+        meta: row.get(18)?,
+        deezer_id: row.get(19)?,
+        created: row.get(20)?,
+    })
+}
+
+fn row_to_playlist(row: &Row) -> rusqlite::Result<Playlist> {
+    let pub_int: i64 = row.get(5)?;
+    let auto_int: i64 = row.get(6)?;
+    let cnt: i64 = row.get(10)?;
+    let dur: i64 = row.get(11)?;
+    Ok(Playlist {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        owner_name: row.get(2)?,
+        name: row.get(3)?,
+        comment: row.get(4)?,
+        public: pub_int != 0,
+        is_auto: auto_int != 0,
+        kind: row.get(7)?,
+        created: row.get(8)?,
+        changed: row.get(9)?,
+        track_count: cnt.max(0) as usize,
+        duration: dur.max(0) as i32,
+        cover_track_id: row.get(12)?,
+    })
+}
+
+pub fn search_match_score(t: &Track, query: &str) -> i32 {
+    let q = query.trim().to_lowercase();
     if q.is_empty() {
+        return 1;
+    }
+    let tokens: Vec<&str> = q.split_whitespace().filter(|s| !s.is_empty()).collect();
+    if tokens.is_empty() {
+        return 1;
+    }
+    let tl = t.title.to_lowercase();
+    let al = t.artist.to_lowercase();
+    let abl = t.album.to_lowercase();
+    let gl = t.genre.to_lowercase();
+    let hay = format!("{} {} {} {}", tl, al, abl, gl);
+    let matched = tokens.iter().filter(|tok| hay.contains(**tok)).count();
+    if matched < tokens.len() {
         return 0;
     }
-    let title = t.title.to_lowercase();
-    let artist = t.artist.to_lowercase();
-    let album = t.album.to_lowercase();
-    let mut score = 0;
 
-    if title == q {
-        score += 120;
-    } else if title.starts_with(&q) {
-        score += 75;
-    } else if title.contains(&q) {
-        score += 45;
-    }
-    if artist == q {
-        score += 100;
-    } else if artist.starts_with(&q) {
-        score += 60;
-    } else if artist.contains(&q) {
-        score += 35;
-    }
-    if album.contains(&q) {
-        score += 15;
+    let mut score = 50 + (t.quality_score() / 10);
+
+    let artist_title = format!("{} {}", al, tl);
+    let title_artist = format!("{} {}", tl, al);
+    if tl == q || artist_title == q || title_artist == q {
+        score += 550;
+    } else if tl.starts_with(&q) {
+        score += 320;
+    } else if tl.contains(&q) {
+        score += 180;
     }
 
-    // Multi-word queries like "artist title" rarely match title or artist as a single substring.
-    let tokens: Vec<&str> = q
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 2)
-        .collect();
-    if tokens.len() > 1 {
-        let matched = tokens
-            .iter()
-            .filter(|tok| title.contains(*tok) || artist.contains(*tok) || album.contains(*tok))
-            .count();
-        if matched == tokens.len() {
-            score += 55;
-        } else {
-            score += (matched as i32) * 10;
+    if al == q {
+        score += 320;
+    } else if al.contains(&q) {
+        score += 150;
+    } else if !al.is_empty() {
+        // Reward artist+title combined queries (e.g. "daft punk one more time").
+        let artist_words: Vec<&str> = al.split_whitespace().collect();
+        if !artist_words.is_empty() && artist_words.iter().all(|w| tokens.contains(w)) {
+            score += 240;
+            let non_artist_tokens: Vec<&str> = tokens
+                .iter()
+                .copied()
+                .filter(|tok| !artist_words.contains(tok))
+                .collect();
+            if !non_artist_tokens.is_empty() {
+                let rem = non_artist_tokens.join(" ");
+                let core_tl = crate::models::core_song_title(&t.title).to_lowercase();
+                if tl == rem || core_tl == rem {
+                    score += 360;
+                } else if tl.starts_with(&rem) || core_tl.starts_with(&rem) {
+                    score += 260;
+                } else if non_artist_tokens.iter().all(|tok| tl.contains(*tok)) {
+                    score += 160;
+                }
+            }
         }
     }
 
-    // Demote covers, remixes, karaoke, TV-size edits, and slowed/nightcore unless explicitly searched.
-    const VARIANT_PENALTIES: &[&str] = &[
-        "remix",
-        "cover",
-        "karaoke",
-        "instrumental",
-        "tv size",
-        "slowed",
-        "reverb",
-        "nightcore",
-        "8d audio",
-        "guitar",
-        "piano",
-        "tribute",
-    ];
-    for kw in VARIANT_PENALTIES {
-        if title.contains(kw) && !q.contains(kw) {
-            score -= 45;
+    if abl.contains(&q) {
+        score += 80;
+    }
+
+    // Demote parody/karaoke/tribute/ringtone clutter unless explicitly searched.
+    for junk in ["parody", "karaoke", "tribute", "made famous by", "ringtone", "8-bit"] {
+        if (tl.contains(junk) || al.contains(junk)) && !q.contains(junk) {
+            score -= 260;
         }
     }
 
-    // Strongly demote <45s previews/clips so full tracks always appear first.
-    if t.duration > 0 && t.duration < 45 {
-        score -= 200;
-    }
+    score.max(1)
+}
 
-    score
+fn title_case(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            let mut ch = w.chars();
+            match ch.next() {
+                Some(first) => first.to_uppercase().to_string() + &ch.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn search_tracks_matches_multi_word_across_artist_and_title() {
-        let store = Store::open_in_memory().unwrap();
-        store
-            .upsert_tracks(&[
-                Track {
-                    id: "t1".into(),
-                    source: "local".into(),
-                    title: "Espresso".into(),
-                    artist: "Sabrina Carpenter".into(),
-                    album: "Short n' Sweet".into(),
-                    genre: "Pop".into(),
-                    duration: 175,
-                    ..Default::default()
-                },
-                Track {
-                    id: "t2".into(),
-                    source: "local".into(),
-                    title: "Coffee".into(),
-                    artist: "Other Artist".into(),
-                    album: "Morning".into(),
-                    genre: "Pop".into(),
-                    duration: 180,
-                    ..Default::default()
-                },
-            ]);
+    fn sample_track(id: &str, title: &str, artist: &str, album: &str) -> Track {
+        Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: album.into(),
+            genre: "Electronic".into(),
+            moods: "energy,party".into(),
+            year: 2020,
+            track_no: 1,
+            disc_no: 1,
+            duration: 210,
+            bitrate: 256,
+            format: "m4a".into(),
+            stream_url: format!("resolve:ytm:{}|{}|210", artist, title),
+            deezer_id: id.trim_start_matches("dz:").into(),
+            ..Default::default()
+        }
+    }
 
-        let hits = store.search_tracks("Sabrina Carpenter Espresso", 10);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "t1");
+    #[test]
+    fn open_signup_and_sessions_persist() {
+        let store = Store::open_memory().unwrap();
+        let (alice, created) = store.authenticate_or_create_user("Alice", "secret123").unwrap();
+        assert!(created);
+        assert_eq!(alice.username, "Alice");
+
+        // Second login (case-insensitive username) with right password succeeds without creating duplicate.
+        let (alice2, created2) = store.authenticate_or_create_user("alice", "secret123").unwrap();
+        assert!(!created2);
+        assert_eq!(alice2.id, alice.id);
+
+        // Wrong password rejects.
+        assert!(store.authenticate_or_create_user("alice", "wrongpass").is_err());
+
+        // Session roundtrip.
+        let tok = store.create_session(alice.id, "nd", 3600).unwrap();
+        let loaded = store.get_session_user(&tok).unwrap().unwrap();
+        assert_eq!(loaded.id, alice.id);
+        store.delete_session(&tok).unwrap();
+        assert!(store.get_session_user(&tok).unwrap().is_none());
+
+        // API key roundtrip.
+        let key1 = store.get_or_create_api_key(alice.id).unwrap();
+        assert_eq!(store.get_user_by_api_key(&key1).unwrap().unwrap().id, alice.id);
+        let key2 = store.regenerate_api_key(alice.id).unwrap();
+        assert_ne!(key1, key2);
+        assert!(store.get_user_by_api_key(&key1).unwrap().is_none());
+    }
+
+    #[test]
+    fn per_user_stats_and_playlists_isolated() {
+        let store = Store::open_memory().unwrap();
+        let (u1, _) = store.authenticate_or_create_user("bob", "pw1").unwrap();
+        let (u2, _) = store.authenticate_or_create_user("carol", "pw2").unwrap();
+        let t1 = sample_track("dz:1", "One More Time", "Daft Punk", "Discovery");
+        let t2 = sample_track("dz:2", "Aerodynamic", "Daft Punk", "Discovery");
+        store.upsert_tracks(&[t1.clone(), t2.clone()]).unwrap();
+
+        store.record_event(u1.id, &t1.id, "play", 1.0).unwrap();
+        store.record_event(u1.id, &t1.id, "play", 1.0).unwrap();
+        store.record_event(u2.id, &t2.id, "play", 1.0).unwrap();
+
+        assert_eq!(store.get_user_track_stats(u1.id, &t1.id).unwrap().play_count, 2);
+        assert_eq!(store.get_user_track_stats(u2.id, &t1.id).unwrap().play_count, 0);
+
+        let pl = store
+            .create_playlist(u1.id, "Mix", "My mix", false, &[t1.id.clone(), t2.id.clone()])
+            .unwrap();
+        assert_eq!(pl.track_count, 2);
+        store.move_playlist_track(&pl.id, 1, 0).unwrap();
+        let tracks = store.playlist_tracks(&pl.id).unwrap();
+        assert_eq!(tracks[0].id, t2.id);
+        store.remove_playlist_positions(&pl.id, &[0]).unwrap();
+        assert_eq!(store.playlist_tracks(&pl.id).unwrap().len(), 1);
+
+        // u2 shouldn't see u1's private playlist
+        assert!(store.list_playlists(u2.id, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn play_queue_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("dave", "pw").unwrap();
+        let state = PlayQueueState {
+            current_id: "dz:10".into(),
+            current_index: 1,
+            position_ms: 42000,
+            track_ids: vec!["dz:9".into(), "dz:10".into(), "dz:11".into()],
+            changed_by: "webapp".into(),
+            updated: 0,
+        };
+        store.save_play_queue(u.id, &state).unwrap();
+        let got = store.get_play_queue(u.id).unwrap().unwrap();
+        assert_eq!(got.current_id, "dz:10");
+        assert_eq!(got.current_index, 1);
+        assert_eq!(got.position_ms, 42000);
+        assert_eq!(got.track_ids.len(), 3);
+    }
+
+    #[test]
+    fn search_match_prefers_original_artist_and_title_over_parody() {
+        let orig = sample_track("dz:orig", "One More Time", "Daft Punk", "Discovery");
+        let parody = sample_track(
+            "dz:par",
+            "Sample a Song (Parody of Daft Punk One More Time)",
+            "DJ Timbo",
+            "Parodies",
+        );
+        let q = "daft punk one more time";
+        assert!(
+            search_match_score(&orig, q) > search_match_score(&parody, q),
+            "orig={}, parody={}",
+            search_match_score(&orig, q),
+            search_match_score(&parody, q)
+        );
     }
 }

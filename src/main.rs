@@ -6,197 +6,234 @@ mod sources;
 mod store;
 mod subsonic;
 mod taste;
-mod webui;
+mod webapp;
 
-use crate::engine::Engine;
-use crate::sources::SourceRegistry;
-use crate::sources::archive::ArchiveSource;
-use crate::sources::bandcamp::BandcampSource;
-use crate::sources::local::LocalSource;
-use crate::sources::soulseek::SoulseekSource;
-use crate::sources::ytdlp::{YtDlpMode, YtDlpSource};
-use crate::store::Store;
-use crate::subsonic::AppState;
-use crate::taste::TasteEngine;
+use axum::http::header;
+use axum::routing::{any, delete, get, post, put};
 use axum::Router;
-use axum::response::Json;
-use axum::routing::{get, post};
-use rand::RngCore;
-use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use engine::StreamEngine;
+use sources::archive::ArchiveSource;
+use sources::deezer::DeezerSource;
+use sources::local::LocalSource;
+use sources::soulseek::SoulseekSource;
+use sources::ytm::YtmSource;
+use sources::SourceRegistry;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tower_http::cors::CorsLayer;
-use tracing::info;
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn admin_password(data_dir: &Path) -> String {
-    if let Ok(v) = std::env::var("BEATLAB_ADMIN_PASSWORD") {
-        if !v.trim().is_empty() {
-            return v;
-        }
-    }
-    let path = data_dir.join("admin-password.txt");
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    let mut buf = [0u8; 9];
-    rand::thread_rng().fill_bytes(&mut buf);
-    let pw = hex::encode(buf);
-    let _ = std::fs::create_dir_all(data_dir);
-    if std::fs::write(&path, format!("{}\n", pw)).is_ok() {
-        info!(path = %path.display(), "generated admin password");
-    }
-    pw
-}
-
-fn parse_music_dirs() -> Vec<PathBuf> {
-    let raw = std::env::var("BEATLAB_MUSIC_DIRS").unwrap_or_default();
-    raw.split([';', ','])
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
-}
+use std::time::Duration;
+use store::Store;
+use subsonic::AppState;
+use taste::TasteEngine;
+use tower_http::cors::{Any, CorsLayer};
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> models::AppResult<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "beatlab=info,tower_http=info".into()),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("beatlab=info,tower_http=warn")),
         )
         .init();
 
-    let addr = env_or("BEATLAB_ADDR", "0.0.0.0:4533");
-    let data_dir = PathBuf::from(env_or("BEATLAB_DATA", "./beatlab-data"));
-    let cache_gb: i64 = env_or("BEATLAB_CACHE_GB", "10")
-        .parse()
-        .unwrap_or(10)
-        .max(1);
+    let addr_str = std::env::var("BEATLAB_ADDR").unwrap_or_else(|_| "0.0.0.0:4533".to_string());
+    let data_dir = PathBuf::from(
+        std::env::var("BEATLAB_DATA").unwrap_or_else(|_| "./data".to_string()),
+    );
+    let max_cache_gb: f64 = std::env::var("BEATLAB_CACHE_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5.0);
+    let music_dirs: Vec<PathBuf> = std::env::var_os("BEATLAB_MUSIC_DIRS")
+        .map(|raw| std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()).collect())
+        .unwrap_or_default();
+    let ytdlp_override = std::env::var("BEATLAB_YTDLP").ok();
 
-    let store = Store::open(&data_dir).expect("failed to open SQLite store");
-    let repaired = store.repair_source_metadata();
-    if repaired > 0 {
-        info!(repaired, "cleaned legacy source metadata");
-    }
-    let password = admin_password(&data_dir);
+    std::fs::create_dir_all(&data_dir)?;
+    let store = Store::open(&data_dir.join("beatlab.db"))?;
 
-    if store.user_count() == 0 {
-        let username = env_or("BEATLAB_USER", "admin");
-        store
-            .create_user(&username, &password, true)
-            .expect("failed to seed admin user");
-        info!(username = %username, "seeded initial admin user");
-    }
-
-    let ytdlp_bin = YtDlpSource::find_binary(std::env::var("BEATLAB_YTDLP").ok().as_deref());
-
-    let local = Arc::new(LocalSource::new(store.clone(), parse_music_dirs()));
-    let archive = Arc::new(ArchiveSource::new());
-    let bandcamp = Arc::new(BandcampSource::new(ytdlp_bin.clone()));
-    let soundcloud = Arc::new(YtDlpSource::new(ytdlp_bin.clone(), YtDlpMode::SoundCloud));
-    let youtube = Arc::new(YtDlpSource::new(ytdlp_bin, YtDlpMode::YouTube));
+    let deezer = DeezerSource::new();
+    let ytm = YtmSource::new(ytdlp_override);
+    let archive = ArchiveSource::new();
+    let local = Arc::new(LocalSource::new(store.clone(), music_dirs));
     let soulseek = SoulseekSource::new(store.clone(), data_dir.join("cache").join("soulseek"));
 
-    let registry = Arc::new(SourceRegistry::new(
-        store.clone(),
-        vec![
-            local.clone(),
-            soulseek.clone(),
-            archive.clone(),
-            bandcamp.clone(),
-            soundcloud.clone(),
-            youtube.clone(),
-        ],
-    ));
+    if let (Ok(u), Ok(p)) = (
+        std::env::var("BEATLAB_SLSK_USER"),
+        std::env::var("BEATLAB_SLSK_PASS"),
+    ) {
+        let srv = std::env::var("BEATLAB_SLSK_SERVER").ok();
+        let slsk = soulseek.clone();
+        tokio::spawn(async move {
+            if let Err(e) = slsk.connect(&u, &p, srv.as_deref()).await {
+                warn!(error = %e, "soulseek env login failed");
+            }
+        });
+    }
 
-    let engine = Arc::new(Engine::new(
+    if !local.dirs().is_empty() {
+        let l = local.clone();
+        tokio::task::spawn_blocking(move || {
+            l.scan();
+        });
+    }
+
+    let sources = SourceRegistry::new(deezer, ytm, archive, local, soulseek);
+    let engine = Arc::new(StreamEngine::new(
         store.clone(),
-        registry.clone(),
+        sources.clone(),
         &data_dir,
-        cache_gb,
+        max_cache_gb,
     ));
-    let taste = Arc::new(TasteEngine::new(store.clone(), registry.clone()));
+    let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
 
     let state = AppState {
         store: store.clone(),
-        registry: registry.clone(),
-        engine: engine.clone(),
+        sources,
+        engine,
         taste: taste.clone(),
-        local: local.clone(),
-        soulseek: soulseek.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
-        admin_password: password,
-        admin_sessions: Arc::new(Mutex::new(HashSet::new())),
     };
 
-    // Background local scan + catalog warming
-    let local_bg = Arc::clone(&local);
-    tokio::task::spawn_blocking(move || {
-        local_bg.scan();
-    });
-    let taste_bg = Arc::clone(&taste);
+    // Fast startup catalog warming + periodic refresh every 45 mins
+    let warm_taste = taste.clone();
     tokio::spawn(async move {
-        taste_bg.warm_catalog().await;
+        warm_taste.warm_catalog().await;
+        let mut interval = tokio::time::interval(Duration::from_secs(45 * 60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            warm_taste.warm_catalog().await;
+        }
     });
 
-    let admin_api = Router::new()
-        .route("/status", get(webui::api_admin_status))
-        .route("/dirs", post(webui::api_admin_add_dir))
-        .route("/scan", post(webui::api_admin_scan))
-        .route("/cache/clear", post(webui::api_admin_clear_cache))
-        .route("/soulseek/connect", post(webui::api_admin_soulseek_connect))
-        .route("/soulseek/disconnect", post(webui::api_admin_soulseek_disconnect))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            webui::require_admin_auth,
-        ));
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers([
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+            header::CONTENT_TYPE,
+            "x-total-count".parse().unwrap(),
+        ]);
 
     let app = Router::new()
-        .route("/", get(webui::admin_page))
-        .route("/admin", get(webui::admin_page))
-        .route("/admin/api/login", post(webui::api_admin_login))
-        .route("/admin/api/logout", post(webui::api_admin_logout))
-        .nest("/admin/api", admin_api)
-        .route("/rest/{action}", get(subsonic::dispatch).post(subsonic::dispatch))
-        .route("/auth/login", post(navidrome::nd_login))
-        .route("/api/keepalive/keepalive", get(navidrome::nd_keepalive))
-        .route("/api/song", get(navidrome::nd_song_list))
-        .route("/api/album", get(navidrome::nd_album_list))
-        .route("/api/album/{id}", get(navidrome::nd_album_get))
-        .route("/api/artist", get(navidrome::nd_artist_list))
-        .route("/api/artist/{id}", get(navidrome::nd_artist_get))
-        .route("/api/genre", get(navidrome::nd_genre_list))
-        .route("/api/playlist", get(navidrome::nd_playlist_list))
-        .route("/api/playlist/{id}", get(navidrome::nd_playlist_get))
-        .route("/api/playlist/{id}/tracks", get(navidrome::nd_playlist_tracks))
-        .route("/api/radio", get(navidrome::nd_radio_list))
+        // Embedded Web Player SPA
+        .route("/", get(webapp::serve_index))
+        .route("/web", get(webapp::serve_index))
+        .route("/web/styles.css", get(webapp::serve_css))
+        .route("/web/app.js", get(webapp::serve_js))
+        // Web Player API (/api/web/*) — open account creation & full player features
+        .route("/api/web/me", get(webapp::me))
+        .route("/api/web/auth/signin", post(webapp::signin))
+        .route("/api/web/auth/signup", post(webapp::signup))
+        .route("/api/web/auth/signout", post(webapp::signout))
+        .route("/api/web/account/apikey", post(webapp::regenerate_api_key))
+        .route("/api/web/account/password", post(webapp::change_password))
+        .route("/api/web/home", get(webapp::home))
+        .route("/api/web/explore", get(webapp::explore))
+        .route("/api/web/mood/{slug}", get(webapp::mood_mix))
+        .route("/api/web/genre/{name}", get(webapp::genre_detail))
+        .route("/api/web/search", get(webapp::search))
+        .route("/api/web/album/{id}", get(webapp::album_detail))
+        .route("/api/web/artist/{id}", get(webapp::artist_detail))
+        .route("/api/web/library", get(webapp::library))
+        .route("/api/web/playlists", post(webapp::create_playlist))
         .route(
-            "/healthz",
-            get(|| async { Json(json!({"ok": true, "version": "0.2.0-rust"})) }),
+            "/api/web/playlist/{id}",
+            get(webapp::get_playlist),
         )
-        .layer(CorsLayer::permissive())
+        .route(
+            "/api/web/playlists/{id}",
+            axum::routing::patch(webapp::update_playlist).delete(webapp::delete_playlist),
+        )
+        .route(
+            "/api/web/playlists/{id}/tracks",
+            post(webapp::add_playlist_tracks),
+        )
+        .route(
+            "/api/web/playlists/{id}/tracks/{pos}",
+            delete(webapp::remove_playlist_track),
+        )
+        .route(
+            "/api/web/playlists/{id}/reorder",
+            post(webapp::reorder_playlist_track),
+        )
+        .route("/api/web/star", post(webapp::toggle_star))
+        .route("/api/web/rate", post(webapp::set_rating))
+        .route("/api/web/event", post(webapp::record_event))
+        .route("/api/web/lyrics/{id}", get(webapp::get_lyrics))
+        .route("/api/web/radio", get(webapp::radio))
+        .route(
+            "/api/web/queue",
+            get(webapp::get_queue).put(webapp::save_queue),
+        )
+        .route("/api/web/warm/{id}", post(webapp::warm_track))
+        .route("/api/web/stream/{id}", get(webapp::stream_track))
+        .route("/api/web/cover/{id}", get(webapp::cover_art))
+        .route("/api/web/sources", get(webapp::sources_info))
+        // Subsonic / OpenSubsonic REST API
+        .route("/rest/{*action}", any(subsonic::dispatch))
+        // Navidrome Auth & Native API (auto-creates new user accounts on first login!)
+        .route("/auth/login", post(navidrome::login))
+        .route("/api/auth/login", post(navidrome::login))
+        .route("/auth/signup", post(navidrome::signup))
+        .route("/api/auth/signup", post(navidrome::signup))
+        .route("/auth/logout", post(navidrome::logout))
+        .route("/api/song", get(navidrome::list_songs))
+        .route("/api/song/{id}", get(navidrome::get_song))
+        .route("/api/album", get(navidrome::list_albums))
+        .route("/api/album/{id}", get(navidrome::get_album))
+        .route("/api/artist", get(navidrome::list_artists))
+        .route("/api/artist/{id}", get(navidrome::get_artist))
+        .route("/api/genre", get(navidrome::list_genres))
+        .route("/api/tag", get(navidrome::list_genres))
+        .route(
+            "/api/playlist",
+            get(navidrome::list_playlists).post(navidrome::create_playlist),
+        )
+        .route(
+            "/api/playlist/{id}",
+            get(navidrome::get_playlist)
+                .put(navidrome::update_playlist)
+                .delete(navidrome::delete_playlist),
+        )
+        .route(
+            "/api/playlist/{id}/tracks",
+            get(navidrome::get_playlist_tracks)
+                .post(navidrome::add_playlist_tracks)
+                .delete(navidrome::remove_playlist_tracks),
+        )
+        .route(
+            "/api/playlist/{id}/tracks/{pos}",
+            put(navidrome::move_playlist_track),
+        )
+        .route(
+            "/api/queue",
+            get(navidrome::get_queue).post(navidrome::save_queue),
+        )
+        .route(
+            "/api/radio",
+            get(navidrome::list_radios).post(navidrome::create_radio),
+        )
+        .route(
+            "/api/radio/{id}",
+            put(navidrome::update_radio).delete(navidrome::delete_radio),
+        )
+        .route("/api/user", get(navidrome::list_users))
+        .route("/api/user/{id}", put(navidrome::update_user))
+        .route("/api/keepalive/keepalive", get(navidrome::keepalive))
+        .layer(cors)
         .with_state(state);
 
-    info!("Beatlab 0.2.0-rust starting");
-    info!(data_dir = %data_dir.display(), "data directory");
-    for s in registry.all() {
-        info!(source = s.name(), status = %s.status(), "source");
-    }
-    info!(url = %format!("http://{}", addr), "Admin Panel & Subsonic API listening");
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind address");
-    axum::serve(listener, app).await.expect("server error");
+    let addr: SocketAddr = addr_str.parse()?;
+    info!(address = %addr, data_dir = %data_dir.display(), "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }

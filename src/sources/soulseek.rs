@@ -104,37 +104,6 @@ impl SoulseekSource {
         src
     }
 
-    pub fn connection_info(&self) -> serde_json::Value {
-        if let Ok(rt) = self.runtime.try_read() {
-            serde_json::json!({
-                "connected": rt.connected,
-                "connecting": rt.connecting,
-                "username": rt.username,
-                "server": rt.server,
-                "last_error": rt.last_error,
-            })
-        } else {
-            serde_json::json!({
-                "connected": false,
-                "connecting": true,
-                "username": null,
-                "server": DEFAULT_SERVER,
-                "last_error": null,
-            })
-        }
-    }
-
-    pub async fn disconnect(&self) {
-        let mut rt = self.runtime.write().await;
-        rt.connected = false;
-        rt.connecting = false;
-        rt.writer = None;
-        rt.last_error = None;
-        rt.session_id = rt.session_id.wrapping_add(1);
-        self.store.kv_set(KV_PASS, "");
-        info!("soulseek disconnected");
-    }
-
     pub async fn connect(
         self: &Arc<Self>,
         username: &str,
@@ -469,7 +438,7 @@ impl MusicSource for SoulseekSource {
                 return format!("disconnected ({})", err);
             }
         }
-        "not signed in (configure in /admin)".to_string()
+        "not signed in (optional; configure via BEATLAB_SLSK_USER/BEATLAB_SLSK_PASS env vars)".to_string()
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
@@ -883,6 +852,7 @@ fn parse_search_response(compressed: &[u8], peer_hint: Option<&str>) -> Option<(
             moods,
             year: 0,
             track_no,
+            disc_no: 1,
             duration,
             bitrate,
             sample_rate,
@@ -892,8 +862,7 @@ fn parse_search_response(compressed: &[u8], peer_hint: Option<&str>) -> Option<(
             stream_url,
             cover_url: String::new(),
             meta: filename,
-            play_count: 0,
-            last_played: 0,
+            deezer_id: String::new(),
             created: chrono::Utc::now().timestamp(),
         });
     }

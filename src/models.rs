@@ -1,12 +1,34 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+#[derive(Debug, Clone)]
+pub struct AppError(pub String);
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<E: std::error::Error> From<E> for AppError {
+    fn from(e: E) -> Self {
+        Self(e.to_string())
+    }
+}
+
+pub type AppResult<T> = std::result::Result<T, AppError>;
+
+pub fn err_msg(msg: impl Into<String>) -> AppError {
+    AppError(msg.into())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: i64,
     pub username: String,
+    #[serde(skip_serializing)]
     pub password: String,
-    pub is_admin: bool,
+    pub created: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -68,6 +90,36 @@ impl Mood {
         }
     }
 
+    pub fn subtitle(&self) -> &'static str {
+        match self {
+            Mood::Chill => "Laid-back beats, dream pop & soft vibes",
+            Mood::Focus => "Ambient, instrumental & flow-state music",
+            Mood::Energy => "Adrenaline, workout & heavy rhythms",
+            Mood::LateNight => "Atmospheric, moody & after-hours tracks",
+            Mood::Upbeat => "Bright hooks, pop anthems & sunshine",
+            Mood::Melancholy => "Reflective ballads & emotional cuts",
+            Mood::Party => "Dancefloor, house, disco & club energy",
+            Mood::Acoustic => "Unplugged guitars, folk & warm vocals",
+            Mood::Groove => "R&B, soul, funk, jazz & hip-hop bounce",
+            Mood::RockIndie => "Alt-rock, indie classics & guitars",
+        }
+    }
+
+    pub fn gradient(&self) -> (&'static str, &'static str) {
+        match self {
+            Mood::Chill => ("#0ea5e9", "#1e3a8a"),
+            Mood::Focus => ("#14b8a6", "#115e59"),
+            Mood::Energy => ("#ef4444", "#7f1d1d"),
+            Mood::LateNight => ("#6366f1", "#1e1b4b"),
+            Mood::Upbeat => ("#f59e0b", "#b45309"),
+            Mood::Melancholy => ("#64748b", "#1e293b"),
+            Mood::Party => ("#ec4899", "#831843"),
+            Mood::Acoustic => ("#84cc16", "#365314"),
+            Mood::Groove => ("#a855f7", "#4c1d95"),
+            Mood::RockIndie => ("#f97316", "#7c2d12"),
+        }
+    }
+
     pub fn from_slug(s: &str) -> Option<Mood> {
         let low = s.trim().to_lowercase().replace('-', "_");
         Self::ALL.iter().copied().find(|m| m.slug() == low)
@@ -92,30 +144,43 @@ pub struct Track {
     pub artist: String,
     pub album: String,
     pub genre: String,
-    pub moods: String, // comma-separated mood slugs
+    pub moods: String,
     pub year: i32,
     pub track_no: i32,
+    pub disc_no: i32,
     pub duration: i32,     // seconds
     pub bitrate: i32,      // kbps
-    pub sample_rate: i32,  // Hz (e.g. 44100, 96000)
-    pub bit_depth: i32,    // bits (e.g. 16, 24)
+    pub sample_rate: i32,  // Hz
+    pub bit_depth: i32,    // bits
     pub format: String,    // flac, wav, alac, mp3, m4a, ogg, opus
     pub size: i64,         // bytes
     pub stream_url: String,
     pub cover_url: String,
     pub meta: String,
-    pub play_count: i32,
-    pub last_played: i64, // unix timestamp
-    pub created: i64,     // unix timestamp
+    pub deezer_id: String,
+    pub created: i64,
 }
 
 impl Track {
     pub fn artist_id(&self) -> String {
-        format!("ar:{}", slug(&self.artist))
+        let pa = primary_artist(&self.artist);
+        let name = if pa.is_empty() { &self.artist } else { &pa };
+        format!("ar:{}", slug(name))
     }
 
     pub fn album_id(&self) -> String {
-        format!("al:{}", slug(&format!("{}|{}", self.artist, self.album)))
+        let pa = primary_artist(&self.artist);
+        let art = if pa.is_empty() || is_generic_folder_name(&pa) {
+            &self.artist
+        } else {
+            &pa
+        };
+        let alb = if self.album.trim().is_empty() {
+            &self.title
+        } else {
+            &self.album
+        };
+        format!("al:{}", slug(&format!("{}|{}", art, alb)))
     }
 
     pub fn is_lossless(&self) -> bool {
@@ -135,17 +200,54 @@ impl Track {
         if self.bitrate >= 256 {
             return QualityTier::HighLossy;
         }
-        if self.bitrate >= 160 || (self.format.eq_ignore_ascii_case("opus") && self.bitrate >= 128)
+        if self.bitrate >= 160
+            || (self.format.eq_ignore_ascii_case("opus") && self.bitrate >= 128)
+            || self.source == "deezer"
+            || self.source == "ytm"
+            || self.source == "soundcloud"
         {
-            return QualityTier::Standard;
-        }
-        if self.source == "bandcamp" || self.source == "soundcloud" {
             return QualityTier::Standard;
         }
         QualityTier::Low
     }
 
-    /// Numeric quality score used to prefer lossless / local / high-bitrate over YouTube.
+    pub fn quality_badge(&self) -> String {
+        match self.quality_tier() {
+            QualityTier::HiRes => {
+                let bd = if self.bit_depth > 0 { self.bit_depth } else { 24 };
+                let khz = if self.sample_rate > 0 {
+                    self.sample_rate as f64 / 1000.0
+                } else {
+                    96.0
+                };
+                format!("HI-RES {}/{:.0}k", bd, khz)
+            }
+            QualityTier::Lossless => {
+                let fmt = if self.format.is_empty() {
+                    "FLAC".to_string()
+                } else {
+                    self.format.to_uppercase()
+                };
+                format!("LOSSLESS {}", fmt)
+            }
+            QualityTier::HighLossy => {
+                let br = if self.bitrate > 0 { self.bitrate } else { 320 };
+                format!("HQ {}k", br)
+            }
+            QualityTier::Standard => {
+                if self.format.eq_ignore_ascii_case("m4a") || self.source == "deezer" || self.source == "ytm" {
+                    "AAC".to_string()
+                } else if !self.format.is_empty() {
+                    self.format.to_uppercase()
+                } else {
+                    "STREAM".to_string()
+                }
+            }
+            QualityTier::Low => "STD".to_string(),
+        }
+    }
+
+    /// Numeric quality score used to prefer lossless / local / clean catalog over raw videos.
     pub fn quality_score(&self) -> i32 {
         let base = match self.quality_tier() {
             QualityTier::HiRes => 1000,
@@ -155,11 +257,13 @@ impl Track {
             QualityTier::Low => 100,
         };
         let source_bonus = match self.source.as_str() {
-            "local" => 80,
-            "archive" => 40,
-            "bandcamp" => 35,
+            "local" => 90,
+            "soulseek" => 65,
+            "archive" => 45,
+            "deezer" => 40,
+            "ytm" => 30,
             "soundcloud" => 20,
-            "youtube" => 0,
+            "youtube" => 10,
             _ => 10,
         };
         let br_bonus = (self.bitrate.clamp(0, 1500)) / 10;
@@ -179,39 +283,60 @@ impl Track {
         let a = if pa.is_empty() { &self.artist } else { &pa };
         format!("{}|{}", slug(a), core_song_title(&self.title))
     }
+}
 
-    pub fn song_aliases(&self) -> Vec<String> {
-        let primary = self.song_key();
-        let pa = primary_artist(&self.artist);
-        let a_slug = slug(if pa.is_empty() { &self.artist } else { &pa });
-        let mut out = Vec::new();
-        for seg in bracket_segments(&self.title) {
-            let core = core_song_title(&seg);
-            if !core.is_empty() {
-                let key = format!("{}|{}", a_slug, core);
-                if key != primary {
-                    out.push(key);
-                }
-            }
-        }
-        out
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlbumSummary {
+    pub id: String,
+    pub name: String,
+    pub artist: String,
+    pub artist_id: String,
+    pub cover_id: String,
+    pub cover_url: String,
+    pub genre: String,
+    pub year: i32,
+    pub label: String,
+    pub deezer_id: String,
+    pub song_count: usize,
+    pub duration: i32,
+    pub play_count: i64,
+    pub last_played: i64,
+    pub created: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArtistSummary {
+    pub id: String,
+    pub name: String,
+    pub cover_url: String,
+    pub bio: String,
+    pub deezer_id: String,
+    pub album_count: usize,
+    pub song_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: String,
     pub user_id: i64,
+    pub owner_name: String,
     pub name: String,
     pub comment: String,
     pub public: bool,
     pub is_auto: bool,
-    pub kind: String, // "user", "supermix", "daily_mix", "discover", "on_repeat", "forgotten_gems", "lossless", "mood"
+    pub kind: String,
     pub created: i64,
     pub changed: i64,
     pub track_count: usize,
     pub duration: i32,
     pub cover_track_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct UserTrackStats {
+    pub play_count: i32,
+    pub skip_count: i32,
+    pub last_played: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -232,9 +357,54 @@ pub struct RadioStation {
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    pub track_id: String,
     pub path: String,
-    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LyricLine {
+    pub start_ms: Option<i64>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LyricsData {
+    pub synced: bool,
+    pub plain: String,
+    pub lines: Vec<LyricLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlayQueueState {
+    pub current_id: String,
+    pub current_index: usize,
+    pub position_ms: i64,
+    pub track_ids: Vec<String>,
+    pub changed_by: String,
+    pub updated: i64,
+}
+
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+pub fn validate_credentials(username: &str, password: &str) -> Result<String, &'static str> {
+    let u = username.trim();
+    if u.is_empty() || u.len() > 64 {
+        return Err("Username must be 1 to 64 characters");
+    }
+    if u.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+        return Err("Username contains invalid characters");
+    }
+    if password.is_empty() || password.len() > 256 {
+        return Err("Password must be 1 to 256 characters");
+    }
+    Ok(u.to_string())
 }
 
 /// Deterministic URL-safe slug for artist/album/title keys.
@@ -260,37 +430,7 @@ pub fn slug(s: &str) -> String {
     }
 }
 
-pub fn bracket_segments(s: &str) -> Vec<String> {
-    let mut segs = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0i32;
-    for ch in s.chars() {
-        match ch {
-            '(' | '[' | '\u{3010}' | '\u{300e}' | '\u{300c}' => {
-                if depth == 0 {
-                    cur.clear();
-                }
-                depth += 1;
-            }
-            ')' | ']' | '\u{3011}' | '\u{300f}' | '\u{300d}' => {
-                if depth > 0 {
-                    depth -= 1;
-                    if depth == 0 && !cur.is_empty() {
-                        segs.push(cur.clone());
-                    }
-                }
-            }
-            _ => {
-                if depth > 0 {
-                    cur.push(ch);
-                }
-            }
-        }
-    }
-    segs
-}
-
-/// Returns true for common Soulseek share root/bucket folder names that are not artist names.
+/// Returns true for common share bucket folder names that are not artist names.
 pub fn is_generic_folder_name(s: &str) -> bool {
     let clean = strip_release_tags(s).trim().to_lowercase();
     if clean.is_empty() {
@@ -404,28 +544,71 @@ fn is_release_tag(inner: &str) -> bool {
         return true;
     }
     let low = t.to_lowercase();
-    // Short hex/hash or release codes like "9a149", "XW", "JP", "WEB", "FLAC"
-    if (2..=8).contains(&low.len()) && low.chars().all(|c| c.is_ascii_hexdigit()) && low.chars().any(|c| c.is_ascii_digit()) {
+    if (2..=8).contains(&low.len())
+        && low.chars().all(|c| c.is_ascii_hexdigit())
+        && low.chars().any(|c| c.is_ascii_digit())
+    {
         return true;
     }
     if matches!(
         low.as_str(),
-        "flac" | "alac" | "mp3" | "wav" | "aiff" | "aac" | "m4a" | "opus" | "ogg"
-            | "web" | "cd" | "v0" | "320" | "320kbps" | "hq" | "hi-res" | "hires"
-            | "lossless" | "jp" | "xw" | "us" | "uk" | "eu" | "mv" | "pv"
-            | "single" | "ep" | "album"
+        "flac"
+            | "alac"
+            | "mp3"
+            | "wav"
+            | "aiff"
+            | "aac"
+            | "m4a"
+            | "opus"
+            | "ogg"
+            | "web"
+            | "cd"
+            | "v0"
+            | "320"
+            | "320kbps"
+            | "hq"
+            | "hi-res"
+            | "hires"
+            | "lossless"
+            | "jp"
+            | "xw"
+            | "us"
+            | "uk"
+            | "eu"
+            | "mv"
+            | "pv"
+            | "single"
+            | "ep"
+            | "album"
     ) {
         return true;
     }
-    // Dates like 2020.07.22, 2020-07-22, 190123, 2023
-    let digits_and_sep = low.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '/'));
+    let digits_and_sep = low
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '/'));
     if digits_and_sep && low.chars().filter(|c| c.is_ascii_digit()).count() >= 4 {
         return true;
     }
     const RELEASE_WORDS: &[&str] = &[
-        "flac", "24bit", "24-bit", "16bit", "16-bit", "khz", "kbps", "320k",
-        "web", "cd", "vinyl", "official", "lyric", "audio", "video", "visualizer",
-        "hi-res", "hires", "remaster",
+        "flac",
+        "24bit",
+        "24-bit",
+        "16bit",
+        "16-bit",
+        "khz",
+        "kbps",
+        "320k",
+        "web",
+        "cd",
+        "vinyl",
+        "official",
+        "lyric",
+        "audio",
+        "video",
+        "visualizer",
+        "hi-res",
+        "hires",
+        "remaster",
     ];
     RELEASE_WORDS.iter().any(|w| low.contains(w))
 }
@@ -449,7 +632,15 @@ pub fn primary_artist(s: &str) -> String {
         }
     }
     let low = cleaned.to_ascii_lowercase();
-    for sep in [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " vs. ", " vs "] {
+    for sep in [
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " ft ",
+        " featuring ",
+        " vs. ",
+        " vs ",
+    ] {
         if let Some(pos) = low.find(sep) {
             if cleaned.is_char_boundary(pos) {
                 cleaned = cleaned[..pos].trim().to_string();
@@ -472,7 +663,6 @@ pub fn core_song_title(s: &str) -> String {
                     depth -= 1;
                 }
             }
-            // Strip Japanese quotation brackets around the title itself, keeping their contents!
             '\u{300c}' | '\u{300d}' | '\u{300e}' | '\u{300f}' => stripped.push(' '),
             _ => {
                 if depth == 0 {
@@ -528,7 +718,8 @@ pub fn core_song_title(s: &str) -> String {
         .map(|w| w.to_lowercase())
         .collect();
 
-    while let Some(last) = tokens.last() {
+    while tokens.len() > 1 {
+        let Some(last) = tokens.last() else { break };
         let is_year = last.len() == 4
             && last.chars().all(|c| c.is_ascii_digit())
             && (last.starts_with("19") || last.starts_with("20"));
@@ -542,12 +733,91 @@ pub fn core_song_title(s: &str) -> String {
     tokens.join(" ")
 }
 
+/// Upgrades thumbnail URLs from YouTube/Google/Apple CDNs to high-resolution artwork.
+pub fn upgrade_cover_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || (!trimmed.starts_with("http://") && !trimmed.starts_with("https://")) {
+        return trimmed.to_string();
+    }
+
+    let split_idx = trimmed.find(['?', '#']).unwrap_or(trimmed.len());
+    let (base, tail) = trimmed.split_at(split_idx);
+    let low_base = base.to_lowercase();
+
+    if low_base.contains("googleusercontent.com/") || low_base.contains(".ggpht.com/") {
+        if let Some(slash_idx) = base.rfind('/') {
+            let segment = &base[slash_idx + 1..];
+            if let Some(eq_rel) = segment.rfind('=') {
+                let prefix = &base[..slash_idx + 1 + eq_rel];
+                let params = &segment[eq_rel + 1..];
+                if let Some(after_w) = params.strip_prefix('w') {
+                    let w_digits_end = after_w
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(after_w.len());
+                    if let Ok(w) = after_w[..w_digits_end].parse::<u32>() {
+                        if let Some(after_h_tag) = after_w[w_digits_end..].strip_prefix("-h") {
+                            let h_digits_end = after_h_tag
+                                .find(|c: char| !c.is_ascii_digit())
+                                .unwrap_or(after_h_tag.len());
+                            let rest = &after_h_tag[h_digits_end..];
+                            if (rest.is_empty() || rest.starts_with('-'))
+                                && h_digits_end > 0
+                            {
+                                if let Ok(h) = after_h_tag[..h_digits_end].parse::<u32>() {
+                                    if w > 0 && h > 0 && w.max(h) < 1000 {
+                                        let scale = 1080.0 / (w.max(h) as f64);
+                                        let nw = ((w as f64) * scale).round() as u32;
+                                        let nh = ((h as f64) * scale).round() as u32;
+                                        return format!("{}=w{}-h{}{}{}", prefix, nw, nh, rest, tail);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(after_s) = params.strip_prefix('s') {
+                    let s_digits_end = after_s
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(after_s.len());
+                    let rest = &after_s[s_digits_end..];
+                    if (rest.is_empty() || rest.starts_with('-')) && s_digits_end > 0 {
+                        if let Ok(s) = after_s[..s_digits_end].parse::<u32>() {
+                            if s > 0 && s < 1000 {
+                                return format!("{}=s1080{}{}", prefix, rest, tail);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (low_base.contains("i.ytimg.com/vi/") || low_base.contains("img.youtube.com/vi/"))
+        && (low_base.ends_with("/hqdefault.jpg")
+            || low_base.ends_with("/mqdefault.jpg")
+            || low_base.ends_with("/default.jpg"))
+    {
+        if let Some(slash_idx) = base.rfind('/') {
+            return format!("{}/maxresdefault.jpg{}", &base[..slash_idx], tail);
+        }
+    }
+
+    if low_base.contains("mzstatic.com/") {
+        for pat in ["/60x60bb", "/100x100bb", "/200x200bb", "/300x300bb"] {
+            if base.contains(pat) {
+                return format!("{}{}", base.replace(pat, "/1000x1000bb"), tail);
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn quality_scoring_prefers_lossless_over_youtube() {
+    fn quality_scoring_prefers_lossless_over_streams() {
         let flac = Track {
             id: "local:1".into(),
             source: "local".into(),
@@ -564,15 +834,15 @@ mod tests {
             sample_rate: 44100,
             ..Default::default()
         };
-        let yt = Track {
-            id: "youtube:1".into(),
-            source: "youtube".into(),
-            format: "opus".into(),
+        let ytm = Track {
+            id: "ytm:1".into(),
+            source: "ytm".into(),
+            format: "m4a".into(),
             bitrate: 128,
             ..Default::default()
         };
         assert!(flac.quality_score() > cd_flac.quality_score());
-        assert!(cd_flac.quality_score() > yt.quality_score());
+        assert!(cd_flac.quality_score() > ytm.quality_score());
         assert_eq!(flac.quality_tier(), QualityTier::HiRes);
         assert_eq!(cd_flac.quality_tier(), QualityTier::Lossless);
     }
@@ -591,5 +861,36 @@ mod tests {
         };
         assert_eq!(t1.song_key(), t2.song_key());
         assert_eq!(t1.song_key(), "kansas|carry on wayward son");
+    }
+
+    #[test]
+    fn core_song_title_preserves_single_word_titles() {
+        assert_eq!(core_song_title("Acoustic"), "acoustic");
+        assert_eq!(core_song_title("Live"), "live");
+    }
+
+    #[test]
+    fn upgrade_cover_url_scales_ytm_and_ytimg_art() {
+        assert_eq!(
+            upgrade_cover_url("https://yt3.googleusercontent.com/abc=w120-h120-l90-rj"),
+            "https://yt3.googleusercontent.com/abc=w1080-h1080-l90-rj"
+        );
+        assert_eq!(
+            upgrade_cover_url("https://lh3.googleusercontent.com/xyz=w226-h127-l90-rj"),
+            "https://lh3.googleusercontent.com/xyz=w1080-h607-l90-rj"
+        );
+        assert_eq!(
+            upgrade_cover_url("https://yt3.ggpht.com/avatar=s120-c-k-c0x00ffffff-no-rj"),
+            "https://yt3.ggpht.com/avatar=s1080-c-k-c0x00ffffff-no-rj"
+        );
+        assert_eq!(
+            upgrade_cover_url("https://i.ytimg.com/vi/R-maTg10QKs/hqdefault.jpg"),
+            "https://i.ytimg.com/vi/R-maTg10QKs/maxresdefault.jpg"
+        );
+        assert_eq!(
+            upgrade_cover_url("https://yt3.googleusercontent.com/abc=w1080-h1080-l90-rj"),
+            "https://yt3.googleusercontent.com/abc=w1080-h1080-l90-rj"
+        );
+        assert_eq!(upgrade_cover_url("local-art:/music/a.flac"), "local-art:/music/a.flac");
     }
 }

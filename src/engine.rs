@@ -1,328 +1,371 @@
-use crate::models::Track;
-use crate::sources::SourceRegistry;
+use crate::models::{err_msg, primary_artist, upgrade_cover_url, AppResult, LyricLine, LyricsData, Track};
 use crate::sources::local::extract_embedded_cover;
+use crate::sources::{MusicSource, SourceRegistry};
 use crate::store::Store;
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use chrono::Utc;
 use futures::StreamExt;
+use serde::Deserialize;
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::io::ReaderStream;
-use tracing::info;
+use tracing::{debug, warn};
 
-pub struct Engine {
-    store: Store,
-    registry: Arc<SourceRegistry>,
-    cache_dir: PathBuf,
-    cover_dir: PathBuf,
-    budget_bytes: i64,
-    http: reqwest::Client,
-    cover_http: reqwest::Client,
-    has_ffmpeg: bool,
-    cover_sem: Arc<Semaphore>,
-    cover_neg_cache: Mutex<HashMap<String, i64>>,
-    inflight_resolves: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+#[derive(Clone)]
+pub struct CachedResolved {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub ext: String,
+    pub webpage_url: String,
+    pub expires_at: i64,
 }
 
-impl Engine {
-    pub fn new(store: Store, registry: Arc<SourceRegistry>, data_dir: &Path, cache_gb: i64) -> Self {
+pub enum PlayTarget {
+    LocalFile {
+        path: PathBuf,
+        content_type: String,
+    },
+    RemoteHttp {
+        url: String,
+        headers: Vec<(String, String)>,
+        content_type: String,
+        ext: String,
+        webpage_url: String,
+        cacheable: bool,
+    },
+}
+
+#[derive(Clone)]
+pub struct StreamEngine {
+    pub store: Store,
+    pub sources: SourceRegistry,
+    pub http: reqwest::Client,
+    pub cache_dir: PathBuf,
+    pub cover_dir: PathBuf,
+    pub max_cache_bytes: i64,
+    pub ffmpeg_available: bool,
+    resolved_cache: Arc<RwLock<HashMap<String, CachedResolved>>>,
+    in_flight_resolutions: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    in_flight_downloads: Arc<Mutex<HashSet<String>>>,
+}
+
+impl StreamEngine {
+    pub fn new(
+        store: Store,
+        sources: SourceRegistry,
+        data_dir: &Path,
+        max_cache_gb: f64,
+    ) -> Self {
         let cache_dir = data_dir.join("cache").join("audio");
         let cover_dir = data_dir.join("cache").join("covers");
         let _ = std::fs::create_dir_all(&cache_dir);
         let _ = std::fs::create_dir_all(&cover_dir);
-        sweep_partials(&cache_dir);
 
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent("Beatlab/0.2")
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(8))
             .build()
             .unwrap_or_default();
 
-        let cover_http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .user_agent("Beatlab/0.2")
-            .build()
-            .unwrap_or_default();
-
-        let has_ffmpeg = std::process::Command::new("ffmpeg")
+        let ffmpeg_available = std::process::Command::new("ffmpeg")
             .arg("-version")
-            .output()
-            .map(|o| o.status.success())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
             .unwrap_or(false);
 
         Self {
             store,
-            registry,
+            sources,
+            http,
             cache_dir,
             cover_dir,
-            budget_bytes: cache_gb.max(1) << 30,
-            http,
-            cover_http,
-            has_ffmpeg,
-            cover_sem: Arc::new(Semaphore::new(12)),
-            cover_neg_cache: Mutex::new(HashMap::new()),
-            inflight_resolves: Mutex::new(HashMap::new()),
+            max_cache_bytes: ((max_cache_gb.max(0.5)) * 1024.0 * 1024.0 * 1024.0) as i64,
+            ffmpeg_available,
+            resolved_cache: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_resolutions: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_downloads: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    pub fn has_ffmpeg(&self) -> bool {
-        self.has_ffmpeg
-    }
-
-    pub fn cache_budget_bytes(&self) -> i64 {
-        self.budget_bytes
-    }
-
-    pub fn clear_audio_cache(&self) {
-        for ent in self.store.cache_entries_oldest() {
-            let _ = std::fs::remove_file(&ent.path);
-            self.store.cache_delete(&ent.track_id);
-        }
-    }
-
-    fn cached_resolved_url(&self, key: &str) -> Option<String> {
-        let raw = self.store.kv_get(key)?;
-        let ent = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
-        let u = ent["u"].as_str().unwrap_or("");
-        let at = ent["a"].as_i64().unwrap_or(0);
-        let age = chrono::Utc::now().timestamp() - at;
-        let valid_local = u
-            .strip_prefix("file:")
-            .map(|p| Path::new(p).exists())
-            .unwrap_or(true);
-        if !u.is_empty() && age < 5 * 3600 && valid_local {
-            Some(u.to_string())
-        } else {
-            None
-        }
-    }
-
-    pub async fn resolve_url(&self, track: &Track, fresh: bool) -> Option<String> {
-        if !track.stream_url.starts_with("ytdlp:") && !track.stream_url.starts_with("slsk:") {
-            return Some(track.stream_url.clone());
-        }
-        let key = format!("ytres:{}", hash_str(&track.stream_url));
-        if !fresh {
-            if let Some(u) = self.cached_resolved_url(&key) {
-                return Some(u);
+    pub async fn resolve_target(&self, track: &Track) -> AppResult<PlayTarget> {
+        // 1. Check disk cache for this exact track.
+        if let Ok(Some(entry)) = self.store.get_cache_entry(&track.id) {
+            let p = PathBuf::from(&entry.path);
+            if p.exists() && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 4096 {
+                let _ = self.store.touch_cache_entry(&track.id);
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or(&track.format);
+                return Ok(PlayTarget::LocalFile {
+                    content_type: mime_for_audio_ext(ext).to_string(),
+                    path: p,
+                });
             }
-        }
-        let lock = {
-            let mut map = self.inflight_resolves.lock().unwrap();
-            if map.len() > 256 {
-                map.retain(|_, v| Arc::strong_count(v) > 1);
-            }
-            Arc::clone(
-                map.entry(key.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
-        let _guard = lock.lock().await;
-        if !fresh {
-            if let Some(u) = self.cached_resolved_url(&key) {
-                return Some(u);
-            }
-        }
-        let resolved = self
-            .registry
-            .resolve_stream(&track.source, &track.stream_url)
-            .await?;
-        let payload = serde_json::json!({
-            "u": resolved,
-            "a": chrono::Utc::now().timestamp()
-        });
-        self.store.kv_set(&key, &payload.to_string());
-        Some(resolved)
-    }
-
-    /// Pre-resolves upcoming `ytdlp:` tracks in the background so playback starts instantly.
-    pub fn warm_resolve(self: &Arc<Self>, tracks: Vec<Track>, limit: usize) {
-        let refs: Vec<Track> = tracks
-            .into_iter()
-            .filter(|t| t.stream_url.starts_with("ytdlp:"))
-            .take(limit)
-            .collect();
-        if refs.is_empty() {
-            return;
-        }
-        let eng = Arc::clone(self);
-        tokio::spawn(async move {
-            futures::stream::iter(refs)
-                .for_each_concurrent(3, |t| {
-                    let eng = Arc::clone(&eng);
-                    async move {
-                        let _ = eng.resolve_url(&t, false).await;
-                    }
-                })
-                .await;
-        });
-    }
-
-    /// Serves a track with bit-perfect quality by default (full HTTP Range support),
-    /// transcoding only if requested or when the source format isn't browser-playable (e.g. ALAC/AIFF).
-    /// Automatically falls back to an alternate source for the same song if the primary source fails.
-    pub async fn serve_track(
-        self: &Arc<Self>,
-        track: &Track,
-        req_headers: &HeaderMap,
-        target_format: Option<&str>,
-        max_bitrate: Option<i32>,
-    ) -> Response {
-        if let Some(resp) = self
-            .serve_track_once(track, req_headers, target_format, max_bitrate)
-            .await
-        {
-            return resp;
+            let _ = self.store.delete_cache_entry(&track.id);
         }
 
-        // Primary source failed (e.g. Soulseek peer queued/offline or expired URL); try fallback sources.
-        let target_key = track.song_key();
-        let query = format!("{} {}", track.artist, track.title);
-        let mut candidates: Vec<Track> = self
-            .store
-            .search_tracks(&query, 12)
-            .into_iter()
-            .filter(|t| t.id != track.id && t.source != track.source && t.song_key() == target_key)
-            .collect();
-
-        if candidates.is_empty() && !query.trim().is_empty() {
-            let remote = self.registry.search_all_raw(&query, 8).await;
-            for t in remote {
-                if t.id != track.id
-                    && t.source != track.source
-                    && (t.song_key() == target_key
-                        || crate::store::search_match_score(&t, &query) >= 60)
-                {
-                    candidates.push(t);
-                }
-            }
-        }
-
-        // Prefer fast-streaming HTTP/ytdlp sources first for instant fallback playback.
-        candidates.sort_by_key(|t| match t.source.as_str() {
-            "local" => 0,
-            "youtube" | "soundcloud" => 1,
-            "bandcamp" | "archive" => 2,
-            _ => 3,
-        });
-
-        for alt in candidates.into_iter().take(3) {
-            if let Some(resp) = self
-                .serve_track_once(&alt, req_headers, target_format, max_bitrate)
-                .await
-            {
-                return resp;
-            }
-        }
-
-        (StatusCode::BAD_GATEWAY, "stream unavailable").into_response()
-    }
-
-    async fn serve_track_once(
-        self: &Arc<Self>,
-        track: &Track,
-        req_headers: &HeaderMap,
-        target_format: Option<&str>,
-        max_bitrate: Option<i32>,
-    ) -> Option<Response> {
-        let is_browser_incompatible = matches!(
-            track.format.to_lowercase().as_str(),
-            "alac" | "aiff" | "aif" | "ape" | "wv" | "dsf" | "wma"
-        );
-        let raw_requested = target_format
-            .map(|f| f.eq_ignore_ascii_case("raw"))
-            .unwrap_or(false);
-        let effective_target_fmt = if target_format
-            .map(|f| !f.is_empty() && !f.eq_ignore_ascii_case("raw"))
-            .unwrap_or(false)
-        {
-            target_format
-        } else if is_browser_incompatible && !raw_requested {
-            Some("flac")
-        } else {
-            None
-        };
-
-        let wants_transcode = self.has_ffmpeg
-            && ((max_bitrate.unwrap_or(0) > 0 && track.bitrate > max_bitrate.unwrap_or(0))
-                || effective_target_fmt
-                    .map(|f| !f.eq_ignore_ascii_case(&track.format))
-                    .unwrap_or(false));
-
-        // 1. Local file source
+        // 2. Local filesystem source.
         if let Some(local_path) = track.stream_url.strip_prefix("file:") {
-            let path = PathBuf::from(local_path);
-            if path.exists() {
-                if wants_transcode {
-                    let s = path.to_string_lossy();
-                    return self
-                        .serve_transcoded(
-                            &s,
-                            effective_target_fmt.unwrap_or("mp3"),
-                            max_bitrate.unwrap_or(320),
-                        )
-                        .await;
-                }
-                return Some(serve_local_file(&path, &track.format, req_headers).await);
-            }
-            return None;
-        }
-
-        // 2. Cached file on disk
-        if let Some(ent) = self.store.cache_get(&track.id) {
-            let p = PathBuf::from(&ent.path);
+            let p = PathBuf::from(local_path);
             if p.exists() {
-                self.store.cache_touch(&track.id);
-                if wants_transcode {
-                    let s = p.to_string_lossy();
-                    return self
-                        .serve_transcoded(
-                            &s,
-                            effective_target_fmt.unwrap_or("mp3"),
-                            max_bitrate.unwrap_or(320),
-                        )
-                        .await;
-                }
-                return Some(serve_local_file(&p, &track.format, req_headers).await);
+                return Ok(PlayTarget::LocalFile {
+                    content_type: mime_for_audio_ext(&track.format).to_string(),
+                    path: p,
+                });
             }
-            self.store.cache_delete(&track.id);
+            return Err(err_msg("Local audio file missing"));
         }
 
-        // 3. Stream from upstream URL + tee to disk cache
-        let mut url = self.resolve_url(track, false).await?;
-
-        if let Some(local_path) = url.strip_prefix("file:") {
-            let path = PathBuf::from(local_path);
-            if path.exists() {
-                if wants_transcode {
-                    let s = path.to_string_lossy();
-                    return self
-                        .serve_transcoded(
-                            &s,
-                            effective_target_fmt.unwrap_or("mp3"),
-                            max_bitrate.unwrap_or(320),
-                        )
-                        .await;
-                }
-                return Some(serve_local_file(&path, &track.format, req_headers).await);
+        // 3. Soulseek P2P source -> downloads into cache directory via MusicSource::resolve_stream.
+        if track.stream_url.starts_with("slsk://") {
+            let resolved = self
+                .sources
+                .soulseek
+                .resolve_stream(&track.stream_url)
+                .await
+                .ok_or_else(|| err_msg("Soulseek download failed"))?;
+            let local_path = PathBuf::from(resolved.strip_prefix("file:").unwrap_or(&resolved));
+            if !local_path.exists() {
+                return Err(err_msg("Soulseek download failed: cached file missing"));
             }
-            return None;
+            let bytes = std::fs::metadata(&local_path)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+            let _ = self
+                .store
+                .upsert_cache_entry(&track.id, &local_path.to_string_lossy(), bytes);
+            let _ = self.store.prune_cache(self.max_cache_bytes);
+            let ext = local_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or(&track.format);
+            return Ok(PlayTarget::LocalFile {
+                content_type: mime_for_audio_ext(ext).to_string(),
+                path: local_path,
+            });
         }
 
-        if wants_transcode {
+        // 4. Local/cached sibling upgrade for streaming metadata tracks (`resolve:ytm:` / `ytm:`).
+        if track.stream_url.starts_with("resolve:") || track.stream_url.starts_with("ytm:") {
+            if let Some(local) = self.find_local_or_cached_sibling(track) {
+                return Ok(local);
+            }
+            let resolved = self.resolve_ytm_singleflight(track, false).await?;
+            return Ok(PlayTarget::RemoteHttp {
+                content_type: mime_for_audio_ext(&resolved.ext).to_string(),
+                url: resolved.url,
+                headers: resolved.headers,
+                ext: resolved.ext,
+                webpage_url: resolved.webpage_url,
+                cacheable: true,
+            });
+        }
+
+        // 5. Direct HTTP stream (Archive.org FLAC/MP3, radio, etc.).
+        if track.stream_url.starts_with("http://") || track.stream_url.starts_with("https://") {
+            return Ok(PlayTarget::RemoteHttp {
+                url: track.stream_url.clone(),
+                headers: vec![(
+                    "User-Agent".to_string(),
+                    "Beatlab/0.3 (HighQualityAudio)".to_string(),
+                )],
+                content_type: mime_for_audio_ext(&track.format).to_string(),
+                ext: if track.format.is_empty() {
+                    "mp3".to_string()
+                } else {
+                    track.format.clone()
+                },
+                webpage_url: track.stream_url.clone(),
+                cacheable: !track.stream_url.contains("/preview/") && track.source != "radio",
+            });
+        }
+
+        Err(err_msg(format!("Unsupported stream URL: {}", track.stream_url)))
+    }
+
+    fn find_local_or_cached_sibling(&self, track: &Track) -> Option<PlayTarget> {
+        let key = track.song_key();
+        let candidates = self.store.search_tracks(&track.title, 40, 0).ok()?;
+        for c in candidates {
+            if c.id == track.id || c.song_key() != key {
+                continue;
+            }
+            if track.duration > 0 && c.duration > 0 && (track.duration - c.duration).abs() > 20 {
+                continue;
+            }
+            if let Some(path_str) = c.stream_url.strip_prefix("file:") {
+                let p = PathBuf::from(path_str);
+                if p.exists() {
+                    return Some(PlayTarget::LocalFile {
+                        content_type: mime_for_audio_ext(&c.format).to_string(),
+                        path: p,
+                    });
+                }
+            }
+            if let Ok(Some(entry)) = self.store.get_cache_entry(&c.id) {
+                let p = PathBuf::from(&entry.path);
+                if p.exists() && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 4096 {
+                    return Some(PlayTarget::LocalFile {
+                        content_type: mime_for_audio_ext(&c.format).to_string(),
+                        path: p,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    async fn resolve_ytm_singleflight(
+        &self,
+        track: &Track,
+        force_refresh: bool,
+    ) -> AppResult<CachedResolved> {
+        let now = Utc::now().timestamp();
+        if !force_refresh {
+            let guard = self.resolved_cache.read().await;
+            if let Some(cached) = guard.get(&track.id) {
+                if cached.expires_at > now + 30 {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        // Coordinate concurrent requests for the same track ID.
+        loop {
+            let (notify, is_leader) = {
+                let mut map = self.in_flight_resolutions.lock().await;
+                if let Some(existing) = map.get(&track.id) {
+                    (Arc::clone(existing), false)
+                } else {
+                    let n = Arc::new(Notify::new());
+                    map.insert(track.id.clone(), Arc::clone(&n));
+                    (n, true)
+                }
+            };
+
+            if !is_leader {
+                notify.notified().await;
+                let guard = self.resolved_cache.read().await;
+                if let Some(cached) = guard.get(&track.id) {
+                    if cached.expires_at > Utc::now().timestamp() {
+                        return Ok(cached.clone());
+                    }
+                }
+                continue;
+            }
+
+            let res = self.perform_ytm_resolve(track).await;
+            {
+                let mut map = self.in_flight_resolutions.lock().await;
+                map.remove(&track.id);
+            }
+            notify.notify_waiters();
+            return res;
+        }
+    }
+
+    async fn perform_ytm_resolve(&self, track: &Track) -> AppResult<CachedResolved> {
+        let video_id = if let Some(vid) = track.stream_url.strip_prefix("ytm:") {
+            vid.trim().to_string()
+        } else if let Some(spec) = track.stream_url.strip_prefix("resolve:ytm:") {
+            let mut parts = spec.splitn(3, '|');
+            let art = parts.next().unwrap_or(&track.artist);
+            let title = parts.next().unwrap_or(&track.title);
+            let dur = parts
+                .next()
+                .and_then(|d| d.parse::<i32>().ok())
+                .unwrap_or(track.duration);
+            self.sources
+                .ytm
+                .find_best_video_for_track(art, title, dur)
+                .await
+                .ok_or_else(|| {
+                    err_msg(format!("No playable match found on YouTube Music for {} - {}", art, title))
+                })?
+        } else {
+            return Err(err_msg("Unsupported resolution specifier"));
+        };
+
+        let resolved = self.sources.ytm.resolve_stream(&video_id).await?;
+        let item = CachedResolved {
+            url: resolved.url,
+            headers: resolved.headers,
+            ext: resolved.ext,
+            webpage_url: resolved.source_webpage_url,
+            expires_at: Utc::now().timestamp() + 3600,
+        };
+        {
+            let mut guard = self.resolved_cache.write().await;
+            guard.insert(track.id.clone(), item.clone());
+        }
+        Ok(item)
+    }
+
+    /// Pre-resolves stream metadata & kicks off background caching so next-track transitions feel instant.
+    pub async fn warm_track(&self, track: &Track) -> AppResult<()> {
+        match self.resolve_target(track).await? {
+            PlayTarget::LocalFile { .. } => Ok(()),
+            PlayTarget::RemoteHttp {
+                url,
+                headers,
+                ext,
+                cacheable,
+                ..
+            } => {
+                if cacheable {
+                    self.spawn_background_cache(&track.id, &url, &headers, &ext);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn serve_track_stream(
+        &self,
+        track: &Track,
+        req_headers: &HeaderMap,
+        max_bitrate: Option<i32>,
+        target_format: Option<&str>,
+        time_offset: f64,
+    ) -> Response {
+        let want_fmt = target_format
+            .map(|f| f.trim().to_lowercase())
+            .filter(|f| !f.is_empty() && f != "raw");
+
+        let resolved = match self.resolve_target(track).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(track_id = %track.id, error = %e, "stream resolution failed");
+                return (StatusCode::BAD_GATEWAY, format!("Stream error: {}", e)).into_response();
+            }
+        };
+
+        let need_transcode = self.ffmpeg_available
+            && (time_offset > 0.5
+                || want_fmt.is_some()
+                || max_bitrate.map(|b| b > 0).unwrap_or(false));
+
+        if need_transcode {
+            let (fmt, br) = choose_transcode_params(
+                want_fmt.as_deref(),
+                max_bitrate,
+                track,
+            );
             return self
-                .serve_transcoded(
-                    &url,
-                    effective_target_fmt.unwrap_or("mp3"),
-                    max_bitrate.unwrap_or(320),
-                )
+                .serve_ffmpeg_transcode(track, &resolved, &fmt, br, time_offset)
                 .await;
         }
 
@@ -331,891 +374,1035 @@ impl Engine {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let mut resp_res = self.fetch_upstream(&url, range_hdr.as_deref()).await;
-        let should_retry = match &resp_res {
-            Err(_) => true,
-            Ok(r) => matches!(
-                r.status(),
-                reqwest::StatusCode::FORBIDDEN
-                    | reqwest::StatusCode::NOT_FOUND
-                    | reqwest::StatusCode::GONE
-            ),
-        };
-        if should_retry && track.stream_url.starts_with("ytdlp:") {
-            if let Some(fresh_url) = self.resolve_url(track, true).await {
-                url = fresh_url;
-                resp_res = self.fetch_upstream(&url, range_hdr.as_deref()).await;
+        match resolved {
+            PlayTarget::LocalFile { path, content_type } => {
+                serve_local_file_range(&path, &content_type, range_hdr.as_deref()).await
             }
-        }
-        let resp = resp_res.ok()?;
-
-        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            return None;
-        }
-
-        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-        let content_len = resp.content_length();
-        let mut out_headers = HeaderMap::new();
-        for h in ["content-length", "content-range", "accept-ranges", "etag"] {
-            if let Some(v) = resp.headers().get(h) {
-                if let Ok(name) = axum::http::HeaderName::from_bytes(h.as_bytes()) {
-                    out_headers.insert(name, v.clone());
+            PlayTarget::RemoteHttp {
+                url,
+                headers,
+                content_type,
+                ext,
+                webpage_url,
+                cacheable,
+            } => {
+                if cacheable {
+                    self.spawn_background_cache(&track.id, &url, &headers, &ext);
                 }
+                self.serve_remote_http_range(
+                    track,
+                    &url,
+                    &headers,
+                    &content_type,
+                    &webpage_url,
+                    range_hdr.as_deref(),
+                )
+                .await
             }
         }
-        let ct = upstream_content_type(&resp, &url, &track.format);
-        if let Ok(hv) = HeaderValue::from_str(&ct) {
-            out_headers.insert(header::CONTENT_TYPE, hv);
-        } else {
-            out_headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(content_type_for_format(&track.format)),
-            );
-        }
-
-        let expected_len_u64 = content_len.unwrap_or(0);
-        let cacheable = range_hdr.is_none()
-            && status == StatusCode::OK
-            && expected_len_u64 > 0;
-
-        if !cacheable {
-            let stream = resp.bytes_stream();
-            let body = Body::from_stream(stream);
-            return Some((status, out_headers, body).into_response());
-        }
-
-        // Tee stream to disk cache
-        let expected_len = expected_len_u64 as i64;
-        let tmp_name = format!("{}.{}.part", hash_str(&track.id), uuid::Uuid::new_v4());
-        let tmp_path = self.cache_dir.join(tmp_name);
-        let ext = if track.format.is_empty() { "bin" } else { &track.format };
-        let final_path = self.cache_dir.join(format!("{}.{}", hash_str(&track.id), ext));
-
-        let Ok(mut file) = tokio::fs::File::create(&tmp_path).await else {
-            let body = Body::from_stream(resp.bytes_stream());
-            return Some((status, out_headers, body).into_response());
-        };
-
-        let track_id = track.id.clone();
-        let eng = Arc::clone(self);
-        let mut upstream = resp.bytes_stream();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
-
-        tokio::spawn(async move {
-            let mut written: i64 = 0;
-            let mut ok = true;
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        written += bytes.len() as i64;
-                        if file.write_all(&bytes).await.is_err() {
-                            ok = false;
-                        }
-                        if tx.send(Ok(bytes)).await.is_err() {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        ok = false;
-                        let _ = tx.send(Err(std::io::Error::other(e))).await;
-                        break;
-                    }
-                }
-            }
-            let _ = file.flush().await;
-            drop(file);
-            if ok && written == expected_len {
-                if tokio::fs::rename(&tmp_path, &final_path).await.is_ok() {
-                    eng.store
-                        .cache_put(&track_id, &final_path.to_string_lossy(), written);
-                    eng.evict();
-                    info!(track_id = %track_id, bytes = written, "cached audio track");
-                } else {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                }
-            } else {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-            }
-        });
-
-        let stream = tokio_util::io::ReaderStream::new(tokio_util::io::StreamReader::new(
-            tokio_stream_from_mpsc(rx),
-        ));
-        let body = Body::from_stream(stream);
-        Some((status, out_headers, body).into_response())
     }
 
-    async fn fetch_upstream(
+    async fn serve_remote_http_range(
         &self,
+        track: &Track,
         url: &str,
-        range: Option<&str>,
-    ) -> Result<reqwest::Response, reqwest::Error> {
-        let mut req = self.http.get(url);
-        if let Some(r) = range {
-            req = req.header(reqwest::header::RANGE, r);
+        headers: &[(String, String)],
+        content_type: &str,
+        webpage_url: &str,
+        range_hdr: Option<&str>,
+    ) -> Response {
+        let mut active_url = url.to_string();
+        let mut active_headers = headers.to_vec();
+        let mut active_ct = content_type.to_string();
+
+        for attempt in 0..2 {
+            let mut req = self.http.get(&active_url);
+            for (k, v) in &active_headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            if let Some(r) = range_hdr {
+                req = req.header(header::RANGE, r);
+            }
+
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    let status = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                        StatusCode::PARTIAL_CONTENT
+                    } else {
+                        StatusCode::OK
+                    };
+                    let mut builder = Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, &active_ct)
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .header(header::CACHE_CONTROL, "private, max-age=3600");
+                    if let Some(len) = resp.headers().get(header::CONTENT_LENGTH) {
+                        builder = builder.header(header::CONTENT_LENGTH, len);
+                    }
+                    if let Some(cr) = resp.headers().get(header::CONTENT_RANGE) {
+                        builder = builder.header(header::CONTENT_RANGE, cr);
+                    }
+                    let stream = resp.bytes_stream().map(|res| {
+                        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                    });
+                    return builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    });
+                }
+                Ok(resp)
+                    if attempt == 0
+                        && (resp.status() == reqwest::StatusCode::FORBIDDEN
+                            || resp.status() == reqwest::StatusCode::GONE)
+                        && (track.stream_url.starts_with("resolve:")
+                            || track.stream_url.starts_with("ytm:")) =>
+                {
+                    // Cached upstream signed URL expired or IP-shifted; re-resolve cleanly.
+                    debug!(track_id = %track.id, status = %resp.status(), "refreshing expired stream URL");
+                    if let Ok(fresh) = self.resolve_ytm_singleflight(track, true).await {
+                        active_url = fresh.url;
+                        active_headers = fresh.headers;
+                        active_ct = mime_for_audio_ext(&fresh.ext).to_string();
+                        continue;
+                    }
+                    break;
+                }
+                Ok(resp) => {
+                    warn!(status = %resp.status(), url = %active_url, "upstream stream failed");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "upstream stream request error");
+                    break;
+                }
+            }
         }
-        req.send().await
+
+        // Last-resort direct pipe via yt-dlp -o - if upstream direct URL failed.
+        if webpage_url.contains("youtube.com") || webpage_url.contains("youtu.be") {
+            return self.serve_ytdlp_pipe(webpage_url).await;
+        }
+        (StatusCode::BAD_GATEWAY, "Failed to proxy upstream audio").into_response()
     }
 
-    async fn serve_transcoded(&self, input: &str, fmt: &str, bitrate_kbps: i32) -> Option<Response> {
-        let br = format!("{}k", bitrate_kbps.clamp(64, 320));
-        let (codec, out_fmt, ct) = match fmt.to_lowercase().as_str() {
-            "flac" => ("flac", "flac", "audio/flac"),
-            "opus" => ("libopus", "opus", "audio/ogg"),
-            "ogg" => ("libvorbis", "ogg", "audio/ogg"),
-            "aac" | "m4a" => ("aac", "adts", "audio/aac"),
-            _ => ("libmp3lame", "mp3", "audio/mpeg"),
+    async fn serve_ytdlp_pipe(&self, watch_url: &str) -> Response {
+        let mut cmd = Command::new(self.sources.ytm.ytdlp_bin());
+        cmd.args([
+            "--no-playlist",
+            "--no-warnings",
+            "--extractor-args",
+            "youtube:player_client=android",
+            "-f",
+            "bestaudio/best",
+            "-o",
+            "-",
+            watch_url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+        let Ok(mut child) = cmd.spawn() else {
+            return (StatusCode::BAD_GATEWAY, "Failed to spawn yt-dlp pipe").into_response();
         };
+        let Some(stdout) = child.stdout.take() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        let stream = ReaderStream::new(stdout);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "audio/mp4")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    }
 
-        let mut child = Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-i",
-                input,
-                "-vn",
-                "-c:a",
-                codec,
-                "-b:a",
-                &br,
-                "-f",
-                out_fmt,
-                "pipe:1",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .ok()?;
-
-        let mut stdout = child.stdout.take()?;
-        // Verify ffmpeg produces real audio bytes before committing a 200 OK header,
-        // allowing `serve_track` to fall back if transcoding the source fails.
-        let mut head = vec![0u8; 4096];
-        let n = match tokio::time::timeout(Duration::from_secs(12), stdout.read(&mut head)).await {
-            Ok(Ok(n)) if n > 0 => n,
-            _ => {
-                let _ = child.kill().await;
-                return None;
+    async fn serve_ffmpeg_transcode(
+        &self,
+        track: &Track,
+        target: &PlayTarget,
+        fmt: &str,
+        bitrate_kbps: i32,
+        time_offset: f64,
+    ) -> Response {
+        let (input_arg, custom_headers, ct) = match target {
+            PlayTarget::LocalFile { path, .. } => (
+                path.to_string_lossy().to_string(),
+                vec![],
+                mime_for_audio_ext(fmt),
+            ),
+            PlayTarget::RemoteHttp {
+                url,
+                headers,
+                ext,
+                cacheable,
+                ..
+            } => {
+                if *cacheable {
+                    self.spawn_background_cache(&track.id, url, headers, ext);
+                }
+                (url.clone(), headers.clone(), mime_for_audio_ext(fmt))
             }
         };
-        head.truncate(n);
 
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-loglevel", "error"]);
+        if time_offset > 0.5 {
+            cmd.args(["-ss", &format!("{:.2}", time_offset)]);
+        }
+        if input_arg.starts_with("http://") || input_arg.starts_with("https://") {
+            let mut ua = String::new();
+            let mut hdr_blob = String::new();
+            for (k, v) in &custom_headers {
+                if k.eq_ignore_ascii_case("user-agent") {
+                    ua = v.clone();
+                } else {
+                    hdr_blob.push_str(&format!("{}: {}\r\n", k, v));
+                }
+            }
+            if !ua.is_empty() {
+                cmd.args(["-user_agent", &ua]);
+            }
+            if !hdr_blob.is_empty() {
+                cmd.args(["-headers", &hdr_blob]);
+            }
+        }
+        cmd.args(["-i", &input_arg, "-vn", "-map_metadata", "-1"]);
+
+        match fmt {
+            "opus" => {
+                cmd.args([
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    &format!("{}k", bitrate_kbps.clamp(48, 320)),
+                    "-f",
+                    "opus",
+                    "pipe:1",
+                ]);
+            }
+            "ogg" => {
+                cmd.args([
+                    "-c:a",
+                    "libvorbis",
+                    "-b:a",
+                    &format!("{}k", bitrate_kbps.clamp(64, 320)),
+                    "-f",
+                    "ogg",
+                    "pipe:1",
+                ]);
+            }
+            "flac" => {
+                cmd.args(["-c:a", "flac", "-f", "flac", "pipe:1"]);
+            }
+            "aac" | "m4a" => {
+                cmd.args([
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    &format!("{}k", bitrate_kbps.clamp(64, 320)),
+                    "-f",
+                    "adts",
+                    "pipe:1",
+                ]);
+            }
+            _ => {
+                cmd.args([
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    &format!("{}k", bitrate_kbps.clamp(64, 320)),
+                    "-f",
+                    "mp3",
+                    "pipe:1",
+                ]);
+            }
+        }
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+        let Ok(mut child) = cmd.spawn() else {
+            return (StatusCode::BAD_GATEWAY, "Failed to launch ffmpeg").into_response();
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
         tokio::spawn(async move {
             let _ = child.wait().await;
         });
 
-        let stream = futures::stream::once(async move {
-            Ok::<_, std::io::Error>(bytes::Bytes::from(head))
-        })
-        .chain(ReaderStream::new(stdout));
-        Some(
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, HeaderValue::from_static(ct))],
-                Body::from_stream(stream),
-            )
-                .into_response(),
-        )
+        let stream = ReaderStream::new(stdout);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     }
 
-    pub fn evict(&self) {
-        let mut used = self.store.cache_bytes();
-        while used > self.budget_bytes {
-            let entries = self.store.cache_entries_oldest();
-            if entries.is_empty() {
-                break;
-            }
-            let mut progressed = false;
-            for ent in entries {
-                if used <= self.budget_bytes {
-                    break;
-                }
-                if (std::fs::remove_file(&ent.path).is_ok() || !Path::new(&ent.path).exists())
-                    && self.store.cache_delete(&ent.track_id)
-                {
-                    used = used.saturating_sub(ent.bytes);
-                    progressed = true;
-                }
-            }
-            if !progressed {
-                break;
+    pub fn spawn_background_cache(
+        &self,
+        track_id: &str,
+        url: &str,
+        headers: &[(String, String)],
+        ext: &str,
+    ) {
+        if let Ok(Some(entry)) = self.store.get_cache_entry(track_id) {
+            if Path::new(&entry.path).exists() {
+                return;
             }
         }
+
+        let this = self.clone();
+        let tid = track_id.to_string();
+        let u = url.to_string();
+        let hdrs = headers.to_vec();
+        let ext_s = if ext.is_empty() { "m4a" } else { ext }.to_string();
+
+        tokio::spawn(async move {
+            {
+                let mut set = this.in_flight_downloads.lock().await;
+                if !set.insert(tid.clone()) {
+                    return;
+                }
+            }
+            let _ = this.download_to_disk_cache(&tid, &u, &hdrs, &ext_s).await;
+            let mut set = this.in_flight_downloads.lock().await;
+            set.remove(&tid);
+        });
     }
 
-    pub async fn serve_cover(&self, id: &str) -> Response {
-        if let Some(raw_artist) = id
-            .strip_prefix("ar:")
-            .and_then(|_| self.store.artist_name_from_id(id))
-        {
-            let clean_artist = crate::models::primary_artist(&raw_artist);
-            if !clean_artist.is_empty()
-                && !clean_artist.eq_ignore_ascii_case("unknown artist")
-                && !crate::models::is_generic_folder_name(&clean_artist)
-            {
-                let ar_slug = crate::models::slug(&clean_artist);
-                let cache_path = self.cover_dir.join(format!("artist_{}.img", ar_slug));
-                if let Ok(bytes) = tokio::fs::read(&cache_path).await {
-                    let ct = sniff_image_mime(&bytes);
-                    return cover_response(bytes, ct);
-                }
-                let neg_key = format!("ar:{}", ar_slug);
-                let now = chrono::Utc::now().timestamp();
-                if !self.is_cover_neg_cached(&neg_key, now) {
-                    if let Ok(_permit) = self.cover_sem.acquire().await {
-                        if let Some(art_url) = self.lookup_artist_image(&clean_artist).await {
-                            if let Some(resp) = self.fetch_and_cache_image(&art_url, &cache_path).await {
-                                return resp;
-                            }
-                        } else {
-                            self.mark_cover_neg_cached(neg_key, now);
-                        }
-                    }
-                }
-            }
-        }
-
-        let track = self.resolve_cover_track(id);
-
-        if let Some(ref t) = track {
-            if let Some(local_path) = t.cover_url.strip_prefix("local-art:") {
-                let cache_path = self.cover_dir.join(format!("loc_{}.img", hash_str(local_path)));
-                if let Ok(bytes) = tokio::fs::read(&cache_path).await {
-                    let ct = sniff_image_mime(&bytes);
-                    return cover_response(bytes, ct);
-                }
-                let p = PathBuf::from(local_path);
-                let extracted = tokio::task::spawn_blocking(move || extract_embedded_cover(&p))
-                    .await
-                    .ok()
-                    .flatten();
-                if let Some((bytes, mime)) = extracted {
-                    let _ = tokio::fs::write(&cache_path, &bytes).await;
-                    return cover_response(bytes, &mime);
-                }
-            }
-
-            if t.cover_url.starts_with("http") {
-                let cache_path = self.cover_dir.join(format!("{}.img", hash_str(&t.cover_url)));
-                if let Ok(bytes) = tokio::fs::read(&cache_path).await {
-                    let ct = sniff_image_mime(&bytes);
-                    return cover_response(bytes, ct);
-                }
-                if let Ok(_permit) = self.cover_sem.acquire().await {
-                    if let Some(resp) = self.fetch_and_cache_image(&t.cover_url, &cache_path).await {
-                        return resp;
-                    }
-                }
-            }
-
-            // Missing cover_url (e.g. Soulseek or untagged local): look up real album art
-            // via iTunes/Deezer and cache both the image bytes and the URL in SQLite.
-            let clean_artist = crate::models::primary_artist(&t.artist);
-            let clean_album = crate::models::strip_release_tags(&t.album);
-            let clean_title = crate::models::strip_release_tags(&t.title);
-            if !clean_artist.is_empty()
-                && !clean_artist.eq_ignore_ascii_case("unknown artist")
-                && !crate::models::is_generic_folder_name(&clean_artist)
-            {
-                let target = if !clean_album.is_empty()
-                    && !clean_album.eq_ignore_ascii_case("unknown album")
-                    && !crate::models::is_generic_folder_name(&clean_album)
-                {
-                    &clean_album
-                } else {
-                    &clean_title
-                };
-                if !target.is_empty() {
-                    let art_key = format!("{}|{}", clean_artist.to_lowercase(), target.to_lowercase());
-                    let cache_path = self.cover_dir.join(format!("art_{}.img", hash_str(&art_key)));
-                    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
-                        let ct = sniff_image_mime(&bytes);
-                        return cover_response(bytes, ct);
-                    }
-                    let now = chrono::Utc::now().timestamp();
-                    if !self.is_cover_neg_cached(&art_key, now) {
-                        if let Ok(_permit) = self.cover_sem.acquire().await {
-                            if let Some((art_url, genre)) = self
-                                .lookup_artwork(&clean_artist, &clean_album, &clean_title)
-                                .await
-                            {
-                                self.store.update_track_cover_and_genre(
-                                    &t.id,
-                                    Some(&art_url),
-                                    genre.as_deref(),
-                                );
-                                if let Some(resp) =
-                                    self.fetch_and_cache_image(&art_url, &cache_path).await
-                                {
-                                    return resp;
-                                }
-                            } else {
-                                self.mark_cover_neg_cached(art_key, now);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Crisp deterministic SVG fallback cover
-        let label = if let Some(ref t) = track {
-            t.title.chars().take(2).collect::<String>().to_uppercase()
-        } else if let Some(name) = id
-            .strip_prefix("ar:")
-            .and_then(|_| self.store.artist_name_from_id(id))
-        {
-            name.chars().take(2).collect::<String>().to_uppercase()
+    async fn download_to_disk_cache(
+        &self,
+        track_id: &str,
+        url: &str,
+        headers: &[(String, String)],
+        ext: &str,
+    ) -> AppResult<()> {
+        let hash = sha1_hex(track_id);
+        let part_path = self.cache_dir.join(format!("{}.part", hash));
+        let final_ext = if ext == "mp4" || ext == "m4a" {
+            "m4a"
         } else {
-            "BL".to_string()
+            ext
         };
-        let svg = generate_svg_cover(id, &label);
-        (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, "image/svg+xml"),
-                (header::CACHE_CONTROL, "public, max-age=86400"),
-            ],
-            svg,
-        )
-            .into_response()
+        let final_path = self.cache_dir.join(format!("{}.{}", hash, final_ext));
+        if final_path.exists() {
+            return Ok(());
+        }
+
+        let mut req = self.http.get(url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            return Err(err_msg(format!("Cache download HTTP {}", resp.status())));
+        }
+
+        let mut file = File::create(&part_path).await?;
+        let mut stream = resp.bytes_stream();
+        let mut total_written: i64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            total_written += bytes.len() as i64;
+            if total_written > 250 * 1024 * 1024 {
+                drop(file);
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Err(err_msg("Track exceeded 250MB cache cap"));
+            }
+            file.write_all(&bytes).await?;
+        }
+        file.flush().await?;
+        drop(file);
+
+        if total_written < 4096 {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(err_msg("Downloaded file too small"));
+        }
+
+        // Convert mp4 progressive streams cleanly into fast-start audio-only m4a if ffmpeg is installed.
+        let remuxed = if self.ffmpeg_available && (ext == "mp4" || ext == "m4a") {
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    &part_path.to_string_lossy(),
+                    "-vn",
+                    "-c:a",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    &final_path.to_string_lossy(),
+                ])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if status && final_path.exists() {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !remuxed {
+            tokio::fs::rename(&part_path, &final_path).await?;
+        }
+
+        let final_bytes = tokio::fs::metadata(&final_path)
+            .await
+            .map(|m| m.len() as i64)
+            .unwrap_or(total_written);
+        self.store
+            .upsert_cache_entry(track_id, &final_path.to_string_lossy(), final_bytes)?;
+        let _ = self.store.prune_cache(self.max_cache_bytes);
+        debug!(track_id = %track_id, bytes = final_bytes, "cached track to disk");
+        Ok(())
     }
 
-    fn resolve_cover_track(&self, id: &str) -> Option<Track> {
-        if let Some(t) = self.store.track(id) {
-            return Some(t);
-        }
-        if id.starts_with("ar:") {
-            if let Some(name) = self.store.artist_name_from_id(id) {
-                let trs = self.store.tracks_by_artist(&name, 10);
-                return trs
-                    .iter()
-                    .find(|t| !t.cover_url.is_empty())
-                    .cloned()
-                    .or_else(|| trs.into_iter().next());
+    // -------------------------------------------------------------------------
+    // Cover Art & Lyrics
+    // -------------------------------------------------------------------------
+
+    pub async fn serve_cover(&self, raw_id: &str) -> Response {
+        let id = raw_id
+            .trim()
+            .trim_start_matches("al-")
+            .trim_start_matches("pl-");
+        let lookup_id = if raw_id.starts_with("al:") || raw_id.starts_with("ar:") || raw_id.starts_with("pl-") {
+            raw_id.trim()
+        } else {
+            id
+        };
+
+        let cache_key = sha1_hex(lookup_id);
+        let cache_file = self.cover_dir.join(format!("{}.img", cache_key));
+        let meta_file = self.cover_dir.join(format!("{}.mime", cache_key));
+        let src_file = self.cover_dir.join(format!("{}.src", cache_key));
+
+        let mut stale_cached: Option<(Vec<u8>, String)> = None;
+        if cache_file.exists() {
+            if let Ok(bytes) = tokio::fs::read(&cache_file).await {
+                if !bytes.is_empty() {
+                    let mime = tokio::fs::read_to_string(&meta_file)
+                        .await
+                        .unwrap_or_else(|_| "image/jpeg".to_string());
+                    if !is_low_res_cover(&bytes) {
+                        return image_response(bytes, &mime);
+                    }
+                    stale_cached = Some((bytes, mime));
+                }
             }
         }
-        if id.starts_with("al:") {
-            let all = self.store.all_tracks(3000);
-            return all
-                .iter()
-                .find(|t| t.album_id() == id && !t.cover_url.is_empty())
-                .cloned()
-                .or_else(|| all.into_iter().find(|t| t.album_id() == id));
-        }
-        if id.starts_with("pl:") || id.starts_with("auto:") {
-            let trs = self.store.playlist_tracks(id);
-            return trs
-                .iter()
-                .find(|t| !t.cover_url.is_empty())
-                .cloned()
-                .or_else(|| trs.into_iter().next());
-        }
-        None
-    }
 
-    fn is_cover_neg_cached(&self, key: &str, now: i64) -> bool {
-        self.cover_neg_cache
-            .lock()
-            .unwrap()
-            .get(key)
-            .map(|&ts| now - ts < 300)
-            .unwrap_or(false)
-    }
-
-    fn mark_cover_neg_cached(&self, key: String, now: i64) {
-        let mut neg = self.cover_neg_cache.lock().unwrap();
-        neg.insert(key, now);
-        if neg.len() > 512 {
-            neg.retain(|_, ts| now - *ts < 300);
-            if neg.len() > 512 {
-                neg.clear();
+        // 1. Check playlist -> first track cover
+        if lookup_id.starts_with("pl-") {
+            if let Ok(tracks) = self.store.playlist_tracks(lookup_id) {
+                if let Some(first) = tracks.first() {
+                    return Box::pin(self.serve_cover(&first.id)).await;
+                }
             }
         }
+
+        // 2. Check album cover -> albums_meta or first track of album
+        let mut label_for_svg = lookup_id.to_string();
+        let mut candidate_url = String::new();
+        let mut embedded_path: Option<PathBuf> = None;
+
+        if lookup_id.starts_with("al:") {
+            if let Ok(Some(meta)) = self.store.get_album_meta(lookup_id) {
+                label_for_svg = meta.name.clone();
+                if !meta.cover_url.is_empty() {
+                    candidate_url = meta.cover_url;
+                }
+            }
+            if candidate_url.is_empty() {
+                if let Ok(tracks) = self.store.album_tracks(lookup_id) {
+                    if let Some(t) = tracks.first() {
+                        label_for_svg = t.album.clone();
+                        if let Some(p) = t.cover_url.strip_prefix("local-art:") {
+                            embedded_path = Some(PathBuf::from(p));
+                        } else if !t.cover_url.is_empty() {
+                            candidate_url = t.cover_url.clone();
+                        }
+                    }
+                }
+            }
+        } else if lookup_id.starts_with("ar:") {
+            if let Ok(Some(meta)) = self.store.get_artist_meta(lookup_id) {
+                label_for_svg = meta.name.clone();
+                if !meta.cover_url.is_empty() {
+                    candidate_url = meta.cover_url;
+                }
+            }
+            if candidate_url.is_empty() {
+                if let Ok(tracks) = self.store.artist_tracks(lookup_id) {
+                    if let Some(t) = tracks.first() {
+                        label_for_svg = t.artist.clone();
+                        if !t.cover_url.is_empty() && !t.cover_url.starts_with("local-art:") {
+                            candidate_url = t.cover_url.clone();
+                        }
+                    }
+                }
+            }
+        } else if let Ok(Some(t)) = self.store.get_track(lookup_id).or_else(|_| self.store.get_track(raw_id)) {
+            label_for_svg = format!("{} - {}", primary_artist(&t.artist), t.title);
+            if let Some(p) = t.cover_url.strip_prefix("local-art:") {
+                embedded_path = Some(PathBuf::from(p));
+            } else if !t.cover_url.is_empty() {
+                candidate_url = t.cover_url;
+            } else {
+                // Quick fallback lookup on iTunes Search API if track has no artwork URL.
+                candidate_url = self.lookup_itunes_cover(&t.artist, &t.title).await;
+            }
+        }
+
+        if let Some(path) = embedded_path {
+            if let Some((bytes, mime)) = extract_embedded_cover(&path) {
+                let _ = tokio::fs::write(&cache_file, &bytes).await;
+                let _ = tokio::fs::write(&meta_file, &mime).await;
+                return image_response(bytes, &mime);
+            }
+        }
+
+        let upgraded_url = upgrade_cover_url(&candidate_url);
+
+        if let Some((stale_bytes, stale_mime)) = stale_cached {
+            let prev_src = tokio::fs::read_to_string(&src_file).await.unwrap_or_default();
+            if upgraded_url.starts_with("http://") || upgraded_url.starts_with("https://") {
+                if prev_src.trim() != upgraded_url {
+                    let fetched = self.fetch_image_bytes(&upgraded_url).await;
+                    let _ = tokio::fs::write(&src_file, &upgraded_url).await;
+                    if let Some((bytes, mime)) = fetched {
+                        if !is_low_res_cover(&bytes) || bytes.len() > stale_bytes.len() {
+                            let _ = tokio::fs::write(&cache_file, &bytes).await;
+                            let _ = tokio::fs::write(&meta_file, &mime).await;
+                            return image_response(bytes, &mime);
+                        }
+                    }
+                }
+            }
+            return image_response(stale_bytes, &stale_mime);
+        }
+
+        if upgraded_url.starts_with("http://") || upgraded_url.starts_with("https://") {
+            let fetched = match self.fetch_image_bytes(&upgraded_url).await {
+                Some(res) => Some(res),
+                None if upgraded_url != candidate_url => self.fetch_image_bytes(&candidate_url).await,
+                None => None,
+            };
+            if let Some((bytes, mime)) = fetched {
+                let _ = tokio::fs::write(&cache_file, &bytes).await;
+                let _ = tokio::fs::write(&meta_file, &mime).await;
+                let _ = tokio::fs::write(&src_file, &upgraded_url).await;
+                return image_response(bytes, &mime);
+            }
+        }
+
+        svg_cover_response(&label_for_svg)
     }
 
-    async fn fetch_and_cache_image(&self, url: &str, cache_path: &Path) -> Option<Response> {
-        let resp = self.cover_http.get(url).send().await.ok()?;
+    async fn fetch_image_bytes(&self, url: &str) -> Option<(Vec<u8>, String)> {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return None;
+        }
+        let resp = self.http.get(url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let header_ct = resp
+        let mime = resp
             .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !header_ct.is_empty()
-            && !header_ct.starts_with("image/")
-            && !header_ct.starts_with("application/octet-stream")
-        {
-            return None;
-        }
+            .unwrap_or("image/jpeg")
+            .to_string();
         let bytes = resp.bytes().await.ok()?;
         if bytes.is_empty() {
             return None;
         }
-        let sniffed = sniff_image_mime(&bytes);
-        let ct = if header_ct.starts_with("image/") && sniffed == "image/jpeg" {
-            header_ct.split(';').next().unwrap_or(sniffed).trim()
-        } else {
-            sniffed
-        };
-        let _ = tokio::fs::write(cache_path, &bytes).await;
-        Some(cover_response(bytes.to_vec(), ct))
+        Some((bytes.to_vec(), mime))
     }
 
-    async fn lookup_artist_image(&self, artist: &str) -> Option<String> {
-        let clean = crate::models::primary_artist(artist);
-        if clean.is_empty()
-            || clean.eq_ignore_ascii_case("unknown artist")
-            || crate::models::is_generic_folder_name(&clean)
-        {
-            return None;
-        }
-        let dz_url = format!(
-            "https://api.deezer.com/search/artist?q={}&limit=5",
-            urlencoding::encode(&clean)
-        );
-        let resp = self.cover_http.get(&dz_url).send().await.ok()?;
-        let json = resp.json::<serde_json::Value>().await.ok()?;
-        let arr = json.get("data").and_then(|r| r.as_array())?;
-        let target_slug = crate::models::slug(&clean);
-        let picked = arr
-            .iter()
-            .find(|a| {
-                a.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|n| {
-                        n.eq_ignore_ascii_case(&clean)
-                            || (!target_slug.is_empty() && crate::models::slug(n) == target_slug)
-                    })
-                    .unwrap_or(false)
-            })
-            .or_else(|| arr.first())?;
-        for field in ["picture_xl", "picture_big", "picture_medium"] {
-            if let Some(url) = picked.get(field).and_then(|v| v.as_str()) {
-                if !url.is_empty() && !url.contains("/artist//") {
-                    return Some(url.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    async fn query_track_artwork(&self, term: &str) -> Option<(String, Option<String>)> {
-        let itunes_url = format!(
+    async fn lookup_itunes_cover(&self, artist: &str, title: &str) -> String {
+        let term = format!("{} {}", primary_artist(artist), title);
+        let url = format!(
             "https://itunes.apple.com/search?term={}&entity=song&limit=1",
-            urlencoding::encode(term)
+            urlencoding::encode(term.trim())
         );
-        if let Ok(resp) = self.cover_http.get(&itunes_url).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(first) = json.get("results").and_then(|r| r.as_array()).and_then(|a| a.first()) {
-                    if let Some(art100) = first.get("artworkUrl100").and_then(|v| v.as_str()) {
-                        let art600 = art100.replace("100x100bb", "600x600bb");
-                        let genre = first
-                            .get("primaryGenreName")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        return Some((art600, genre));
-                    }
-                }
-            }
-        }
-        let dz_url = format!(
-            "https://api.deezer.com/search?q={}&limit=1",
-            urlencoding::encode(term)
-        );
-        if let Ok(resp) = self.cover_http.get(&dz_url).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(first) = json.get("data").and_then(|r| r.as_array()).and_then(|a| a.first()) {
-                    if let Some(alb) = first.get("album") {
-                        if let Some(cov) = alb
-                            .get("cover_xl")
-                            .or_else(|| alb.get("cover_big"))
-                            .and_then(|v| v.as_str())
-                        {
-                            if !cov.is_empty() {
-                                return Some((cov.to_string(), None));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let Ok(resp) = self.http.get(&url).send().await else {
+            return String::new();
+        };
+        let Ok(val) = resp.json::<serde_json::Value>().await else {
+            return String::new();
+        };
+        val.pointer("/results/0/artworkUrl100")
+            .and_then(|s| s.as_str())
+            .map(upgrade_cover_url)
+            .unwrap_or_default()
     }
 
-    async fn lookup_artwork(&self, artist: &str, album: &str, title: &str) -> Option<(String, Option<String>)> {
-        let clean_artist = crate::models::primary_artist(artist);
-        if clean_artist.is_empty()
-            || clean_artist.eq_ignore_ascii_case("unknown artist")
-            || crate::models::is_generic_folder_name(&clean_artist)
-        {
+    pub async fn fetch_lyrics(&self, track: &Track) -> LyricsData {
+        let kv_key = format!("lyrics:{}", track.id);
+        if let Some(cached) = self.store.kv_get(&kv_key) {
+            if let Ok(parsed) = serde_json::from_str::<LyricsData>(&cached) {
+                return parsed;
+            }
+        }
+
+        let artist = primary_artist(&track.artist);
+        let artist_q = if artist.is_empty() {
+            track.artist.trim()
+        } else {
+            artist.as_str()
+        };
+        let clean_title = crate::models::strip_release_tags(&track.title);
+
+        let url = format!(
+            "https://lrclib.net/api/get?artist_name={}&track_name={}&album_name={}{}",
+            urlencoding::encode(artist_q),
+            urlencoding::encode(&clean_title),
+            urlencoding::encode(track.album.trim()),
+            if track.duration > 0 {
+                format!("&duration={}", track.duration)
+            } else {
+                String::new()
+            }
+        );
+
+        let mut data = self.try_lrclib_get(&url).await;
+        if data.is_none() {
+            let search_url = format!(
+                "https://lrclib.net/api/search?q={}",
+                urlencoding::encode(&format!("{} {}", artist_q, clean_title))
+            );
+            data = self.try_lrclib_search(&search_url).await;
+        }
+
+        let final_lyrics = data.unwrap_or_default();
+        if !final_lyrics.plain.is_empty() || !final_lyrics.lines.is_empty() {
+            if let Ok(json) = serde_json::to_string(&final_lyrics) {
+                self.store.kv_set(&kv_key, &json);
+            }
+        }
+        final_lyrics
+    }
+
+    async fn try_lrclib_get(&self, url: &str) -> Option<LyricsData> {
+        let resp = self.http.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
             return None;
         }
-        let clean_album = crate::models::strip_release_tags(album);
-        let clean_title = crate::models::strip_release_tags(title);
+        let item: LrclibEntry = resp.json().await.ok()?;
+        lrclib_entry_to_lyrics(item)
+    }
 
-        let has_album = !clean_album.is_empty()
-            && !clean_album.eq_ignore_ascii_case("unknown album")
-            && !crate::models::is_generic_folder_name(&clean_album);
-        if has_album {
-            let term = format!("{} {}", clean_artist, clean_album);
-            if let Some(hit) = self.query_track_artwork(&term).await {
-                return Some(hit);
+    async fn try_lrclib_search(&self, url: &str) -> Option<LyricsData> {
+        let resp = self.http.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let items: Vec<LrclibEntry> = resp.json().await.ok()?;
+        items.into_iter().find_map(lrclib_entry_to_lyrics)
+    }
+}
+
+#[derive(Deserialize)]
+struct LrclibEntry {
+    #[serde(default)]
+    #[serde(rename = "plainLyrics")]
+    plain_lyrics: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "syncedLyrics")]
+    synced_lyrics: Option<String>,
+}
+
+fn lrclib_entry_to_lyrics(entry: LrclibEntry) -> Option<LyricsData> {
+    if let Some(synced) = entry.synced_lyrics.filter(|s| !s.trim().is_empty()) {
+        let lines = parse_lrc(&synced);
+        let plain = entry
+            .plain_lyrics
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                lines
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        return Some(LyricsData {
+            synced: !lines.is_empty(),
+            plain,
+            lines,
+        });
+    }
+    if let Some(plain) = entry.plain_lyrics.filter(|s| !s.trim().is_empty()) {
+        let lines = plain
+            .lines()
+            .map(|l| LyricLine {
+                start_ms: None,
+                text: l.to_string(),
+            })
+            .collect();
+        return Some(LyricsData {
+            synced: false,
+            plain,
+            lines,
+        });
+    }
+    None
+}
+
+pub fn parse_lrc(lrc: &str) -> Vec<LyricLine> {
+    let mut lines = Vec::new();
+    for raw_line in lrc.lines() {
+        let mut s = raw_line.trim();
+        let mut timestamps = Vec::new();
+        while s.starts_with('[') {
+            let Some(close) = s.find(']') else {
+                break;
+            };
+            let tag = &s[1..close];
+            if let Some(ms) = parse_lrc_timestamp(tag) {
+                timestamps.push(ms);
+                s = &s[close + 1..];
+            } else {
+                break;
             }
         }
-        if !clean_title.is_empty() && (!has_album || !clean_title.eq_ignore_ascii_case(&clean_album)) {
-            let term = format!("{} {}", clean_artist, clean_title);
-            if let Some(hit) = self.query_track_artwork(&term).await {
-                return Some(hit);
+        let text = s.trim().to_string();
+        if timestamps.is_empty() {
+            if !text.is_empty() {
+                lines.push(LyricLine {
+                    start_ms: None,
+                    text,
+                });
+            }
+        } else {
+            for ts in timestamps {
+                lines.push(LyricLine {
+                    start_ms: Some(ts),
+                    text: text.clone(),
+                });
             }
         }
-        self.lookup_artist_image(&clean_artist)
-            .await
-            .map(|url| (url, None))
     }
+    lines.sort_by_key(|l| l.start_ms.unwrap_or(i64::MAX));
+    lines
 }
 
-fn cover_response(bytes: Vec<u8>, content_type: &str) -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, content_type.to_string()),
-            (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
-        ],
-        bytes,
-    )
-        .into_response()
+fn parse_lrc_timestamp(tag: &str) -> Option<i64> {
+    let (m_str, rest) = tag.split_once(':')?;
+    let mins: i64 = m_str.trim().parse().ok()?;
+    let secs: f64 = rest.trim().parse().ok()?;
+    Some(mins * 60_000 + (secs * 1000.0).round() as i64)
 }
 
-pub fn sniff_audio_bytes(head: &[u8], format: &str) -> &'static str {
-    if head.starts_with(b"fLaC") {
-        return "audio/flac";
-    }
-    if head.starts_with(b"OggS") {
-        return "audio/ogg";
-    }
-    if (head.len() >= 8 && &head[4..8] == b"ftyp") || head.starts_with(b"ftyp") {
-        return "audio/mp4";
-    }
-    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WAVE" {
-        return "audio/wav";
-    }
-    if head.starts_with(b"ID3")
-        || (head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0 && (head[1] & 0x06) != 0)
-    {
-        return "audio/mpeg";
-    }
-    if head.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
-        return "audio/webm";
-    }
-    content_type_for_format(format)
-}
-
-async fn sniff_audio_mime(file: &mut tokio::fs::File, total: u64, format: &str) -> &'static str {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    if total == 0 {
-        return content_type_for_format(format);
-    }
-    let mut buf = [0u8; 16];
-    let n = file.read(&mut buf).await.unwrap_or(0);
-    let _ = file.seek(std::io::SeekFrom::Start(0)).await;
-    sniff_audio_bytes(&buf[..n], format)
-}
-
-async fn serve_local_file(path: &Path, format: &str, req_headers: &HeaderMap) -> Response {
-    let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return (StatusCode::NOT_FOUND, "file not found").into_response();
+async fn serve_local_file_range(
+    path: &Path,
+    content_type: &str,
+    range_hdr: Option<&str>,
+) -> Response {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(meta) = file.metadata().await else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "stat failed").into_response();
-    };
-    let total = meta.len();
-    let ct = sniff_audio_mime(&mut file, total, format).await;
+    let size = meta.len();
+    if size == 0 {
+        return StatusCode::NO_CONTENT.into_response();
+    }
 
-    if let Some(range_val) = req_headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        if let Ok(ranges) = http_range_header::parse_range_header(range_val) {
-            if let Some(r) = ranges.ranges.first() {
-                let start = match r.start {
-                    http_range_header::StartPosition::Index(i) => i,
-                    http_range_header::StartPosition::FromLast(n) => total.saturating_sub(n),
-                };
-                let end = match r.end {
-                    http_range_header::EndPosition::Index(i) => i.min(total.saturating_sub(1)),
-                    http_range_header::EndPosition::LastByte => total.saturating_sub(1),
-                };
-                if start <= end && start < total {
-                    let len = end - start + 1;
-                    if file.seek(std::io::SeekFrom::Start(start)).await.is_ok() {
-                        let limited = file.take(len);
-                        let stream = ReaderStream::new(limited);
-                        return (
-                            StatusCode::PARTIAL_CONTENT,
-                            [
-                                (header::CONTENT_TYPE, ct.to_string()),
-                                (header::ACCEPT_RANGES, "bytes".to_string()),
-                                (header::CONTENT_LENGTH, len.to_string()),
-                                (
-                                    header::CONTENT_RANGE,
-                                    format!("bytes {}-{}/{}", start, end, total),
-                                ),
-                            ],
-                            Body::from_stream(stream),
-                        )
-                            .into_response();
-                    }
-                } else {
-                    return (
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        [(header::CONTENT_RANGE, format!("bytes */{}", total))],
-                    )
-                        .into_response();
-                }
+    if let Some(r_str) = range_hdr {
+        if let Some((start, end)) = parse_byte_range(r_str, size) {
+            let len = end - start + 1;
+            let Ok(mut file) = File::open(path).await else {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
+            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
             }
+            let limited = file.take(len);
+            let stream = ReaderStream::new(limited);
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_LENGTH, len.to_string())
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, size),
+                )
+                .header(header::CACHE_CONTROL, "private, max-age=86400")
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     }
 
+    let Ok(file) = File::open(path).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let stream = ReaderStream::new(file);
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, ct.to_string()),
-            (header::ACCEPT_RANGES, "bytes".to_string()),
-            (header::CONTENT_LENGTH, total.to_string()),
-        ],
-        Body::from_stream(stream),
-    )
-        .into_response()
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, size.to_string())
+        .header(header::CACHE_CONTROL, "private, max-age=86400")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn tokio_stream_from_mpsc(
-    mut rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
-) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
-    futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
+pub fn parse_byte_range(header_val: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = header_val.trim().strip_prefix("bytes=")?;
+    let first = spec.split(',').next()?.trim();
+    let (s, e) = first.split_once('-')?;
+    if s.is_empty() {
+        let suffix: u64 = e.trim().parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let start = total.saturating_sub(suffix);
+        return Some((start, total - 1));
+    }
+    let start: u64 = s.trim().parse().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end = if e.trim().is_empty() {
+        total - 1
+    } else {
+        e.trim().parse::<u64>().ok()?.min(total - 1)
+    };
+    (start <= end).then_some((start, end))
 }
 
-pub fn content_type_for_format(format: &str) -> &'static str {
-    match format.to_lowercase().as_str() {
-        "flac" => "audio/flac",
-        "alac" | "m4a" | "aac" => "audio/mp4",
-        "wav" => "audio/wav",
-        "aiff" | "aif" => "audio/aiff",
+fn choose_transcode_params(
+    want_fmt: Option<&str>,
+    max_bitrate: Option<i32>,
+    track: &Track,
+) -> (String, i32) {
+    let fmt = want_fmt.unwrap_or_else(|| {
+        if track.format.is_empty() {
+            "mp3"
+        } else if track.format == "m4a" || track.format == "mp4" {
+            "aac"
+        } else {
+            track.format.as_str()
+        }
+    });
+    let norm = match fmt {
+        "mp3" => "mp3",
+        "opus" => "opus",
+        "ogg" | "vorbis" => "ogg",
+        "aac" | "m4a" => "aac",
+        "flac" => "flac",
+        _ => "mp3",
+    };
+    let br = max_bitrate
+        .filter(|&b| b > 0)
+        .unwrap_or_else(|| if track.bitrate > 0 { track.bitrate } else { 256 });
+    (norm.to_string(), br)
+}
+
+pub fn mime_for_audio_ext(ext: &str) -> &'static str {
+    match ext.trim().to_lowercase().as_str() {
         "mp3" => "audio/mpeg",
-        "ogg" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
+        "m4a" | "mp4" | "alac" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "wav" => "audio/wav",
         "webm" => "audio/webm",
-        _ => "application/octet-stream",
+        _ => "audio/mpeg",
     }
 }
 
-fn upstream_content_type(resp: &reqwest::Response, url: &str, track_format: &str) -> String {
-    if let Some(raw) = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-    {
-        let media = raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-        if media.starts_with("audio/") || media == "video/mp4" || media == "video/webm" {
-            return media;
-        }
-    }
-    if let Some((_, query)) = url.split_once('?') {
-        for pair in query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k.eq_ignore_ascii_case("mime") {
-                    if let Ok(dec) = urlencoding::decode(v) {
-                        let media = dec.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-                        if media.starts_with("audio/")
-                            || media == "video/mp4"
-                            || media == "video/webm"
-                        {
-                            return media;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let path_part = url.split(['?', '#']).next().unwrap_or(url);
-    if let Some(ext) = path_part.rsplit('.').next() {
-        let from_ext = content_type_for_format(ext);
-        if from_ext != "application/octet-stream" {
-            return from_ext.to_string();
-        }
-    }
-    content_type_for_format(track_format).to_string()
-}
-
-pub fn sniff_image_mime(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
-        return "image/png";
-    }
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return "image/webp";
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return "image/gif";
-    }
-    let trimmed = bytes
-        .iter()
-        .copied()
-        .skip_while(|b| b.is_ascii_whitespace())
-        .take(16)
-        .collect::<Vec<_>>();
-    if trimmed.starts_with(b"<svg") || trimmed.starts_with(b"<?xml") {
-        return "image/svg+xml";
-    }
-    "image/jpeg"
-}
-
-fn hash_str(s: &str) -> String {
+fn sha1_hex(s: &str) -> String {
     let mut h = Sha1::new();
     h.update(s.as_bytes());
     hex::encode(h.finalize())
 }
 
-fn sweep_partials(dir: &Path) {
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".part") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+/// Parses pixel `(width, height)` from PNG, JPEG, or WebP headers.
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // PNG: 8-byte signature + IHDR chunk (width at 16..20, height at 20..24)
+    if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" {
+        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+
+    // JPEG: scan segments until SOF0..SOF15 (excluding DHT/JPG/DAC: 0xC4, 0xC8, 0xCC)
+    if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        let mut i = 2usize;
+        while i + 3 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
             }
+            while i < bytes.len() && bytes[i] == 0xFF {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let marker = bytes[i];
+            i += 1;
+            if marker == 0xD9 || marker == 0x00 {
+                break;
+            }
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                continue;
+            }
+            if i + 2 > bytes.len() {
+                break;
+            }
+            let seg_len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+            if seg_len < 2 || i + seg_len > bytes.len() {
+                break;
+            }
+            let is_sof = matches!(
+                marker,
+                0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
+            );
+            if is_sof && seg_len >= 7 && i + 7 <= bytes.len() {
+                let h = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as u32;
+                let w = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                return (w > 0 && h > 0).then_some((w, h));
+            }
+            i += seg_len;
         }
     }
+
+    // WebP: RIFF....WEBP
+    if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        match &bytes[12..16] {
+            b"VP8 " if bytes[23..26] == [0x9d, 0x01, 0x2a] => {
+                let w = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF) as u32;
+                let h = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF) as u32;
+                return (w > 0 && h > 0).then_some((w, h));
+            }
+            b"VP8L" if bytes[20] == 0x2F => {
+                let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+                let w = (bits & 0x3FFF) + 1;
+                let h = ((bits >> 14) & 0x3FFF) + 1;
+                return Some((w, h));
+            }
+            b"VP8X" => {
+                let w = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]) + 1;
+                let h = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]) + 1;
+                return Some((w, h));
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
-fn generate_svg_cover(seed: &str, label: &str) -> String {
-    let h = hash_str(seed);
-    let b0 = u8::from_str_radix(&h[0..2], 16).unwrap_or(90);
-    let b1 = u8::from_str_radix(&h[2..4], 16).unwrap_or(180);
-    let hue1 = (b0 as u32 * 360 / 255) % 360;
-    let hue2 = (hue1 + 45 + (b1 as u32 % 60)) % 360;
-    let escaped_label = label
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!(
+fn is_low_res_cover(bytes: &[u8]) -> bool {
+    image_dimensions(bytes)
+        .map(|(w, h)| w.max(h) < 240)
+        .unwrap_or(false)
+}
+
+fn image_response(bytes: Vec<u8>, mime: &str) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CACHE_CONTROL, "public, max-age=604800");
+    if let Ok(hv) = HeaderValue::from_str(mime) {
+        builder = builder.header(header::CONTENT_TYPE, hv);
+    } else {
+        builder = builder.header(header::CONTENT_TYPE, "image/jpeg");
+    }
+    builder
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn svg_cover_response(label: &str) -> Response {
+    let palettes = [
+        ("#1db954", "#064e3b"),
+        ("#7c3aed", "#3b0764"),
+        ("#2563eb", "#1e3a8a"),
+        ("#e11d48", "#881337"),
+        ("#d97706", "#78350f"),
+        ("#0891b2", "#164e63"),
+    ];
+    let hash: usize = label.bytes().fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    let (c1, c2) = palettes[hash % palettes.len()];
+    let initial = label
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .unwrap_or('B')
+        .to_uppercase()
+        .to_string();
+    let svg = format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="hsl({},72%,42%)"/>
-      <stop offset="100%" stop-color="hsl({},78%,22%)"/>
-    </linearGradient>
-  </defs>
-  <rect width="300" height="300" fill="url(#g)" rx="16"/>
-  <circle cx="150" cy="150" r="88" fill="rgba(255,255,255,0.08)"/>
-  <text x="150" y="168" font-family="system-ui,sans-serif" font-size="72" font-weight="700" fill="rgba(255,255,255,0.92)" text-anchor="middle">{}</text>
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="{}"/><stop offset="100%" stop-color="{}"/></linearGradient></defs>
+<rect width="300" height="300" fill="url(#g)"/>
+<circle cx="150" cy="150" r="84" fill="rgba(255,255,255,0.1)"/>
+<text x="150" y="176" text-anchor="middle" font-family="system-ui,sans-serif" font-size="96" font-weight="700" fill="rgba(255,255,255,0.92)">{}</text>
 </svg>"#,
-        hue1, hue2, escaped_label
-    )
+        c1, c2, initial
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/svg+xml")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(svg))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::SourceRegistry;
-    use crate::store::Store;
 
     #[test]
-    fn generate_svg_cover_never_overflows_and_escapes_xml() {
-        for i in 0..500 {
-            let svg = generate_svg_cover(&format!("track-{}", i), "A&B");
-            assert!(svg.contains("<svg"));
-            assert!(svg.contains("A&amp;B"));
-        }
+    fn byte_range_parsing_handles_standard_cases() {
+        assert_eq!(parse_byte_range("bytes=0-", 1000), Some((0, 999)));
+        assert_eq!(parse_byte_range("bytes=100-499", 1000), Some((100, 499)));
+        assert_eq!(parse_byte_range("bytes=-200", 1000), Some((800, 999)));
+        assert_eq!(parse_byte_range("bytes=1200-", 1000), None);
     }
 
     #[test]
-    fn sniff_image_mime_detects_formats() {
-        assert_eq!(
-            sniff_image_mime(b"\x89PNG\r\n\x1a\n\x00"),
-            "image/png"
-        );
-        assert_eq!(sniff_image_mime(b"RIFF1234WEBPabcd"), "image/webp");
-        assert_eq!(sniff_image_mime(b"GIF89a..."), "image/gif");
-        assert_eq!(sniff_image_mime(b"  <svg xmlns='...'>"), "image/svg+xml");
-        assert_eq!(sniff_image_mime(b"\xff\xd8\xff\xe0"), "image/jpeg");
+    fn lrc_parser_sorts_and_extracts_timestamps() {
+        let raw = "[01:05.50]Second line\n[00:10.00]First line";
+        let lines = parse_lrc(raw);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "First line");
+        assert_eq!(lines[0].start_ms, Some(10_000));
+        assert_eq!(lines[1].text, "Second line");
+        assert_eq!(lines[1].start_ms, Some(65_500));
     }
 
-    #[tokio::test]
-    async fn serve_local_file_returns_416_on_unsatisfiable_range() {
-        let dir = std::env::temp_dir().join(format!("beatlab_eng_test_{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::create_dir_all(&dir);
-        let fpath = dir.join("tiny.mp3");
-        std::fs::write(&fpath, b"1234567890").unwrap();
+    #[test]
+    fn image_dimensions_detects_small_and_hd_covers() {
+        // Minimal valid PNG header with 120x120 dimensions
+        let mut small_png = vec![0u8; 24];
+        small_png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        small_png[12..16].copy_from_slice(b"IHDR");
+        small_png[16..20].copy_from_slice(&120u32.to_be_bytes());
+        small_png[20..24].copy_from_slice(&120u32.to_be_bytes());
+        assert_eq!(image_dimensions(&small_png), Some((120, 120)));
+        assert!(is_low_res_cover(&small_png));
 
-        let mut hdrs = HeaderMap::new();
-        hdrs.insert(header::RANGE, "bytes=9999-".parse().unwrap());
-        let resp = serve_local_file(&fpath, "mp3", &hdrs).await;
-        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes */10");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn resolve_url_ignores_missing_cached_local_file() {
-        let dir = std::env::temp_dir().join(format!("beatlab_eng_test2_{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::create_dir_all(&dir);
-        let store = Store::open_in_memory().unwrap();
-        let reg = Arc::new(SourceRegistry::new(store.clone(), vec![]));
-        let eng = Engine::new(store.clone(), reg, &dir, 1);
-        let tr = Track {
-            id: "tr1".into(),
-            source: "soulseek".into(),
-            stream_url: "slsk:user/file.flac".into(),
-            ..Default::default()
-        };
-        let key = format!("ytres:{}", hash_str(&tr.stream_url));
-        let missing = dir.join("does_not_exist.flac");
-        let payload = serde_json::json!({
-            "u": format!("file:{}", missing.display()),
-            "a": chrono::Utc::now().timestamp()
-        });
-        store.kv_set(&key, &payload.to_string());
-        assert!(eng.resolve_url(&tr, false).await.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn sniff_audio_mime_detects_m4a_under_opus_label() {
-        use axum::body::to_bytes;
-
-        assert_eq!(sniff_audio_bytes(b"fLaC\x00\x00\x00\"", "mp3"), "audio/flac");
-        assert_eq!(sniff_audio_bytes(b"OggS\x00\x02", "m4a"), "audio/ogg");
-        assert_eq!(sniff_audio_bytes(b"RIFF1234WAVEfmt ", "mp3"), "audio/wav");
-        assert_eq!(sniff_audio_bytes(b"ID3\x03\x00", "flac"), "audio/mpeg");
-        assert_eq!(sniff_audio_bytes(b"\x00\x00\x00\x00", "mp3"), "audio/mpeg");
-
-        let dir = std::env::temp_dir().join(format!("beatlab_eng_test3_{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::create_dir_all(&dir);
-        let fpath = dir.join("mislabeled.opus");
-        let payload = b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00M4A isom";
-        std::fs::write(&fpath, payload).unwrap();
-
-        let resp = serve_local_file(&fpath, "opus", &HeaderMap::new()).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "audio/mp4");
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(&body[..], payload);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn serve_transcoded_returns_none_on_missing_input() {
-        let dir = std::env::temp_dir().join(format!("beatlab_eng_test4_{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::create_dir_all(&dir);
-        let store = Store::open_in_memory().unwrap();
-        let reg = Arc::new(SourceRegistry::new(store.clone(), vec![]));
-        let eng = Engine::new(store, reg, &dir, 1);
-        let missing = dir.join("definitely_missing_input.flac");
-        assert!(eng
-            .serve_transcoded(&missing.to_string_lossy(), "mp3", 192)
-            .await
-            .is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        // Minimal valid JPEG SOI + SOF0 segment with 1080x1080 dimensions
+        let hd_jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x0B, // segment length = 11
+            0x08,       // precision
+            0x04, 0x38, // height = 1080
+            0x04, 0x38, // width = 1080
+            0x03, 0x01, 0x11, 0x00,
+        ];
+        assert_eq!(image_dimensions(&hd_jpeg), Some((1080, 1080)));
+        assert!(!is_low_res_cover(&hd_jpeg));
     }
 }

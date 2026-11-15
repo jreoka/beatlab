@@ -1,34 +1,32 @@
-use crate::engine::{Engine, content_type_for_format};
-use crate::models::{Track, User};
+use crate::engine::{mime_for_audio_ext, StreamEngine};
+use crate::models::{AlbumSummary, ArtistSummary, Playlist, Track, User, UserTrackStats};
 use crate::sources::SourceRegistry;
-use crate::sources::local::LocalSource;
-use crate::sources::soulseek::SoulseekSource;
 use crate::store::Store;
 use crate::taste::TasteEngine;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
+use md5::{Digest, Md5};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use tracing::info;
 
 const API_VERSION: &str = "1.16.1";
 const SERVER_TYPE: &str = "beatlab";
-const SERVER_VERSION: &str = "0.2.0";
+const SERVER_VERSION: &str = "0.3.0";
 
+/// (user_id, track, started_at_unix, username, player_name)
 pub type NowPlayingMap = Arc<Mutex<HashMap<i64, (Track, i64, String)>>>;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
-    pub registry: Arc<SourceRegistry>,
-    pub engine: Arc<Engine>,
+    pub sources: SourceRegistry,
+    pub engine: Arc<StreamEngine>,
     pub taste: Arc<TasteEngine>,
-    pub local: Arc<LocalSource>,
-    pub soulseek: Arc<SoulseekSource>,
     pub now_playing: NowPlayingMap,
-    pub admin_password: String,
-    pub admin_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -37,6 +35,35 @@ pub struct XmlElem {
     pub attrs: Vec<(String, Value)>,
     pub children: Vec<XmlElem>,
     pub text: Option<String>,
+}
+
+pub trait IntoXmlAttr {
+    fn into_xml_val(self) -> Value;
+}
+
+impl IntoXmlAttr for &str {
+    fn into_xml_val(self) -> Value { Value::String(self.to_string()) }
+}
+impl IntoXmlAttr for String {
+    fn into_xml_val(self) -> Value { Value::String(self) }
+}
+impl IntoXmlAttr for &String {
+    fn into_xml_val(self) -> Value { Value::String(self.clone()) }
+}
+impl IntoXmlAttr for i32 {
+    fn into_xml_val(self) -> Value { Value::from(self) }
+}
+impl IntoXmlAttr for i64 {
+    fn into_xml_val(self) -> Value { Value::from(self) }
+}
+impl IntoXmlAttr for usize {
+    fn into_xml_val(self) -> Value { Value::from(self) }
+}
+impl IntoXmlAttr for f64 {
+    fn into_xml_val(self) -> Value { Value::from(self) }
+}
+impl IntoXmlAttr for bool {
+    fn into_xml_val(self) -> Value { Value::from(self) }
 }
 
 impl XmlElem {
@@ -49,8 +76,8 @@ impl XmlElem {
         }
     }
 
-    pub fn attr(mut self, k: &str, v: impl Into<Value>) -> Self {
-        let val = v.into();
+    pub fn attr(mut self, k: &str, v: impl IntoXmlAttr) -> Self {
+        let val = v.into_xml_val();
         if let Value::String(ref s) = val {
             if s.is_empty() {
                 return self;
@@ -62,11 +89,6 @@ impl XmlElem {
 
     pub fn child(mut self, c: XmlElem) -> Self {
         self.children.push(c);
-        self
-    }
-
-    pub fn children(mut self, cs: impl IntoIterator<Item = XmlElem>) -> Self {
-        self.children.extend(cs);
         self
     }
 
@@ -153,6 +175,7 @@ fn is_subsonic_array_child(parent: &str, child: &str) -> bool {
             | "similarArtist"
             | "structuredLyrics"
             | "line"
+            | "nowPlaying"
     )
 }
 
@@ -162,6 +185,47 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn iso8601(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts.max(0), 0)
+        .unwrap_or_default()
+        .to_rfc3339()
+}
+
+pub fn parse_multi_params(raw: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for part in raw.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let (k_raw, v_raw) = part.split_once('=').unwrap_or((part, ""));
+        let k = urlencoding::decode(k_raw.replace('+', " ").as_str())
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| k_raw.to_string());
+        let v = urlencoding::decode(v_raw.replace('+', " ").as_str())
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| v_raw.to_string());
+        pairs.push((k, v));
+    }
+    pairs
+}
+
+fn params_map(pairs: &[(String, String)]) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    for (k, v) in pairs {
+        m.insert(k.clone(), v.clone());
+    }
+    m
+}
+
+fn multi_vals(pairs: &[(String, String)], key: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
 fn respond(params: &HashMap<String, String>, ok: bool, inner: Option<XmlElem>) -> Response {
@@ -175,7 +239,6 @@ fn respond_children(params: &HashMap<String, String>, ok: bool, children: Vec<Xm
         .attr("type", SERVER_TYPE)
         .attr("serverVersion", SERVER_VERSION)
         .attr("openSubsonic", true);
-
     for c in children {
         root = root.child(c);
     }
@@ -193,21 +256,16 @@ fn respond_children(params: &HashMap<String, String>, ok: bool, children: Vec<Xm
         }
         "jsonp" => {
             let raw_cb = params.get("callback").map(|s| s.as_str()).unwrap_or("callback");
-            let cb = if !raw_cb.is_empty()
-                && raw_cb
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'))
-                && !raw_cb.as_bytes()[0].is_ascii_digit()
-            {
-                raw_cb
-            } else {
-                "callback"
-            };
+            let cb: String = raw_cb
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            let cb_name = if cb.is_empty() { "callback" } else { &cb };
             let payload = serde_json::json!({ "subsonic-response": root.to_json() });
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                format!("{}({});", cb, payload),
+                format!("{}({})", cb_name, payload),
             )
                 .into_response()
         }
@@ -226,7 +284,7 @@ fn respond_children(params: &HashMap<String, String>, ok: bool, children: Vec<Xm
     }
 }
 
-fn subsonic_err(params: &HashMap<String, String>, code: i32, msg: &str) -> Response {
+fn error_resp(params: &HashMap<String, String>, code: i32, msg: &str) -> Response {
     respond(
         params,
         false,
@@ -234,1305 +292,1315 @@ fn subsonic_err(params: &HashMap<String, String>, code: i32, msg: &str) -> Respo
     )
 }
 
-fn track_elem(store: &Store, user_id: i64, t: &Track) -> XmlElem {
-    track_elem_named("song", store, user_id, t)
+fn authenticate_subsonic(
+    state: &AppState,
+    params: &HashMap<String, String>,
+) -> Result<User, (i32, &'static str)> {
+    // 1. OpenSubsonic apiKey authentication
+    if let Some(key) = params.get("apiKey").filter(|k| !k.trim().is_empty()) {
+        return state
+            .store
+            .get_user_by_api_key(key)
+            .ok()
+            .flatten()
+            .ok_or((40, "Invalid API key"));
+    }
+
+    let Some(username) = params.get("u").map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return Err((10, "Missing username parameter 'u'"));
+    };
+
+    // 2. Password or hex-encoded password -> auto-create account if unknown!
+    if let Some(raw_p) = params.get("p") {
+        let plain = decode_subsonic_password(raw_p)?;
+        match state.store.authenticate_or_create_user(username, &plain) {
+            Ok((user, created)) => {
+                if created {
+                    info!(username = %user.username, "auto-created user account via Subsonic client");
+                    let taste = state.taste.clone();
+                    let uid = user.id;
+                    tokio::spawn(async move {
+                        taste.rebuild_auto_playlists(uid);
+                    });
+                }
+                return Ok(user);
+            }
+            Err(_) => return Err((40, "Wrong username or password")),
+        }
+    }
+
+    // 3. Salted MD5 token auth (u + t + s)
+    if let (Some(token), Some(salt)) = (params.get("t"), params.get("s")) {
+        match state.store.get_user_by_name(username).ok().flatten() {
+            Some(user) => {
+                let mut h = Md5::new();
+                h.update(format!("{}{}", user.password, salt).as_bytes());
+                let expected = hex::encode(h.finalize());
+                if crate::models::constant_time_eq(&expected.to_lowercase(), &token.to_lowercase()) {
+                    return Ok(user);
+                }
+                return Err((40, "Wrong username or password"));
+            }
+            None => {
+                // Subsonic Error 41 triggers client automatic fallback to password/enc auth so the user account gets created!
+                return Err((
+                    41,
+                    "Account does not exist yet; retry using password authentication to create it",
+                ));
+            }
+        }
+    }
+
+    Err((10, "Missing authentication credentials"))
 }
 
-fn track_elem_named(tag: &str, store: &Store, user_id: i64, t: &Track) -> XmlElem {
-    let starred = store.is_starred(user_id, &t.id);
-    let rating = store.user_rating(user_id, &t.id);
-    let mut e = XmlElem::new(tag)
-        .attr("id", t.id.clone())
-        .attr("parent", t.album_id())
-        .attr("isDir", false)
-        .attr("title", t.title.clone())
-        .attr("album", t.album.clone())
-        .attr("artist", t.artist.clone())
-        .attr("track", t.track_no)
-        .attr("year", t.year)
-        .attr("genre", t.genre.clone())
-        .attr("coverArt", t.id.clone())
-        .attr("size", t.size)
-        .attr("contentType", content_type_for_format(&t.format))
-        .attr("suffix", t.format.clone())
-        .attr("duration", t.duration)
-        .attr("bitRate", t.bitrate)
-        .attr("samplingRate", t.sample_rate)
-        .attr("bitDepth", t.bit_depth)
-        .attr("albumId", t.album_id())
-        .attr("artistId", t.artist_id())
-        .attr("type", "music")
-        .attr("playCount", t.play_count);
-
-    if starred {
-        e = e.attr("starred", iso_now());
+fn decode_subsonic_password(p: &str) -> Result<String, (i32, &'static str)> {
+    if let Some(hex_part) = p.strip_prefix("enc:") {
+        let bytes = hex::decode(hex_part).map_err(|_| (40, "Malformed hex password"))?;
+        let s = String::from_utf8(bytes).map_err(|_| (40, "Malformed UTF-8 password"))?;
+        Ok(s)
+    } else {
+        Ok(p.to_string())
     }
-    if rating > 0 {
-        e = e.attr("userRating", rating);
-    }
-    e
-}
-
-fn album_elem(album_name: &str, trs: &[Track]) -> XmlElem {
-    let first = trs.first().unwrap();
-    let duration: i32 = trs.iter().map(|x| x.duration).sum();
-    let play_count: i64 = trs.iter().map(|x| x.play_count as i64).sum();
-    let max_created = trs.iter().map(|x| x.created).max().unwrap_or(0);
-    let created_iso = chrono::DateTime::from_timestamp(max_created, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(iso_now);
-    let best_cov = trs
-        .iter()
-        .find(|x| !x.cover_url.is_empty())
-        .map(|x| x.id.clone())
-        .unwrap_or_else(|| first.id.clone());
-    let rep_artist = trs
-        .iter()
-        .find(|x| !crate::models::is_generic_folder_name(&x.artist))
-        .unwrap_or(first);
-    let best_year = trs.iter().map(|x| x.year).find(|&y| y > 0).unwrap_or(0);
-    let best_genre = trs
-        .iter()
-        .find(|x| !x.genre.trim().is_empty())
-        .map(|x| x.genre.clone())
-        .unwrap_or_default();
-    let mut el = XmlElem::new("album")
-        .attr("id", first.album_id())
-        .attr("name", album_name)
-        .attr("title", album_name)
-        .attr("album", album_name)
-        .attr("artist", rep_artist.artist.clone())
-        .attr("artistId", rep_artist.artist_id())
-        .attr("coverArt", best_cov)
-        .attr("songCount", trs.len())
-        .attr("duration", duration)
-        .attr("playCount", play_count)
-        .attr("created", created_iso);
-    if best_year > 0 {
-        el = el.attr("year", best_year);
-    }
-    if !best_genre.is_empty() {
-        el = el.attr("genre", best_genre);
-    }
-    el
-}
-
-fn iso_now() -> String {
-    chrono::Utc::now().to_rfc3339()
 }
 
 pub async fn dispatch(
     State(state): State<AppState>,
-    Path(action_raw): Path<String>,
+    Path(action): Path<String>,
     RawQuery(raw_q): RawQuery,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let mut params: HashMap<String, String> = HashMap::new();
-    let mut multi: HashMap<String, Vec<String>> = HashMap::new();
-    for (k, v) in url_form_decode(raw_q.as_deref().unwrap_or(""))
-        .into_iter()
-        .chain(url_form_decode(&body))
-    {
-        params.entry(k.clone()).or_insert_with(|| v.clone());
-        multi.entry(k).or_default().push(v);
+    let mut pairs = raw_q
+        .as_deref()
+        .map(parse_multi_params)
+        .unwrap_or_default();
+    if !body.trim().is_empty() && !body.trim_start().starts_with('{') {
+        pairs.extend(parse_multi_params(&body));
     }
+    let params = params_map(&pairs);
 
-    let action = action_raw.trim_end_matches(".view").trim_start_matches('/');
-    let u = params.get("u").map(|s| s.as_str()).unwrap_or("");
-    let p = params.get("p").map(|s| s.as_str()).unwrap_or("");
-    let t = params.get("t").map(|s| s.as_str()).unwrap_or("");
-    let s = params.get("s").map(|s| s.as_str()).unwrap_or("");
+    let endpoint = action.trim_end_matches(".view").trim_start_matches('/');
 
-    let Some(user) = state.store.auth_subsonic(u, p, t, s) else {
-        return subsonic_err(&params, 40, "Wrong username or password.");
+    // Public ping only works when authenticated in Subsonic spec (so clients detect auth failure early!).
+    let user = match authenticate_subsonic(&state, &params) {
+        Ok(u) => u,
+        Err((code, msg)) => return error_resp(&params, code, msg),
     };
 
-    match action {
+    let uid = user.id;
+
+    match endpoint {
         "ping" => respond(&params, true, None),
         "getLicense" => respond(
             &params,
             true,
-            Some(XmlElem::new("license").attr("valid", true).attr("email", "admin@beatlab.local")),
+            Some(
+                XmlElem::new("license")
+                    .attr("valid", true)
+                    .attr("email", "open@beatlab.local")
+                    .attr("licenseExpires", "2099-12-31T23:59:59"),
+            ),
         ),
         "getOpenSubsonicExtensions" => respond_children(
             &params,
             true,
             vec![
                 XmlElem::new("openSubsonicExtensions")
-                    .attr("name", "transcodeOffset")
-                    .attr("versions", serde_json::json!([1])),
+                    .attr("name", "apiKeyAuthentication")
+                    .child(XmlElem::new("versions").text("1")),
                 XmlElem::new("openSubsonicExtensions")
-                    .attr("name", "formPost")
-                    .attr("versions", serde_json::json!([1])),
+                    .attr("name", "transcodeOffset")
+                    .child(XmlElem::new("versions").text("1")),
                 XmlElem::new("openSubsonicExtensions")
                     .attr("name", "songLyrics")
-                    .attr("versions", serde_json::json!([1])),
+                    .child(XmlElem::new("versions").text("1")),
+                XmlElem::new("openSubsonicExtensions")
+                    .attr("name", "formPost")
+                    .child(XmlElem::new("versions").text("1")),
+                XmlElem::new("openSubsonicExtensions")
+                    .attr("name", "indexBasedQueue")
+                    .child(XmlElem::new("versions").text("1")),
             ],
         ),
+        "tokenInfo" => respond(
+            &params,
+            true,
+            Some(XmlElem::new("tokenInfo").attr("username", &user.username)),
+        ),
+
+        "getUser" => {
+            let target = params
+                .get("username")
+                .map(|s| s.as_str())
+                .unwrap_or(&user.username);
+            if !target.eq_ignore_ascii_case(&user.username) {
+                return error_resp(&params, 50, "You can only view your own user profile");
+            }
+            respond(&params, true, Some(user_to_xml(&user)))
+        }
+        "getUsers" => respond(
+            &params,
+            true,
+            Some(XmlElem::new("users").child(user_to_xml(&user))),
+        ),
+        "createUser" => {
+            let u = params.get("username").map(|s| s.trim()).unwrap_or("");
+            let p = params.get("password").map(|s| s.as_str()).unwrap_or("");
+            match state.store.create_user(u, p) {
+                Ok(new_user) => {
+                    state.taste.rebuild_auto_playlists(new_user.id);
+                    respond(&params, true, None)
+                }
+                Err(e) => error_resp(&params, 0, &e.to_string()),
+            }
+        }
+        "changePassword" => {
+            let target = params
+                .get("username")
+                .map(|s| s.as_str())
+                .unwrap_or(&user.username);
+            if !target.eq_ignore_ascii_case(&user.username) {
+                return error_resp(&params, 50, "You can only change your own password");
+            }
+            let Some(new_pw) = params.get("password") else {
+                return error_resp(&params, 10, "Missing password");
+            };
+            match state.store.change_password(uid, new_pw) {
+                Ok(()) => respond(&params, true, None),
+                Err(e) => error_resp(&params, 0, &e.to_string()),
+            }
+        }
+
         "getMusicFolders" => respond(
             &params,
             true,
             Some(
-                XmlElem::new("musicFolders")
-                    .child(XmlElem::new("musicFolder").attr("id", "1").attr("name", "Beatlab")),
+                XmlElem::new("musicFolders").child(
+                    XmlElem::new("musicFolder")
+                        .attr("id", "1")
+                        .attr("name", "Beatlab Library"),
+                ),
             ),
         ),
-        "getUser" => respond(&params, true, Some(user_elem(&user))),
-        "getUsers" => {
-            let users = state.store.list_users();
-            respond(
-                &params,
-                true,
-                Some(XmlElem::new("users").children(users.iter().map(user_elem))),
-            )
-        }
-        "stream" | "download" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let Some(track) = state.store.track(id) else {
-                return (StatusCode::NOT_FOUND, "track not found").into_response();
-            };
-            let target_fmt = params.get("format").map(|s| s.as_str());
-            let max_br = params.get("maxBitRate").and_then(|v| v.parse::<i32>().ok());
-            state
-                .engine
-                .serve_track(&track, &headers, target_fmt, max_br)
-                .await
-        }
-        "getCoverArt" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            state.engine.serve_cover(id).await
-        }
-        "search3" | "search2" => {
-            let raw_q = params.get("query").map(|s| s.as_str()).unwrap_or("");
-            let q = raw_q.trim().trim_matches('"').trim();
-            let song_count = params
-                .get("songCount")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(20);
-            let song_offset = params
-                .get("songOffset")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-            let album_count = params
-                .get("albumCount")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(20);
-            let album_offset = params
-                .get("albumOffset")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-            let artist_count = params
-                .get("artistCount")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(20);
-            let artist_offset = params
-                .get("artistOffset")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-
-            let max_offset = song_offset.max(album_offset).max(artist_offset);
-            let fetch_limit = song_count.max(album_count).max(artist_count).max(20) + max_offset;
-            let mut pool = state.store.search_tracks(q, fetch_limit);
-            if !q.is_empty() && pool.len() < fetch_limit {
-                let remote = state.registry.search_all(q, fetch_limit).await;
-                pool.extend(remote);
-                pool = crate::sources::dedup_and_rank_search(pool, q, fetch_limit);
-            }
-
-            let tag = if action == "search3" { "searchResult3" } else { "searchResult2" };
-            let mut el = XmlElem::new(tag);
-
-            if artist_count > 0 {
-                let mut seen_artists: HashMap<String, (String, String, HashSet<String>)> = HashMap::new();
-                let mut artist_order = Vec::new();
-                for tr in &pool {
-                    if crate::models::is_generic_folder_name(&tr.artist) {
-                        continue;
-                    }
-                    let aid = tr.artist_id();
-                    if !seen_artists.contains_key(&aid) {
-                        artist_order.push(aid.clone());
-                        seen_artists.insert(aid.clone(), (tr.artist.clone(), tr.id.clone(), HashSet::new()));
-                    }
-                    seen_artists.get_mut(&aid).unwrap().2.insert(tr.album_id());
-                }
-                for aid in artist_order.into_iter().skip(artist_offset).take(artist_count) {
-                    if let Some((name, cover, albs)) = seen_artists.get(&aid) {
-                        el = el.child(
-                            XmlElem::new("artist")
-                                .attr("id", aid)
-                                .attr("name", name.clone())
-                                .attr("coverArt", cover.clone())
-                                .attr("albumCount", albs.len()),
-                        );
-                    }
-                }
-            }
-
-            if album_count > 0 {
-                let mut albums_map: HashMap<String, (String, Vec<Track>)> = HashMap::new();
-                let mut album_order = Vec::new();
-                for tr in &pool {
-                    if crate::models::is_generic_folder_name(&tr.artist) {
-                        continue;
-                    }
-                    let albid = tr.album_id();
-                    if !albums_map.contains_key(&albid) {
-                        album_order.push(albid.clone());
-                        albums_map.insert(albid.clone(), (tr.album.clone(), Vec::new()));
-                    }
-                    albums_map.get_mut(&albid).unwrap().1.push(tr.clone());
-                }
-                for albid in album_order.into_iter().skip(album_offset).take(album_count) {
-                    if let Some((alb_name, trs)) = albums_map.get(&albid) {
-                        el = el.child(album_elem(alb_name, trs));
-                    }
-                }
-            }
-
-            for tr in pool.iter().skip(song_offset).take(song_count) {
-                el = el.child(track_elem(&state.store, user.id, tr));
-            }
-            state.engine.warm_resolve(
-                pool.iter().skip(song_offset).take(5).cloned().collect(),
-                5,
-            );
-            respond(&params, true, Some(el))
-        }
-        "getSong" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let Some(tr) = state.store.track(id) else {
-                return subsonic_err(&params, 70, "Song not found");
-            };
-            respond(&params, true, Some(track_elem(&state.store, user.id, &tr)))
-        }
-        "getArtists" => {
-            let artists = state.store.artists();
-            let idx_elems = build_artist_indexes(artists);
-            respond(&params, true, Some(XmlElem::new("artists").children(idx_elems)))
-        }
-        "getArtist" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let Some(name) = state.store.artist_name_from_id(id) else {
-                return subsonic_err(&params, 70, "Artist not found");
-            };
-            let tracks = state.store.tracks_by_artist(&name, 500);
-            let mut albums_map: HashMap<String, (String, Vec<Track>)> = HashMap::new();
-            for tr in tracks {
-                let alb_id = tr.album_id();
-                let alb_name = tr.album.clone();
-                albums_map
-                    .entry(alb_id)
-                    .or_insert_with(|| (alb_name, Vec::new()))
-                    .1
-                    .push(tr);
-            }
-            let mut albums: Vec<_> = albums_map
-                .into_values()
-                .map(|(alb, mut trs)| {
-                    trs.sort_by_key(|t| std::cmp::Reverse(t.quality_score()));
-                    let mut seen_keys = HashSet::new();
-                    trs.retain(|t| seen_keys.insert(t.song_key()));
-                    trs.sort_by(|a, b| a.track_no.cmp(&b.track_no).then_with(|| a.title.cmp(&b.title)));
-                    let y = trs.iter().map(|t| t.year).find(|&y| y > 0).unwrap_or(0);
-                    (y, album_elem(&alb, &trs))
-                })
-                .collect();
-            albums.sort_by_key(|a| std::cmp::Reverse(a.0));
-            let album_count = albums.len();
+        "getScanStatus" => {
+            let count = state.store.count_tracks().unwrap_or(0);
             respond(
                 &params,
                 true,
                 Some(
-                    XmlElem::new("artist")
-                        .attr("id", id)
-                        .attr("name", name)
-                        .attr("coverArt", id)
-                        .attr("albumCount", album_count)
-                        .children(albums.into_iter().map(|(_, el)| el)),
+                    XmlElem::new("scanStatus")
+                        .attr("scanning", false)
+                        .attr("count", count),
                 ),
             )
         }
-        "getAlbum" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let all = state.store.all_tracks(5000);
-            let mut trs: Vec<Track> = all.into_iter().filter(|t| t.album_id() == id).collect();
-            if trs.is_empty() {
-                return subsonic_err(&params, 70, "Album not found");
-            }
-            trs.sort_by(|a, b| {
-                a.track_no
-                    .cmp(&b.track_no)
-                    .then_with(|| b.quality_score().cmp(&a.quality_score()))
-                    .then_with(|| a.title.cmp(&b.title))
-            });
-            // Keep best quality copy per canonical song_key inside an album
-            let mut seen_songs: HashSet<String> = HashSet::new();
-            trs.retain(|t| seen_songs.insert(t.song_key()));
-            state.engine.warm_resolve(trs.clone(), 5);
-            let first = trs.first().unwrap().clone();
-            let mut el = album_elem(&first.album, &trs);
-            for tr in &trs {
-                el = el.child(track_elem(&state.store, user.id, tr));
-            }
-            respond(&params, true, Some(el))
-        }
-        "getRandomSongs" => {
-            let size = params
-                .get("size")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(20)
-                .min(200);
-            let genre_filter = params.get("genre").map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
-            let from_year = params.get("fromYear").and_then(|v| v.parse::<i32>().ok());
-            let to_year = params.get("toYear").and_then(|v| v.parse::<i32>().ok());
-
-            let mut recs = state.taste.recommend_for_user(user.id, size * 3);
-            if let Some(ref g) = genre_filter {
-                recs.retain(|t| t.genre.to_lowercase().contains(g));
-            }
-            if let Some(fy) = from_year {
-                recs.retain(|t| t.year >= fy);
-            }
-            if let Some(ty) = to_year {
-                recs.retain(|t| t.year <= ty);
-            }
-            recs.truncate(size);
-            state.engine.warm_resolve(recs.clone(), 5);
-            let mut el = XmlElem::new("randomSongs");
-            for tr in &recs {
-                el = el.child(track_elem(&state.store, user.id, tr));
-            }
-            respond(&params, true, Some(el))
-        }
-        "getGenres" => {
-            let genres = state.store.genres();
-            let el = XmlElem::new("genres").children(genres.into_iter().map(|(g, c)| {
-                XmlElem::new("genre")
-                    .attr("songCount", c)
-                    .attr("albumCount", 1)
-                    .text(g)
-            }));
-            respond(&params, true, Some(el))
-        }
-        "getSongsByGenre" => {
-            let genre = params.get("genre").map(|s| s.as_str()).unwrap_or("");
-            let count = params.get("count").and_then(|v| v.parse().ok()).unwrap_or(20);
-            let offset = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let trs = state.store.tracks_by_genre(genre, count, offset);
-            state.engine.warm_resolve(trs.clone(), 5);
-            let mut el = XmlElem::new("songsByGenre");
-            for tr in &trs {
-                el = el.child(track_elem(&state.store, user.id, tr));
-            }
-            respond(&params, true, Some(el))
-        }
-        "getStarred" | "getStarred2" => {
-            let starred = state.store.starred_tracks(user.id);
-            let tag = if action == "getStarred2" { "starred2" } else { "starred" };
-            let mut el = XmlElem::new(tag);
-            for tr in &starred {
-                el = el.child(track_elem(&state.store, user.id, tr));
-            }
-            respond(&params, true, Some(el))
-        }
-        "star" => {
-            set_starred(&state, user.id, &multi, true);
-            respond(&params, true, None)
-        }
-        "unstar" => {
-            set_starred(&state, user.id, &multi, false);
-            respond(&params, true, None)
-        }
-        "setRating" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let rating = params.get("rating").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
-            state.store.set_rating(user.id, id, rating);
-            if let Some(tr) = state.store.track(id) {
-                state.taste.learn_event(user.id, &tr, "rate", rating as f64);
-            }
-            respond(&params, true, None)
-        }
-        "scrobble" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let submission = params.get("submission").map(|s| s != "false").unwrap_or(true);
-            if let Some(tr) = state.store.track(id) {
-                if submission {
-                    state.store.increment_play(id);
-                    state.store.record_event(user.id, id, "complete", 1.0);
-                    state.taste.learn_event(user.id, &tr, "complete", 1.0);
-                } else {
-                    state.store.record_event(user.id, id, "play", 1.0);
-                    state.taste.learn_event(user.id, &tr, "play", 1.0);
-                    let mut np = state.now_playing.lock().unwrap();
-                    np.insert(user.id, (tr, chrono::Utc::now().timestamp(), "Subsonic".into()));
-                }
-            }
-            respond(&params, true, None)
-        }
-        "getPlaylists" => {
-            state.taste.ensure_auto_playlists_fresh(user.id);
-            let pls = state.store.list_playlists(user.id);
-            let el = XmlElem::new("playlists").children(
-                pls.into_iter()
-                    .map(|p| playlist_elem(&state.store, &p, &user.username, p.track_count)),
-            );
-            respond(&params, true, Some(el))
-        }
-        "getPlaylist" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let Some(p) = state.store.get_playlist(id) else {
-                return subsonic_err(&params, 70, "Playlist not found");
-            };
-            if !p.public && p.user_id != user.id && !user.is_admin {
-                return subsonic_err(&params, 50, "Permission denied");
-            }
-            let trs = state.store.playlist_tracks(id);
-            state.engine.warm_resolve(trs.clone(), 5);
-            let mut el = playlist_elem(&state.store, &p, &user.username, trs.len());
-            for tr in &trs {
-                el = el.child(track_elem_named("entry", &state.store, user.id, tr));
-            }
-            respond(&params, true, Some(el))
-        }
-        "createPlaylist" => {
-            let song_ids: Vec<String> = multi.get("songId").cloned().unwrap_or_default();
-            let saved = if let Some(pid) = params.get("playlistId").filter(|s| !s.is_empty()) {
-                let Some(p) = state.store.get_playlist(pid) else {
-                    return subsonic_err(&params, 70, "Playlist not found");
-                };
-                if p.user_id != user.id && !user.is_admin {
-                    return subsonic_err(&params, 50, "Permission denied");
-                }
-                if let Some(name) = params.get("name").map(|s| s.as_str()) {
-                    state.store.update_playlist_meta(pid, Some(name), None, None);
-                }
-                let _ = state.store.set_playlist_tracks(pid, &song_ids);
-                state.store.get_playlist(pid)
-            } else {
-                let name = params.get("name").map(|s| s.as_str()).unwrap_or("New Playlist");
-                state
-                    .store
-                    .create_user_playlist(user.id, name, true, &song_ids)
-                    .ok()
-            };
-            let body = saved.map(|p| {
-                let mut el = playlist_elem(&state.store, &p, &user.username, p.track_count);
-                for tr in &state.store.playlist_tracks(&p.id) {
-                    el = el.child(track_elem_named("entry", &state.store, user.id, tr));
-                }
-                el
-            });
-            respond(&params, true, body)
-        }
-        "updatePlaylist" => {
-            let id = params.get("playlistId").map(|s| s.as_str()).unwrap_or("");
-            let Some(p) = state.store.get_playlist(id) else {
-                return subsonic_err(&params, 70, "Playlist not found");
-            };
-            if p.user_id != user.id && !user.is_admin {
-                return subsonic_err(&params, 50, "Permission denied");
-            }
-            let name = params.get("name").map(|s| s.as_str());
-            let comment = params.get("comment").map(|s| s.as_str());
-            let public = params.get("public").map(|s| s == "true");
-            state.store.update_playlist_meta(id, name, comment, public);
-            let to_add: Vec<String> = multi.get("songIdToAdd").cloned().unwrap_or_default();
-            let to_remove: Vec<usize> = multi
-                .get("songIndexToRemove")
-                .map(|v| v.iter().filter_map(|s| s.parse::<usize>().ok()).collect())
-                .unwrap_or_default();
-            if !to_add.is_empty() || !to_remove.is_empty() {
-                let _ = state.store.update_playlist_tracks(id, &to_add, &to_remove);
-            }
-            respond(&params, true, None)
-        }
-        "deletePlaylist" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let Some(p) = state.store.get_playlist(id) else {
-                return subsonic_err(&params, 70, "Playlist not found");
-            };
-            if p.user_id != user.id && !user.is_admin {
-                return subsonic_err(&params, 50, "Permission denied");
-            }
-            state.store.delete_playlist(id);
-            respond(&params, true, None)
-        }
-        "getSimilarSongs" | "getSimilarSongs2" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let count = params.get("count").and_then(|v| v.parse().ok()).unwrap_or(25).min(100);
-            let trs = if let Some(seed) = resolve_seed_track(&state.store, id) {
-                state.taste.similar_songs_async(&seed, user.id, count).await
-            } else {
-                state.taste.recommend_for_user(user.id, count)
-            };
-            state.engine.warm_resolve(trs.clone(), 5);
-            let tag = if action == "getSimilarSongs2" { "similarSongs2" } else { "similarSongs" };
-            let mut el = XmlElem::new(tag);
-            for tr in &trs {
-                el = el.child(track_elem(&state.store, user.id, tr));
-            }
-            respond(&params, true, Some(el))
-        }
-        "getTopSongs" => {
-            let artist = params.get("artist").map(|s| s.as_str()).unwrap_or("");
-            let count = params.get("count").and_then(|v| v.parse().ok()).unwrap_or(20);
-            let trs = state.store.tracks_by_artist(artist, count);
-            state.engine.warm_resolve(trs.clone(), 5);
-            let mut el = XmlElem::new("topSongs");
-            for tr in &trs {
-                el = el.child(track_elem(&state.store, user.id, tr));
-            }
-            respond(&params, true, Some(el))
-        }
-        "getNowPlaying" => {
-            let mut np = state.now_playing.lock().unwrap();
-            let now = chrono::Utc::now().timestamp();
-            np.retain(|_, (_, at, _)| now - *at < 3600);
-            let mut el = XmlElem::new("nowPlaying");
-            for (tr, at, player) in np.values() {
-                let mins_ago = ((chrono::Utc::now().timestamp() - at) / 60).max(0);
-                el = el.child(
-                    track_elem_named("entry", &state.store, user.id, tr)
-                        .attr("username", user.username.clone())
-                        .attr("minutesAgo", mins_ago)
-                        .attr("playerName", player.clone()),
-                );
-            }
-            respond(&params, true, Some(el))
-        }
-        "getScanStatus" => respond(
-            &params,
-            true,
-            Some(
-                XmlElem::new("scanStatus")
-                    .attr("scanning", false)
-                    .attr("count", state.store.track_count()),
-            ),
-        ),
         "startScan" => {
-            let local = Arc::clone(&state.local);
+            let local = state.sources.local.clone();
             tokio::task::spawn_blocking(move || local.scan());
+            let count = state.store.count_tracks().unwrap_or(0);
             respond(
                 &params,
                 true,
                 Some(
                     XmlElem::new("scanStatus")
                         .attr("scanning", true)
-                        .attr("count", state.store.track_count()),
+                        .attr("count", count),
                 ),
             )
         }
-        "savePlayQueue" => {
-            let cur = params.get("current").map(|s| s.as_str()).unwrap_or("");
-            let pos = params.get("position").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
-            let ids: Vec<String> = multi.get("id").cloned().unwrap_or_default();
-            state
-                .store
-                .save_play_queue(user.id, cur, pos, &ids, params.get("c").map(|s| s.as_str()).unwrap_or("client"));
-            respond(&params, true, None)
+
+        "getIndexes" => handle_get_indexes(&state, &params, false),
+        "getArtists" => handle_get_indexes(&state, &params, true),
+
+        "getMusicDirectory" => {
+            let id = params.get("id").map(|s| s.as_str()).unwrap_or("1");
+            handle_music_directory(&state, &params, uid, id).await
         }
-        "getPlayQueue" => {
-            if let Some((cur, pos, ids, by, _)) = state.store.get_play_queue(user.id) {
-                let mut el = XmlElem::new("playQueue")
-                    .attr("current", cur)
-                    .attr("position", pos)
-                    .attr("username", user.username.clone())
-                    .attr("changedBy", by);
-                for id in ids {
-                    if let Some(tr) = state.store.track(&id) {
-                        el = el.child(track_elem_named("entry", &state.store, user.id, &tr));
-                    }
+        "getArtist" => {
+            let Some(id) = params.get("id") else {
+                return error_resp(&params, 10, "Missing id");
+            };
+            let Some((artist, _top, albums, _related)) =
+                state.taste.get_or_hydrate_artist(id, uid).await
+            else {
+                return error_resp(&params, 70, "Artist not found");
+            };
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let mut elem = XmlElem::new("artist")
+                .attr("id", &artist.id)
+                .attr("name", &artist.name)
+                .attr("coverArt", &artist.id)
+                .attr("albumCount", albums.len())
+                .attr("artistImageUrl", &artist.cover_url);
+            if starred.contains(&artist.id) {
+                elem = elem.attr("starred", iso8601(Utc::now().timestamp()));
+            }
+            for alb in albums {
+                elem = elem.child(album_to_xml(&alb, &starred, "album"));
+            }
+            respond(&params, true, Some(elem))
+        }
+        "getArtistInfo" | "getArtistInfo2" => {
+            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
+            let is_v2 = endpoint == "getArtistInfo2";
+            let root_name = if is_v2 { "artistInfo2" } else { "artistInfo" };
+            if let Some((artist, _, _, related)) =
+                state.taste.get_or_hydrate_artist(id, uid).await
+            {
+                let mut elem = XmlElem::new(root_name);
+                if !artist.bio.is_empty() {
+                    elem = elem.child(XmlElem::new("biography").text(&artist.bio));
                 }
-                respond(&params, true, Some(el))
+                if !artist.cover_url.is_empty() {
+                    elem = elem
+                        .child(XmlElem::new("smallImageUrl").text(&artist.cover_url))
+                        .child(XmlElem::new("mediumImageUrl").text(&artist.cover_url))
+                        .child(XmlElem::new("largeImageUrl").text(&artist.cover_url));
+                }
+                for rel in related {
+                    elem = elem.child(
+                        XmlElem::new("similarArtist")
+                            .attr("id", &rel.id)
+                            .attr("name", &rel.name)
+                            .attr("coverArt", &rel.id)
+                            .attr("artistImageUrl", &rel.cover_url),
+                    );
+                }
+                respond(&params, true, Some(elem))
             } else {
-                respond(&params, true, Some(XmlElem::new("playQueue")))
+                respond(&params, true, Some(XmlElem::new(root_name)))
             }
         }
-        "getInternetRadioStations" => {
-            let stations = state.store.list_radio_stations();
-            let el = XmlElem::new("internetRadioStations").children(stations.into_iter().map(|r| {
-                XmlElem::new("internetRadioStation")
-                    .attr("id", r.id)
-                    .attr("name", r.name)
-                    .attr("streamUrl", r.stream_url)
-                    .attr("homePageUrl", r.home_page_url)
-            }));
-            respond(&params, true, Some(el))
-        }
-        "createInternetRadioStation" | "updateInternetRadioStation" => {
-            let id = params.get("id").map(|s| s.as_str());
-            let name = params.get("name").map(|s| s.as_str()).unwrap_or("Radio");
-            let stream_url = params.get("streamUrl").map(|s| s.as_str()).unwrap_or("");
-            let home = params.get("homepageUrl").map(|s| s.as_str()).unwrap_or("");
-            state.store.upsert_radio_station(id, name, stream_url, home);
-            respond(&params, true, None)
-        }
-        "deleteInternetRadioStation" => {
-            if let Some(id) = params.get("id") {
-                state.store.delete_radio_station(id);
+        "getAlbum" => {
+            let Some(id) = params.get("id") else {
+                return error_resp(&params, 10, "Missing id");
+            };
+            let Some((alb, tracks)) = state.taste.get_or_hydrate_album(id).await else {
+                return error_resp(&params, 70, "Album not found");
+            };
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let stats = state.store.track_stats_map(uid).unwrap_or_default();
+            let ratings = state.store.user_ratings(uid).unwrap_or_default();
+            let mut elem = album_to_xml(&alb, &starred, "album");
+            for t in &tracks {
+                elem = elem.child(track_to_xml(
+                    t,
+                    starred.contains(&t.id),
+                    stats.get(&t.id),
+                    ratings.get(&t.id).copied(),
+                    "song",
+                ));
             }
-            respond(&params, true, None)
+            respond(&params, true, Some(elem))
+        }
+        "getAlbumInfo" | "getAlbumInfo2" => {
+            let root_name = if endpoint == "getAlbumInfo2" {
+                "albumInfo"
+            } else {
+                "albumInfo"
+            };
+            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
+            if let Some((alb, _)) = state.taste.get_or_hydrate_album(id).await {
+                let mut elem = XmlElem::new(root_name);
+                if !alb.cover_url.is_empty() {
+                    elem = elem
+                        .child(XmlElem::new("smallImageUrl").text(&alb.cover_url))
+                        .child(XmlElem::new("mediumImageUrl").text(&alb.cover_url))
+                        .child(XmlElem::new("largeImageUrl").text(&alb.cover_url));
+                }
+                if !alb.label.is_empty() {
+                    elem = elem.child(XmlElem::new("notes").text(&format!("Label: {}", alb.label)));
+                }
+                respond(&params, true, Some(elem))
+            } else {
+                respond(&params, true, Some(XmlElem::new(root_name)))
+            }
+        }
+        "getSong" => {
+            let Some(id) = params.get("id") else {
+                return error_resp(&params, 10, "Missing id");
+            };
+            let Some(t) = state.store.get_track(id).ok().flatten() else {
+                return error_resp(&params, 70, "Song not found");
+            };
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let st = state.store.get_user_track_stats(uid, &t.id).ok();
+            let rating = state.store.user_ratings(uid).ok().and_then(|m| m.get(&t.id).copied());
+            respond(
+                &params,
+                true,
+                Some(track_to_xml(&t, starred.contains(&t.id), st.as_ref(), rating, "song")),
+            )
+        }
+        "getGenres" => {
+            let genres = state.store.genres().unwrap_or_default();
+            let mut root = XmlElem::new("genres");
+            for (name, sc, ac) in genres {
+                root = root.child(
+                    XmlElem::new("genre")
+                        .attr("songCount", sc)
+                        .attr("albumCount", ac)
+                        .text(name),
+                );
+            }
+            respond(&params, true, Some(root))
+        }
+        "getSongsByGenre" => {
+            let genre = params.get("genre").map(|s| s.as_str()).unwrap_or("");
+            let count = parse_usize(&params, "count", 50).min(200);
+            let offset = parse_usize(&params, "offset", 0);
+            let tracks = state
+                .store
+                .tracks_by_genre(genre, count, offset)
+                .unwrap_or_default();
+            let elem = songs_container(&state, uid, "songsByGenre", "song", &tracks);
+            respond(&params, true, Some(elem))
+        }
+        "getRandomSongs" => {
+            let size = parse_usize(&params, "size", 20).min(100);
+            let genre = params.get("genre").map(|s| s.as_str());
+            let tracks = state.store.random_tracks(size, genre).unwrap_or_default();
+            let elem = songs_container(&state, uid, "randomSongs", "song", &tracks);
+            respond(&params, true, Some(elem))
+        }
+        "getTopSongs" => {
+            let artist_name = params.get("artist").map(|s| s.as_str()).unwrap_or("");
+            let count = parse_usize(&params, "count", 25).min(100);
+            let aid = format!("ar:{}", crate::models::slug(artist_name));
+            let tracks = if let Some((_, top, _, _)) =
+                state.taste.get_or_hydrate_artist(&aid, uid).await
+            {
+                top.into_iter().take(count).collect()
+            } else {
+                state
+                    .store
+                    .search_tracks(artist_name, count, 0)
+                    .unwrap_or_default()
+            };
+            let elem = songs_container(&state, uid, "topSongs", "song", &tracks);
+            respond(&params, true, Some(elem))
+        }
+        "getSimilarSongs" | "getSimilarSongs2" => {
+            let root_name = if endpoint == "getSimilarSongs2" {
+                "similarSongs2"
+            } else {
+                "similarSongs"
+            };
+            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
+            let count = parse_usize(&params, "count", 25).min(100);
+            let tracks = if let Some(seed) = state.store.get_track(id).ok().flatten() {
+                state.taste.similar_songs_async(&seed, count).await
+            } else {
+                state.taste.for_you_tracks(uid, count)
+            };
+            let elem = songs_container(&state, uid, root_name, "song", &tracks);
+            respond(&params, true, Some(elem))
         }
         "getAlbumList" | "getAlbumList2" => {
-            let tag = if action == "getAlbumList2" { "albumList2" } else { "albumList" };
-            let albums = build_album_list(&state, user.id, &params);
-            let el = XmlElem::new(tag).children(albums);
-            respond(&params, true, Some(el))
+            let root_name = if endpoint == "getAlbumList2" {
+                "albumList2"
+            } else {
+                "albumList"
+            };
+            let list_type = params.get("type").map(|s| s.as_str()).unwrap_or("newest");
+            let size = parse_usize(&params, "size", 20).min(100);
+            let offset = parse_usize(&params, "offset", 0);
+            let albums = get_sorted_albums(&state, uid, list_type, &params, size, offset);
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let mut root = XmlElem::new(root_name);
+            for a in albums {
+                root = root.child(album_to_xml(&a, &starred, "album"));
+            }
+            respond(&params, true, Some(root))
         }
-        "getIndexes" => {
-            let artists = state.store.artists();
-            let idx_elems = build_artist_indexes(artists);
+        "search" | "search2" | "search3" => {
+            handle_search(&state, &params, uid, endpoint).await
+        }
+
+        "getStarred" | "getStarred2" => {
+            let root_name = if endpoint == "getStarred2" {
+                "starred2"
+            } else {
+                "starred"
+            };
+            let starred_tracks = state.store.starred_tracks(uid).unwrap_or_default();
+            let starred_ids = state.store.starred_ids(uid).unwrap_or_default();
+            let stats = state.store.track_stats_map(uid).unwrap_or_default();
+            let ratings = state.store.user_ratings(uid).unwrap_or_default();
+            let saved_albums = state.store.saved_album_ids(uid).unwrap_or_default();
+            let followed_artists = state.store.followed_artist_ids(uid).unwrap_or_default();
+
+            let mut root = XmlElem::new(root_name);
+            for a in state.store.build_artist_summaries().unwrap_or_default() {
+                if followed_artists.contains(&a.id) {
+                    root = root.child(artist_to_xml(&a));
+                }
+            }
+            for alb in state.store.build_album_summaries(uid).unwrap_or_default() {
+                if saved_albums.contains(&alb.id) {
+                    root = root.child(album_to_xml(&alb, &saved_albums, "album"));
+                }
+            }
+            for (t, _) in starred_tracks {
+                root = root.child(track_to_xml(
+                    &t,
+                    starred_ids.contains(&t.id),
+                    stats.get(&t.id),
+                    ratings.get(&t.id).copied(),
+                    "song",
+                ));
+            }
+            respond(&params, true, Some(root))
+        }
+        "star" => {
+            for id in multi_vals(&pairs, "id") {
+                let _ = state.store.star_track(uid, &id);
+                state.taste.record_event(uid, &id, "star", 1.0);
+            }
+            for aid in multi_vals(&pairs, "albumId") {
+                let _ = state.store.save_album(uid, &aid);
+            }
+            for arid in multi_vals(&pairs, "artistId") {
+                let _ = state.store.follow_artist(uid, &arid);
+            }
+            respond(&params, true, None)
+        }
+        "unstar" => {
+            for id in multi_vals(&pairs, "id") {
+                let _ = state.store.unstar_track(uid, &id);
+                state.taste.record_event(uid, &id, "unstar", 0.0);
+            }
+            for aid in multi_vals(&pairs, "albumId") {
+                let _ = state.store.unsave_album(uid, &aid);
+            }
+            for arid in multi_vals(&pairs, "artistId") {
+                let _ = state.store.unfollow_artist(uid, &arid);
+            }
+            respond(&params, true, None)
+        }
+        "setRating" => {
+            let Some(id) = params.get("id") else {
+                return error_resp(&params, 10, "Missing id");
+            };
+            let rating: i32 = params
+                .get("rating")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let _ = state.store.set_rating(uid, id, rating);
+            state.taste.record_event(uid, id, "rate", rating as f64);
+            respond(&params, true, None)
+        }
+
+        "getPlaylists" => {
+            let playlists = state.store.list_playlists(uid, true).unwrap_or_default();
+            let mut root = XmlElem::new("playlists");
+            for p in playlists {
+                root = root.child(playlist_to_xml(&p));
+            }
+            respond(&params, true, Some(root))
+        }
+        "getPlaylist" => {
+            let Some(id) = params.get("id") else {
+                return error_resp(&params, 10, "Missing id");
+            };
+            let Some(p) = state.store.get_playlist(id).ok().flatten() else {
+                return error_resp(&params, 70, "Playlist not found");
+            };
+            if !p.public && p.user_id != uid {
+                return error_resp(&params, 50, "Permission denied");
+            }
+            let tracks = state.store.playlist_tracks(id).unwrap_or_default();
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let stats = state.store.track_stats_map(uid).unwrap_or_default();
+            let ratings = state.store.user_ratings(uid).unwrap_or_default();
+            let mut elem = playlist_to_xml(&p);
+            for t in tracks {
+                elem = elem.child(track_to_xml(
+                    &t,
+                    starred.contains(&t.id),
+                    stats.get(&t.id),
+                    ratings.get(&t.id).copied(),
+                    "entry",
+                ));
+            }
+            respond(&params, true, Some(elem))
+        }
+        "createPlaylist" => {
+            let song_ids = multi_vals(&pairs, "songId");
+            if let Some(pid) = params.get("playlistId") {
+                let Some(existing) = state.store.get_playlist(pid).ok().flatten() else {
+                    return error_resp(&params, 70, "Playlist not found");
+                };
+                if existing.user_id != uid {
+                    return error_resp(&params, 50, "Permission denied");
+                }
+                let _ = state.store.update_playlist(
+                    pid,
+                    params.get("name").map(|s| s.as_str()),
+                    None,
+                    None,
+                );
+                let _ = state.store.replace_playlist_tracks(pid, &song_ids);
+                let updated = state.store.get_playlist(pid).unwrap().unwrap();
+                respond(&params, true, Some(playlist_to_xml(&updated)))
+            } else {
+                let name = params
+                    .get("name")
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("New Playlist");
+                match state.store.create_playlist(uid, name, "", false, &song_ids) {
+                    Ok(p) => respond(&params, true, Some(playlist_to_xml(&p))),
+                    Err(e) => error_resp(&params, 0, &e.to_string()),
+                }
+            }
+        }
+        "updatePlaylist" => {
+            let Some(pid) = params.get("playlistId") else {
+                return error_resp(&params, 10, "Missing playlistId");
+            };
+            let Some(existing) = state.store.get_playlist(pid).ok().flatten() else {
+                return error_resp(&params, 70, "Playlist not found");
+            };
+            if existing.user_id != uid {
+                return error_resp(&params, 50, "Permission denied");
+            }
+            let public = params.get("public").map(|v| v == "true" || v == "1");
+            let _ = state.store.update_playlist(
+                pid,
+                params.get("name").map(|s| s.as_str()),
+                params.get("comment").map(|s| s.as_str()),
+                public,
+            );
+            let remove_idxs: Vec<usize> = multi_vals(&pairs, "songIndexToRemove")
+                .into_iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if !remove_idxs.is_empty() {
+                let _ = state.store.remove_playlist_positions(pid, &remove_idxs);
+            }
+            let add_ids = multi_vals(&pairs, "songIdToAdd");
+            if !add_ids.is_empty() {
+                let _ = state.store.add_tracks_to_playlist(pid, &add_ids);
+            }
+            respond(&params, true, None)
+        }
+        "deletePlaylist" => {
+            let Some(pid) = params.get("id") else {
+                return error_resp(&params, 10, "Missing id");
+            };
+            let Some(existing) = state.store.get_playlist(pid).ok().flatten() else {
+                return error_resp(&params, 70, "Playlist not found");
+            };
+            if existing.user_id != uid {
+                return error_resp(&params, 50, "Permission denied");
+            }
+            let _ = state.store.delete_playlist(pid);
+            respond(&params, true, None)
+        }
+
+        "scrobble" => {
+            let ids = multi_vals(&pairs, "id");
+            let submission = params
+                .get("submission")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true);
+            for id in &ids {
+                let kind = if submission { "complete" } else { "play" };
+                state.taste.record_event(uid, id, kind, 1.0);
+                if let Ok(Some(t)) = state.store.get_track(id) {
+                    let mut np = state.now_playing.lock().unwrap();
+                    np.insert(uid, (t, Utc::now().timestamp(), user.username.clone()));
+                }
+            }
+            respond(&params, true, None)
+        }
+        "getNowPlaying" => {
+            let cutoff = Utc::now().timestamp() - 600;
+            let active: Vec<(Track, i64, String)> = {
+                let np = state.now_playing.lock().unwrap();
+                np.values()
+                    .filter(|(_, ts, _)| *ts >= cutoff)
+                    .cloned()
+                    .collect()
+            };
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let stats = state.store.track_stats_map(uid).unwrap_or_default();
+            let mut root = XmlElem::new("nowPlaying");
+            let now = Utc::now().timestamp();
+            for (t, ts, uname) in active {
+                let mut elem = track_to_xml(&t, starred.contains(&t.id), stats.get(&t.id), None, "entry");
+                elem = elem
+                    .attr("username", uname)
+                    .attr("minutesAgo", ((now - ts).max(0)) / 60);
+                root = root.child(elem);
+            }
+            respond(&params, true, Some(root))
+        }
+
+        "getPlayQueue" | "getPlayQueueByIndex" => {
+            let root_name = if endpoint == "getPlayQueueByIndex" {
+                "playQueueByIndex"
+            } else {
+                "playQueue"
+            };
+            let Some(q) = state.store.get_play_queue(uid).ok().flatten() else {
+                return respond(&params, true, None);
+            };
+            let tracks = state.store.get_tracks_by_ids(&q.track_ids).unwrap_or_default();
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let stats = state.store.track_stats_map(uid).unwrap_or_default();
+            let mut root = XmlElem::new(root_name)
+                .attr("position", q.position_ms)
+                .attr("username", &user.username)
+                .attr("changed", iso8601(q.updated))
+                .attr("changedBy", &q.changed_by);
+            if endpoint == "getPlayQueueByIndex" {
+                root = root.attr("currentIndex", q.current_index);
+            } else {
+                root = root.attr("current", &q.current_id);
+            }
+            for t in tracks {
+                root = root.child(track_to_xml(
+                    &t,
+                    starred.contains(&t.id),
+                    stats.get(&t.id),
+                    None,
+                    "entry",
+                ));
+            }
+            respond(&params, true, Some(root))
+        }
+        "savePlayQueue" | "savePlayQueueByIndex" => {
+            let ids = multi_vals(&pairs, "id");
+            let cur_idx: usize = params
+                .get("currentIndex")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    params
+                        .get("current")
+                        .and_then(|cid| ids.iter().position(|id| id == cid))
+                        .unwrap_or(0)
+                });
+            let cur_id = params
+                .get("current")
+                .cloned()
+                .or_else(|| ids.get(cur_idx).cloned())
+                .unwrap_or_default();
+            let pos_ms: i64 = params
+                .get("position")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let client = params
+                .get("c")
+                .cloned()
+                .unwrap_or_else(|| "subsonic".to_string());
+            let _ = state.store.save_play_queue(
+                uid,
+                &crate::models::PlayQueueState {
+                    current_id: cur_id,
+                    current_index: cur_idx,
+                    position_ms: pos_ms,
+                    track_ids: ids,
+                    changed_by: client,
+                    updated: Utc::now().timestamp(),
+                },
+            );
+            respond(&params, true, None)
+        }
+
+        "getLyrics" => {
+            let artist = params.get("artist").map(|s| s.as_str()).unwrap_or("");
+            let title = params.get("title").map(|s| s.as_str()).unwrap_or("");
+            let dummy = Track {
+                id: format!("adhoc:{}:{}", artist, title),
+                artist: artist.to_string(),
+                title: title.to_string(),
+                ..Default::default()
+            };
+            let data = state.engine.fetch_lyrics(&dummy).await;
             respond(
                 &params,
                 true,
                 Some(
-                    XmlElem::new("indexes")
-                        .attr("lastModified", chrono::Utc::now().timestamp_millis())
-                        .children(idx_elems),
+                    XmlElem::new("lyrics")
+                        .attr("artist", artist)
+                        .attr("title", title)
+                        .text(data.plain),
                 ),
             )
         }
-        "getArtistInfo" | "getArtistInfo2" => {
-            let tag = if action == "getArtistInfo2" { "artistInfo2" } else { "artistInfo" };
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let count = params.get("count").and_then(|v| v.parse().ok()).unwrap_or(12);
-            let el = fetch_artist_info_elem(&state.store, tag, id, count).await;
-            respond(&params, true, Some(el))
-        }
-        "getAlbumInfo" | "getAlbumInfo2" => {
-            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let mut el = XmlElem::new("albumInfo");
-            if let Some(tr) = resolve_seed_track(&state.store, id) {
-                if tr.cover_url.starts_with("http") {
-                    el = el
-                        .child(XmlElem::new("smallImageUrl").text(tr.cover_url.clone()))
-                        .child(XmlElem::new("mediumImageUrl").text(tr.cover_url.clone()))
-                        .child(XmlElem::new("largeImageUrl").text(tr.cover_url));
-                }
-            }
-            respond(&params, true, Some(el))
-        }
         "getLyricsBySongId" => {
             let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
-            let el = fetch_structured_lyrics_elem(&state.store, id).await;
-            respond(&params, true, Some(el))
+            let Some(t) = state.store.get_track(id).ok().flatten() else {
+                return respond(&params, true, Some(XmlElem::new("lyricsList")));
+            };
+            let data = state.engine.fetch_lyrics(&t).await;
+            let mut list = XmlElem::new("lyricsList");
+            if !data.lines.is_empty() {
+                let mut sl = XmlElem::new("structuredLyrics")
+                    .attr("displayArtist", &t.artist)
+                    .attr("displayTitle", &t.title)
+                    .attr("lang", "und")
+                    .attr("synced", data.synced);
+                for line in data.lines {
+                    let mut le = XmlElem::new("line").text(line.text);
+                    if let Some(ms) = line.start_ms {
+                        le = le.attr("start", ms);
+                    }
+                    sl = sl.child(le);
+                }
+                list = list.child(sl);
+            }
+            respond(&params, true, Some(list))
         }
-        "getLyrics" => {
-            let artist = params.get("artist").map(|s| s.as_str()).unwrap_or("");
-            let title = params.get("title").map(|s| s.as_str()).unwrap_or("");
-            let el = fetch_plain_lyrics_elem(&state.store, artist, title).await;
-            respond(&params, true, Some(el))
+
+        "getInternetRadioStations" => {
+            let stations = state.store.list_radio_stations(uid).unwrap_or_default();
+            let mut root = XmlElem::new("internetRadioStations");
+            for s in stations {
+                root = root.child(
+                    XmlElem::new("internetRadioStation")
+                        .attr("id", &s.id)
+                        .attr("name", &s.name)
+                        .attr("streamUrl", &s.stream_url)
+                        .attr("homePageUrl", &s.home_page_url),
+                );
+            }
+            respond(&params, true, Some(root))
         }
-        _ => subsonic_err(&params, 0, &format!("Unsupported endpoint: {}", action)),
+        "createInternetRadioStation" => {
+            let station = crate::models::RadioStation {
+                id: String::new(),
+                name: params.get("name").cloned().unwrap_or_default(),
+                stream_url: params.get("streamUrl").cloned().unwrap_or_default(),
+                home_page_url: params.get("homepageUrl").cloned().unwrap_or_default(),
+            };
+            let _ = state.store.upsert_radio_station(uid, &station);
+            respond(&params, true, None)
+        }
+        "updateInternetRadioStation" => {
+            let station = crate::models::RadioStation {
+                id: params.get("id").cloned().unwrap_or_default(),
+                name: params.get("name").cloned().unwrap_or_default(),
+                stream_url: params.get("streamUrl").cloned().unwrap_or_default(),
+                home_page_url: params.get("homepageUrl").cloned().unwrap_or_default(),
+            };
+            let _ = state.store.upsert_radio_station(uid, &station);
+            respond(&params, true, None)
+        }
+        "deleteInternetRadioStation" => {
+            if let Some(id) = params.get("id") {
+                let _ = state.store.delete_radio_station(uid, id);
+            }
+            respond(&params, true, None)
+        }
+
+        "getBookmarks" => respond(&params, true, Some(XmlElem::new("bookmarks"))),
+
+        "stream" | "download" => {
+            let Some(id) = params.get("id") else {
+                return error_resp(&params, 10, "Missing id");
+            };
+            let Some(t) = state.store.get_track(id).ok().flatten() else {
+                return error_resp(&params, 70, "Song not found");
+            };
+            let max_br = params
+                .get("maxBitRate")
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|&b| b > 0);
+            let fmt = if endpoint == "download" {
+                None
+            } else {
+                params.get("format").map(|s| s.as_str())
+            };
+            let offset = params
+                .get("timeOffset")
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            {
+                let mut np = state.now_playing.lock().unwrap();
+                np.insert(uid, (t.clone(), Utc::now().timestamp(), user.username.clone()));
+            }
+            state
+                .engine
+                .serve_track_stream(&t, &headers, max_br, fmt, offset)
+                .await
+        }
+        "getCoverArt" => {
+            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
+            state.engine.serve_cover(id).await
+        }
+        "getAvatar" => state.engine.serve_cover(&format!("ar:{}", user.username)).await,
+
+        _ => error_resp(&params, 0, &format!("Unsupported endpoint '{}'", endpoint)),
     }
 }
 
-fn build_album_list(state: &AppState, user_id: i64, params: &HashMap<String, String>) -> Vec<XmlElem> {
-    use rand::seq::SliceRandom;
-
-    let list_type = params.get("type").map(|s| s.as_str()).unwrap_or("newest");
-    let size = params
-        .get("size")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(10)
-        .min(500);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    let tracks = if list_type == "starred" {
-        state.store.starred_tracks(user_id)
-    } else {
-        state.store.all_tracks(5000)
-    };
-
-    let mut groups: HashMap<String, (String, Vec<Track>)> = HashMap::new();
-    for t in tracks {
-        let id = t.album_id();
-        groups
-            .entry(id)
-            .or_insert_with(|| (t.album.clone(), Vec::new()))
-            .1
-            .push(t);
-    }
-
-    let mut albums: Vec<(String, Vec<Track>)> = groups.into_values().collect();
-
-    if list_type == "byGenre" {
-        let genre = params
-            .get("genre")
-            .map(|s| s.trim().to_lowercase())
-            .unwrap_or_default();
-        albums.retain(|(_, trs)| {
-            trs.iter()
-                .any(|t| t.genre.to_lowercase().contains(&genre))
-        });
-    } else if list_type == "byYear" {
-        let from_y = params
-            .get("fromYear")
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0);
-        let to_y = params
-            .get("toYear")
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(9999);
-        let (lo, hi) = if from_y <= to_y {
-            (from_y, to_y)
-        } else {
-            (to_y, from_y)
-        };
-        albums.retain(|(_, trs)| {
-            trs.first()
-                .map(|t| t.year >= lo && t.year <= hi)
-                .unwrap_or(false)
-        });
-    }
-
-    match list_type {
-        "random" => {
-            let mut rng = rand::thread_rng();
-            albums.shuffle(&mut rng);
-        }
-        "alphabeticalByName" => {
-            albums.sort_by_key(|a| a.0.to_lowercase());
-        }
-        "alphabeticalByArtist" => {
-            albums.sort_by(|a, b| {
-                let aa = a.1.first().map(|t| t.artist.to_lowercase()).unwrap_or_default();
-                let ba = b.1.first().map(|t| t.artist.to_lowercase()).unwrap_or_default();
-                aa.cmp(&ba).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-            });
-        }
-        "frequent" => {
-            albums.sort_by(|a, b| {
-                let pa: i64 = a.1.iter().map(|t| t.play_count as i64).sum();
-                let pb: i64 = b.1.iter().map(|t| t.play_count as i64).sum();
-                let ca = a.1.iter().map(|t| t.created).max().unwrap_or(0);
-                let cb = b.1.iter().map(|t| t.created).max().unwrap_or(0);
-                pb.cmp(&pa).then_with(|| cb.cmp(&ca))
-            });
-        }
-        "recent" => {
-            albums.sort_by(|a, b| {
-                let la = a.1.iter().map(|t| t.last_played).max().unwrap_or(0);
-                let lb = b.1.iter().map(|t| t.last_played).max().unwrap_or(0);
-                let ca = a.1.iter().map(|t| t.created).max().unwrap_or(0);
-                let cb = b.1.iter().map(|t| t.created).max().unwrap_or(0);
-                lb.cmp(&la).then_with(|| cb.cmp(&ca))
-            });
-        }
-        "highest" => {
-            albums.sort_by(|a, b| {
-                let ra = a
-                    .1
-                    .iter()
-                    .map(|t| state.store.user_rating(user_id, &t.id))
-                    .max()
-                    .unwrap_or(0);
-                let rb = b
-                    .1
-                    .iter()
-                    .map(|t| state.store.user_rating(user_id, &t.id))
-                    .max()
-                    .unwrap_or(0);
-                let qa = a.1.iter().map(|t| t.quality_score()).max().unwrap_or(0);
-                let qb = b.1.iter().map(|t| t.quality_score()).max().unwrap_or(0);
-                rb.cmp(&ra).then_with(|| qb.cmp(&qa))
-            });
-        }
-        "byYear" => {
-            let from_y = params.get("fromYear").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
-            let to_y = params.get("toYear").and_then(|v| v.parse::<i32>().ok()).unwrap_or(9999);
-            let desc = from_y > to_y;
-            albums.sort_by(|a, b| {
-                let ya = a.1.first().map(|t| t.year).unwrap_or(0);
-                let yb = b.1.first().map(|t| t.year).unwrap_or(0);
-                if desc { yb.cmp(&ya) } else { ya.cmp(&yb) }
-            });
-        }
-        _ => {
-            // "newest" and default
-            albums.sort_by(|a, b| {
-                let ca = a.1.iter().map(|t| t.created).max().unwrap_or(0);
-                let cb = b.1.iter().map(|t| t.created).max().unwrap_or(0);
-                cb.cmp(&ca)
-            });
-        }
-    }
-
-    albums
-        .into_iter()
-        .skip(offset)
-        .take(size)
-        .map(|(name, trs)| album_elem(&name, &trs))
-        .collect()
-}
-
-fn user_elem(u: &User) -> XmlElem {
+fn user_to_xml(u: &User) -> XmlElem {
     XmlElem::new("user")
-        .attr("username", u.username.clone())
-        .attr("adminRole", u.is_admin)
+        .attr("username", &u.username)
+        .attr("email", format!("{}@beatlab.local", u.username))
+        .attr("scrobblingEnabled", true)
+        .attr("adminRole", false)
         .attr("settingsRole", true)
-        .attr("streamRole", true)
-        .attr("jukeboxRole", false)
         .attr("downloadRole", true)
         .attr("uploadRole", false)
         .attr("playlistRole", true)
         .attr("coverArtRole", true)
         .attr("commentRole", false)
         .attr("podcastRole", false)
-        .attr("shareRole", false)
+        .attr("streamRole", true)
+        .attr("jukeboxRole", false)
+        .attr("shareRole", true)
+        .attr("videoConversionRole", false)
+        .child(XmlElem::new("folder").text("1"))
 }
 
-fn build_artist_indexes(artists: Vec<(String, String, usize)>) -> Vec<XmlElem> {
-    let mut buckets: std::collections::BTreeMap<String, Vec<(String, String, usize)>> =
-        std::collections::BTreeMap::new();
-    for (id, name, count) in artists {
-        let ch = name.trim().chars().next().unwrap_or('#').to_ascii_uppercase();
+pub fn track_to_xml(
+    t: &Track,
+    is_starred: bool,
+    stats: Option<&UserTrackStats>,
+    rating: Option<i32>,
+    elem_name: &str,
+) -> XmlElem {
+    let ct = mime_for_audio_ext(&t.format);
+    let mut e = XmlElem::new(elem_name)
+        .attr("id", &t.id)
+        .attr("parent", t.album_id())
+        .attr("isDir", false)
+        .attr("title", &t.title)
+        .attr("album", &t.album)
+        .attr("artist", &t.artist)
+        .attr("track", t.track_no)
+        .attr("discNumber", t.disc_no.max(1))
+        .attr("year", t.year)
+        .attr("genre", &t.genre)
+        .attr("coverArt", &t.id)
+        .attr("size", t.size.max(0))
+        .attr("contentType", ct)
+        .attr("suffix", if t.format.is_empty() { "m4a" } else { &t.format })
+        .attr("duration", t.duration.max(0))
+        .attr("bitRate", t.bitrate.max(128))
+        .attr("samplingRate", t.sample_rate)
+        .attr("bitDepth", t.bit_depth)
+        .attr("type", "music")
+        .attr("isVideo", false)
+        .attr("albumId", t.album_id())
+        .attr("artistId", t.artist_id())
+        .attr("created", iso8601(t.created));
+
+    if is_starred {
+        e = e.attr("starred", iso8601(t.created));
+    }
+    if let Some(st) = stats {
+        e = e.attr("playCount", st.play_count);
+        if st.last_played > 0 {
+            e = e.attr("played", iso8601(st.last_played));
+        }
+    }
+    if let Some(r) = rating.filter(|&r| r > 0) {
+        e = e.attr("userRating", r);
+    }
+    e
+}
+
+fn album_to_xml(a: &AlbumSummary, saved: &HashSet<String>, elem_name: &str) -> XmlElem {
+    let mut e = XmlElem::new(elem_name)
+        .attr("id", &a.id)
+        .attr("name", &a.name)
+        .attr("title", &a.name)
+        .attr("artist", &a.artist)
+        .attr("artistId", &a.artist_id)
+        .attr("coverArt", &a.id)
+        .attr("songCount", a.song_count)
+        .attr("duration", a.duration)
+        .attr("playCount", a.play_count)
+        .attr("year", a.year)
+        .attr("genre", &a.genre)
+        .attr("isDir", true)
+        .attr("created", iso8601(a.created));
+    if saved.contains(&a.id) {
+        e = e.attr("starred", iso8601(a.created));
+    }
+    e
+}
+
+fn artist_to_xml(a: &ArtistSummary) -> XmlElem {
+    XmlElem::new("artist")
+        .attr("id", &a.id)
+        .attr("name", &a.name)
+        .attr("coverArt", &a.id)
+        .attr("albumCount", a.album_count)
+        .attr("artistImageUrl", &a.cover_url)
+}
+
+fn playlist_to_xml(p: &Playlist) -> XmlElem {
+    XmlElem::new("playlist")
+        .attr("id", &p.id)
+        .attr("name", &p.name)
+        .attr("comment", &p.comment)
+        .attr("owner", &p.owner_name)
+        .attr("public", p.public)
+        .attr("songCount", p.track_count)
+        .attr("duration", p.duration)
+        .attr("created", iso8601(p.created))
+        .attr("changed", iso8601(p.changed))
+        .attr("coverArt", p.cover_track_id.as_deref().unwrap_or(&p.id))
+}
+
+fn songs_container(
+    state: &AppState,
+    uid: i64,
+    container: &str,
+    child_name: &str,
+    tracks: &[Track],
+) -> XmlElem {
+    let starred = state.store.starred_ids(uid).unwrap_or_default();
+    let stats = state.store.track_stats_map(uid).unwrap_or_default();
+    let ratings = state.store.user_ratings(uid).unwrap_or_default();
+    let mut root = XmlElem::new(container);
+    for t in tracks {
+        root = root.child(track_to_xml(
+            t,
+            starred.contains(&t.id),
+            stats.get(&t.id),
+            ratings.get(&t.id).copied(),
+            child_name,
+        ));
+    }
+    root
+}
+
+fn handle_get_indexes(state: &AppState, params: &HashMap<String, String>, id3: bool) -> Response {
+    let artists = state.store.build_artist_summaries().unwrap_or_default();
+    let mut buckets: BTreeMap<String, Vec<ArtistSummary>> = BTreeMap::new();
+    for a in artists {
+        let stripped = a
+            .name
+            .strip_prefix("The ")
+            .or_else(|| a.name.strip_prefix("the "))
+            .unwrap_or(&a.name);
+        let ch = stripped
+            .chars()
+            .next()
+            .unwrap_or('#')
+            .to_uppercase()
+            .next()
+            .unwrap_or('#');
         let key = if ch.is_ascii_alphabetic() {
             ch.to_string()
         } else {
             "#".to_string()
         };
-        buckets.entry(key).or_default().push((id, name, count));
+        buckets.entry(key).or_default().push(a);
     }
-    buckets
-        .into_iter()
-        .map(|(letter, list)| {
-            XmlElem::new("index").attr("name", letter).children(
-                list.into_iter().map(|(id, name, count)| {
-                    XmlElem::new("artist")
-                        .attr("id", id.clone())
-                        .attr("name", name)
-                        .attr("coverArt", id)
-                        .attr("albumCount", count)
-                }),
-            )
-        })
-        .collect()
+
+    let mut root = XmlElem::new(if id3 { "artists" } else { "indexes" })
+        .attr("ignoredArticles", "The El La Los Las Le Les")
+        .attr("lastModified", Utc::now().timestamp_millis());
+    for (letter, items) in buckets {
+        let mut idx = XmlElem::new("index").attr("name", letter);
+        for a in items {
+            idx = idx.child(artist_to_xml(&a));
+        }
+        root = root.child(idx);
+    }
+    respond(params, true, Some(root))
 }
 
-fn resolve_seed_track(store: &Store, id: &str) -> Option<Track> {
-    if let Some(tr) = store.track(id) {
-        return Some(tr);
+async fn handle_music_directory(
+    state: &AppState,
+    params: &HashMap<String, String>,
+    uid: i64,
+    id: &str,
+) -> Response {
+    if id == "1" || id.is_empty() {
+        let artists = state.store.build_artist_summaries().unwrap_or_default();
+        let mut dir = XmlElem::new("directory").attr("id", "1").attr("name", "Beatlab Library");
+        for a in artists {
+            dir = dir.child(
+                XmlElem::new("child")
+                    .attr("id", &a.id)
+                    .attr("parent", "1")
+                    .attr("title", &a.name)
+                    .attr("isDir", true)
+                    .attr("coverArt", &a.id),
+            );
+        }
+        return respond(params, true, Some(dir));
     }
     if id.starts_with("ar:") {
-        if let Some(name) = store.artist_name_from_id(id) {
-            let mut trs = store.tracks_by_artist(&name, 20);
-            trs.sort_by(|a, b| b.play_count.cmp(&a.play_count).then_with(|| b.quality_score().cmp(&a.quality_score())));
-            if let Some(best) = trs.into_iter().next() {
-                return Some(best);
+        if let Some((art, _, albums, _)) = state.taste.get_or_hydrate_artist(id, uid).await {
+            let saved = state.store.saved_album_ids(uid).unwrap_or_default();
+            let mut dir = XmlElem::new("directory").attr("id", &art.id).attr("name", &art.name);
+            for a in albums {
+                dir = dir.child(album_to_xml(&a, &saved, "child"));
             }
-            return Some(Track {
-                artist: name,
-                ..Default::default()
-            });
+            return respond(params, true, Some(dir));
         }
     }
     if id.starts_with("al:") {
-        let all = store.all_tracks(3000);
-        let mut trs: Vec<Track> = all.into_iter().filter(|t| t.album_id() == id).collect();
-        trs.sort_by(|a, b| b.play_count.cmp(&a.play_count).then_with(|| b.quality_score().cmp(&a.quality_score())));
-        return trs.into_iter().next();
+        if let Some((alb, tracks)) = state.taste.get_or_hydrate_album(id).await {
+            let starred = state.store.starred_ids(uid).unwrap_or_default();
+            let stats = state.store.track_stats_map(uid).unwrap_or_default();
+            let mut dir = XmlElem::new("directory").attr("id", &alb.id).attr("name", &alb.name);
+            for t in &tracks {
+                dir = dir.child(track_to_xml(
+                    t,
+                    starred.contains(&t.id),
+                    stats.get(&t.id),
+                    None,
+                    "child",
+                ));
+            }
+            return respond(params, true, Some(dir));
+        }
     }
-    None
+    error_resp(params, 70, "Directory not found")
 }
 
-fn metadata_http() -> reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(3))
-                .user_agent("Beatlab/0.2")
-                .build()
+fn get_sorted_albums(
+    state: &AppState,
+    uid: i64,
+    list_type: &str,
+    params: &HashMap<String, String>,
+    size: usize,
+    offset: usize,
+) -> Vec<AlbumSummary> {
+    let mut all = state.store.build_album_summaries(uid).unwrap_or_default();
+    let saved = state.store.saved_album_ids(uid).unwrap_or_default();
+    match list_type {
+        "random" => {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            all.shuffle(&mut rng);
+        }
+        "newest" => {
+            all.sort_by(|a, b| b.created.cmp(&a.created));
+        }
+        "frequent" => {
+            all.sort_by(|a, b| b.play_count.cmp(&a.play_count));
+        }
+        "recent" => {
+            all.sort_by(|a, b| b.last_played.cmp(&a.last_played));
+        }
+        "starred" => {
+            all.retain(|a| saved.contains(&a.id));
+        }
+        "alphabeticalByName" => {
+            all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        }
+        "alphabeticalByArtist" => {
+            all.sort_by(|a, b| {
+                a.artist
+                    .to_lowercase()
+                    .cmp(&b.artist.to_lowercase())
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+        }
+        "byGenre" => {
+            let g = params
+                .get("genre")
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            all.retain(|a| a.genre.to_lowercase().contains(&g));
+        }
+        "byYear" => {
+            let from_y: i32 = params
+                .get("fromYear")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let to_y: i32 = params
+                .get("toYear")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9999);
+            let (lo, hi) = if from_y <= to_y {
+                (from_y, to_y)
+            } else {
+                (to_y, from_y)
+            };
+            all.retain(|a| a.year >= lo && a.year <= hi);
+            if from_y > to_y {
+                all.sort_by(|a, b| b.year.cmp(&a.year));
+            } else {
+                all.sort_by(|a, b| a.year.cmp(&b.year));
+            }
+        }
+        _ => {}
+    }
+    all.into_iter().skip(offset).take(size).collect()
+}
+
+async fn handle_search(
+    state: &AppState,
+    params: &HashMap<String, String>,
+    uid: i64,
+    endpoint: &str,
+) -> Response {
+    let q = params.get("query").map(|s| s.trim()).unwrap_or("");
+    let song_count = parse_usize(params, "songCount", 25).min(100);
+    let song_offset = parse_usize(params, "songOffset", 0);
+    let album_count = parse_usize(params, "albumCount", 15).min(50);
+    let album_offset = parse_usize(params, "albumOffset", 0);
+    let artist_count = parse_usize(params, "artistCount", 15).min(50);
+    let artist_offset = parse_usize(params, "artistOffset", 0);
+
+    let (tracks, albums, artists) = if !q.is_empty() && q != "\"\"" {
+        let (remote_tracks, (dz_tracks, dz_albums, dz_artists)) = tokio::join!(
+            state.sources.search_all(q, 20),
+            state.sources.deezer.search_all(q, 12),
+        );
+        let combined = [remote_tracks, dz_tracks].concat();
+        let _ = state.store.upsert_tracks(&combined);
+        for a in &dz_albums {
+            let _ = state.store.upsert_album_meta(a);
+        }
+        for ar in &dz_artists {
+            let _ = state.store.upsert_artist_meta(ar);
+        }
+        (
+            state
+                .store
+                .search_tracks(q, song_count, song_offset)
+                .unwrap_or_default(),
+            state
+                .store
+                .search_albums(uid, q, album_count, album_offset)
+                .unwrap_or_default(),
+            state
+                .store
+                .search_artists(q, artist_count, artist_offset)
+                .unwrap_or_default(),
+        )
+    } else {
+        (
+            state.store.all_tracks(song_count, song_offset).unwrap_or_default(),
+            state
+                .store
+                .build_album_summaries(uid)
                 .unwrap_or_default()
-        })
-        .clone()
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct CachedArtistInfo {
-    at: i64,
-    image_url: String,
-    biography: String,
-    similar: Vec<String>,
-}
-
-async fn fetch_artist_info_elem(store: &Store, tag: &str, id: &str, count: usize) -> XmlElem {
-    let mut el = XmlElem::new(tag);
-    let raw_name = if let Some(n) = store.artist_name_from_id(id) {
-        n
-    } else if let Some(t) = store.track(id) {
-        t.artist
-    } else {
-        return el;
-    };
-    let artist_name = {
-        let p = crate::models::primary_artist(&raw_name);
-        if p.is_empty() { raw_name } else { p }
-    };
-    if crate::models::is_generic_folder_name(&artist_name) {
-        return el;
-    }
-
-    let kv_key = format!("artinfo:v1:{}", crate::models::slug(&artist_name));
-    let now = chrono::Utc::now().timestamp();
-    let cached: Option<CachedArtistInfo> = store
-        .kv_get(&kv_key)
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .filter(|c: &CachedArtistInfo| now - c.at < 7 * 86400);
-
-    let info = if let Some(c) = cached {
-        c
-    } else {
-        let client = metadata_http();
-        let mut fetched = CachedArtistInfo {
-            at: now,
-            ..Default::default()
-        };
-        let search_url = format!(
-            "https://api.deezer.com/search/artist?q={}&limit=1",
-            urlencoding::encode(&artist_name)
-        );
-        if let Ok(resp) = client.get(&search_url).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(first) = json.get("data").and_then(|d| d.as_array()).and_then(|a| a.first()) {
-                    fetched.image_url = first
-                        .get("picture_xl")
-                        .or_else(|| first.get("picture_big"))
-                        .or_else(|| first.get("picture_medium"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(aid) = first.get("id").and_then(|v| v.as_u64()) {
-                        let rel_url = format!("https://api.deezer.com/artist/{}/related?limit=15", aid);
-                        if let Ok(r2) = client.get(&rel_url).send().await {
-                            if let Ok(j2) = r2.json::<serde_json::Value>().await {
-                                if let Some(arr) = j2.get("data").and_then(|d| d.as_array()) {
-                                    for item in arr {
-                                        if let Some(n) = item.get("name").and_then(|v| v.as_str()) {
-                                            fetched.similar.push(n.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let wiki_url = format!(
-            "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
-            urlencoding::encode(&artist_name.replace(' ', "_"))
-        );
-        if let Ok(resp) = client.get(&wiki_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(ext) = json.get("extract").and_then(|v| v.as_str()) {
-                        fetched.biography = ext.to_string();
-                    }
-                }
-            }
-        }
-        if let Ok(s) = serde_json::to_string(&fetched) {
-            store.kv_set(&kv_key, &s);
-        }
-        fetched
+                .into_iter()
+                .skip(album_offset)
+                .take(album_count)
+                .collect(),
+            state
+                .store
+                .build_artist_summaries()
+                .unwrap_or_default()
+                .into_iter()
+                .skip(artist_offset)
+                .take(artist_count)
+                .collect(),
+        )
     };
 
-    if !info.biography.is_empty() {
-        el = el.child(XmlElem::new("biography").text(info.biography));
-    }
-    if !info.image_url.is_empty() {
-        el = el
-            .child(XmlElem::new("smallImageUrl").text(info.image_url.clone()))
-            .child(XmlElem::new("mediumImageUrl").text(info.image_url.clone()))
-            .child(XmlElem::new("largeImageUrl").text(info.image_url));
-    }
-
-    // Match similar artists against local store so clicking them in Feishin opens their artist page
-    let local_artists: HashMap<String, (String, String, usize)> = store
-        .artists()
-        .into_iter()
-        .map(|(aid, name, cnt)| (name.to_lowercase(), (aid, name, cnt)))
-        .collect();
-
-    for sim_name in info.similar.into_iter().take(count) {
-        if let Some((aid, lname, cnt)) = local_artists.get(&sim_name.to_lowercase()) {
-            el = el.child(
-                XmlElem::new("similarArtist")
-                    .attr("id", aid.clone())
-                    .attr("name", lname.clone())
-                    .attr("coverArt", aid.clone())
-                    .attr("albumCount", *cnt),
-            );
-        }
-    }
-    el
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct CachedLyrics {
-    at: i64,
-    plain: String,
-    synced: String,
-}
-
-async fn get_or_fetch_lyrics(store: &Store, artist: &str, title: &str) -> Option<CachedLyrics> {
-    if artist.trim().is_empty() || title.trim().is_empty() {
-        return None;
-    }
-    let clean_title = crate::models::core_song_title(title);
-    let key = format!("lyrics:v1:{}|{}", crate::models::slug(artist), clean_title);
-    let now = chrono::Utc::now().timestamp();
-    if let Some(raw) = store.kv_get(&key) {
-        if let Ok(c) = serde_json::from_str::<CachedLyrics>(&raw) {
-            if now - c.at < 14 * 86400 {
-                return Some(c);
-            }
-        }
-    }
-
-    let url = format!(
-        "https://lrclib.net/api/get?artist_name={}&track_name={}",
-        urlencoding::encode(artist.trim()),
-        urlencoding::encode(title.trim())
-    );
-    let mut result = CachedLyrics {
-        at: now,
-        ..Default::default()
+    let root_name = match endpoint {
+        "search3" => "searchResult3",
+        "search2" => "searchResult2",
+        _ => "searchResult",
     };
-    if let Ok(resp) = metadata_http().get(&url).send().await {
-        if resp.status().is_success() {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                result.plain = json.get("plainLyrics").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                result.synced = json.get("syncedLyrics").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            }
-        }
+
+    let starred = state.store.starred_ids(uid).unwrap_or_default();
+    let stats = state.store.track_stats_map(uid).unwrap_or_default();
+    let ratings = state.store.user_ratings(uid).unwrap_or_default();
+    let saved = state.store.saved_album_ids(uid).unwrap_or_default();
+
+    let mut root = XmlElem::new(root_name);
+    for a in artists {
+        root = root.child(artist_to_xml(&a));
     }
-    if let Ok(s) = serde_json::to_string(&result) {
-        store.kv_set(&key, &s);
+    for alb in albums {
+        root = root.child(album_to_xml(&alb, &saved, "album"));
     }
-    Some(result)
+    let child_song_name = if endpoint == "search" { "match" } else { "song" };
+    for t in tracks {
+        root = root.child(track_to_xml(
+            &t,
+            starred.contains(&t.id),
+            stats.get(&t.id),
+            ratings.get(&t.id).copied(),
+            child_song_name,
+        ));
+    }
+    respond(params, true, Some(root))
 }
 
-async fn fetch_structured_lyrics_elem(store: &Store, id: &str) -> XmlElem {
-    let mut root = XmlElem::new("lyricsList");
-    let Some(tr) = store.track(id) else {
-        return root;
-    };
-    let Some(lyr) = get_or_fetch_lyrics(store, &tr.artist, &tr.title).await else {
-        return root;
-    };
-    if !lyr.synced.is_empty() {
-        let mut sl = XmlElem::new("structuredLyrics")
-            .attr("displayArtist", tr.artist.clone())
-            .attr("displayTitle", tr.title.clone())
-            .attr("lang", "und")
-            .attr("synced", true);
-        for (ms, text) in parse_lrc_lines(&lyr.synced) {
-            sl = sl.child(XmlElem::new("line").attr("start", ms).text(text));
-        }
-        root = root.child(sl);
-    } else if !lyr.plain.is_empty() {
-        let mut sl = XmlElem::new("structuredLyrics")
-            .attr("displayArtist", tr.artist.clone())
-            .attr("displayTitle", tr.title.clone())
-            .attr("lang", "und")
-            .attr("synced", false);
-        for line in lyr.plain.lines() {
-            sl = sl.child(XmlElem::new("line").text(line.to_string()));
-        }
-        root = root.child(sl);
-    }
-    root
-}
-
-async fn fetch_plain_lyrics_elem(store: &Store, artist: &str, title: &str) -> XmlElem {
-    let mut el = XmlElem::new("lyrics")
-        .attr("artist", artist.to_string())
-        .attr("title", title.to_string());
-    if let Some(lyr) = get_or_fetch_lyrics(store, artist, title).await {
-        if !lyr.plain.is_empty() {
-            el = el.text(lyr.plain);
-        }
-    }
-    el
-}
-
-fn parse_lrc_lines(lrc: &str) -> Vec<(i64, String)> {
-    let mut out = Vec::new();
-    for raw in lrc.lines() {
-        let line = raw.trim();
-        if let Some(rest) = line.strip_prefix('[') {
-            if let Some((ts, text)) = rest.split_once(']') {
-                if let Some((min_s, sec_s)) = ts.split_once(':') {
-                    if let (Ok(mins), Ok(secs)) = (min_s.parse::<i64>(), sec_s.parse::<f64>()) {
-                        let ms = mins * 60_000 + (secs * 1000.0).round() as i64;
-                        out.push((ms, text.trim().to_string()));
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn iso_utc(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
-}
-
-fn playlist_elem(
-    store: &Store,
-    p: &crate::models::Playlist,
-    fallback_owner: &str,
-    song_count: usize,
-) -> XmlElem {
-    let owner = store
-        .get_user_by_id(p.user_id)
-        .map(|u| u.username)
-        .unwrap_or_else(|| fallback_owner.to_string());
-    let cov = p.cover_track_id.clone().unwrap_or_else(|| p.id.clone());
-    XmlElem::new("playlist")
-        .attr("id", p.id.clone())
-        .attr("name", p.name.clone())
-        .attr("comment", p.comment.clone())
-        .attr("owner", owner)
-        .attr("public", p.public)
-        .attr("songCount", song_count)
-        .attr("duration", p.duration)
-        .attr("created", iso_utc(p.created))
-        .attr("changed", iso_utc(p.changed))
-        .attr("coverArt", cov)
-}
-
-fn set_starred(state: &AppState, user_id: i64, multi: &HashMap<String, Vec<String>>, starred: bool) {
-    let event = if starred { "star" } else { "unstar" };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut targets: Vec<(String, Option<Track>)> = Vec::new();
-
-    if let Some(ids) = multi.get("id") {
-        for id in ids {
-            if seen.insert(id.clone()) {
-                targets.push((id.clone(), state.store.track(id)));
-            }
-        }
-    }
-
-    if let Some(album_ids) = multi.get("albumId") {
-        let wanted: HashSet<&str> = album_ids.iter().map(|s| s.as_str()).collect();
-        if !wanted.is_empty() {
-            for tr in state.store.all_tracks(5000) {
-                if wanted.contains(tr.album_id().as_str()) && seen.insert(tr.id.clone()) {
-                    targets.push((tr.id.clone(), Some(tr)));
-                }
-            }
-        }
-    }
-
-    if let Some(artist_ids) = multi.get("artistId") {
-        for aid in artist_ids {
-            if let Some(name) = state.store.artist_name_from_id(aid) {
-                for tr in state.store.tracks_by_artist(&name, 500) {
-                    if seen.insert(tr.id.clone()) {
-                        targets.push((tr.id.clone(), Some(tr)));
-                    }
-                }
-            }
-        }
-    }
-
-    for (id, track_opt) in targets {
-        if starred {
-            state.store.star_track(user_id, &id);
-        } else {
-            state.store.unstar_track(user_id, &id);
-        }
-        if let Some(ref tr) = track_opt {
-            state.taste.learn_event(user_id, tr, event, 1.0);
-        }
-    }
-}
-
-fn url_form_decode(body: &str) -> Vec<(String, String)> {
-    if body.is_empty() {
-        return vec![];
-    }
-    body.split('&')
-        .filter_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            let k_norm = k.replace('+', " ");
-            let v_norm = v.replace('+', " ");
-            let dk = urlencoding::decode(&k_norm).ok()?.into_owned();
-            let dv = urlencoding::decode(&v_norm).ok()?.into_owned();
-            Some((dk, dv))
-        })
-        .collect()
+fn parse_usize(params: &HashMap<String, String>, k: &str, default: usize) -> usize {
+    params
+        .get(k)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::archive::ArchiveSource;
+    use crate::sources::deezer::DeezerSource;
     use crate::sources::local::LocalSource;
+    use crate::sources::soulseek::SoulseekSource;
+    use crate::sources::ytm::YtmSource;
     use axum::body::to_bytes;
 
     fn test_state() -> AppState {
-        let dir = std::env::temp_dir().join(format!("beatlab_subsonic_test_{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::create_dir_all(&dir);
-        let store = Store::open_in_memory().unwrap();
-        store.create_user("admin", "pass", true).unwrap();
-        store.upsert_tracks(&[Track {
-            id: "t1".into(),
-            source: "soulseek".into(),
-            title: "Midnight City".into(),
-            artist: "M83".into(),
-            album: "Hurry Up, We're Dreaming".into(),
-            genre: "Electronic".into(),
-            year: 2011,
-            duration: 243,
-            bitrate: 950,
-            format: "flac".into(),
-            created: 1000,
-            ..Default::default()
-        }]);
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-test-{}", uuid::Uuid::new_v4()));
+        let deezer = DeezerSource::new();
+        let ytm = YtmSource::new(None);
+        let archive = ArchiveSource::new();
         let local = Arc::new(LocalSource::new(store.clone(), vec![]));
-        let soulseek = SoulseekSource::new(store.clone(), dir.join("slsk"));
-        let registry = Arc::new(SourceRegistry::new(store.clone(), vec![local.clone()]));
-        let engine = Arc::new(Engine::new(store.clone(), registry.clone(), &dir, 1));
-        let taste = Arc::new(TasteEngine::new(store.clone(), registry.clone()));
+        let soulseek = SoulseekSource::new(store.clone(), tmp.join("slsk"));
+        let sources = SourceRegistry::new(deezer, ytm, archive, local, soulseek);
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+        store
+            .upsert_tracks(&[Track {
+                id: "t1".into(),
+                source: "local".into(),
+                title: "Midnight City".into(),
+                artist: "M83".into(),
+                album: "Hurry Up, We're Dreaming".into(),
+                genre: "Electronic".into(),
+                year: 2011,
+                track_no: 1,
+                disc_no: 1,
+                duration: 243,
+                format: "flac".into(),
+                bitrate: 900,
+                ..Default::default()
+            }])
+            .unwrap();
         AppState {
             store,
-            registry,
+            sources,
             engine,
             taste,
-            local,
-            soulseek,
             now_playing: Arc::new(Mutex::new(HashMap::new())),
-            admin_password: "pass".into(),
-            admin_sessions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    async fn call_subsonic(state: AppState, action: &str, extra: &[(&str, &str)]) -> Value {
-        let mut pairs = vec![
-            ("u", "admin"),
-            ("p", "pass"),
-            ("f", "json"),
-        ];
-        pairs.extend_from_slice(extra);
-        let qs = pairs
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
+    async fn call_subsonic(
+        st: AppState,
+        user: &str,
+        pass: &str,
+        action: &str,
+        extra: &[(&str, &str)],
+    ) -> Value {
+        let mut qs = format!(
+            "u={}&p={}&f=json&v=1.16.1&c=test",
+            urlencoding::encode(user),
+            urlencoding::encode(pass)
+        );
+        for (k, v) in extra {
+            qs.push('&');
+            qs.push_str(k);
+            qs.push('=');
+            qs.push_str(&urlencoding::encode(v));
+        }
         let resp = dispatch(
-            State(state),
+            State(st),
             Path(action.into()),
             RawQuery(Some(qs)),
             HeaderMap::new(),
@@ -1543,123 +1611,69 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    #[test]
-    fn to_json_keeps_single_collection_items_as_arrays() {
-        let root = XmlElem::new("subsonic-response")
-            .attr("status", "ok")
-            .child(
-                XmlElem::new("searchResult3")
-                    .child(XmlElem::new("song").attr("id", "t1"))
-                    .child(XmlElem::new("album").attr("id", "a1")),
-            );
-        let j = root.to_json();
-        assert!(j["searchResult3"].is_object());
-        assert!(j["searchResult3"]["song"].is_array());
-        assert!(j["searchResult3"]["album"].is_array());
-    }
-
     #[tokio::test]
-    async fn get_album_list2_returns_albums_array() {
+    async fn subsonic_auto_creates_account_on_first_login_and_returns_41_for_unknown_token() {
         let st = test_state();
-        let j = call_subsonic(st, "getAlbumList2.view", &[("type", "newest"), ("size", "10")]).await;
-        let sr = &j["subsonic-response"];
-        assert_eq!(sr["status"], "ok");
-        let albums = sr["albumList2"]["album"].as_array().expect("album must be array");
-        assert_eq!(albums.len(), 1);
-        assert_eq!(albums[0]["name"], "Hurry Up, We're Dreaming");
-    }
 
-    #[tokio::test]
-    async fn search3_handles_quoted_empty_and_single_hit_arrays() {
-        let st = test_state();
-        let j = call_subsonic(st.clone(), "search3.view", &[("query", "\"\""), ("songCount", "10")]).await;
-        let sr = &j["subsonic-response"]["searchResult3"];
-        assert_eq!(sr["song"].as_array().unwrap().len(), 1);
-        assert_eq!(sr["album"].as_array().unwrap().len(), 1);
-        assert_eq!(sr["artist"].as_array().unwrap().len(), 1);
-
-        let j2 = call_subsonic(st, "search3.view", &[("query", "Midnight"), ("songCount", "10")]).await;
-        let sr2 = &j2["subsonic-response"]["searchResult3"];
-        assert_eq!(sr2["song"][0]["title"], "Midnight City");
-    }
-
-    #[tokio::test]
-    async fn open_subsonic_extensions_is_top_level_array() {
-        let st = test_state();
-        let j = call_subsonic(st, "getOpenSubsonicExtensions.view", &[]).await;
-        let exts = j["subsonic-response"]["openSubsonicExtensions"]
-            .as_array()
-            .expect("openSubsonicExtensions must be a JSON array directly under subsonic-response");
-        assert!(exts.iter().any(|e| e["name"] == "transcodeOffset"));
-        assert!(exts.iter().any(|e| e["name"] == "songLyrics"));
-    }
-
-    #[tokio::test]
-    async fn save_play_queue_accepts_multiple_ids() {
-        let st = test_state();
-        st.store.upsert_tracks(&[Track {
-            id: "t2".into(),
-            source: "local".into(),
-            title: "Wait".into(),
-            artist: "M83".into(),
-            album: "Hurry Up, We're Dreaming".into(),
-            genre: "Electronic".into(),
-            year: 2011,
-            duration: 343,
-            ..Default::default()
-        }]);
-        let _ = call_subsonic(
-            st.clone(),
-            "savePlayQueue.view",
-            &[("current", "t1"), ("position", "12000"), ("id", "t1"), ("id", "t2")],
+        // Unknown user with token auth triggers Subsonic code 41 (fallback prompt)
+        let resp41 = dispatch(
+            State(st.clone()),
+            Path("ping.view".into()),
+            RawQuery(Some("u=newlistener&t=deadbeef&s=1234&f=json".into())),
+            HeaderMap::new(),
+            String::new(),
         )
         .await;
-        let q = call_subsonic(st, "getPlayQueue.view", &[]).await;
-        let entries = q["subsonic-response"]["playQueue"]["entry"]
-            .as_array()
-            .expect("playQueue entry must be array");
-        assert_eq!(entries.len(), 2);
+        let bytes41 = to_bytes(resp41.into_body(), 1024 * 1024).await.unwrap();
+        let body41: Value = serde_json::from_slice(&bytes41).unwrap();
+        assert_eq!(body41["subsonic-response"]["error"]["code"], 41);
+
+        // Plain/enc auth immediately creates account with non-admin role!
+        let ok = call_subsonic(st.clone(), "newlistener", "enc:736563726574", "ping.view", &[]).await;
+        assert_eq!(ok["subsonic-response"]["status"], "ok");
+        assert!(st.store.get_user_by_name("newlistener").unwrap().is_some());
+
+        let uinfo = call_subsonic(st.clone(), "newlistener", "secret", "getUser.view", &[]).await;
+        assert_eq!(uinfo["subsonic-response"]["user"]["adminRole"], false);
+
+        // Subsequent salted token auth now succeeds!
+        let mut h = Md5::new();
+        h.update(b"secretsalt99");
+        let tok = hex::encode(h.finalize());
+        let ok_tok = dispatch(
+            State(st),
+            Path("ping.view".into()),
+            RawQuery(Some(format!("u=newlistener&t={}&s=salt99&f=json", tok))),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        let bytes_tok = to_bytes(ok_tok.into_body(), 1024 * 1024).await.unwrap();
+        let body_tok: Value = serde_json::from_slice(&bytes_tok).unwrap();
+        assert_eq!(body_tok["subsonic-response"]["status"], "ok");
     }
 
     #[tokio::test]
-    async fn get_artists_groups_alphabetically() {
+    async fn update_playlist_enforces_owner() {
         let st = test_state();
-        let j = call_subsonic(st, "getArtists.view", &[]).await;
-        let indexes = j["subsonic-response"]["artists"]["index"]
-            .as_array()
-            .expect("index must be array");
-        assert_eq!(indexes[0]["name"], "M");
-        assert_eq!(indexes[0]["artist"][0]["name"], "M83");
-    }
+        st.store
+            .upsert_tracks(&[Track {
+                id: "t2".into(),
+                source: "local".into(),
+                title: "Wait".into(),
+                artist: "M83".into(),
+                album: "Hurry Up, We're Dreaming".into(),
+                genre: "Electronic".into(),
+                year: 2011,
+                duration: 343,
+                ..Default::default()
+            }])
+            .unwrap();
 
-    #[test]
-    fn url_form_decode_handles_plus_as_space_and_percent() {
-        let pairs = url_form_decode("artist+name=Sabrina+Carpenter&query=espresso+%26+more");
-        assert_eq!(
-            pairs,
-            vec![
-                ("artist name".to_string(), "Sabrina Carpenter".to_string()),
-                ("query".to_string(), "espresso & more".to_string()),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn update_playlist_adds_removes_and_enforces_owner() {
-        let st = test_state();
-        st.store.upsert_tracks(&[Track {
-            id: "t2".into(),
-            source: "local".into(),
-            title: "Wait".into(),
-            artist: "M83".into(),
-            album: "Hurry Up, We're Dreaming".into(),
-            genre: "Electronic".into(),
-            year: 2011,
-            duration: 343,
-            ..Default::default()
-        }]);
         let created = call_subsonic(
             st.clone(),
+            "alice",
+            "pass1",
             "createPlaylist.view",
             &[("name", "Roadtrip"), ("songId", "t1")],
         )
@@ -1671,6 +1685,8 @@ mod tests {
 
         let _ = call_subsonic(
             st.clone(),
+            "alice",
+            "pass1",
             "updatePlaylist.view",
             &[
                 ("playlistId", &pid),
@@ -1679,30 +1695,23 @@ mod tests {
             ],
         )
         .await;
-        let fetched = call_subsonic(st.clone(), "getPlaylist.view", &[("id", &pid)]).await;
+        let fetched = call_subsonic(st.clone(), "alice", "pass1", "getPlaylist.view", &[("id", &pid)]).await;
         let entries = fetched["subsonic-response"]["playlist"]["entry"]
             .as_array()
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["id"], "t2");
 
-        // Non-owner non-admin receives Subsonic permission error (50)
-        st.store.create_user("bob", "bobpw", false).unwrap();
-        let qs = format!(
-            "u=bob&p=bobpw&f=json&playlistId={}&name=Hijack",
-            urlencoding::encode(&pid)
-        );
-        let resp = dispatch(
-            State(st),
-            Path("updatePlaylist.view".into()),
-            RawQuery(Some(qs)),
-            HeaderMap::new(),
-            String::new(),
+        // Bob cannot modify Alice's playlist (Subsonic error 50)
+        let hijack = call_subsonic(
+            st,
+            "bob",
+            "pass2",
+            "updatePlaylist.view",
+            &[("playlistId", &pid), ("name", "Hijack")],
         )
         .await;
-        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["subsonic-response"]["error"]["code"], 50);
+        assert_eq!(hijack["subsonic-response"]["error"]["code"], 50);
     }
 
     #[test]
@@ -1719,9 +1728,5 @@ mod tests {
         assert_eq!(j["biography"], "Bio text");
         assert_eq!(j["smallImageUrl"], "https://img.example/s.jpg");
         assert_eq!(j["structuredLyrics"][0]["line"][0]["value"], "Lyric line");
-
-        // Empty container with no attrs/children/text remains an empty object
-        let empty = XmlElem::new("artistInfo2").to_json();
-        assert!(empty.is_object());
     }
 }

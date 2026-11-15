@@ -9,7 +9,7 @@ use lofty::tag::Accessor;
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 use walkdir::WalkDir;
 
 const AUDIO_EXTS: &[&str] = &[
@@ -44,20 +44,6 @@ impl LocalSource {
         self.dirs.read().unwrap().clone()
     }
 
-    pub fn add_dir(&self, path: PathBuf) {
-        let mut guard = self.dirs.write().unwrap();
-        if !guard.contains(&path) {
-            guard.push(path);
-            let strs: Vec<String> = guard
-                .iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            if let Ok(json) = serde_json::to_string(&strs) {
-                self.store.kv_set("local_dirs", &json);
-            }
-        }
-    }
-
     /// Scans all configured directories and upserts tracks into SQLite.
     pub fn scan(&self) -> usize {
         let dirs = self.dirs();
@@ -87,14 +73,18 @@ impl LocalSource {
                     batch.push(track);
                     count += 1;
                     if batch.len() >= 100 {
-                        self.store.upsert_tracks(&batch);
+                        if let Err(e) = self.store.upsert_tracks(&batch) {
+                            warn!(error = %e, "upsert_tracks batch failed");
+                        }
                         batch.clear();
                     }
                 }
             }
         }
         if !batch.is_empty() {
-            self.store.upsert_tracks(&batch);
+            if let Err(e) = self.store.upsert_tracks(&batch) {
+                warn!(error = %e, "upsert_tracks final batch failed");
+            }
         }
         info!(tracks = count, "local library scan complete");
         count
@@ -114,7 +104,7 @@ impl MusicSource for LocalSource {
     fn status(&self) -> String {
         let dirs = self.dirs();
         if dirs.is_empty() {
-            "no local folders configured (set BEATLAB_MUSIC_DIRS or add in /admin)".to_string()
+            "no local folders configured (set BEATLAB_MUSIC_DIRS)".to_string()
         } else {
             let joined: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
             format!("watching {} folder(s): {}", dirs.len(), joined.join(", "))
@@ -123,7 +113,8 @@ impl MusicSource for LocalSource {
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
         self.store
-            .search_tracks(query, limit * 2)
+            .search_tracks(query, limit * 2, 0)
+            .unwrap_or_default()
             .into_iter()
             .filter(|t| t.source == "local")
             .take(limit)
@@ -153,6 +144,7 @@ fn read_local_track(path: &Path, ext: &str) -> Option<Track> {
     let mut genre = String::new();
     let mut year = 0i32;
     let mut track_no = 0i32;
+    let mut disc_no = 1i32;
     let mut duration = 0i32;
     let mut bitrate = 0i32;
     let mut sample_rate = 0i32;
@@ -191,6 +183,11 @@ fn read_local_track(path: &Path, ext: &str) -> Option<Track> {
             if let Some(tn) = tag.track() {
                 track_no = tn as i32;
             }
+            if let Some(dn) = tag.disk() {
+                if dn > 0 {
+                    disc_no = dn as i32;
+                }
+            }
             has_cover = !tag.pictures().is_empty();
         }
     }
@@ -212,6 +209,7 @@ fn read_local_track(path: &Path, ext: &str) -> Option<Track> {
         moods,
         year,
         track_no,
+        disc_no,
         duration,
         bitrate,
         sample_rate,
@@ -221,8 +219,7 @@ fn read_local_track(path: &Path, ext: &str) -> Option<Track> {
         stream_url: format!("file:{}", abs_str),
         cover_url,
         meta: String::new(),
-        play_count: 0,
-        last_played: 0,
+        deezer_id: String::new(),
         created: chrono::Utc::now().timestamp(),
     })
 }
