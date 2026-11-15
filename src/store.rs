@@ -35,6 +35,7 @@ impl Store {
         Ok(store)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let store = Self {
@@ -232,12 +233,6 @@ impl Store {
         .flatten()
         .filter_map(|r| r.ok())
         .collect()
-    }
-
-    pub fn delete_user(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM users WHERE id = ?1", params![id])?;
-        Ok(())
     }
 
     pub fn auth_subsonic(&self, username: &str, password: &str, token: &str, salt: &str) -> Option<User> {

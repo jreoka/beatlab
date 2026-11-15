@@ -106,18 +106,6 @@ pub enum QualityTier {
     HiRes = 5,
 }
 
-impl QualityTier {
-    pub fn label(&self) -> &'static str {
-        match self {
-            QualityTier::HiRes => "Hi-Res Lossless",
-            QualityTier::Lossless => "CD Lossless",
-            QualityTier::HighLossy => "High Quality",
-            QualityTier::Standard => "Standard",
-            QualityTier::Low => "Compressed",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Track {
     pub id: String,

@@ -22,7 +22,6 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub taste: Arc<TasteEngine>,
     pub local: Arc<LocalSource>,
-    pub admin_password: String,
     pub now_playing: Arc<Mutex<HashMap<i64, (Track, i64, String)>>>,
 }
 

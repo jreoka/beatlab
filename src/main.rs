@@ -128,7 +128,6 @@ async fn main() {
         engine: engine.clone(),
         taste: taste.clone(),
         local: local.clone(),
-        admin_password: password,
         now_playing: Arc::new(Mutex::new(HashMap::new())),
     };
 
