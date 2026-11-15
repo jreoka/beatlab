@@ -12,6 +12,7 @@ use std::collections::HashSet;
 const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLES_CSS: &str = include_str!("web/styles.css");
 const APP_JS: &str = include_str!("web/app.js");
+const FAVICON_SVG: &str = include_str!("web/favicon.svg");
 
 pub async fn serve_index() -> impl IntoResponse {
     (
@@ -34,6 +35,14 @@ pub async fn serve_js() -> impl IntoResponse {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
         APP_JS,
+    )
+}
+
+pub async fn serve_favicon() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        FAVICON_SVG,
     )
 }
 

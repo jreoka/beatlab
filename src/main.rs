@@ -141,6 +141,8 @@ async fn main() -> models::AppResult<()> {
         .route("/web", get(webapp::serve_index))
         .route("/web/styles.css", get(webapp::serve_css))
         .route("/web/app.js", get(webapp::serve_js))
+        .route("/web/favicon.svg", get(webapp::serve_favicon))
+        .route("/favicon.svg", get(webapp::serve_favicon))
         // Web Player API (/api/web/*) — open account creation & full player features
         .route("/api/web/me", get(webapp::me))
         .route("/api/web/auth/signin", post(webapp::signin))
