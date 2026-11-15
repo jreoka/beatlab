@@ -8,7 +8,10 @@ mod subsonic;
 mod taste;
 mod webapp;
 
-use axum::http::header;
+use axum::extract::{Request, State};
+use axum::http::{header, uri::Authority, StatusCode, Uri};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use axum::Router;
 use engine::StreamEngine;
@@ -52,6 +55,15 @@ async fn main() -> models::AppResult<()> {
         .map(|raw| std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()).collect())
         .unwrap_or_default();
     let ytdlp_override = std::env::var("BEATLAB_YTDLP").ok();
+    let allowed_url_raw = std::env::var("URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let allowed_url = allowed_url_raw
+        .as_deref()
+        .map(AllowedUrl::parse)
+        .transpose()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Store::open(&data_dir.join("beatlab.db"))?;
@@ -236,9 +248,289 @@ async fn main() -> models::AppResult<()> {
         .layer(cors)
         .with_state(state);
 
+    let app = if let Some(ref allowed) = allowed_url {
+        app.layer(middleware::from_fn_with_state(
+            allowed.clone(),
+            enforce_allowed_url,
+        ))
+    } else {
+        app
+    };
+
     let addr: SocketAddr = addr_str.parse()?;
-    info!(address = %addr, data_dir = %data_dir.display(), "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
+    if let Some(ref raw_url) = allowed_url_raw {
+        info!(address = %addr, data_dir = %data_dir.display(), url = %raw_url, "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
+    } else {
+        info!(address = %addr, data_dir = %data_dir.display(), "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Allowed origin parsed from the `URL` environment variable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AllowedUrl {
+    scheme: Option<String>,
+    host: String,
+    port: Option<u16>,
+}
+
+impl AllowedUrl {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("URL must not be empty".to_string());
+        }
+
+        if trimmed.contains("://") {
+            let uri: Uri = trimmed
+                .parse()
+                .map_err(|e| format!("Invalid URL '{trimmed}': {e}"))?;
+            let scheme = uri.scheme_str().map(|s| s.to_ascii_lowercase());
+            let auth = uri
+                .authority()
+                .ok_or_else(|| format!("Invalid URL '{trimmed}': missing host"))?;
+            let host = auth.host();
+            if host.is_empty() {
+                return Err(format!("Invalid URL '{trimmed}': missing host"));
+            }
+            let port = auth.port_u16().or_else(|| default_port(scheme.as_deref()));
+            Ok(Self {
+                scheme,
+                host: host.to_ascii_lowercase(),
+                port,
+            })
+        } else {
+            let auth_part = trimmed.split('/').next().unwrap_or(trimmed);
+            let auth: Authority = auth_part
+                .parse()
+                .map_err(|e| format!("Invalid URL '{trimmed}': {e}"))?;
+            let host = auth.host();
+            if host.is_empty() {
+                return Err(format!("Invalid URL '{trimmed}': missing host"));
+            }
+            Ok(Self {
+                scheme: None,
+                host: host.to_ascii_lowercase(),
+                port: auth.port_u16(),
+            })
+        }
+    }
+
+    fn matches(&self, req: &Request) -> bool {
+        let Some(req_auth) = extract_request_authority(req) else {
+            return false;
+        };
+
+        if !req_auth.host().eq_ignore_ascii_case(&self.host) {
+            return false;
+        }
+
+        let req_scheme = extract_request_scheme(req);
+        if let (Some(expected_scheme), Some(actual_scheme)) = (&self.scheme, &req_scheme) {
+            if expected_scheme != actual_scheme {
+                return false;
+            }
+        }
+
+        let req_port = req_auth
+            .port_u16()
+            .or_else(|| default_port(req_scheme.as_deref()))
+            .or_else(|| {
+                if self.scheme.is_some() && req_scheme.is_none() {
+                    default_port(self.scheme.as_deref())
+                } else {
+                    None
+                }
+            });
+
+        req_port == self.port
+    }
+}
+
+fn default_port(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some("http") => Some(80),
+        Some("https") => Some(443),
+        _ => None,
+    }
+}
+
+fn extract_request_authority(req: &Request) -> Option<Authority> {
+    if let Some(raw) = req
+        .headers()
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+    {
+        let first = raw.split(',').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return first.parse::<Authority>().ok();
+        }
+    }
+
+    if let Some(raw) = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.parse::<Authority>().ok();
+        }
+    }
+
+    req.uri().authority().cloned()
+}
+
+fn extract_request_scheme(req: &Request) -> Option<String> {
+    for header_name in ["x-forwarded-proto", "x-forwarded-scheme"] {
+        if let Some(raw) = req.headers().get(header_name).and_then(|v| v.to_str().ok()) {
+            let first = raw.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return Some(first.to_ascii_lowercase());
+            }
+        }
+    }
+
+    req.uri().scheme_str().map(|s| s.to_ascii_lowercase())
+}
+
+async fn enforce_allowed_url(
+    State(allowed): State<AllowedUrl>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if allowed.matches(&req) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "Forbidden").into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    #[test]
+    fn allowed_url_parses_schemes_hosts_and_ports() {
+        let https = AllowedUrl::parse("https://music.example.com/").unwrap();
+        assert_eq!(https.scheme.as_deref(), Some("https"));
+        assert_eq!(https.host, "music.example.com");
+        assert_eq!(https.port, Some(443));
+
+        let custom_port = AllowedUrl::parse("http://localhost:4533").unwrap();
+        assert_eq!(custom_port.scheme.as_deref(), Some("http"));
+        assert_eq!(custom_port.host, "localhost");
+        assert_eq!(custom_port.port, Some(4533));
+
+        let host_only = AllowedUrl::parse("music.example.com").unwrap();
+        assert_eq!(host_only.scheme, None);
+        assert_eq!(host_only.host, "music.example.com");
+        assert_eq!(host_only.port, None);
+
+        assert!(AllowedUrl::parse("").is_err());
+        assert!(AllowedUrl::parse("https://").is_err());
+    }
+
+    #[test]
+    fn allowed_url_matches_expected_requests_and_rejects_others() {
+        let allowed = AllowedUrl::parse("https://music.example.com").unwrap();
+
+        // Matching Host (plain HTTP behind reverse proxy without X-Forwarded-Proto)
+        let req = Request::builder()
+            .uri("/")
+            .header(header::HOST, "music.example.com")
+            .body(Body::empty())
+            .unwrap();
+        assert!(allowed.matches(&req));
+
+        // Matching X-Forwarded-Host and X-Forwarded-Proto
+        let req = Request::builder()
+            .uri("/")
+            .header(header::HOST, "127.0.0.1:4533")
+            .header("x-forwarded-host", "Music.Example.com:443")
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .unwrap();
+        assert!(allowed.matches(&req));
+
+        // Different host -> rejected
+        let req = Request::builder()
+            .uri("/")
+            .header(header::HOST, "127.0.0.1:4533")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!allowed.matches(&req));
+
+        // Wrong port -> rejected
+        let req = Request::builder()
+            .uri("/")
+            .header(header::HOST, "music.example.com:4533")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!allowed.matches(&req));
+
+        // Wrong scheme via X-Forwarded-Proto -> rejected
+        let req = Request::builder()
+            .uri("/")
+            .header(header::HOST, "music.example.com")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!allowed.matches(&req));
+
+        // Missing Host -> rejected
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert!(!allowed.matches(&req));
+    }
+
+    #[test]
+    fn allowed_url_checks_explicit_non_default_port() {
+        let allowed = AllowedUrl::parse("http://localhost:4533").unwrap();
+
+        let ok_req = Request::builder()
+            .uri("/")
+            .header(header::HOST, "localhost:4533")
+            .body(Body::empty())
+            .unwrap();
+        assert!(allowed.matches(&ok_req));
+
+        let missing_port_req = Request::builder()
+            .uri("/")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!allowed.matches(&missing_port_req));
+    }
+
+    #[tokio::test]
+    async fn enforce_allowed_url_middleware_returns_403_for_other_urls() {
+        let allowed = AllowedUrl::parse("https://music.example.com").unwrap();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(allowed, enforce_allowed_url));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{addr}/");
+
+        // Direct access with 127.0.0.1:<port> Host -> 403 Forbidden
+        let forbidden_resp = client.get(&base_url).send().await.unwrap();
+        assert_eq!(forbidden_resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // Access matching URL via forwarded headers -> 200 OK
+        let ok_resp = client
+            .get(&base_url)
+            .header("x-forwarded-host", "music.example.com")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
+
+        server.abort();
+    }
 }
