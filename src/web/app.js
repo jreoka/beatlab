@@ -223,15 +223,12 @@
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       const bars = 40;
       const bw = canvas.width / bars;
+      ctx.fillStyle = '#1ed760';
       for (let i = 0; i < bars; i++) {
         const val = data[i] / 255;
         const h = Math.max(4, val * canvas.height);
         const x = i * bw + 2;
         const y = canvas.height - h;
-        const grad = ctx.createLinearGradient(0, y, 0, canvas.height);
-        grad.addColorStop(0, '#38bdf8');
-        grad.addColorStop(1, '#1ed760');
-        ctx.fillStyle = grad;
         ctx.fillRect(x, y, Math.max(3, bw - 4), h);
       }
     }
@@ -822,7 +819,7 @@
       const m = d.mood;
       const tracks = cacheTracks(d.tracks || []);
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
-      let html = `<div class="hero-header" style="background:linear-gradient(135deg, ${m.c1}aa, ${m.c2}dd);">
+      let html = `<div class="hero-header" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)};">
         <div class="hero-info">
           <div class="hero-kicker" style="color:#fff">MOOD MIX</div>
           <h1 class="hero-title">${esc(m.label)}</h1>
@@ -992,7 +989,7 @@
   }
 
   function renderMoodTile(m) {
-    return `<div class="mood-tile" style="background:linear-gradient(135deg, ${m.c1}, ${m.c2})" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">
+    return `<div class="mood-tile" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)}" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">
       <h3>${esc(m.label)}</h3>
       <p>${esc(m.subtitle)}</p>
     </div>`;
