@@ -1619,7 +1619,6 @@
         html += `<section class="section">
           <div class="section-head">
             <h2>Mixed for you</h2>
-            <span class="section-hint">Rebuilt on the server from the music you listen to</span>
           </div>
           <div class="mixed-for-you-grid">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;
