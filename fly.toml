@@ -7,7 +7,7 @@ primary_region = "ord"
 [env]
   BEATLAB_ADDR = "0.0.0.0:4533"
   BEATLAB_DATA = "/data"
-  BEATLAB_CACHE_GB = "5.0"
+  BEATLAB_CACHE_GB = "10.0"
   RUST_LOG = "info"
 
 [http_service]

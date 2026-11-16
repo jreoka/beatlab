@@ -312,6 +312,7 @@ impl Store {
 
         migrate_legacy_moods(&mut conn)?;
         migrate_artist_disambiguation(&mut conn)?;
+        migrate_artist_disambiguation_v2(&mut conn)?;
 
         Ok(())
     }
@@ -976,6 +977,12 @@ impl Store {
     pub fn upsert_artist_meta(&self, meta: &ArtistSummary) -> AppResult<()> {
         let conn = self.lock();
         let now = Utc::now().timestamp();
+        let dz_clean = meta.deezer_id.trim();
+        let canonical_id = if !dz_clean.is_empty() && !meta.id.starts_with("ar:dz:") {
+            format!("ar:dz:{}", dz_clean)
+        } else {
+            meta.id.clone()
+        };
         conn.execute(
             "INSERT INTO artists_meta(id, name, cover_url, bio, deezer_id, updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -986,7 +993,7 @@ impl Store {
                deezer_id = CASE WHEN excluded.deezer_id != '' THEN excluded.deezer_id ELSE artists_meta.deezer_id END,
                updated = excluded.updated",
             params![
-                meta.id,
+                canonical_id,
                 meta.name,
                 meta.cover_url,
                 meta.bio,
@@ -1084,10 +1091,13 @@ impl Store {
             HashMap::new()
         };
         let metas = self.all_album_metas_map()?;
+        let artist_metas = self.all_artist_metas_map()?;
+        let artist_resolver = ArtistResolver::build(&tracks, &artist_metas);
         let mut map: HashMap<String, AlbumSummary> = HashMap::new();
 
         for t in tracks {
             let aid = t.album_id();
+            let resolved_artist_id = artist_resolver.resolve_track(&t);
             let entry = map.entry(aid.clone()).or_insert_with(|| {
                 let name = if t.album.trim().is_empty() {
                     t.title.clone()
@@ -1098,7 +1108,7 @@ impl Store {
                     id: aid.clone(),
                     name,
                     artist: t.artist.clone(),
-                    artist_id: t.artist_id(),
+                    artist_id: resolved_artist_id,
                     cover_id: t.id.clone(),
                     cover_url: t.cover_url.clone(),
                     genre: t.genre.clone(),
@@ -1136,11 +1146,12 @@ impl Store {
         }
 
         for (id, meta) in metas {
-            let resolved_artist_id = if meta.artist_id.trim().is_empty() {
+            let raw_artist_id = if meta.artist_id.trim().is_empty() {
                 format!("ar:{}", slug(&primary_artist(&meta.artist)))
             } else {
                 meta.artist_id.clone()
             };
+            let resolved_artist_id = artist_resolver.resolve(&raw_artist_id, &meta.artist);
             let entry = map.entry(id.clone()).or_insert_with(|| AlbumSummary {
                 id: id.clone(),
                 name: meta.name.clone(),
@@ -1229,11 +1240,12 @@ impl Store {
     pub fn build_artist_summaries(&self) -> AppResult<Vec<ArtistSummary>> {
         let tracks = self.all_tracks(8000, 0)?;
         let metas = self.all_artist_metas_map()?;
+        let resolver = ArtistResolver::build(&tracks, &metas);
         let mut albums_per_artist: HashMap<String, HashSet<String>> = HashMap::new();
         let mut map: HashMap<String, ArtistSummary> = HashMap::new();
 
         for t in tracks {
-            let arid = resolve_track_artist_id(&t, &metas);
+            let arid = resolver.resolve_track(&t);
             albums_per_artist
                 .entry(arid.clone())
                 .or_default()
@@ -1268,8 +1280,10 @@ impl Store {
         }
 
         for (id, meta) in metas {
-            let entry = map.entry(id.clone()).or_insert_with(|| ArtistSummary {
-                id,
+            let canonical_id = resolver.resolve_meta(&id, &meta);
+            let is_canonical = canonical_id == id;
+            let entry = map.entry(canonical_id.clone()).or_insert_with(|| ArtistSummary {
+                id: canonical_id,
                 name: meta.name.clone(),
                 cover_url: meta.cover_url.clone(),
                 bio: meta.bio.clone(),
@@ -1277,17 +1291,32 @@ impl Store {
                 album_count: 0,
                 song_count: 0,
             });
-            if !meta.name.is_empty() {
-                entry.name = meta.name;
-            }
-            if !meta.cover_url.is_empty() {
-                entry.cover_url = meta.cover_url;
-            }
-            if !meta.bio.is_empty() {
-                entry.bio = meta.bio;
-            }
-            if !meta.deezer_id.is_empty() {
-                entry.deezer_id = meta.deezer_id;
+            if is_canonical {
+                if !meta.name.is_empty() {
+                    entry.name = meta.name;
+                }
+                if !meta.cover_url.is_empty() {
+                    entry.cover_url = meta.cover_url;
+                }
+                if !meta.bio.is_empty() {
+                    entry.bio = meta.bio;
+                }
+                if !meta.deezer_id.is_empty() {
+                    entry.deezer_id = meta.deezer_id;
+                }
+            } else {
+                if entry.name.is_empty() && !meta.name.is_empty() {
+                    entry.name = meta.name;
+                }
+                if entry.cover_url.is_empty() && !meta.cover_url.is_empty() {
+                    entry.cover_url = meta.cover_url;
+                }
+                if entry.bio.is_empty() && !meta.bio.is_empty() {
+                    entry.bio = meta.bio;
+                }
+                if entry.deezer_id.is_empty() && !meta.deezer_id.is_empty() {
+                    entry.deezer_id = meta.deezer_id;
+                }
             }
         }
 
@@ -1360,13 +1389,12 @@ impl Store {
     }
 
     pub fn artist_tracks(&self, artist_id: &str) -> AppResult<Vec<Track>> {
+        let all = self.all_tracks(8000, 0)?;
         let metas = self.all_artist_metas_map()?;
-        let mut tracks: Vec<Track> = self
-            .all_tracks(8000, 0)?
+        let resolver = ArtistResolver::build(&all, &metas);
+        let mut tracks: Vec<Track> = all
             .into_iter()
-            .filter(|t| {
-                t.artist_id() == artist_id || resolve_track_artist_id(t, &metas) == artist_id
-            })
+            .filter(|t| t.artist_id() == artist_id || resolver.resolve_track(t) == artist_id)
             .collect();
         tracks.sort_by(|a, b| {
             b.quality_score()
@@ -3394,33 +3422,140 @@ fn migrate_legacy_moods(conn: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
-fn resolve_track_artist_id(t: &Track, metas: &HashMap<String, ArtistSummary>) -> String {
-    let raw_id = t.artist_id();
-    if raw_id.starts_with("ar:dz:") || raw_id.starts_with("ar:ytm:") || metas.contains_key(&raw_id) {
-        return raw_id;
+struct ArtistResolver {
+    ytm_to_dz: HashMap<String, Option<String>>,
+    dz_exact: HashMap<String, Option<String>>,
+    dz_slug: HashMap<String, Option<String>>,
+    ytm_exact: HashMap<String, Option<String>>,
+    ytm_slug: HashMap<String, Option<String>>,
+}
+
+impl ArtistResolver {
+    fn record_unique(map: &mut HashMap<String, Option<String>>, key: String, val: &str) {
+        if key.is_empty() || val.is_empty() {
+            return;
+        }
+        map.entry(key)
+            .and_modify(|cur| {
+                if cur.as_deref() != Some(val) {
+                    *cur = None;
+                }
+            })
+            .or_insert_with(|| Some(val.to_string()));
     }
-    let pa = primary_artist(&t.artist);
-    if pa.is_empty() {
-        return raw_id;
-    }
-    let exact_matches: Vec<&ArtistSummary> = metas
-        .values()
-        .filter(|m| m.name == pa)
-        .collect();
-    if exact_matches.len() == 1 {
-        return exact_matches[0].id.clone();
-    }
-    let pa_slug = slug(&pa);
-    if !pa_slug.is_empty() {
-        let slug_matches: Vec<&ArtistSummary> = metas
-            .values()
-            .filter(|m| slug(&m.name) == pa_slug)
-            .collect();
-        if slug_matches.len() == 1 {
-            return slug_matches[0].id.clone();
+
+    fn record_artist(&mut self, id: &str, name: &str) {
+        let pa = primary_artist(name);
+        let key_name = if pa.is_empty() { name.trim() } else { pa.as_str() };
+        if key_name.is_empty() {
+            return;
+        }
+        let sl = slug(key_name);
+        if id.starts_with("ar:dz:") {
+            Self::record_unique(&mut self.dz_exact, key_name.to_string(), id);
+            Self::record_unique(&mut self.dz_slug, sl, id);
+        } else if id.starts_with("ar:ytm:") {
+            Self::record_unique(&mut self.ytm_exact, key_name.to_string(), id);
+            Self::record_unique(&mut self.ytm_slug, sl, id);
         }
     }
-    raw_id
+
+    fn build(tracks: &[Track], metas: &HashMap<String, ArtistSummary>) -> Self {
+        let mut res = Self {
+            ytm_to_dz: HashMap::new(),
+            dz_exact: HashMap::new(),
+            dz_slug: HashMap::new(),
+            ytm_exact: HashMap::new(),
+            ytm_slug: HashMap::new(),
+        };
+
+        for m in metas.values() {
+            res.record_artist(&m.id, &m.name);
+            let dz_clean = m.deezer_id.trim();
+            if !dz_clean.is_empty() && !m.id.starts_with("ar:dz:") {
+                let dz_ar_id = format!("ar:dz:{}", dz_clean);
+                res.record_artist(&dz_ar_id, &m.name);
+                if m.id.starts_with("ar:ytm:") {
+                    Self::record_unique(&mut res.ytm_to_dz, m.id.clone(), &dz_ar_id);
+                }
+            }
+        }
+
+        for t in tracks {
+            let pa = primary_artist(&t.artist);
+            let name = if pa.is_empty() { t.artist.as_str() } else { pa.as_str() };
+            if let Some(dz_id) = t.deezer_artist_id() {
+                let dz_ar_id = format!("ar:dz:{}", dz_id);
+                res.record_artist(&dz_ar_id, name);
+                if let Some(ytm_id) = t.ytm_artist_id() {
+                    let ytm_ar_id = format!("ar:ytm:{}", ytm_id);
+                    Self::record_unique(&mut res.ytm_to_dz, ytm_ar_id, &dz_ar_id);
+                }
+            } else if let Some(ytm_id) = t.ytm_artist_id() {
+                let ytm_ar_id = format!("ar:ytm:{}", ytm_id);
+                res.record_artist(&ytm_ar_id, name);
+            }
+        }
+
+        res
+    }
+
+    fn resolve(&self, raw_id: &str, name: &str) -> String {
+        if raw_id.starts_with("ar:dz:") {
+            return raw_id.to_string();
+        }
+        if raw_id.starts_with("ar:ytm:") {
+            if let Some(Some(dz_ar_id)) = self.ytm_to_dz.get(raw_id) {
+                return dz_ar_id.clone();
+            }
+        }
+        let pa = primary_artist(name);
+        let key_name = if pa.is_empty() { name.trim() } else { pa.as_str() };
+        if key_name.is_empty() {
+            return raw_id.to_string();
+        }
+        match self.dz_exact.get(key_name) {
+            Some(Some(dz_ar_id)) => return dz_ar_id.clone(),
+            Some(None) => return raw_id.to_string(),
+            None => {
+                let sl = slug(key_name);
+                if !sl.is_empty() {
+                    match self.dz_slug.get(&sl) {
+                        Some(Some(dz_ar_id)) => return dz_ar_id.clone(),
+                        Some(None) => return raw_id.to_string(),
+                        None => {}
+                    }
+                }
+            }
+        }
+        if !raw_id.starts_with("ar:ytm:") {
+            match self.ytm_exact.get(key_name) {
+                Some(Some(ytm_ar_id)) => return ytm_ar_id.clone(),
+                Some(None) => return raw_id.to_string(),
+                None => {
+                    let sl = slug(key_name);
+                    if !sl.is_empty() {
+                        if let Some(Some(ytm_ar_id)) = self.ytm_slug.get(&sl) {
+                            return ytm_ar_id.clone();
+                        }
+                    }
+                }
+            }
+        }
+        raw_id.to_string()
+    }
+
+    fn resolve_track(&self, t: &Track) -> String {
+        self.resolve(&t.artist_id(), &t.artist)
+    }
+
+    fn resolve_meta(&self, id: &str, meta: &ArtistSummary) -> String {
+        let dz_clean = meta.deezer_id.trim();
+        if !dz_clean.is_empty() && !id.starts_with("ar:dz:") {
+            return format!("ar:dz:{}", dz_clean);
+        }
+        self.resolve(id, &meta.name)
+    }
 }
 
 fn migrate_artist_disambiguation(conn: &mut Connection) -> AppResult<()> {
@@ -3477,6 +3612,81 @@ fn migrate_artist_disambiguation(conn: &mut Connection) -> AppResult<()> {
 
     tx.execute(
         "INSERT OR REPLACE INTO kv(key, value) VALUES ('artist_disambig_v1', '1')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Consolidates duplicate non-Deezer `artists_meta` and `followed_artists` rows
+/// (e.g. `ar:yorushika` or `ar:ytm:...`) into their unambiguous canonical `ar:dz:<id>`
+/// profile, without ever merging distinct homonym artists (e.g. Korean `LISA` vs Japanese `LiSA`).
+fn migrate_artist_disambiguation_v2(conn: &mut Connection) -> AppResult<()> {
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'artist_disambig_v2'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+
+    let metas: HashMap<String, ArtistSummary> = {
+        let mut stmt = conn.prepare("SELECT id, name, cover_url, bio, deezer_id FROM artists_meta")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ArtistSummary {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    cover_url: r.get(2)?,
+                    bio: r.get(3)?,
+                    deezer_id: r.get(4)?,
+                    album_count: 0,
+                    song_count: 0,
+                },
+            ))
+        })?;
+        rows.flatten().collect()
+    };
+
+    let tracks: Vec<Track> = {
+        let sql = format!("SELECT {} FROM tracks LIMIT 8000", TRACK_COLS);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_track)?;
+        rows.flatten().collect()
+    };
+
+    let resolver = ArtistResolver::build(&tracks, &metas);
+    let mut remaps: Vec<(String, String)> = Vec::new();
+    for (id, meta) in &metas {
+        let canonical = resolver.resolve_meta(id, meta);
+        if canonical != *id {
+            remaps.push((id.clone(), canonical));
+        }
+    }
+
+    let tx = conn.transaction()?;
+    for (old_id, new_id) in remaps {
+        tx.execute(
+            "UPDATE OR IGNORE artists_meta SET id = ?1 WHERE id = ?2",
+            params![new_id, old_id],
+        )?;
+        tx.execute("DELETE FROM artists_meta WHERE id = ?1", params![old_id])?;
+        tx.execute(
+            "UPDATE OR IGNORE followed_artists SET artist_id = ?1 WHERE artist_id = ?2",
+            params![new_id, old_id],
+        )?;
+        tx.execute(
+            "DELETE FROM followed_artists WHERE artist_id = ?1",
+            params![old_id],
+        )?;
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO kv(key, value) VALUES ('artist_disambig_v2', '1')",
         [],
     )?;
     tx.commit()?;
@@ -3986,5 +4196,143 @@ mod tests {
         for junk in ["!ARTIST", "03 2025", "07", "08 To Sort", "'80s Pop Hits", "Unknown Artist"] {
             assert!(!names.contains(&junk), "junk leaked into featured: {:?}", names);
         }
+    }
+
+    #[test]
+    fn consolidates_same_artist_across_sources_without_merging_homonyms() {
+        let store = Store::open_memory().unwrap();
+
+        // Yorushika appears across Deezer, YTM (without deezer_artist_id), and legacy/local slug.
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:14873123".into(),
+                name: "Yorushika".into(),
+                cover_url: "https://cdn.deezer.com/yorushika_official.jpg".into(),
+                bio: "250000 fans on Deezer".into(),
+                deezer_id: "14873123".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:yorushika".into(),
+                name: "Yorushika".into(),
+                cover_url: "https://local.example/yorushika_alt.jpg".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:ytm:UC_YORU".into(),
+                name: "Yorushika".into(),
+                cover_url: "https://ytm.example/yorushika_ytm.jpg".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut yoru_dz = sample_track("dz:yoru1", "Say It.", "Yorushika", "Natsukusa ga Jama wo Suru");
+        yoru_dz.cover_url = "https://cdn.deezer.com/album1.jpg".into();
+        yoru_dz.meta = r#"{"deezer_artist_id":14873123}"#.into();
+
+        let mut yoru_ytm = sample_track("ytm:yoru2", "Spring Thief", "Yorushika", "Creation");
+        yoru_ytm.source = "ytm".into();
+        yoru_ytm.cover_url = "https://ytm.example/spring_thief.jpg".into();
+        yoru_ytm.meta = r#"{"ytm_artist_id":"UC_YORU"}"#.into();
+
+        let mut yoru_local = sample_track("loc:yoru3", "Hitchcock", "Yorushika", "Makeinu ni Encore wa Iranai");
+        yoru_local.source = "local".into();
+        yoru_local.cover_url = "https://local.example/hitchcock.jpg".into();
+
+        // Homonym artists Korean LISA and Japanese LiSA in the same store must stay separate.
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:14559887".into(),
+                name: "LISA".into(),
+                cover_url: "https://cdn.deezer.com/lisa_kr.jpg".into(),
+                deezer_id: "14559887".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:418196".into(),
+                name: "LiSA".into(),
+                cover_url: "https://cdn.deezer.com/lisa_jp.jpg".into(),
+                deezer_id: "418196".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut lisa_ambig = sample_track("loc:lisa_ambig", "Some Song", "Lisa", "Single");
+        lisa_ambig.source = "local".into();
+
+        store
+            .upsert_tracks(&[yoru_dz, yoru_ytm, yoru_local, lisa_ambig])
+            .unwrap();
+
+        let summaries = store.build_artist_summaries().unwrap();
+        let yoru_profiles: Vec<&ArtistSummary> = summaries
+            .iter()
+            .filter(|a| a.name.eq_ignore_ascii_case("Yorushika"))
+            .collect();
+        assert_eq!(
+            yoru_profiles.len(),
+            1,
+            "Expected exactly 1 Yorushika profile, got: {:?}",
+            yoru_profiles
+        );
+        assert_eq!(yoru_profiles[0].id, "ar:dz:14873123");
+        assert_eq!(
+            yoru_profiles[0].cover_url,
+            "https://cdn.deezer.com/yorushika_official.jpg"
+        );
+        assert_eq!(yoru_profiles[0].song_count, 3);
+        assert_eq!(yoru_profiles[0].album_count, 3);
+
+        let yoru_tracks = store.artist_tracks("ar:dz:14873123").unwrap();
+        assert_eq!(yoru_tracks.len(), 3);
+        let yoru_albums = store.artist_albums(0, "ar:dz:14873123").unwrap();
+        assert_eq!(yoru_albums.len(), 3);
+
+        assert!(summaries.iter().any(|a| a.id == "ar:dz:14559887" && a.name == "LISA"));
+        assert!(summaries.iter().any(|a| a.id == "ar:dz:418196" && a.name == "LiSA"));
+    }
+
+    #[test]
+    fn migrate_artist_disambiguation_v2_merges_legacy_followed_and_meta_safely() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("tester", "secret123").unwrap();
+
+        // Simulate legacy DB state before v2 migration.
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:14873123".into(),
+                name: "Yorushika".into(),
+                cover_url: "https://cdn.deezer.com/yorushika_official.jpg".into(),
+                deezer_id: "14873123".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:yorushika".into(),
+                name: "Yorushika".into(),
+                cover_url: "https://local.example/yorushika_alt.jpg".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.follow_artist(u.id, "ar:yorushika").unwrap();
+
+        // Reset the v2 migration marker and re-run migration.
+        {
+            let mut conn = store.lock();
+            conn.execute("DELETE FROM kv WHERE key = 'artist_disambig_v2'", [])
+                .unwrap();
+            migrate_artist_disambiguation_v2(&mut conn).unwrap();
+        }
+
+        let followed = store.followed_artist_ids(u.id).unwrap();
+        assert!(followed.contains("ar:dz:14873123"));
+        assert!(!followed.contains("ar:yorushika"));
+        assert!(store.get_artist_meta("ar:yorushika").unwrap().is_none());
     }
 }

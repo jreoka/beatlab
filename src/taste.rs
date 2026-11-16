@@ -3031,7 +3031,8 @@ impl TasteEngine {
                 ),
             );
             let mut extra = Vec::new();
-            for t in dz_hits
+            let meta_pa = primary_artist(&meta.name);
+            for mut t in dz_hits
                 .unwrap_or_default()
                 .into_iter()
                 .chain(ytm_hits.unwrap_or_default())
@@ -3042,6 +3043,14 @@ impl TasteEngine {
                 if let (Some(want), Some(got)) = (want_dz, t.deezer_artist_id().as_deref()) {
                     if want != got {
                         continue;
+                    }
+                }
+                if let Some(want) = want_dz {
+                    if t.deezer_artist_id().is_none()
+                        && !meta_pa.is_empty()
+                        && primary_artist(&t.artist) == meta_pa
+                    {
+                        t.set_deezer_artist_id(want);
                     }
                 }
                 extra.push(t);
