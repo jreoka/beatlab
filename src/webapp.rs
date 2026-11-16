@@ -647,12 +647,19 @@ pub async fn search(
     }
 
     let intent = crate::taste::parse_search_intent(&query);
+    let base_query = intent
+        .entity_query
+        .as_deref()
+        .unwrap_or(&query)
+        .to_string();
+
     let mix_future = async {
-        if !intent.is_mix_query {
+        if !intent.is_theme_mix {
             return (Vec::new(), Vec::new());
         }
         let pl_queries = intent.playlist_search_queries();
         let tr_queries = intent.expanded_track_queries();
+        let genre_hints = intent.deezer_genre_hints();
 
         let pl_futs = pl_queries
             .iter()
@@ -664,33 +671,81 @@ pub async fn search(
             use crate::sources::MusicSource;
             state.sources.ytm.search(tq, 15)
         });
+        let genre_chart_fut = async {
+            if genre_hints.is_empty() {
+                return Vec::new();
+            }
+            let dz_genres = state.sources.deezer.fetch_genres().await;
+            let matched: Vec<_> = dz_genres
+                .into_iter()
+                .filter(|g| {
+                    let gl = g.name.to_lowercase();
+                    genre_hints
+                        .iter()
+                        .any(|want| crate::taste::contains_term(&gl, want))
+                })
+                .take(2)
+                .collect();
+            let chart_futs = matched.into_iter().map(|g| {
+                let dz = state.sources.deezer.clone();
+                async move { dz.fetch_genre_chart_tracks(g.id, &g.name, 22).await }
+            });
+            futures::future::join_all(chart_futs)
+                .await
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
 
-        let (pl_batches, dz_extra, ytm_extra) = tokio::join!(
+        let (pl_batches, dz_extra, ytm_extra, genre_tracks) = tokio::join!(
             futures::future::join_all(pl_futs),
             futures::future::join_all(dz_extra_futs),
             futures::future::join_all(ytm_extra_futs),
+            genre_chart_fut,
         );
         let curated: Vec<(String, Vec<Track>)> = pl_batches.into_iter().flatten().collect();
         let extra_tracks: Vec<Track> = dz_extra
             .into_iter()
             .chain(ytm_extra)
             .flatten()
+            .chain(genre_tracks)
             .collect();
         (curated, extra_tracks)
     };
 
-    let ((all_tracks, (dz_tracks, dz_albums, dz_artists)), mix_res) = tokio::join!(
-        async {
-            tokio::join!(
-                state.sources.search_all(&query, 20),
-                state.sources.deezer.search_all(&query, 12),
-            )
-        },
-        tokio::time::timeout(std::time::Duration::from_secs(4), mix_future)
-    );
+    let raw_radio_fut = async {
+        if intent.has_trailing_radio_ambiguity && !base_query.eq_ignore_ascii_case(&query) {
+            state.sources.search_all_with_ytm_hints(&query, 10).await
+        } else {
+            (Vec::new(), std::collections::HashMap::new())
+        }
+    };
+
+    let (((all_tracks, mut ytm_hints), (dz_albums, dz_artists), (raw_tracks_extra, raw_ytm_hints)), mix_res) =
+        tokio::join!(
+            async {
+                tokio::join!(
+                    state.sources.search_all_with_ytm_hints(&base_query, 20),
+                    async {
+                        tokio::join!(
+                            state.sources.deezer.search_albums(&base_query, 12),
+                            state.sources.deezer.search_artists(&base_query, 12),
+                        )
+                    },
+                    raw_radio_fut,
+                )
+            },
+            tokio::time::timeout(std::time::Duration::from_secs(4), mix_future)
+        );
+
+    for (k, v) in raw_ytm_hints {
+        ytm_hints.entry(k).or_insert(v);
+    }
 
     let (curated_batches, extra_tracks) = mix_res.unwrap_or_default();
-    let combined = [all_tracks, dz_tracks, extra_tracks].concat();
+    let combined = [all_tracks, raw_tracks_extra, extra_tracks].concat();
+
+    // Persist initial search hits before entity-radio expansion.
     let mut to_upsert = combined.clone();
     for (_, batch) in &curated_batches {
         to_upsert.extend(batch.iter().cloned());
@@ -705,31 +760,209 @@ pub async fn search(
         let _ = state.store.upsert_artist_meta(ar);
     }
 
+    let mix_ctx = if !intent.is_theme_mix {
+        expand_entity_mix_context(&state, user.id, &query, &combined, &dz_artists, &ytm_hints).await
+    } else {
+        crate::taste::SearchMixContext::default()
+    };
+
     build_search_response(
         state,
         user.id,
         query,
+        base_query,
         combined,
         curated_batches,
+        mix_ctx,
         dz_albums,
         dz_artists,
     )
     .await
 }
 
+async fn expand_entity_mix_context(
+    state: &AppState,
+    uid: i64,
+    query: &str,
+    combined: &[Track],
+    dz_artists: &[ArtistSummary],
+    ytm_hints: &std::collections::HashMap<String, String>,
+) -> crate::taste::SearchMixContext {
+    let taste = state.taste.clone();
+    let q_owned = query.to_string();
+    let tracks_owned = combined.to_vec();
+    let artists_owned = dz_artists.to_vec();
+    let plan = tokio::task::spawn_blocking(move || {
+        taste.plan_entity_mix_anchor(uid, &q_owned, &tracks_owned, &artists_owned)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some(plan) = plan else {
+        return crate::taste::SearchMixContext::default();
+    };
+
+    let ytm = state.sources.ytm.clone();
+    let dz = state.sources.deezer.clone();
+    let artist_name = plan.artist_name.clone();
+    let artist_slug = crate::models::slug(&crate::models::primary_artist(&artist_name));
+    let seed_track = plan.seed_track.clone();
+    let ytm_hint_vid = seed_track
+        .as_ref()
+        .and_then(|s| ytm_hints.get(&s.song_key()).cloned());
+
+    let ytm_branch = async {
+        let vid = if let Some(ref seed) = seed_track {
+            if seed.source == "ytm" || seed.id.starts_with("ytm:") {
+                Some(seed.id.trim_start_matches("ytm:").to_string())
+            } else if let Some(hint_vid) = ytm_hint_vid {
+                Some(hint_vid)
+            } else {
+                ytm.find_best_video_for_track(&artist_name, &seed.title, seed.duration)
+                    .await
+            }
+        } else {
+            use crate::sources::MusicSource;
+            let found = ytm.search(&artist_name, 6).await;
+            found
+                .into_iter()
+                .find(|t| {
+                    crate::models::slug(&crate::models::primary_artist(&t.artist)) == artist_slug
+                })
+                .map(|t| t.id.trim_start_matches("ytm:").to_string())
+        };
+
+        let Some(vid) = vid.filter(|v| !v.is_empty()) else {
+            return Vec::new();
+        };
+        let mut radio = ytm.fetch_radio_tracks(&vid, 30).await;
+        if radio.len() < 10 {
+            if let Some(hop_vid) = radio
+                .iter()
+                .find(|t| {
+                    crate::models::slug(&crate::models::primary_artist(&t.artist)) != artist_slug
+                })
+                .map(|t| t.id.trim_start_matches("ytm:").to_string())
+            {
+                let hop_tracks = ytm.fetch_radio_tracks(&hop_vid, 20).await;
+                radio.extend(hop_tracks);
+            }
+        }
+        radio
+    };
+
+    let dz_artist_id_opt = plan.deezer_artist_id.clone();
+    let dz_branch = async {
+        let dz_id = match dz_artist_id_opt {
+            Some(id) if !id.is_empty() => Some(id),
+            _ => {
+                let found = dz.search_artists(&artist_name, 4).await;
+                found
+                    .into_iter()
+                    .find(|a| crate::models::slug(&a.name) == artist_slug)
+                    .map(|a| a.deezer_id)
+                    .filter(|id| !id.is_empty())
+            }
+        };
+        let Some(dz_id) = dz_id else {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        };
+        let (artist_res, radio_res) = tokio::join!(
+            dz.fetch_artist(&dz_id),
+            dz.fetch_artist_radio(&dz_id),
+        );
+        let mut top_tracks = Vec::new();
+        let mut related_artists = Vec::new();
+        let mut related_tracks = Vec::new();
+        if let Some((meta, top, _albums, related)) = artist_res {
+            top_tracks = top;
+            let hop_targets: Vec<_> = related
+                .iter()
+                .filter(|r| {
+                    !r.deezer_id.is_empty()
+                        && crate::models::slug(&r.name) != artist_slug
+                })
+                .take(3)
+                .cloned()
+                .collect();
+            related_artists.push(meta);
+            related_artists.extend(related);
+            let rel_futs = hop_targets.into_iter().map(|rel| {
+                let dz_c = dz.clone();
+                async move { dz_c.fetch_artist_top_tracks(&rel.deezer_id, 5).await }
+            });
+            for batch in futures::future::join_all(rel_futs).await {
+                related_tracks.extend(batch);
+            }
+        }
+        (top_tracks, radio_res, related_tracks, related_artists)
+    };
+
+    let budget = std::time::Duration::from_millis(2600);
+    let (ytm_res, dz_res) = tokio::join!(
+        tokio::time::timeout(budget, ytm_branch),
+        tokio::time::timeout(budget, dz_branch),
+    );
+
+    let ytm_radio = ytm_res.unwrap_or_default();
+    let (dz_artist_top, dz_artist_radio, dz_related_tracks, related_artists) =
+        dz_res.unwrap_or_default();
+
+    let mut to_upsert = Vec::with_capacity(
+        ytm_radio.len() + dz_artist_top.len() + dz_artist_radio.len() + dz_related_tracks.len(),
+    );
+    to_upsert.extend(ytm_radio.iter().cloned());
+    to_upsert.extend(dz_artist_top.iter().cloned());
+    to_upsert.extend(dz_artist_radio.iter().cloned());
+    to_upsert.extend(dz_related_tracks.iter().cloned());
+    if !to_upsert.is_empty() {
+        let _ = state.store.upsert_tracks(&to_upsert);
+    }
+    for ar in &related_artists {
+        let _ = state.store.upsert_artist_meta(ar);
+    }
+
+    let anchor_genres = seed_track
+        .as_ref()
+        .map(|t| t.genre.clone())
+        .filter(|g| !g.trim().is_empty())
+        .into_iter()
+        .collect();
+
+    crate::taste::SearchMixContext {
+        anchor_artist: Some(plan.artist_name),
+        anchor_track_key: seed_track.as_ref().map(Track::song_key),
+        anchor_genres,
+        is_artist_query: plan.is_artist_query,
+        ytm_radio,
+        dz_artist_top,
+        dz_artist_radio,
+        dz_related_tracks,
+    }
+}
+
 async fn build_search_response(
     state: AppState,
     uid: i64,
     query: String,
+    catalog_query: String,
     mut combined: Vec<Track>,
     curated_batches: Vec<(String, Vec<Track>)>,
+    mix_ctx: crate::taste::SearchMixContext,
     dz_albums: Vec<AlbumSummary>,
     dz_artists: Vec<ArtistSummary>,
 ) -> Response {
     let taste = state.taste.clone();
     let q_clone = query.clone();
     let refined = tokio::task::spawn_blocking(move || {
-        taste.search_and_refine(uid, &q_clone, std::mem::take(&mut combined), curated_batches)
+        taste.search_and_refine_with_context(
+            uid,
+            &q_clone,
+            std::mem::take(&mut combined),
+            curated_batches,
+            mix_ctx,
+        )
     })
     .await
     .unwrap_or_else(|_| state.taste.search_and_refine(uid, &query, vec![], vec![]));
@@ -742,13 +975,16 @@ async fn build_search_response(
     } else {
         state
             .store
-            .search_albums(uid, &query, 12, 0)
+            .search_albums(uid, &catalog_query, 12, 0)
             .unwrap_or_default()
     };
     let artists = if !dz_artists.is_empty() {
         dz_artists
     } else {
-        state.store.search_artists(&query, 12, 0).unwrap_or_default()
+        state
+            .store
+            .search_artists(&catalog_query, 12, 0)
+            .unwrap_or_default()
     };
 
     let instant_mix_json = refined.instant_mix.as_ref().map(|mix| {
@@ -757,6 +993,7 @@ async fn build_search_response(
             "subtitle": mix.subtitle,
             "query": mix.query,
             "isThemeMix": mix.is_theme_mix,
+            "prominent": mix.prominent,
             "totalDuration": mix.total_duration,
             "tracks": to_web_tracks_with_taste(&state, uid, &mix.tracks, &refined.taste_match_ids),
         })
@@ -1043,12 +1280,14 @@ pub async fn remove_playlist_track(
         return err_res(StatusCode::FORBIDDEN, "Permission denied");
     }
     let current = state.store.playlist_tracks(&id).unwrap_or_default();
-    let removed_id = current.get(pos).map(|t| t.id.clone());
-    let _ = state.store.remove_playlist_positions(&id, &[pos]);
+    let Some(removed_id) = current.get(pos).map(|t| t.id.clone()) else {
+        return err_res(StatusCode::BAD_REQUEST, "Track position out of range");
+    };
+    if let Err(e) = state.store.remove_playlist_positions(&id, &[pos]) {
+        return err_res(StatusCode::BAD_REQUEST, &e.to_string());
+    }
     if !pl.is_auto {
-        if let Some(tid) = removed_id {
-            state.taste.record_playlist_removals(user.id, &[tid]);
-        }
+        state.taste.record_playlist_removals(user.id, &[removed_id]);
     }
     json_res(json!({ "ok": true }))
 }
@@ -1227,7 +1466,9 @@ pub async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some(q) = state.store.get_play_queue(user.id).ok().flatten() else {
+    let Some((q, tracks, resolved_idx, resolved_id)) =
+        state.store.load_play_queue_tracks(user.id).ok().flatten()
+    else {
         return json_res(json!({
             "currentId": "",
             "currentIndex": 0,
@@ -1235,10 +1476,9 @@ pub async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Res
             "tracks": [],
         }));
     };
-    let tracks = state.store.get_tracks_by_ids(&q.track_ids).unwrap_or_default();
     json_res(json!({
-        "currentId": q.current_id,
-        "currentIndex": q.current_index,
+        "currentId": resolved_id,
+        "currentIndex": resolved_idx,
         "positionMs": q.position_ms,
         "tracks": to_web_tracks(&state, user.id, &tracks),
     }))
@@ -1582,8 +1822,10 @@ mod tests {
             state.clone(),
             u.id,
             "80s".into(),
+            "80s".into(),
             vec![],
             vec![],
+            crate::taste::SearchMixContext::default(),
             vec![],
             vec![],
         )

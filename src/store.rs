@@ -1081,7 +1081,7 @@ impl Store {
                 id: id.clone(),
                 name: meta.name.clone(),
                 artist: meta.artist.clone(),
-                artist_id: format!("ar:{}", slug(&meta.artist)),
+                artist_id: format!("ar:{}", slug(&primary_artist(&meta.artist))),
                 cover_id: id,
                 cover_url: meta.cover_url.clone(),
                 genre: meta.genre.clone(),
@@ -1948,10 +1948,10 @@ impl Store {
     ) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();
-        if let Some(n) = name {
+        if let Some(n) = name.map(str::trim).filter(|s| !s.is_empty()) {
             conn.execute(
                 "UPDATE playlists SET name = ?1, changed = ?2 WHERE id = ?3",
-                params![n.trim(), now, id],
+                params![n, now, id],
             )?;
         }
         if let Some(c) = comment {
@@ -2160,6 +2160,31 @@ impl Store {
         Ok(row)
     }
 
+    /// Loads the saved play queue along with surviving tracks and reconciles `current_index` and
+    /// `current_id` so deletions from the `tracks` table never desynchronize the active track.
+    pub fn load_play_queue_tracks(
+        &self,
+        user_id: i64,
+    ) -> AppResult<Option<(PlayQueueState, Vec<Track>, usize, String)>> {
+        let Some(q) = self.get_play_queue(user_id)? else {
+            return Ok(None);
+        };
+        let tracks = self.get_tracks_by_ids(&q.track_ids)?;
+        if tracks.is_empty() {
+            return Ok(Some((q, tracks, 0, String::new())));
+        }
+        let resolved_idx = if !q.current_id.is_empty() {
+            tracks
+                .iter()
+                .position(|t| t.id == q.current_id)
+                .unwrap_or_else(|| q.current_index.min(tracks.len() - 1))
+        } else {
+            q.current_index.min(tracks.len() - 1)
+        };
+        let resolved_id = tracks[resolved_idx].id.clone();
+        Ok(Some((q, tracks, resolved_idx, resolved_id)))
+    }
+
     // -------------------------------------------------------------------------
     // Internet Radio Stations, Cache & KV
     // -------------------------------------------------------------------------
@@ -2188,19 +2213,35 @@ impl Store {
         user_id: i64,
         station: &RadioStation,
     ) -> AppResult<RadioStation> {
-        let id = if station.id.trim().is_empty() {
+        let trimmed_id = station.id.trim();
+        let id = if trimmed_id.is_empty() {
             format!("rad-{}", Uuid::new_v4().simple())
         } else {
-            station.id.clone()
+            trimmed_id.to_string()
         };
         let conn = self.lock();
+        if !trimmed_id.is_empty() {
+            let existing_owner: Option<i64> = conn
+                .query_row(
+                    "SELECT user_id FROM radio_stations WHERE id = ?1",
+                    params![&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(owner) = existing_owner {
+                if owner != user_id {
+                    return Err(err_msg("Permission denied"));
+                }
+            }
+        }
         conn.execute(
             "INSERT INTO radio_stations(id, user_id, name, stream_url, home_page_url)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                stream_url = excluded.stream_url,
-               home_page_url = excluded.home_page_url",
+               home_page_url = excluded.home_page_url
+             WHERE radio_stations.user_id = excluded.user_id",
             params![
                 id,
                 user_id,
@@ -2219,10 +2260,22 @@ impl Store {
 
     pub fn delete_radio_station(&self, user_id: i64, id: &str) -> AppResult<()> {
         let conn = self.lock();
-        conn.execute(
-            "DELETE FROM radio_stations WHERE id = ?1 AND (user_id = ?2 OR user_id = 0)",
-            params![id, user_id],
-        )?;
+        let existing_owner: Option<i64> = conn
+            .query_row(
+                "SELECT user_id FROM radio_stations WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = existing_owner {
+            if owner != user_id {
+                return Err(err_msg("Permission denied"));
+            }
+            conn.execute(
+                "DELETE FROM radio_stations WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -2850,5 +2903,105 @@ mod tests {
 
         drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn radio_station_ownership_prevents_cross_user_overwrite_and_delete() {
+        let store = Store::open_memory().unwrap();
+        let (alice, _) = store.authenticate_or_create_user("alice", "pw1").unwrap();
+        let (bob, _) = store.authenticate_or_create_user("bob", "pw2").unwrap();
+
+        let created = store
+            .upsert_radio_station(
+                alice.id,
+                &RadioStation {
+                    id: String::new(),
+                    name: "Alice FM".into(),
+                    stream_url: "https://example.com/alice.mp3".into(),
+                    home_page_url: String::new(),
+                },
+            )
+            .unwrap();
+
+        // Bob cannot overwrite or delete Alice's station.
+        let overwrite = store.upsert_radio_station(
+            bob.id,
+            &RadioStation {
+                id: created.id.clone(),
+                name: "Hijacked FM".into(),
+                stream_url: "https://evil.example/stream.mp3".into(),
+                home_page_url: String::new(),
+            },
+        );
+        assert!(overwrite.is_err());
+        assert!(store.delete_radio_station(bob.id, &created.id).is_err());
+
+        // Global (user_id = 0) stations are also protected against non-owner deletes.
+        {
+            let conn = store.lock();
+            conn.execute(
+                "INSERT INTO radio_stations(id, user_id, name, stream_url, home_page_url)
+                 VALUES ('rad-global', 0, 'Global FM', 'https://example.com/global.mp3', '')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(store.delete_radio_station(bob.id, "rad-global").is_err());
+
+        // Owner can still update and delete her own station.
+        let updated = store
+            .upsert_radio_station(
+                alice.id,
+                &RadioStation {
+                    id: created.id.clone(),
+                    name: "Alice HD".into(),
+                    stream_url: "https://example.com/alice-hd.mp3".into(),
+                    home_page_url: String::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.name, "Alice HD");
+        store.delete_radio_station(alice.id, &created.id).unwrap();
+    }
+
+    #[test]
+    fn load_play_queue_tracks_reconciles_index_after_missing_track() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("q_user", "pw").unwrap();
+        let t2 = sample_track("dz:2", "Two", "Artist", "Album");
+        let t3 = sample_track("dz:3", "Three", "Artist", "Album");
+        store.upsert_tracks(&[t2, t3]).unwrap();
+
+        // Queue originally held ["missing:1", "dz:2", "dz:3"] with currentIndex = 2 pointing at "dz:3".
+        store
+            .save_play_queue(
+                u.id,
+                &PlayQueueState {
+                    current_id: "dz:3".into(),
+                    current_index: 2,
+                    position_ms: 42_000,
+                    track_ids: vec!["missing:1".into(), "dz:2".into(), "dz:3".into()],
+                    changed_by: "webapp".into(),
+                    updated: 1,
+                },
+            )
+            .unwrap();
+
+        let (q, tracks, resolved_idx, resolved_id) =
+            store.load_play_queue_tracks(u.id).unwrap().unwrap();
+        assert_eq!(q.position_ms, 42_000);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(resolved_idx, 1);
+        assert_eq!(resolved_id, "dz:3");
+    }
+
+    #[test]
+    fn update_playlist_ignores_blank_name() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("pl_user", "pw").unwrap();
+        let pl = store.create_playlist(u.id, "Original Name", "", false, &[]).unwrap();
+        store.update_playlist(&pl.id, Some("   "), None, None).unwrap();
+        let after = store.get_playlist(&pl.id).unwrap().unwrap();
+        assert_eq!(after.name, "Original Name");
     }
 }

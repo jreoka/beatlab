@@ -808,8 +808,28 @@ pub async fn move_playlist_track(
     if p.user_id != user.id {
         return json_err(StatusCode::FORBIDDEN, "Permission denied");
     }
-    let from_pos = pos_str.parse::<usize>().unwrap_or(1).saturating_sub(1);
-    let to_pos = req.insert_before.saturating_sub(1);
+    let current = state.store.playlist_tracks(&id).unwrap_or_default();
+    if current.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "Playlist is empty");
+    }
+    let from_pos = match pos_str.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= current.len() => n - 1,
+        Ok(_) => return json_err(StatusCode::BAD_REQUEST, "Track position out of range"),
+        Err(_) => match current.iter().position(|t| t.id == pos_str) {
+            Some(idx) => idx,
+            None => return json_err(StatusCode::BAD_REQUEST, "Invalid track position"),
+        },
+    };
+    if req.insert_before > current.len() + 1 {
+        return json_err(StatusCode::BAD_REQUEST, "Target position out of range");
+    }
+    // `insert_before` is the 1-based position before which the track is inserted (`len + 1` = end).
+    let before_idx = req.insert_before.saturating_sub(1).min(current.len());
+    let to_pos = if from_pos < before_idx {
+        before_idx.saturating_sub(1)
+    } else {
+        before_idx.min(current.len() - 1)
+    };
     match state.store.move_playlist_track(&id, from_pos, to_pos) {
         Ok(()) => json_ok(json!({ "ok": true }), None),
         Err(e) => json_err(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -821,13 +841,14 @@ pub async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some(q) = state.store.get_play_queue(user.id).ok().flatten() else {
+    let Some((q, tracks, resolved_idx, resolved_id)) =
+        state.store.load_play_queue_tracks(user.id).ok().flatten()
+    else {
         return json_ok(
             json!({ "id": user.id.to_string(), "current": 0, "position": 0, "items": [] }),
             None,
         );
     };
-    let tracks = state.store.get_tracks_by_ids(&q.track_ids).unwrap_or_default();
     let starred = state.store.starred_ids(user.id).unwrap_or_default();
     let stats = state.store.track_stats_map(user.id).unwrap_or_default();
     let items: Vec<Value> = tracks
@@ -838,8 +859,8 @@ pub async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Res
         json!({
             "id": user.id.to_string(),
             "userId": user.id.to_string(),
-            "current": q.current_index,
-            "currentId": q.current_id,
+            "current": resolved_idx,
+            "currentId": resolved_id,
             "position": q.position_ms,
             "items": items,
             "changedBy": q.changed_by,
@@ -1109,5 +1130,94 @@ mod tests {
                 .unwrap();
         assert_eq!(pl["name"], "Night Drive");
         assert_eq!(pl["songCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn navidrome_move_playlist_track_handles_insert_before_and_end_of_list() {
+        let st = nd_test_state();
+        st.store
+            .upsert_tracks(&[
+                Track {
+                    id: "t2".into(),
+                    source: "local".into(),
+                    title: "Blinding Lights".into(),
+                    artist: "The Weeknd".into(),
+                    duration: 200,
+                    ..Default::default()
+                },
+                Track {
+                    id: "t3".into(),
+                    source: "local".into(),
+                    title: "After Hours".into(),
+                    artist: "The Weeknd".into(),
+                    duration: 360,
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+        let (u, _) = st.store.authenticate_or_create_user("ndmv", "pw123").unwrap();
+        let tok = st.store.create_session(u.id, "nd", 3600).unwrap();
+        let pl = st
+            .store
+            .create_playlist(
+                u.id,
+                "Order Test",
+                "",
+                false,
+                &["t1".into(), "t2".into(), "t3".into()],
+            )
+            .unwrap();
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(
+            "x-nd-authorization",
+            format!("Bearer {}", tok).parse().unwrap(),
+        );
+
+        // Move item 1 ("t1") before item 3 ("t3") -> ["t2", "t1", "t3"]
+        let r1 = move_playlist_track(
+            State(st.clone()),
+            Path((pl.id.clone(), "1".into())),
+            hdrs.clone(),
+            Json(MoveTrackReq { insert_before: 3 }),
+        )
+        .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        let ids1: Vec<String> = st
+            .store
+            .playlist_tracks(&pl.id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids1, vec!["t2", "t1", "t3"]);
+
+        // Move item 1 ("t2") to end (insert_before = 4 = len + 1) -> ["t1", "t3", "t2"]
+        let r2 = move_playlist_track(
+            State(st.clone()),
+            Path((pl.id.clone(), "1".into())),
+            hdrs.clone(),
+            Json(MoveTrackReq { insert_before: 4 }),
+        )
+        .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        let ids2: Vec<String> = st
+            .store
+            .playlist_tracks(&pl.id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids2, vec!["t1", "t3", "t2"]);
+
+        // Invalid position rejects with 400 rather than mutating index 0
+        let bad = move_playlist_track(
+            State(st.clone()),
+            Path((pl.id.clone(), "bad".into())),
+            hdrs,
+            Json(MoveTrackReq { insert_before: 1 }),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     }
 }

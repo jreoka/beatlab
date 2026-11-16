@@ -987,10 +987,11 @@ pub async fn dispatch(
             } else {
                 "playQueue"
             };
-            let Some(q) = state.store.get_play_queue(uid).ok().flatten() else {
+            let Some((q, tracks, resolved_idx, resolved_id)) =
+                state.store.load_play_queue_tracks(uid).ok().flatten()
+            else {
                 return respond(&params, true, None);
             };
-            let tracks = state.store.get_tracks_by_ids(&q.track_ids).unwrap_or_default();
             let starred = state.store.starred_ids(uid).unwrap_or_default();
             let stats = state.store.track_stats_map(uid).unwrap_or_default();
             let mut root = XmlElem::new(root_name)
@@ -999,9 +1000,9 @@ pub async fn dispatch(
                 .attr("changed", iso8601(q.updated))
                 .attr("changedBy", &q.changed_by);
             if endpoint == "getPlayQueueByIndex" {
-                root = root.attr("currentIndex", q.current_index);
+                root = root.attr("currentIndex", resolved_idx);
             } else {
-                root = root.attr("current", &q.current_id);
+                root = root.attr("current", &resolved_id);
             }
             for t in tracks {
                 root = root.child(track_to_xml(
@@ -1129,12 +1130,16 @@ pub async fn dispatch(
                 stream_url: params.get("streamUrl").cloned().unwrap_or_default(),
                 home_page_url: params.get("homepageUrl").cloned().unwrap_or_default(),
             };
-            let _ = state.store.upsert_radio_station(uid, &station);
-            respond(&params, true, None)
+            match state.store.upsert_radio_station(uid, &station) {
+                Ok(_) => respond(&params, true, None),
+                Err(e) => error_resp(&params, 50, &e.to_string()),
+            }
         }
         "deleteInternetRadioStation" => {
             if let Some(id) = params.get("id") {
-                let _ = state.store.delete_radio_station(uid, id);
+                if let Err(e) = state.store.delete_radio_station(uid, id) {
+                    return error_resp(&params, 50, &e.to_string());
+                }
             }
             respond(&params, true, None)
         }

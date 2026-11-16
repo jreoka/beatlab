@@ -198,7 +198,13 @@ impl StreamEngine {
 
     fn find_local_or_cached_sibling(&self, track: &Track) -> Option<PlayTarget> {
         let key = track.song_key();
-        let candidates = self.store.search_tracks(&track.title, 40, 0).ok()?;
+        let clean_title = crate::models::core_song_title(&track.title);
+        let search_title = if clean_title.trim().is_empty() {
+            track.title.as_str()
+        } else {
+            clean_title.as_str()
+        };
+        let candidates = self.store.search_tracks(search_title, 40, 0).ok()?;
         for c in candidates {
             if c.id == track.id || c.song_key() != key {
                 continue;
@@ -539,7 +545,7 @@ impl StreamEngine {
             "--extractor-args",
             "youtube:player_client=android",
             "-f",
-            "bestaudio/best",
+            "bestaudio[ext=m4a][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[protocol!=m3u8][protocol!=m3u8_native]/bestaudio/best",
             "-o",
             "-",
             watch_url,
@@ -700,8 +706,16 @@ impl StreamEngine {
             ext
         };
         let final_path = self.cache_dir.join(format!("{}.{}", hash, final_ext));
-        if final_path.exists() {
-            return Ok(());
+        if let Ok(meta) = tokio::fs::metadata(&final_path).await {
+            if meta.len() > 4096 {
+                let _ = self.store.upsert_cache_entry(
+                    track_id,
+                    &final_path.to_string_lossy(),
+                    meta.len() as i64,
+                );
+                return Ok(());
+            }
+            let _ = tokio::fs::remove_file(&final_path).await;
         }
 
         let mut req = self.http.get(url);
@@ -785,12 +799,16 @@ impl StreamEngine {
     // -------------------------------------------------------------------------
 
     pub async fn serve_cover(&self, raw_id: &str) -> Response {
-        let id = raw_id
-            .trim()
+        let trimmed_raw = raw_id.trim();
+        let id = trimmed_raw
             .trim_start_matches("al-")
             .trim_start_matches("pl-");
-        let lookup_id = if raw_id.starts_with("al:") || raw_id.starts_with("ar:") || raw_id.starts_with("pl-") {
-            raw_id.trim()
+        let lookup_id = if trimmed_raw.starts_with("al:")
+            || trimmed_raw.starts_with("ar:")
+            || trimmed_raw.starts_with("pl-")
+            || trimmed_raw.starts_with("auto-")
+        {
+            trimmed_raw
         } else {
             id
         };
@@ -815,8 +833,8 @@ impl StreamEngine {
             }
         }
 
-        // 1. Check playlist -> first track cover
-        if lookup_id.starts_with("pl-") {
+        // 1. Check playlist or auto-mix -> first track cover
+        if lookup_id.starts_with("pl-") || lookup_id.starts_with("auto-") {
             if let Ok(tracks) = self.store.playlist_tracks(lookup_id) {
                 if let Some(first) = tracks.first() {
                     return Box::pin(self.serve_cover(&first.id)).await;
@@ -1690,6 +1708,122 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("bytes 2-5/10")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_local_or_cached_sibling_matches_despite_remaster_title_tag() {
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+
+        let dir = std::env::temp_dir().join(format!("beatlab_sibling_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_flac = dir.join("take_on_me.flac");
+        std::fs::write(&local_flac, vec![0u8; 8192]).unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), dir.join("slsk")),
+        );
+        let engine = StreamEngine::new(store.clone(), sources, &dir, 1.0);
+
+        let local_track = Track {
+            id: "loc:aha-take-on-me".into(),
+            source: "local".into(),
+            title: "Take On Me".into(),
+            artist: "a-ha".into(),
+            duration: 225,
+            format: "flac".into(),
+            bitrate: 1000,
+            stream_url: format!("file:{}", local_flac.display()),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[local_track]).unwrap();
+
+        let tagged_stream_track = Track {
+            id: "dz:aha-remaster".into(),
+            source: "deezer".into(),
+            title: "Take On Me (2015 Remaster)".into(),
+            artist: "a-ha feat. Other".into(),
+            duration: 226,
+            format: "m4a".into(),
+            bitrate: 256,
+            stream_url: "resolve:ytm:a-ha|Take On Me|226".into(),
+            ..Default::default()
+        };
+
+        let target = engine.find_local_or_cached_sibling(&tagged_stream_track);
+        match target {
+            Some(PlayTarget::LocalFile { path, .. }) => assert_eq!(path, local_flac),
+            other => panic!("expected local sibling match, got {:?}", other.is_some()),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serve_cover_resolves_auto_playlist_first_track() {
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use axum::body::to_bytes;
+
+        let dir = std::env::temp_dir().join(format!("beatlab_cover_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_memory().unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), dir.join("slsk")),
+        );
+        let engine = StreamEngine::new(store.clone(), sources, &dir, 1.0);
+
+        let track = Track {
+            id: "loc:cover-t1".into(),
+            source: "local".into(),
+            title: "Horizon".into(),
+            artist: "Tycho".into(),
+            album: "Awake".into(),
+            duration: 210,
+            ..Default::default()
+        };
+        store.upsert_tracks(&[track.clone()]).unwrap();
+        let (u, _) = store.authenticate_or_create_user("cover_u", "pw").unwrap();
+        store
+            .upsert_auto_playlist(
+                "auto-u1-supermix",
+                u.id,
+                "My Supermix",
+                "",
+                "supermix",
+                &[track.id.clone()],
+            )
+            .unwrap();
+
+        let auto_resp = engine.serve_cover("auto-u1-supermix").await;
+        let track_resp = engine.serve_cover(&track.id).await;
+        let missing_resp = engine.serve_cover("auto-u1-nonexistent").await;
+
+        assert_eq!(auto_resp.status(), StatusCode::OK);
+        let auto_bytes = to_bytes(auto_resp.into_body(), 1024 * 64).await.unwrap();
+        let track_bytes = to_bytes(track_resp.into_body(), 1024 * 64).await.unwrap();
+        let missing_bytes = to_bytes(missing_resp.into_body(), 1024 * 64).await.unwrap();
+        assert_eq!(auto_bytes, track_bytes);
+        assert_ne!(auto_bytes, missing_bytes);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

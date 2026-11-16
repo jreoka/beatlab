@@ -80,9 +80,19 @@ impl SourceRegistry {
 
     /// Queries all active sources concurrently and returns a deduplicated, quality-ranked list.
     pub async fn search_all(&self, query: &str, per_source: usize) -> Vec<Track> {
+        self.search_all_with_ytm_hints(query, per_source).await.0
+    }
+
+    /// Queries all active sources concurrently and returns a deduplicated, quality-ranked list
+    /// alongside a `song_key -> ytm_video_id` map captured prior to cross-source quality dedup.
+    pub async fn search_all_with_ytm_hints(
+        &self,
+        query: &str,
+        per_source: usize,
+    ) -> (Vec<Track>, HashMap<String, String>) {
         let q = query.trim();
         if q.is_empty() {
-            return vec![];
+            return (vec![], HashMap::new());
         }
         let sources: Vec<&dyn MusicSource> = {
             let mut v: Vec<&dyn MusicSource> = vec![
@@ -104,7 +114,18 @@ impl SourceRegistry {
             .flatten()
             .filter(|t| !t.stream_url.contains("/preview/"))
             .collect();
-        dedup_and_rank_search(combined, q)
+        let mut ytm_ids_by_key = HashMap::new();
+        for t in &combined {
+            if t.source == "ytm" || t.id.starts_with("ytm:") {
+                let vid = t.id.trim_start_matches("ytm:");
+                if !vid.is_empty() {
+                    ytm_ids_by_key
+                        .entry(t.song_key())
+                        .or_insert_with(|| vid.to_string());
+                }
+            }
+        }
+        (dedup_and_rank_search(combined, q), ytm_ids_by_key)
     }
 }
 
@@ -126,6 +147,9 @@ pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
                 }
                 if winner.genre.is_empty() && !loser.genre.is_empty() {
                     winner.genre = loser.genre;
+                }
+                if winner.moods.is_empty() && !loser.moods.is_empty() {
+                    winner.moods = loser.moods;
                 }
                 if winner.year == 0 && loser.year > 0 {
                     winner.year = loser.year;

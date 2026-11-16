@@ -397,9 +397,20 @@ impl DeezerSource {
     ) -> Vec<(String, Vec<Track>)> {
         let playlists = self.search_playlists(query, 10).await;
         let q_low = query.to_lowercase();
-        let chosen: Vec<DzPlaylist> = playlists
+        let mut scored: Vec<(i32, DzPlaylist)> = playlists
             .into_iter()
-            .filter(|p| is_usable_mix_playlist(&p, &q_low))
+            .filter_map(|p| {
+                if !is_usable_mix_playlist(&p, &q_low) {
+                    return None;
+                }
+                let rel = playlist_title_relevance_score(&p.title, &q_low)?;
+                Some((rel, p))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        let chosen: Vec<DzPlaylist> = scored
+            .into_iter()
+            .map(|(_, p)| p)
             .take(max_playlists.max(1))
             .collect();
         if chosen.is_empty() {
@@ -447,12 +458,103 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         "slowed",
         "nightcore",
         "8d audio",
+        "sped up",
     ] {
         if title_low.contains(bad) && !query_low.contains(bad) {
             return false;
         }
     }
     true
+}
+
+fn normalize_playlist_terms(s: &str) -> String {
+    s.to_lowercase()
+        .replace("'s", "s")
+        .replace('\'', "")
+        .replace("1950s", "50s")
+        .replace("1960s", "60s")
+        .replace("1970s", "70s")
+        .replace("1980s", "80s")
+        .replace("1990s", "90s")
+        .replace("2000s", "00s")
+        .replace("2010s", "10s")
+        .replace("2020s", "20s")
+        .replace("eighties", "80s")
+        .replace("nineties", "90s")
+        .replace("seventies", "70s")
+        .replace("sixties", "60s")
+        .replace("fifties", "50s")
+}
+
+fn playlist_title_relevance_score(title: &str, query_low: &str) -> Option<i32> {
+    let title_norm = normalize_playlist_terms(title);
+    let q_norm = normalize_playlist_terms(query_low);
+
+    let decades = ["50s", "60s", "70s", "80s", "90s", "00s", "10s", "20s"];
+    let query_decades: Vec<&str> = decades
+        .iter()
+        .copied()
+        .filter(|d| crate::taste::contains_term(&q_norm, d))
+        .collect();
+    if !query_decades.is_empty() {
+        let matches_query_dec = query_decades
+            .iter()
+            .any(|d| crate::taste::contains_term(&title_norm, d));
+        let mentions_other_dec = decades
+            .iter()
+            .any(|d| !query_decades.contains(d) && crate::taste::contains_term(&title_norm, d));
+        if mentions_other_dec && !matches_query_dec {
+            return None;
+        }
+    }
+
+    let generic = [
+        "mix", "playlist", "radio", "hits", "hit", "best", "top", "greatest", "songs", "tracks",
+        "music", "the", "of", "and", "for", "a", "an", "vibes", "vibe", "classic", "classics",
+    ];
+    let content_tokens: Vec<&str> = q_norm
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '&')
+        .filter(|tok| !tok.is_empty() && !generic.contains(tok))
+        .collect();
+
+    if content_tokens.is_empty() {
+        return Some(1);
+    }
+
+    let mut score = 0i32;
+    let mut matched = 0usize;
+    for tok in &content_tokens {
+        let synonym_hit = match *tok {
+            "christmas" | "xmas" => ["christmas", "xmas", "holiday", "noel"]
+                .iter()
+                .any(|s| crate::taste::contains_term(&title_norm, s)),
+            "lofi" | "lo-fi" => ["lofi", "lo-fi", "chillhop", "chill"]
+                .iter()
+                .any(|s| crate::taste::contains_term(&title_norm, s)),
+            "hip-hop" | "hiphop" => ["hip-hop", "hip hop", "hiphop", "rap"]
+                .iter()
+                .any(|s| crate::taste::contains_term(&title_norm, s)),
+            "r&b" | "rnb" => ["r&b", "rnb", "soul"]
+                .iter()
+                .any(|s| crate::taste::contains_term(&title_norm, s)),
+            _ => crate::taste::contains_term(&title_norm, tok),
+        };
+        if synonym_hit {
+            matched += 1;
+            score += 20;
+        }
+    }
+
+    if matched == 0 {
+        return None;
+    }
+    if matched == content_tokens.len() {
+        score += 15;
+    }
+    if title_norm.contains(&q_norm) {
+        score += 10;
+    }
+    Some(score)
 }
 
 #[async_trait]
@@ -753,4 +855,18 @@ fn first_non_empty(candidates: &[String]) -> String {
         .find(|s| !s.trim().is_empty())
         .cloned()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playlist_relevance_rejects_mismatched_eras_and_unrelated_titles() {
+        assert!(playlist_title_relevance_score("80s Hits", "80s").is_some());
+        assert!(playlist_title_relevance_score("Best of the 80's", "80s").is_some());
+        assert!(playlist_title_relevance_score("Best of 2020s", "80s").is_none());
+        assert!(playlist_title_relevance_score("90s Rock Classics", "90s rock").is_some());
+        assert!(playlist_title_relevance_score("Workout Mix", "90s rock").is_none());
+    }
 }

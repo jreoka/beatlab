@@ -32,6 +32,20 @@
     repeatOne: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/><path d="M11 10.2 12.4 9.2V15"/>',
   };
 
+  function loadEqGains() {
+    const flat = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    try {
+      const parsed = JSON.parse(localStorage.getItem('beatlab_eq_gains') || 'null');
+      if (Array.isArray(parsed) && parsed.length === EQ_FREQS.length) {
+        return parsed.map((v) => {
+          const n = Number(v);
+          return Number.isFinite(n) ? Math.max(-12, Math.min(12, n)) : 0;
+        });
+      }
+    } catch {}
+    return flat;
+  }
+
   const state = {
     token: localStorage.getItem('beatlab_token') || '',
     user: null,
@@ -39,6 +53,7 @@
     trackMap: new Map(), // id -> track object for instant access
     queue: [],
     queueIndex: -1,
+    pendingSeekSec: 0,
     shuffle: false,
     repeat: 'off', // off | all | one
     autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
@@ -56,8 +71,14 @@
     lyrics: { synced: false, plain: '', lines: [] },
     activeLyricIdx: -1,
     eqEnabled: localStorage.getItem('beatlab_eq_on') === 'true',
-    eqGains: JSON.parse(localStorage.getItem('beatlab_eq_gains') || '[0,0,0,0,0,0,0,0,0,0]'),
+    eqGains: loadEqGains(),
     searchTimer: null,
+    searchComposing: false,
+    ownSearchNavQuery: null,
+    searchFetchingQuery: '',
+    searchLoadingUi: false,
+    viewReqToken: 0,
+    viewAbortController: null,
     libTab: 'playlists',
     searchState: null,
     activeSearchQuery: '',
@@ -329,6 +350,11 @@
     state.activeLyricIdx = -1;
     state.searchState = null;
     state.activeSearchQuery = '';
+    clearTimeout(state.searchTimer);
+    state.searchTimer = null;
+    state.searchComposing = false;
+    state.ownSearchNavQuery = null;
+    abortActiveViewRequest();
     state.fsMobileView = 'player';
 
     $('pb-cover').src = '/api/web/cover/default';
@@ -518,29 +544,83 @@
       }
     });
 
-    $('global-search').addEventListener('input', (e) => {
-      const val = e.target.value;
+    const globalSearch = $('global-search');
+    const triggerSearchFromInput = (rawVal) => {
+      const q = String(rawVal !== undefined ? rawVal : globalSearch.value || '').trim();
+      if (!q) return;
+      state.ownSearchNavQuery = q;
+      navigate(`search?q=${encodeURIComponent(q)}`);
+    };
+
+    const handleSearchBoxEdit = (rawVal) => {
+      const val = String(rawVal || '');
       $('clear-search-btn').classList.toggle('hidden', !val);
       clearTimeout(state.searchTimer);
-      state.searchTimer = setTimeout(() => {
-        if (val.trim()) {
-          navigate(`search?q=${encodeURIComponent(val.trim())}`);
+      state.searchTimer = null;
+
+      const trimmed = val.trim();
+      if (!trimmed) {
+        if (state.searchFetchingQuery || state.searchLoadingUi) {
+          abortActiveViewRequest();
+          if (state.searchState) {
+            renderSearchView();
+          } else {
+            setMainLoading('Search songs, artists, or albums...');
+          }
         }
+        return;
+      }
+
+      if (state.searchFetchingQuery && state.searchFetchingQuery !== trimmed) {
+        abortActiveViewRequest();
+        state.searchLoadingUi = true;
+        setMainLoading(`Searching for "${trimmed}" across all sources...`);
+      } else if (state.searchLoadingUi) {
+        setMainLoading(`Searching for "${trimmed}" across all sources...`);
+      }
+
+      state.searchTimer = setTimeout(() => {
+        state.searchTimer = null;
+        const liveQ = (globalSearch.value || '').trim();
+        if (!liveQ) return;
+        const currentHash = location.hash.replace(/^#/, '');
+        const targetHash = `search?q=${encodeURIComponent(liveQ)}`;
+        if (
+          currentHash === targetHash &&
+          (state.searchFetchingQuery === liveQ || (!state.searchLoadingUi && state.searchState?.query === liveQ))
+        ) {
+          return;
+        }
+        triggerSearchFromInput(liveQ);
       }, 320);
+    };
+
+    globalSearch.addEventListener('compositionstart', () => {
+      state.searchComposing = true;
     });
 
-    $('global-search').addEventListener('keydown', (e) => {
+    globalSearch.addEventListener('compositionend', (e) => {
+      state.searchComposing = false;
+      handleSearchBoxEdit(e.target.value);
+    });
+
+    globalSearch.addEventListener('input', (e) => {
+      handleSearchBoxEdit(e.target.value);
+    });
+
+    globalSearch.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
+        if (e.isComposing || e.keyCode === 229 || state.searchComposing) return;
         e.preventDefault();
         clearTimeout(state.searchTimer);
-        const val = e.target.value.trim();
-        if (val) navigate(`search?q=${encodeURIComponent(val)}`);
+        state.searchTimer = null;
+        triggerSearchFromInput(e.target.value);
       }
     });
 
     wireAudioEvents();
     wireKeyboardShortcuts();
-    window.addEventListener('hashchange', renderCurrentHash);
+    window.addEventListener('hashchange', () => renderCurrentHash());
 
     if (state.token) {
       try {
@@ -590,11 +670,34 @@
       const q = await api('/api/web/queue');
       if (q.tracks && q.tracks.length > 0) {
         state.queue = cacheTracks(q.tracks);
-        state.queueIndex = Math.min(q.currentIndex || 0, state.queue.length - 1);
+        let idx = Math.max(0, Math.min(q.currentIndex || 0, state.queue.length - 1));
+        if (q.currentId) {
+          const byId = state.queue.findIndex((t) => t.id === q.currentId);
+          if (byId >= 0) idx = byId;
+        }
+        state.queueIndex = idx;
         const cur = currentTrack();
+        const savedSec = q.positionMs > 1000 ? q.positionMs / 1000 : 0;
+        state.pendingSeekSec = savedSec;
         updateNowPlayingUI(cur, false);
         renderQueuePanel();
-        if (cur) loadLyricsForTrack(cur.id);
+        if (cur) {
+          audio.src = buildStreamUrl(cur);
+          if (savedSec > 0) {
+            const total = cur.duration > 0 ? cur.duration : savedSec;
+            const clamped = Math.min(savedSec, total);
+            const el = fmtTime(clamped);
+            $('pb-elapsed').textContent = el;
+            if ($('fs-elapsed')) $('fs-elapsed').textContent = el;
+            if (cur.duration > 0) {
+              const pct = Math.min(100, (clamped / cur.duration) * 100);
+              $('pb-seek').value = String(pct);
+              if ($('fs-seek')) $('fs-seek').value = String(pct);
+              if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = `${pct.toFixed(2)}%`;
+            }
+          }
+          loadLyricsForTrack(cur.id);
+        }
       }
     } catch {
       // optional
@@ -618,10 +721,69 @@
   // ---------------------------------------------------------------------------
   // Routing & Views
   // ---------------------------------------------------------------------------
+  function safeDecodeUri(str) {
+    try {
+      return decodeURIComponent(str);
+    } catch {
+      return str;
+    }
+  }
+
+  function isSearchHash(hash) {
+    return hash === 'search' || hash.startsWith('search?') || hash.startsWith('search/');
+  }
+
+  function extractSearchQueryFromHash(hash) {
+    if (hash.startsWith('search/')) {
+      return safeDecodeUri(hash.slice(7));
+    }
+    const qIdx = hash.indexOf('?');
+    if (qIdx < 0) return '';
+    return new URLSearchParams(hash.slice(qIdx + 1)).get('q') || '';
+  }
+
+  function abortActiveViewRequest() {
+    state.viewReqToken += 1;
+    if (state.viewAbortController) {
+      state.viewAbortController.abort();
+      state.viewAbortController = null;
+    }
+    state.searchFetchingQuery = '';
+    state.searchLoadingUi = false;
+  }
+
+  function beginViewRequest() {
+    abortActiveViewRequest();
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.viewAbortController = controller;
+    return {
+      reqToken: state.viewReqToken,
+      signal: controller ? controller.signal : undefined,
+    };
+  }
+
+  function isViewRequestCurrent(reqToken, signal) {
+    return reqToken === state.viewReqToken && (!signal || !signal.aborted);
+  }
+
+  function handleViewFetchError(err, reqToken, signal) {
+    if (!isViewRequestCurrent(reqToken, signal) || (err && err.name === 'AbortError')) {
+      return;
+    }
+    state.searchFetchingQuery = '';
+    state.searchLoadingUi = false;
+    $('main-view').innerHTML = `<p class="muted-center">${esc(err.message)}</p>`;
+  }
+
   function navigate(route) {
     setExpandedPlayer(false);
     closeTrackMenu();
     const clean = route.replace(/^#/, '');
+    if (!isSearchHash(clean)) {
+      clearTimeout(state.searchTimer);
+      state.searchTimer = null;
+      state.ownSearchNavQuery = null;
+    }
     if (location.hash.replace(/^#/, '') === clean) {
       renderCurrentHash();
     } else {
@@ -631,6 +793,9 @@
 
   function renderCurrentHash() {
     if (!state.user) return;
+    const ownSearchQuery = state.ownSearchNavQuery;
+    state.ownSearchNavQuery = null;
+
     const hash = location.hash.replace(/^#/, '') || 'home';
     document.querySelectorAll('.nav-item').forEach((el) => {
       const r = el.dataset.route;
@@ -644,21 +809,32 @@
 
     if (hash === 'home') return renderHome();
     if (hash === 'explore') return renderExplore();
-    if (hash.startsWith('search')) {
-      const q = hash.startsWith('search/')
-        ? decodeURIComponent(hash.slice(7))
-        : new URLSearchParams(hash.split('?')[1] || '').get('q') || '';
-      if ($('global-search').value !== q) {
-        $('global-search').value = q;
-        $('clear-search-btn').classList.toggle('hidden', !q);
+    if (isSearchHash(hash)) {
+      const q = extractSearchQueryFromHash(hash);
+      const searchInput = $('global-search');
+      const liveTrimmed = searchInput ? (searchInput.value || '').trim() : '';
+
+      if (ownSearchQuery !== null && ownSearchQuery === q) {
+        if (searchInput && liveTrimmed !== q) {
+          return;
+        }
+      } else if (searchInput && !state.searchComposing && !state.searchTimer) {
+        if (searchInput.value !== q) {
+          searchInput.value = q;
+          $('clear-search-btn').classList.toggle('hidden', !q);
+        }
+      }
+
+      if (q && state.searchFetchingQuery === q) {
+        return;
       }
       return renderSearch(q);
     }
-    if (hash.startsWith('album/')) return renderAlbum(decodeURIComponent(hash.slice(6)));
-    if (hash.startsWith('artist/')) return renderArtist(decodeURIComponent(hash.slice(7)));
-    if (hash.startsWith('playlist/')) return renderPlaylist(decodeURIComponent(hash.slice(9)));
-    if (hash.startsWith('mood/')) return renderMood(decodeURIComponent(hash.slice(5)));
-    if (hash.startsWith('genre/')) return renderGenre(decodeURIComponent(hash.slice(6)));
+    if (hash.startsWith('album/')) return renderAlbum(safeDecodeUri(hash.slice(6)));
+    if (hash.startsWith('artist/')) return renderArtist(safeDecodeUri(hash.slice(7)));
+    if (hash.startsWith('playlist/')) return renderPlaylist(safeDecodeUri(hash.slice(9)));
+    if (hash.startsWith('mood/')) return renderMood(safeDecodeUri(hash.slice(5)));
+    if (hash.startsWith('genre/')) return renderGenre(safeDecodeUri(hash.slice(6)));
     if (hash === 'library') return renderLibrary(state.libTab);
     if (hash === 'liked') return renderLibrary('liked');
     if (hash === 'history') return renderLibrary('history');
@@ -670,9 +846,11 @@
   }
 
   async function renderHome() {
+    const { reqToken, signal } = beginViewRequest();
     setMainLoading('Curating your feed...');
     try {
-      const d = await api('/api/web/home');
+      const d = await api('/api/web/home', { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       const quickPicks = cacheTracks(d.quickPicks || []).slice(0, 6);
       const trending = cacheTracks(d.trending || []);
       const recent = cacheTracks(d.recent || []);
@@ -735,14 +913,16 @@
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
   async function renderExplore() {
+    const { reqToken, signal } = beginViewRequest();
     setMainLoading('Exploring charts & genres...');
     try {
-      const d = await api('/api/web/explore');
+      const d = await api('/api/web/explore', { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       const charts = cacheTracks(d.charts || []);
       let html = `<h1 class="page-greeting">Explore</h1>`;
       html += `<section class="section">
@@ -775,7 +955,7 @@
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
@@ -783,9 +963,16 @@
     if (!query) {
       return renderExplore();
     }
+    const { reqToken, signal } = beginViewRequest();
+    state.searchFetchingQuery = query;
+    state.searchLoadingUi = true;
     setMainLoading(`Searching for "${query}" across all sources...`);
     try {
-      const d = await api(`/api/web/search?q=${encodeURIComponent(query)}`);
+      const d = await api(`/api/web/search?q=${encodeURIComponent(query)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
+      state.searchFetchingQuery = '';
+      state.searchLoadingUi = false;
+
       const tracks = cacheTracks(d.tracks || []);
       const albums = d.albums || [];
       const artists = d.artists || [];
@@ -798,6 +985,7 @@
       const refinements = d.refinements || null;
 
       if (!tracks.length && !albums.length && !artists.length && !instantMix) {
+        state.searchState = null;
         $('main-view').innerHTML = `<p class="muted-center">No matches found for "${esc(query)}".</p>`;
         return;
       }
@@ -815,7 +1003,7 @@
       renderSearchView();
       $('main-view').scrollTop = 0;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
@@ -846,7 +1034,8 @@
     const previewCount = expanded ? mix.tracks.length : Math.min(6, mix.tracks.length);
     const intentTag = refinements?.detectedIntent ? ` · ${esc(refinements.detectedIntent)}` : '';
 
-    return `<section class="instant-mix-card ${mix.isThemeMix ? 'prominent' : ''}">
+    const isProminent = !!(mix.prominent || mix.isThemeMix);
+    return `<section class="instant-mix-card ${isProminent ? 'prominent' : ''}">
       <div class="instant-mix-head">
         ${artHtml}
         <div class="instant-mix-info">
@@ -913,7 +1102,8 @@
       html += `</div>`;
     }
 
-    if (instantMix && instantMix.isThemeMix && activeFilter === 'all') {
+    const mixIsProminent = !!(instantMix && (instantMix.prominent || instantMix.isThemeMix));
+    if (instantMix && mixIsProminent && activeFilter === 'all') {
       html += renderInstantMixCard(instantMix, refinements, query, mixExpanded);
     }
 
@@ -948,7 +1138,7 @@
       html += `<p class="muted-center" style="margin:24px 0">No tracks matched this filter. <button class="mini-btn" onclick="App.setSearchFilter('all')">Reset filter</button></p>`;
     }
 
-    if (instantMix && !instantMix.isThemeMix && activeFilter === 'all') {
+    if (instantMix && !mixIsProminent && activeFilter === 'all') {
       html += renderInstantMixCard(instantMix, refinements, query, mixExpanded);
     }
 
@@ -975,9 +1165,11 @@
   }
 
   async function renderAlbum(id) {
+    const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading album & tracklist...');
     try {
-      const d = await api(`/api/web/album/${encodeURIComponent(id)}`);
+      const d = await api(`/api/web/album/${encodeURIComponent(id)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       const alb = d.album;
       const tracks = cacheTracks(d.tracks || []);
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
@@ -1008,23 +1200,25 @@
       if (discs.length > 1) {
         for (const dn of discs) {
           html += `<div class="disc-divider">Disc ${dn}</div>`;
-          html += renderTrackRows(tracks.filter((t) => (t.discNo || 1) === dn), tracks);
+          html += renderTrackRows(tracks.filter((t) => (t.discNo || 1) === dn), tracks, null, false, '', true);
         }
       } else {
-        html += renderTrackRows(tracks);
+        html += renderTrackRows(tracks, null, null, false, '', true);
       }
       html += `</div>`;
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
   async function renderArtist(id) {
+    const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading artist profile...');
     try {
-      const d = await api(`/api/web/artist/${encodeURIComponent(id)}`);
+      const d = await api(`/api/web/artist/${encodeURIComponent(id)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       const art = d.artist;
       const top = cacheTracks(d.topTracks || []);
       const albums = d.albums || [];
@@ -1067,14 +1261,16 @@
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
   async function renderPlaylist(id) {
+    const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading playlist...');
     try {
-      const d = await api(`/api/web/playlist/${encodeURIComponent(id)}`);
+      const d = await api(`/api/web/playlist/${encodeURIComponent(id)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       const pl = d.playlist;
       const tracks = cacheTracks(d.tracks || []);
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
@@ -1119,21 +1315,22 @@
         loadPlaylistRecs(pl.id);
       }
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
   async function loadPlaylistRecs(pid) {
     const box = $('pl-recs-body');
     if (!box) return;
+    const signal = state.viewAbortController ? state.viewAbortController.signal : undefined;
     box.innerHTML = `<p style="color:var(--text-muted);font-size:13px;padding:8px 0">Finding matching tracks...</p>`;
     try {
-      const d = await api(`/api/web/playlist/${encodeURIComponent(pid)}/recommendations`);
+      const d = await api(`/api/web/playlist/${encodeURIComponent(pid)}/recommendations`, { signal });
       const targetBox = $('pl-recs-body');
       const curPlHash = location.hash.startsWith('#playlist/')
-        ? decodeURIComponent(location.hash.slice('#playlist/'.length))
+        ? safeDecodeUri(location.hash.slice('#playlist/'.length))
         : '';
-      if (!targetBox || curPlHash !== pid) return;
+      if (!targetBox || curPlHash !== pid || (signal && signal.aborted)) return;
       const recs = cacheTracks(d.tracks || []);
       if (!recs.length) {
         targetBox.innerHTML = `<p style="color:var(--text-muted);font-size:13px;padding:8px 0">No extra matches found yet. Try searching or playing a few songs first.</p>`;
@@ -1164,7 +1361,8 @@
             </div>`;
         })
         .join('')}</div>`;
-    } catch {
+    } catch (e) {
+      if ((e && e.name === 'AbortError') || (signal && signal.aborted)) return;
       const targetBox = $('pl-recs-body');
       if (targetBox) {
         targetBox.innerHTML = `<p style="color:var(--text-muted);font-size:13px;padding:8px 0">Couldn't load recommendations right now.</p>`;
@@ -1173,9 +1371,11 @@
   }
 
   async function renderMood(slug) {
+    const { reqToken, signal } = beginViewRequest();
     setMainLoading('Building mood mix...');
     try {
-      const d = await api(`/api/web/mood/${encodeURIComponent(slug)}`);
+      const d = await api(`/api/web/mood/${encodeURIComponent(slug)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       const m = d.mood;
       const tracks = cacheTracks(d.tracks || []);
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
@@ -1194,14 +1394,16 @@
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
   async function renderGenre(name) {
+    const { reqToken, signal } = beginViewRequest();
     setMainLoading(`Loading ${name}...`);
     try {
-      const d = await api(`/api/web/genre/${encodeURIComponent(name)}`);
+      const d = await api(`/api/web/genre/${encodeURIComponent(name)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       const tracks = cacheTracks(d.tracks || []);
       const artists = d.artists || [];
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
@@ -1228,15 +1430,17 @@
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
   async function renderLibrary(tab = 'playlists') {
+    const { reqToken, signal } = beginViewRequest();
     state.libTab = tab;
     setMainLoading('Loading your library...');
     try {
-      const lib = await api('/api/web/library');
+      const lib = await api('/api/web/library', { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
       state.playlists = lib.playlists || [];
       const liked = cacheTracks(lib.likedTracks || []);
       const recent = cacheTracks(lib.recentTracks || []);
@@ -1287,7 +1491,7 @@
 
       $('main-view').innerHTML = html;
     } catch (e) {
-      $('main-view').innerHTML = `<p class="muted-center">${esc(e.message)}</p>`;
+      handleViewFetchError(e, reqToken, signal);
     }
   }
 
@@ -1355,30 +1559,40 @@
     </div>`;
   }
 
-  function renderTrackRows(tracks, fullContext = null, editablePlaylistId = null, singleRadio = false, searchQuery = '') {
+  function renderTrackRows(
+    tracks,
+    fullContext = null,
+    editablePlaylistId = null,
+    singleRadio = false,
+    searchQuery = '',
+    useTrackNo = false
+  ) {
     const queueList = fullContext || tracks;
     const idsJson = singleRadio ? '' : esc(JSON.stringify(queueList.map((t) => t.id)));
     const cur = currentTrack();
 
     return tracks
       .map((t, i) => {
-        const ctxIdx = queueList.findIndex((x) => x.id === t.id);
+        const ctxIdx =
+          fullContext && fullContext !== tracks
+            ? Math.max(0, queueList.findIndex((x) => x.id === t.id))
+            : i;
         const isCur = cur && cur.id === t.id;
         let playClick;
         if (searchQuery) {
           playClick = singleRadio
             ? `App.playSearchTrack(${esc(JSON.stringify(t.id))}, ${esc(JSON.stringify(searchQuery))})`
-            : `App.playInstantMixAt(${Math.max(0, ctxIdx)})`;
+            : `App.playInstantMixAt(${ctxIdx})`;
         } else {
           playClick = singleRadio
             ? `App.playSingle(${esc(JSON.stringify(t.id))})`
-            : `App.playListByIds(${idsJson}, ${Math.max(0, ctxIdx)})`;
+            : `App.playListByIds(${idsJson}, ${ctxIdx})`;
         }
         const editArgs = editablePlaylistId
           ? `, ${esc(JSON.stringify(editablePlaylistId))}, ${i}`
           : '';
         return `<div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
-          <div class="tr-idx" onclick="${playClick}">${isCur ? ICONS.nowPlaying : t.trackNo > 0 && fullContext ? t.trackNo : i + 1}</div>
+          <div class="tr-idx" onclick="${playClick}">${isCur ? ICONS.nowPlaying : useTrackNo && t.trackNo > 0 ? t.trackNo : i + 1}</div>
           <div class="tr-main" onclick="${playClick}">
             <img class="tr-thumb" src="${esc(t.coverUrl)}" loading="lazy" alt="" />
             <div class="tr-text">
@@ -1446,6 +1660,7 @@
   async function playQueueAt(index) {
     if (index < 0 || index >= state.queue.length) return;
     state.queueIndex = index;
+    state.pendingSeekSec = 0;
     const track = state.queue[index];
     state.lastScrobbleCompleteId = '';
     state.compatAttemptedId = '';
@@ -1453,6 +1668,7 @@
     ensureAudioGraph();
     audio.src = buildStreamUrl(track);
     audio.play().catch((e) => {
+      updatePlayButton(false);
       console.warn('Playback prevented or error:', e);
     });
 
@@ -1673,6 +1889,10 @@
   function runRefinedSearch(query) {
     const q = String(query || '').trim();
     if (!q) return;
+    clearTimeout(state.searchTimer);
+    state.searchTimer = null;
+    state.searchComposing = false;
+    state.ownSearchNavQuery = q;
     $('global-search').value = q;
     $('clear-search-btn').classList.remove('hidden');
     navigate(`search?q=${encodeURIComponent(q)}`);
@@ -1782,10 +2002,16 @@
   }
 
   function togglePlay() {
-    if (!currentTrack()) return;
+    const cur = currentTrack();
+    if (!cur) return;
     ensureAudioGraph();
+    if (!audio.getAttribute('src')) {
+      audio.src = buildStreamUrl(cur);
+    }
     if (audio.paused) {
-      audio.play().catch(() => {});
+      audio.play().catch(() => {
+        updatePlayButton(false);
+      });
     } else {
       audio.pause();
     }
@@ -1793,11 +2019,12 @@
 
   function prevTrack() {
     if (!state.queue.length) return;
-    if (audio.currentTime > 4) {
+    if (audio.currentTime > 4 || (state.queueIndex === 0 && state.repeat !== 'all')) {
       audio.currentTime = 0;
+      if (audio.paused) audio.play().catch(() => {});
       return;
     }
-    const prev = state.queueIndex > 0 ? state.queueIndex - 1 : state.repeat === 'all' ? state.queue.length - 1 : 0;
+    const prev = state.queueIndex > 0 ? state.queueIndex - 1 : state.queue.length - 1;
     playQueueAt(prev);
   }
 
@@ -1809,7 +2036,8 @@
     if (!state.queue.length) return;
 
     if (state.shuffle && state.queue.length > 1) {
-      const nextIdx = Math.floor(Math.random() * state.queue.length);
+      let nextIdx = Math.floor(Math.random() * (state.queue.length - 1));
+      if (nextIdx >= state.queueIndex) nextIdx += 1;
       return playQueueAt(nextIdx);
     }
     if (state.queueIndex + 1 < state.queue.length) {
@@ -1833,7 +2061,20 @@
 
   function wireAudioEvents() {
     audio.addEventListener('play', () => updatePlayButton(true));
-    audio.addEventListener('pause', () => updatePlayButton(false));
+    audio.addEventListener('pause', () => {
+      updatePlayButton(false);
+      if (!audio.ended && state.queue.length) saveServerQueue();
+    });
+    audio.addEventListener('loadedmetadata', () => {
+      if (state.pendingSeekSec > 0) {
+        const target = state.pendingSeekSec;
+        state.pendingSeekSec = 0;
+        const maxDur = Number.isFinite(audio.duration) && audio.duration > 1 ? audio.duration - 1 : target;
+        try {
+          audio.currentTime = Math.max(0, Math.min(target, maxDur));
+        } catch {}
+      }
+    });
     audio.addEventListener('error', () => {
       const cur = currentTrack();
       if (!cur || !audio.error || !audio.getAttribute('src')) return;
@@ -1908,6 +2149,7 @@
         const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
         if (total > 0) {
           audio.currentTime = (parseFloat(e.target.value) / 100) * total;
+          if (state.queue.length) saveServerQueue();
         }
       });
     };
@@ -2276,6 +2518,11 @@
       }
     },
     clearSearch: () => {
+      clearTimeout(state.searchTimer);
+      state.searchTimer = null;
+      state.searchComposing = false;
+      state.ownSearchNavQuery = null;
+      abortActiveViewRequest();
       $('global-search').value = '';
       $('clear-search-btn').classList.add('hidden');
       navigate('explore');
@@ -2463,18 +2710,26 @@
       showToast('Select and copy manually');
     },
     toggleSaveAlbum: async (id, saved) => {
-      await api('/api/web/star', {
-        method: 'POST',
-        body: JSON.stringify({ id, starred: saved, kind: 'album' }),
-      });
-      renderAlbum(id);
+      try {
+        await api('/api/web/star', {
+          method: 'POST',
+          body: JSON.stringify({ id, starred: saved, kind: 'album' }),
+        });
+        renderAlbum(id);
+      } catch (e) {
+        showToast(e.message);
+      }
     },
     toggleFollowArtist: async (id, followed) => {
-      await api('/api/web/star', {
-        method: 'POST',
-        body: JSON.stringify({ id, starred: followed, kind: 'artist' }),
-      });
-      renderArtist(id);
+      try {
+        await api('/api/web/star', {
+          method: 'POST',
+          body: JSON.stringify({ id, starred: followed, kind: 'artist' }),
+        });
+        renderArtist(id);
+      } catch (e) {
+        showToast(e.message);
+      }
     },
     promptCreatePlaylist: (initialTrackId = null) => {
       openModal(`
@@ -2490,28 +2745,40 @@
     submitCreatePlaylist: async (e, tid) => {
       e.preventDefault();
       const name = $('new-pl-name').value.trim();
+      if (!name) {
+        showToast('Please enter a playlist name');
+        return;
+      }
       const comment = $('new-pl-desc').value.trim();
-      const res = await api('/api/web/playlists', {
-        method: 'POST',
-        body: JSON.stringify({ name, comment, trackIds: tid ? [tid] : [] }),
-      });
-      closeModal();
-      await refreshSidebarPlaylists();
-      showToast(`Created "${name}"`);
-      navigate(`playlist/${encodeURIComponent(res.playlist.id)}`);
+      try {
+        const res = await api('/api/web/playlists', {
+          method: 'POST',
+          body: JSON.stringify({ name, comment, trackIds: tid ? [tid] : [] }),
+        });
+        closeModal();
+        await refreshSidebarPlaylists();
+        showToast(`Created "${name}"`);
+        navigate(`playlist/${encodeURIComponent(res.playlist.id)}`);
+      } catch (err) {
+        showToast(err.message);
+      }
     },
     addTrackToPlaylist: async (pid, tid) => {
-      const res = await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks`, {
-        method: 'POST',
-        body: JSON.stringify({ trackIds: [tid] }),
-      });
-      refreshSidebarPlaylists();
-      showToast(res.added === 0 ? 'Already in playlist' : 'Added to playlist');
-      const curPlHash = location.hash.startsWith('#playlist/')
-        ? decodeURIComponent(location.hash.slice('#playlist/'.length))
-        : '';
-      if (curPlHash === pid) {
-        renderPlaylist(pid);
+      try {
+        const res = await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks`, {
+          method: 'POST',
+          body: JSON.stringify({ trackIds: [tid] }),
+        });
+        refreshSidebarPlaylists();
+        showToast(res.added === 0 ? 'Already in playlist' : 'Added to playlist');
+        const curPlHash = location.hash.startsWith('#playlist/')
+          ? decodeURIComponent(location.hash.slice('#playlist/'.length))
+          : '';
+        if (curPlHash === pid) {
+          renderPlaylist(pid);
+        }
+      } catch (err) {
+        showToast(err.message);
       }
     },
     quickAddToPlaylist: async (pid, tid, btn) => {
@@ -2539,15 +2806,23 @@
     playInstantMixAt,
     queueInstantMix,
     removePlaylistItem: async (pid, pos) => {
-      await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks/${pos}`, { method: 'DELETE' });
-      renderPlaylist(pid);
+      try {
+        await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks/${pos}`, { method: 'DELETE' });
+        renderPlaylist(pid);
+      } catch (err) {
+        showToast(err.message);
+      }
     },
     movePlaylistItem: async (pid, from, to) => {
-      await api(`/api/web/playlists/${encodeURIComponent(pid)}/reorder`, {
-        method: 'POST',
-        body: JSON.stringify({ from, to }),
-      });
-      renderPlaylist(pid);
+      try {
+        await api(`/api/web/playlists/${encodeURIComponent(pid)}/reorder`, {
+          method: 'POST',
+          body: JSON.stringify({ from, to }),
+        });
+        renderPlaylist(pid);
+      } catch (err) {
+        showToast(err.message);
+      }
     },
     promptRenamePlaylist: (pid, curName) => {
       openModal(`
@@ -2561,19 +2836,31 @@
     submitRenamePlaylist: async (e, pid) => {
       e.preventDefault();
       const name = $('rename-pl-input').value.trim();
-      await api(`/api/web/playlists/${encodeURIComponent(pid)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ name }),
-      });
-      closeModal();
-      await refreshSidebarPlaylists();
-      renderPlaylist(pid);
+      if (!name) {
+        showToast('Please enter a playlist name');
+        return;
+      }
+      try {
+        await api(`/api/web/playlists/${encodeURIComponent(pid)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ name }),
+        });
+        closeModal();
+        await refreshSidebarPlaylists();
+        renderPlaylist(pid);
+      } catch (err) {
+        showToast(err.message);
+      }
     },
     deletePlaylist: async (pid) => {
-      await api(`/api/web/playlists/${encodeURIComponent(pid)}`, { method: 'DELETE' });
-      await refreshSidebarPlaylists();
-      showToast('Playlist deleted');
-      navigate('library');
+      try {
+        await api(`/api/web/playlists/${encodeURIComponent(pid)}`, { method: 'DELETE' });
+        await refreshSidebarPlaylists();
+        showToast('Playlist deleted');
+        navigate('library');
+      } catch (err) {
+        showToast(err.message);
+      }
     },
     openEqModal,
     closeModal,
@@ -2598,11 +2885,15 @@
     },
     openConnectModal,
     regenApiKey: async () => {
-      const res = await api('/api/web/account/apikey', { method: 'POST' });
-      state.user.apiKey = res.apiKey;
-      const el = $('modal-apikey');
-      if (el) el.textContent = res.apiKey;
-      showToast('API Key regenerated');
+      try {
+        const res = await api('/api/web/account/apikey', { method: 'POST' });
+        state.user.apiKey = res.apiKey;
+        const el = $('modal-apikey');
+        if (el) el.textContent = res.apiKey;
+        showToast('API Key regenerated');
+      } catch (err) {
+        showToast(err.message);
+      }
     },
     submitPasswordChange: async (e) => {
       e.preventDefault();

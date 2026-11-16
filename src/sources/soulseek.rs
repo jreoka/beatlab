@@ -504,6 +504,20 @@ impl MusicSource for SoulseekSource {
         let rest = stream_ref.strip_prefix("slsk://")?;
         let (peer, remote_path) = rest.split_once('/')?;
 
+        let _ = std::fs::create_dir_all(&self.download_dir);
+        let ext = sanitize_slsk_ext(remote_path);
+        let base_hash = hash_str(stream_ref);
+        let local_path = self.download_dir.join(format!("{}.{}", base_hash, ext));
+        if tokio::fs::metadata(&local_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+            > 4096
+        {
+            return Some(format!("file:{}", local_path.display()));
+        }
+        let part_path = self.download_dir.join(format!("{}.part", base_hash));
+
         // Request peer address from server if not cached
         if !self.peer_addrs.lock().await.contains_key(peer) {
             if let Some(writer) = self.runtime.read().await.writer.clone() {
@@ -589,15 +603,6 @@ impl MusicSource for SoulseekSource {
         fsock.write_all(&token.to_le_bytes()).await.ok()?;
         fsock.write_all(&0u64.to_le_bytes()).await.ok()?; // start offset 0
 
-        let _ = std::fs::create_dir_all(&self.download_dir);
-        let ext = Path::new(remote_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mp3");
-        let base_hash = hash_str(stream_ref);
-        let local_path = self.download_dir.join(format!("{}.{}", base_hash, ext));
-        let part_path = self.download_dir.join(format!("{}.part", base_hash));
-
         // Stream directly to a .part file with per-chunk idle timeout and verify complete length.
         let mut file = tokio::fs::File::create(&part_path).await.ok()?;
         let mut chunk = [0u8; 32 * 1024];
@@ -634,6 +639,26 @@ impl MusicSource for SoulseekSource {
 }
 
 // --- Binary protocol helpers ---
+
+fn sanitize_slsk_ext(remote_path: &str) -> String {
+    let raw = remote_path
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+        .unwrap_or("mp3");
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_lowercase();
+    if clean.is_empty() {
+        "mp3".to_string()
+    } else {
+        clean
+    }
+}
 
 fn hash_str(s: &str) -> String {
     let mut h = Md5::new();
@@ -780,9 +805,12 @@ impl<'a> Cursor<'a> {
 }
 
 fn parse_search_response(compressed: &[u8], peer_hint: Option<&str>) -> Option<(u32, Vec<SlskSearchHit>)> {
-    let mut decoder = ZlibDecoder::new(compressed);
+    let decoder = ZlibDecoder::new(compressed);
     let mut raw = Vec::new();
-    decoder.read_to_end(&mut raw).ok()?;
+    decoder
+        .take(16 * 1024 * 1024)
+        .read_to_end(&mut raw)
+        .ok()?;
 
     let mut cur = Cursor::new(&raw);
     let peer = cur
@@ -1107,5 +1135,13 @@ mod tests {
         assert_eq!(alb2, "HUMAN (SAO)");
         assert_eq!(t2, "HUMAN");
         assert_eq!(n2, 1);
+    }
+
+    #[test]
+    fn sanitize_slsk_ext_strips_traversal_and_punctuation() {
+        assert_eq!(sanitize_slsk_ext("@@peer\\song.FLAC"), "flac");
+        assert_eq!(sanitize_slsk_ext("folder/track.mp3?.."), "mp3");
+        assert_eq!(sanitize_slsk_ext("no_extension"), "mp3");
+        assert_eq!(sanitize_slsk_ext("song.???"), "mp3");
     }
 }
