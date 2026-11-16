@@ -175,6 +175,11 @@
         <span>You are offline. Waiting for connection to Beatlab server…</span>
       </div>
 
+      <div id="ptr-indicator" class="ptr-indicator hidden" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+        <span id="ptr-text">Pull to refresh</span>
+      </div>
+
       <main id="main-view" class="main-view"></main>
     </div>
 
@@ -292,6 +297,7 @@
   <div id="fullscreen-player" class="fs-player" aria-hidden="true">
     <div id="fs-bg" class="fs-bg"></div>
     <div class="fs-inner">
+      <div class="fs-drag-handle" aria-hidden="true"></div>
       <div class="fs-topbar">
         <button class="circle-btn fs-mobile-collapse" title="Collapse player" onclick="App.toggleFullscreen(false)">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8.5 7 7 7-7"/></svg>

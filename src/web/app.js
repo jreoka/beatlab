@@ -59,6 +59,7 @@
     shuffle: false,
     repeat: 'off', // off | all | one
     autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
+    hapticsEnabled: localStorage.getItem('beatlab_haptics') !== 'false',
     radioReqToken: 0,
     radioLoading: false,
     radioInFlight: null,
@@ -131,8 +132,38 @@
     return isIos && !isStandalonePwa();
   }
 
+  const HAPTIC_PATTERNS = {
+    tick: 6,
+    tap: 9,
+    select: 12,
+    medium: 18,
+    success: [10, 28, 14],
+    warning: [18, 36, 18],
+  };
+
+  let lastHapticAt = 0;
+  let lastTickHapticAt = 0;
+
+  function haptic(kind = 'tap') {
+    if (!state.hapticsEnabled) return;
+    if (typeof navigator === 'undefined' || typeof navigator.vibrate !== 'function') return;
+    const now = Date.now();
+    if (kind === 'tick') {
+      if (now - lastTickHapticAt < 55) return;
+      lastTickHapticAt = now;
+    } else if (now - lastHapticAt < 28) {
+      return;
+    } else {
+      lastHapticAt = now;
+    }
+    try {
+      navigator.vibrate(HAPTIC_PATTERNS[kind] || HAPTIC_PATTERNS.tap);
+    } catch {}
+  }
+
   function updateInstallUI() {
     state.isStandalone = isStandalonePwa();
+    document.documentElement.classList.toggle('is-standalone', state.isStandalone);
     const btn = $('pwa-install-btn');
     if (btn) {
       btn.classList.toggle('hidden', state.isStandalone || !state.deferredInstallPrompt);
@@ -165,7 +196,7 @@
   }
 
   function wirePwaLifecycle() {
-    state.isStandalone = isStandalonePwa();
+    updateInstallUI();
     syncOnlineStatus();
     registerServiceWorker();
 
@@ -185,6 +216,7 @@
       state.deferredInstallPrompt = null;
       state.isStandalone = true;
       updateInstallUI();
+      haptic('success');
       showToast('Beatlab installed!');
     });
 
@@ -367,11 +399,15 @@
   function setExpandedPlayer(open) {
     const fs = $('fullscreen-player');
     if (!fs) return;
-    const next = typeof open === 'boolean' ? open : !fs.classList.contains('open');
+    const wasOpen = fs.classList.contains('open');
+    const next = typeof open === 'boolean' ? open : !wasOpen;
     fs.classList.toggle('open', next);
     fs.setAttribute('aria-hidden', next ? 'false' : 'true');
+    if (next !== wasOpen && window.innerWidth <= 780) {
+      haptic(next ? 'select' : 'tap');
+    }
     if (next && window.innerWidth <= 780) {
-      setFsMobileView(state.fsMobileView || 'player');
+      setFsMobileView(state.fsMobileView || 'player', true);
     }
     const btn = $('btn-expand-player');
     if (btn) {
@@ -384,19 +420,23 @@
     }
   }
 
-  function setFsMobileView(view) {
+  function setFsMobileView(view, silent = false) {
     const next = view === 'queue' || view === 'lyrics' ? view : 'player';
+    const changed = state.fsMobileView !== next;
     state.fsMobileView = next;
     const fs = $('fullscreen-player');
     if (fs) {
       fs.classList.remove('fs-view-player', 'fs-view-queue', 'fs-view-lyrics');
       fs.classList.add(`fs-view-${next}`);
     }
+    if (!silent && changed && window.innerWidth <= 780) {
+      haptic('select');
+    }
     if ($('fs-tab-player')) $('fs-tab-player').classList.toggle('active', next === 'player');
     if ($('fs-tab-mobile-queue')) $('fs-tab-mobile-queue').classList.toggle('active', next === 'queue');
     if ($('fs-tab-mobile-lyrics')) $('fs-tab-mobile-lyrics').classList.toggle('active', next === 'lyrics');
     if (next === 'queue' || next === 'lyrics') {
-      window.App.setFsTab(next);
+      window.App.setFsTab(next, true);
     }
   }
 
@@ -589,16 +629,99 @@
     const bar = $('player-bar');
     if (!bar) return;
     let pointerDownIgnored = false;
+    let suppressClick = false;
+    let startX = 0;
+    let startY = 0;
+    let lastDx = 0;
+    let lastDy = 0;
+    let gestureAxis = '';
+    let hapticFired = false;
+    let tracking = false;
+    const metaBox = bar.querySelector('.pb-left');
+
     const isInteractive = (target) => {
       if (window.innerWidth <= 780) {
         return !!target.closest('button, a, input, label, .pb-progress-row');
       }
       return !!target.closest('button, a, input, label, .pb-title, .pb-artist, .pb-progress-row');
     };
+
     bar.addEventListener('pointerdown', (e) => {
       pointerDownIgnored = isInteractive(e.target);
     });
+
+    bar.addEventListener('touchstart', (e) => {
+      if (window.innerWidth > 780 || e.touches.length !== 1) return;
+      if (isInteractive(e.target)) return;
+      startX = e.touches[0].clientX;
+      startY = e.touches[0].clientY;
+      lastDx = 0;
+      lastDy = 0;
+      gestureAxis = '';
+      hapticFired = false;
+      tracking = true;
+      if (metaBox) metaBox.style.transition = 'none';
+    }, { passive: true });
+
+    bar.addEventListener('touchmove', (e) => {
+      if (!tracking || e.touches.length !== 1) return;
+      const dx = e.touches[0].clientX - startX;
+      const dy = e.touches[0].clientY - startY;
+      lastDx = dx;
+      lastDy = dy;
+      if (!gestureAxis && (Math.abs(dx) > 10 || Math.abs(dy) > 10)) {
+        gestureAxis = Math.abs(dx) > Math.abs(dy) * 1.15 ? 'x' : 'y';
+      }
+      if (gestureAxis === 'x' && state.queue.length > 0 && metaBox) {
+        const clamped = Math.max(-56, Math.min(56, dx * 0.55));
+        metaBox.style.transform = `translateX(${clamped}px)`;
+        metaBox.style.opacity = String(Math.max(0.55, 1 - Math.abs(clamped) / 110));
+        if (!hapticFired && Math.abs(dx) >= 52) {
+          hapticFired = true;
+          haptic('tick');
+        }
+      } else if (gestureAxis === 'y' && dy < -36 && !hapticFired) {
+        hapticFired = true;
+        haptic('tick');
+      }
+    }, { passive: true });
+
+    const finishSwipe = () => {
+      if (!tracking) return;
+      tracking = false;
+      if (metaBox) {
+        metaBox.style.transition = 'transform 0.18s ease, opacity 0.18s ease';
+        metaBox.style.transform = '';
+        metaBox.style.opacity = '';
+      }
+      if (gestureAxis === 'x' && Math.abs(lastDx) >= 52 && state.queue.length > 0) {
+        suppressClick = true;
+        if (lastDx < 0) {
+          nextTrack(true);
+        } else {
+          haptic('medium');
+          prevTrack();
+        }
+      } else if (gestureAxis === 'y' && lastDy < -36) {
+        suppressClick = true;
+        if (!$('fullscreen-player').classList.contains('open')) {
+          setFsMobileView('player', true);
+          setExpandedPlayer(true);
+        }
+      }
+      gestureAxis = '';
+      lastDx = 0;
+      lastDy = 0;
+    };
+
+    bar.addEventListener('touchend', finishSwipe, { passive: true });
+    bar.addEventListener('touchcancel', finishSwipe, { passive: true });
+
     bar.addEventListener('click', (e) => {
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
       const titleEl = e.target.closest('#pb-title');
       const artistEl = e.target.closest('#pb-artist');
       if (window.innerWidth > 780 && titleEl) {
@@ -613,7 +736,7 @@
       pointerDownIgnored = false;
       if (ignored) return;
       if (window.innerWidth <= 780 && !$('fullscreen-player').classList.contains('open')) {
-        setFsMobileView('player');
+        setFsMobileView('player', true);
       }
       setExpandedPlayer();
     });
@@ -622,29 +745,57 @@
   function wireFsSwipeClose() {
     const fs = $('fullscreen-player');
     if (!fs) return;
+    const cover = $('fs-cover');
     let startY = 0;
     let startX = 0;
     let tracking = false;
+    let axis = '';
+    let canSwipeArt = false;
     let deltaY = 0;
+    let deltaX = 0;
+    let closeHapticFired = false;
+    let skipHapticFired = false;
 
     fs.addEventListener('touchstart', (e) => {
       if (window.innerWidth > 780 || !fs.classList.contains('open')) return;
       if (e.touches.length !== 1) return;
-      if (e.target.closest('input, button, a, .fs-panel-body')) return;
+      if (e.target.closest('input, button, a, .fs-panel-body, .fs-mobile-tabs')) return;
       startY = e.touches[0].clientY;
       startX = e.touches[0].clientX;
       deltaY = 0;
+      deltaX = 0;
+      axis = '';
+      canSwipeArt = state.fsMobileView === 'player' && !!e.target.closest('.fs-art-col') && state.queue.length > 0;
+      closeHapticFired = false;
+      skipHapticFired = false;
       tracking = true;
       fs.style.transition = 'none';
+      if (cover) cover.style.transition = 'none';
     }, { passive: true });
 
     fs.addEventListener('touchmove', (e) => {
       if (!tracking || e.touches.length !== 1) return;
       const dy = e.touches[0].clientY - startY;
       const dx = e.touches[0].clientX - startX;
-      if (dy > 8 && Math.abs(dy) > Math.abs(dx) * 1.2) {
+      if (!axis && (Math.abs(dy) > 10 || Math.abs(dx) > 10)) {
+        axis = Math.abs(dx) > Math.abs(dy) * 1.2 && canSwipeArt ? 'x' : 'y';
+      }
+      if (axis === 'y' && dy > 8 && Math.abs(dy) > Math.abs(dx) * 1.15) {
         deltaY = dy;
         fs.style.transform = `translateY(${dy}px)`;
+        if (!closeHapticFired && dy > 90) {
+          closeHapticFired = true;
+          haptic('tick');
+        }
+      } else if (axis === 'x' && canSwipeArt && cover) {
+        deltaX = dx;
+        const clamped = Math.max(-72, Math.min(72, dx * 0.48));
+        cover.style.transform = `translateX(${clamped}px) scale(${Math.max(0.94, 1 - Math.abs(clamped) / 720)})`;
+        cover.style.opacity = String(Math.max(0.6, 1 - Math.abs(clamped) / 150));
+        if (!skipHapticFired && Math.abs(dx) >= 64) {
+          skipHapticFired = true;
+          haptic('tick');
+        }
       }
     }, { passive: true });
 
@@ -653,13 +804,164 @@
       tracking = false;
       fs.style.transition = '';
       fs.style.transform = '';
-      if (deltaY > 90) {
-        setExpandedPlayer(false);
+      if (cover) {
+        cover.style.transition = 'transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease';
+        cover.style.transform = '';
+        cover.style.opacity = '';
       }
+      if (axis === 'y' && deltaY > 90) {
+        setExpandedPlayer(false);
+      } else if (axis === 'x' && Math.abs(deltaX) >= 64 && canSwipeArt) {
+        if (deltaX < 0) {
+          nextTrack(true);
+        } else {
+          haptic('medium');
+          prevTrack();
+        }
+      }
+      axis = '';
       deltaY = 0;
+      deltaX = 0;
     };
     fs.addEventListener('touchend', finish, { passive: true });
     fs.addEventListener('touchcancel', finish, { passive: true });
+  }
+
+  function wireSheetAndPtrGestures() {
+    // Swipe down on mobile bottom context sheet to dismiss
+    const menu = $('context-menu');
+    if (menu) {
+      let startY = 0;
+      let startX = 0;
+      let dy = 0;
+      let tracking = false;
+      let detent = false;
+
+      menu.addEventListener('touchstart', (e) => {
+        if (window.innerWidth > 780 || menu.classList.contains('hidden')) return;
+        if (e.touches.length !== 1) return;
+        if (menu.scrollTop > 2 && !e.target.closest('.ctx-sheet-head')) return;
+        startY = e.touches[0].clientY;
+        startX = e.touches[0].clientX;
+        dy = 0;
+        detent = false;
+        tracking = true;
+        menu.style.transition = 'none';
+      }, { passive: true });
+
+      menu.addEventListener('touchmove', (e) => {
+        if (!tracking || e.touches.length !== 1) return;
+        const nextDy = e.touches[0].clientY - startY;
+        const dx = e.touches[0].clientX - startX;
+        if (nextDy > 8 && Math.abs(nextDy) > Math.abs(dx) * 1.15 && menu.scrollTop <= 2) {
+          dy = nextDy;
+          menu.style.transform = `translateY(${nextDy}px)`;
+          if (!detent && nextDy > 72) {
+            detent = true;
+            haptic('tick');
+          }
+        }
+      }, { passive: true });
+
+      const finishSheet = () => {
+        if (!tracking) return;
+        tracking = false;
+        menu.style.transition = '';
+        menu.style.transform = '';
+        if (dy > 72) {
+          haptic('tap');
+          closeTrackMenu();
+        }
+        dy = 0;
+      };
+      menu.addEventListener('touchend', finishSheet, { passive: true });
+      menu.addEventListener('touchcancel', finishSheet, { passive: true });
+    }
+
+    // Mobile pull-to-refresh inside main scrollable view
+    const main = $('main-view');
+    const ptr = $('ptr-indicator');
+    const ptrText = $('ptr-text');
+    if (main && ptr) {
+      let startY = 0;
+      let startX = 0;
+      let pullPx = 0;
+      let active = false;
+      let refreshing = false;
+      let primed = false;
+
+      main.addEventListener('touchstart', (e) => {
+        if (window.innerWidth > 780 || refreshing || e.touches.length !== 1) return;
+        if (main.scrollTop > 0) return;
+        if (e.target.closest('input, textarea, select, .tabs-bar, .stats-range-pills')) return;
+        startY = e.touches[0].clientY;
+        startX = e.touches[0].clientX;
+        pullPx = 0;
+        primed = false;
+        active = true;
+      }, { passive: true });
+
+      main.addEventListener('touchmove', (e) => {
+        if (!active || refreshing || e.touches.length !== 1) return;
+        if (main.scrollTop > 0) {
+          active = false;
+          ptr.classList.add('hidden');
+          ptr.style.transform = '';
+          return;
+        }
+        const dy = e.touches[0].clientY - startY;
+        const dx = e.touches[0].clientX - startX;
+        if (dy <= 14 || Math.abs(dx) > Math.abs(dy)) {
+          if (dy < 0) active = false;
+          return;
+        }
+        pullPx = Math.min(84, (dy - 14) * 0.5);
+        ptr.classList.remove('hidden', 'ptr-spinning');
+        ptr.classList.toggle('ptr-ready', pullPx >= 48);
+        ptr.style.transform = `translate(-50%, ${Math.round(pullPx - 36)}px)`;
+        ptr.style.opacity = String(Math.min(1, pullPx / 36));
+        if (ptrText) ptrText.textContent = pullPx >= 48 ? 'Release to refresh' : 'Pull to refresh';
+        if (!primed && pullPx >= 48) {
+          primed = true;
+          haptic('tick');
+        }
+      }, { passive: true });
+
+      const finishPtr = async () => {
+        if (!active) return;
+        active = false;
+        const shouldRefresh = pullPx >= 48 && !refreshing;
+        pullPx = 0;
+        if (shouldRefresh) {
+          refreshing = true;
+          haptic('medium');
+          ptr.classList.remove('ptr-ready');
+          ptr.classList.add('ptr-spinning');
+          ptr.style.transform = 'translate(-50%, 10px)';
+          ptr.style.opacity = '1';
+          if (ptrText) ptrText.textContent = 'Refreshing...';
+          try {
+            await renderCurrentHash();
+          } finally {
+            setTimeout(() => {
+              ptr.classList.add('hidden');
+              ptr.classList.remove('ptr-spinning', 'ptr-ready');
+              ptr.style.transform = '';
+              ptr.style.opacity = '';
+              refreshing = false;
+            }, 220);
+          }
+        } else {
+          ptr.classList.add('hidden');
+          ptr.classList.remove('ptr-ready', 'ptr-spinning');
+          ptr.style.transform = '';
+          ptr.style.opacity = '';
+        }
+      };
+
+      main.addEventListener('touchend', finishPtr, { passive: true });
+      main.addEventListener('touchcancel', finishPtr, { passive: true });
+    }
   }
 
   async function init() {
@@ -669,6 +971,7 @@
     localStorage.removeItem('beatlab_quality');
     wirePlayerBarToggle();
     wireFsSwipeClose();
+    wireSheetAndPtrGestures();
     wirePwaLifecycle();
     syncResponsiveLayout();
     window.matchMedia('(max-width: 1060px)').addEventListener('change', syncResponsiveLayout);
@@ -967,6 +1270,7 @@
   }
 
   function navigate(route) {
+    haptic('tap');
     setExpandedPlayer(false);
     closeTrackMenu();
     hideStatsTooltip();
@@ -3411,6 +3715,7 @@
   function togglePlay() {
     const cur = currentTrack();
     if (!cur) return;
+    haptic('medium');
     ensureAudioGraph();
     if (!audio.getAttribute('src')) {
       audio.src = buildStreamUrl(cur);
@@ -3426,6 +3731,7 @@
 
   function prevTrack() {
     if (!state.queue.length) return;
+    haptic('medium');
     if (audio.currentTime > 4 || (state.queueIndex === 0 && state.repeat !== 'all')) {
       audio.currentTime = 0;
       if (audio.paused) audio.play().catch(() => {});
@@ -3436,6 +3742,7 @@
   }
 
   async function nextTrack(manual = false) {
+    if (manual) haptic('medium');
     const cur = currentTrack();
     if (
       manual &&
@@ -3575,6 +3882,7 @@
         const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
         if (total > 0) {
           audio.currentTime = (parseFloat(e.target.value) / 100) * total;
+          haptic('tap');
           if (state.queue.length) saveServerQueue();
         }
       });
@@ -3705,6 +4013,7 @@
     if (!t || state.likeInFlight.has(id)) return;
     state.likeInFlight.add(id);
     const next = !t.isStarred;
+    haptic(next ? 'success' : 'tap');
     try {
       await api('/api/web/star', {
         method: 'POST',
@@ -3747,6 +4056,7 @@
   }
 
   function positionContextMenu(menu, backdrop, event) {
+    haptic('select');
     menu.classList.remove('hidden');
     if (window.innerWidth <= 780) {
       menu.style.left = '';
@@ -3964,11 +4274,7 @@
         holdTimer = null;
         longPressFiredAt = Date.now();
         suppressNextClick = true;
-        if (navigator.vibrate) {
-          try {
-            navigator.vibrate(15);
-          } catch {}
-        }
+        haptic('medium');
         openTargetMenu({ clientX: startX, clientY: startY }, info);
       }, 480);
     });
@@ -3992,7 +4298,12 @@
           if (Date.now() - longPressFiredAt < 1200) {
             e.preventDefault();
             e.stopPropagation();
+            return;
           }
+        }
+        if (e.target.closest('.tr-like-btn, .tr-more-btn, input, select, textarea')) return;
+        if (e.target.closest('.track-row, .q-item, .qp-tile, .media-card, .mood-tile, .top-result-card, .tab-chip, .pill-btn')) {
+          haptic('tap');
         }
       },
       true
@@ -4001,6 +4312,7 @@
 
   async function shareEntity({ kind, targetId, title = '', subtitle = '', trackIds = [], coverUrl = '' }) {
     if (state.shareInFlight) return;
+    haptic('success');
     state.shareInFlight = true;
     try {
       const res = await api('/api/web/share', {
@@ -4074,6 +4386,7 @@
 
   async function markNotInterested(trackId) {
     if (!trackId) return;
+    haptic('warning');
     try {
       await api('/api/web/not-interested', {
         method: 'POST',
@@ -4137,6 +4450,7 @@
   }
 
   function openModal(html, extraClass = '') {
+    haptic('tap');
     const box = $('modal-box');
     box.className = extraClass ? `modal-box ${extraClass}` : 'modal-box';
     box.innerHTML = html;
@@ -4225,6 +4539,16 @@
             </div>
             <label class="switch-toggle">
               <input type="checkbox" ${state.autoplay ? 'checked' : ''} onchange="App.toggleAutoplay(this.checked)" />
+              <span class="switch-track"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Haptic Feedback</div>
+              <div class="settings-row-desc">Subtle tactile vibrations on mobile taps, swipes, and controls (when supported by device)</div>
+            </div>
+            <label class="switch-toggle">
+              <input type="checkbox" ${state.hapticsEnabled ? 'checked' : ''} onchange="App.toggleHaptics(this.checked)" />
               <span class="switch-track"></span>
             </label>
           </div>
@@ -4452,6 +4776,7 @@
   window.App = {
     navigate,
     focusSearch: () => {
+      haptic('tap');
       setExpandedPlayer(false);
       closeTrackMenu();
       const input = $('global-search');
@@ -4487,24 +4812,31 @@
         }).catch(() => {});
       }
     },
-    setLibTab: (tab) => renderLibrary(tab),
+    setLibTab: (tab) => {
+      haptic('tap');
+      return renderLibrary(tab);
+    },
     setStatsRange: (range) => {
+      haptic('tap');
       state.statsRange = range || 'all';
       navigate(state.statsRange === 'all' ? 'stats' : `stats?range=${encodeURIComponent(state.statsRange)}`);
     },
     setStatsMetric: (metric) => {
+      haptic('tap');
       state.statsMetric = metric === 'mins' ? 'mins' : 'streams';
       renderStatsView();
     },
     refreshStats: () => renderStats(state.statsRange || 'all'),
     setRightTab: (tab) => {
+      haptic('tap');
       $('tab-queue').classList.toggle('active', tab === 'queue');
       $('tab-lyrics').classList.toggle('active', tab === 'lyrics');
       $('rp-queue-body').classList.toggle('hidden', tab !== 'queue');
       $('rp-lyrics-body').classList.toggle('hidden', tab !== 'lyrics');
     },
     setFsMobileView,
-    setFsTab: (tab) => {
+    setFsTab: (tab, silent = false) => {
+      if (!silent && state.fsTab !== tab) haptic('tap');
       state.fsTab = tab;
       $('fs-tab-queue').classList.toggle('active', tab === 'queue');
       $('fs-tab-lyrics').classList.toggle('active', tab === 'lyrics');
@@ -4552,11 +4884,18 @@
       window.App.setRightTab(tab);
     },
     toggleAutoplay: (v) => {
+      haptic('select');
       state.autoplay = !!v;
       localStorage.setItem('beatlab_autoplay', state.autoplay ? 'true' : 'false');
     },
+    toggleHaptics: (v) => {
+      state.hapticsEnabled = !!v;
+      localStorage.setItem('beatlab_haptics', state.hapticsEnabled ? 'true' : 'false');
+      if (state.hapticsEnabled) haptic('success');
+    },
     removeFromQueue: (idx) => {
       if (idx > state.queueIndex && idx < state.queue.length) {
+        haptic('tap');
         state.queue.splice(idx, 1);
         renderQueuePanel();
         saveServerQueue();
@@ -4572,6 +4911,7 @@
     playNext: (tid) => {
       const t = state.trackMap.get(tid);
       if (!t) return;
+      haptic('success');
       if (state.queue.length === 0) return playSingle(tid);
       state.queue.splice(state.queueIndex + 1, 0, t);
       renderQueuePanel();
@@ -4581,6 +4921,7 @@
     addToQueue: (tid) => {
       const t = state.trackMap.get(tid);
       if (!t) return;
+      haptic('success');
       if (state.queue.length === 0) return playSingle(tid);
       state.queue.push(t);
       renderQueuePanel();
@@ -4591,11 +4932,13 @@
     prevTrack,
     nextTrack,
     toggleShuffle: () => {
+      haptic('select');
       state.shuffle = !state.shuffle;
       $('btn-shuffle').classList.toggle('active', state.shuffle);
       if ($('fs-shuffle')) $('fs-shuffle').classList.toggle('active', state.shuffle);
     },
     cycleRepeat: () => {
+      haptic('select');
       const modes = ['off', 'all', 'one'];
       state.repeat = modes[(modes.indexOf(state.repeat) + 1) % modes.length];
       for (const btnId of ['btn-repeat', 'fs-repeat']) {
@@ -4631,6 +4974,7 @@
     },
     seekMs: (ms) => {
       if (Number.isFinite(ms)) {
+        haptic('tap');
         audio.currentTime = ms / 1000;
         if (audio.paused) audio.play().catch(() => {});
       }
@@ -4710,6 +5054,7 @@
     markNotInterested,
     openSettingsModal,
     setSettingsTab: (tab) => {
+      haptic('tap');
       state.settingsTab = tab;
       state.settingsData.confirmResetHidden = false;
       renderSettingsModalBody();
@@ -4755,6 +5100,7 @@
       try {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           await navigator.clipboard.writeText(text);
+          haptic('success');
           showToast(label);
           return;
         }
@@ -4762,6 +5108,7 @@
       showToast('Select and copy manually');
     },
     toggleSaveAlbum: async (id, saved) => {
+      haptic(saved ? 'success' : 'tap');
       try {
         await api('/api/web/star', {
           method: 'POST',
@@ -4773,6 +5120,7 @@
       }
     },
     toggleFollowArtist: async (id, followed) => {
+      haptic(followed ? 'success' : 'tap');
       try {
         await api('/api/web/star', {
           method: 'POST',
@@ -4807,6 +5155,7 @@
           method: 'POST',
           body: JSON.stringify({ name, comment, trackIds: tid ? [tid] : [] }),
         });
+        haptic('success');
         closeModal();
         await refreshSidebarPlaylists();
         showToast(`Created "${name}"`);
@@ -4821,6 +5170,7 @@
           method: 'POST',
           body: JSON.stringify({ trackIds: [tid] }),
         });
+        haptic('success');
         refreshSidebarPlaylists();
         showToast(res.added === 0 ? 'Already in playlist' : 'Added to playlist');
         const curPlHash = location.hash.startsWith('#playlist/')
@@ -4840,6 +5190,7 @@
           method: 'POST',
           body: JSON.stringify({ trackIds: [tid] }),
         });
+        haptic('success');
         refreshSidebarPlaylists();
         showToast(res.added === 0 ? 'Already in playlist' : 'Added to playlist');
         renderPlaylist(pid);
@@ -4907,6 +5258,7 @@
     deletePlaylist: async (pid) => {
       try {
         await api(`/api/web/playlists/${encodeURIComponent(pid)}`, { method: 'DELETE' });
+        haptic('warning');
         await refreshSidebarPlaylists();
         showToast('Playlist deleted');
         navigate('library');
@@ -4918,11 +5270,13 @@
     closeModal,
     installPwa,
     toggleEq: (on) => {
+      haptic('select');
       state.eqEnabled = on;
       applyEqGains();
     },
     setEqBand: (idx, val) => {
       const n = parseInt(val, 10) || 0;
+      if (n === 0 || Math.abs(n) === 12) haptic('tick');
       state.eqGains[idx] = n;
       const lbl = $(`eq-val-${idx}`);
       if (lbl) lbl.textContent = `${n > 0 ? '+' : ''}${n}dB`;
@@ -4931,6 +5285,7 @@
     applyEqPreset: (name) => {
       const vals = EQ_PRESETS[name];
       if (!vals) return;
+      haptic('select');
       state.eqGains = [...vals];
       state.eqEnabled = name !== 'Flat';
       applyEqGains();
