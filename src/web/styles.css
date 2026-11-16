@@ -978,6 +978,33 @@ a {
   letter-spacing: -0.015em;
 }
 
+/* New Releases (home) */
+.section-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.new-release-card {
+  border-color: rgba(30, 215, 96, 0.22);
+}
+.new-release-card:hover {
+  border-color: rgba(30, 215, 96, 0.5);
+}
+.new-release-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #06120b;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1.4;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
 /* Quick Picks 2x3 or 3x2 grid */
 .quick-picks-grid {
   display: grid;

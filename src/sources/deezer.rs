@@ -2,7 +2,7 @@ use crate::models::{slug, AlbumSummary, ArtistSummary, Track};
 use crate::sources::MusicSource;
 use crate::taste::classify_moods_str;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -365,6 +365,69 @@ impl DeezerSource {
         summary.album_count = albums.len();
         summary.song_count = top_tracks.len();
         Some((summary, top_tracks, albums, related))
+    }
+
+    /// Fetches an artist's most recent, genuine releases (albums/EPs/singles),
+    /// newest first. Powers the personalised "New Releases" home feed.
+    pub async fn fetch_artist_releases(
+        &self,
+        deezer_artist_id: &str,
+        artist_name: &str,
+        limit: usize,
+    ) -> Vec<AlbumSummary> {
+        let Ok(dz_id) = deezer_artist_id.trim().parse::<u64>() else {
+            return Vec::new();
+        };
+        if dz_id == 0 {
+            return Vec::new();
+        }
+        let url = format!("https://api.deezer.com/artist/{}/albums?limit=50", dz_id);
+        let Some(parsed) = self.get_json::<DzDataList<DzAlbum>>(&url).await else {
+            return Vec::new();
+        };
+
+        let min_year = Utc::now().year() - 1;
+        let mut entries: Vec<(String, DzAlbum)> = parsed
+            .data
+            .into_iter()
+            .filter(|a| a.id > 0)
+            // Keep the artist's own releases, not compilations/appearances.
+            .filter(|a| {
+                a.artist
+                    .as_ref()
+                    .map(|ar| ar.id == dz_id)
+                    .unwrap_or(true)
+            })
+            .map(|a| (a.release_date.clone(), a))
+            .collect();
+        // ISO dates (YYYY-MM-DD) sort lexicographically: newest first.
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let fallback_artist = DzArtist {
+            id: dz_id,
+            name: artist_name.trim().to_string(),
+            ..Default::default()
+        };
+        let mut out: Vec<AlbumSummary> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (_, mut album) in entries {
+            let year = parse_year(&album.release_date);
+            if year <= 0 || year < min_year {
+                continue;
+            }
+            if album.artist.is_none() {
+                album.artist = Some(fallback_artist.clone());
+            }
+            if let Some(summary) = album.into_summary() {
+                if seen.insert(summary.id.clone()) {
+                    out.push(summary);
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
     }
 
     pub async fn fetch_genres(&self) -> Vec<DeezerGenre> {

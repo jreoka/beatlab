@@ -1693,6 +1693,7 @@
       const d = await api('/api/web/home', { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const quickPicks = cacheTracks(d.quickPicks || []).slice(0, 6);
+      const newReleases = d.newReleases || [];
       const trending = cacheTracks(d.trending || []);
       const recent = cacheTracks(d.recent || []);
       const relatedTracks = cacheTracks(d.relatedTracks || []);
@@ -1708,6 +1709,16 @@
         html += `<section class="section">
           <div class="section-head"><h2>Quick Picks</h2></div>
           <div class="quick-picks-grid">${quickPicks.map(renderQuickTile).join('')}</div>
+        </section>`;
+      }
+
+      if (newReleases.length > 0) {
+        html += `<section class="section">
+          <div class="section-head">
+            <h2>New Releases</h2>
+            <span class="section-hint">Fresh drops from artists you follow &amp; listen to</span>
+          </div>
+          <div class="card-grid">${newReleases.map(renderNewReleaseCard).join('')}</div>
         </section>`;
       }
 
@@ -3898,6 +3909,19 @@
     return `<div class="media-card" data-share-kind="album" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
+        <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
+      </div>
+      <div class="card-title">${esc(a.name)}</div>
+      <div class="card-sub">${esc(sub)}</div>
+    </div>`;
+  }
+
+  function renderNewReleaseCard(a) {
+    const sub = `${a.artist}${a.year ? ` · ${a.year}` : ''}`;
+    return `<div class="media-card new-release-card" data-share-kind="album" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
+      <div class="card-art-wrap">
+        <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
+        <span class="new-release-badge">NEW</span>
         <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(a.name)}</div>

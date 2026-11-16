@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -761,6 +761,66 @@ pub async fn change_password(
     }
 }
 
+/// Builds the personalised "New Releases" feed: recent albums from artists the
+/// user follows or listens to. Fresh releases are pulled from Deezer in
+/// parallel; a short timeout keeps the home tab responsive, and the newest
+/// matching albums already in the local library fill any gaps.
+async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<AlbumSummary> {
+    let artists = state
+        .store
+        .relevant_artists_for_releases(uid, 8)
+        .unwrap_or_default();
+    if artists.is_empty() {
+        return Vec::new();
+    }
+
+    let fetches = artists.iter().map(|artist| {
+        let dz = state.sources.deezer.clone();
+        let id = artist.deezer_id.clone();
+        let name = artist.name.clone();
+        async move { dz.fetch_artist_releases(&id, &name, 4).await }
+    });
+    let batches = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures::future::join_all(fetches),
+    )
+    .await
+    .unwrap_or_default();
+
+    let mut albums: Vec<AlbumSummary> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for batch in batches {
+        for album in batch {
+            if seen.insert(album.id.clone()) {
+                albums.push(album);
+            }
+        }
+    }
+
+    // Local fallback: newest recent albums from the same artists in the library.
+    if albums.len() < limit {
+        let min_year = Utc::now().year() - 2;
+        let artist_ids: HashSet<&str> = artists.iter().map(|a| a.id.as_str()).collect();
+        let local = state.store.build_album_summaries(uid).unwrap_or_default();
+        for album in local.into_iter().filter(|a| {
+            artist_ids.contains(a.artist_id.as_str())
+                && a.year >= min_year
+                && a.year <= min_year + 3
+        }) {
+            if seen.insert(album.id.clone()) {
+                albums.push(album);
+            }
+            if albums.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    albums.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
+    albums.truncate(limit);
+    albums
+}
+
 pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
@@ -839,6 +899,11 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
 
+    let new_releases = collect_new_releases(&state, uid, 12).await;
+    for a in &new_releases {
+        let _ = state.store.upsert_album_meta(a);
+    }
+
     let moods: Vec<Value> = Mood::ALL
         .iter()
         .map(|m| {
@@ -858,6 +923,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
 
     json_res(json!({
         "quickPicks": to_web_tracks(&state, uid, &quick_picks),
+        "newReleases": new_releases.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "recent": to_web_tracks(&state, uid, &recent),
         "madeForYou": auto_mixes,
         "relatedTracks": to_web_tracks(&state, uid, &related_tracks),

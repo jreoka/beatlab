@@ -2407,6 +2407,85 @@ impl Store {
         Ok(rows)
     }
 
+    /// Artists the user cares about most, used to personalise the "New Releases"
+    /// feed on the home tab. Explicitly followed artists always rank first; the
+    /// rest come from listening history (play count + recency). Only artists we
+    /// can look up on Deezer are returned so fresh releases can be fetched for
+    /// them.
+    pub fn relevant_artists_for_releases(
+        &self,
+        user_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<ArtistSummary>> {
+        if user_id <= 0 {
+            return Ok(Vec::new());
+        }
+        let followed = self.followed_artist_ids(user_id).unwrap_or_default();
+        let mut score: HashMap<String, f64> = HashMap::new();
+        // Followed artists get a strong, stable boost so they lead the list.
+        for id in &followed {
+            *score.entry(id.clone()).or_insert(0.0) += 1000.0;
+        }
+
+        // Artists from listening history, ranked by play count and recency.
+        let listened = self.user_recent_tracks(user_id, 500, 0).unwrap_or_default();
+        let mut names: HashMap<String, String> = HashMap::new();
+        for (t, st) in listened {
+            let aid = t.artist_id();
+            let name = primary_artist(&t.artist);
+            let name = if name.is_empty() { t.artist.clone() } else { name };
+            names.entry(aid.clone()).or_insert(name);
+            let plays = (st.play_count.max(0) as f64).ln_1p().min(8.0);
+            let recency = ((st.last_played.max(0) as f64) / 86_400.0).ln_1p().min(6.0);
+            *score.entry(aid).or_insert(0.0) += plays + recency;
+        }
+
+        let metas = self.all_artist_metas_map()?;
+        let mut ranked: Vec<(f64, ArtistSummary)> = score
+            .into_iter()
+            .filter_map(|(id, s)| {
+                let meta = metas.get(&id);
+                let deezer_id = meta
+                    .and_then(|m| {
+                        let d = m.deezer_id.trim();
+                        (!d.is_empty() && d != "0").then(|| d.to_string())
+                    })
+                    .or_else(|| {
+                        id.strip_prefix("ar:dz:")
+                            .and_then(|d| (!d.is_empty() && d != "0").then(|| d.to_string()))
+                    })
+                    .unwrap_or_default();
+                if deezer_id.is_empty() {
+                    return None;
+                }
+                let name = meta
+                    .map(|m| m.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| names.get(&id).cloned())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| deezer_id.clone());
+                let cover_url = meta.map(|m| m.cover_url.clone()).unwrap_or_default();
+                Some((
+                    s,
+                    ArtistSummary {
+                        id,
+                        name,
+                        cover_url,
+                        bio: String::new(),
+                        deezer_id,
+                        album_count: 0,
+                        song_count: 0,
+                    },
+                ))
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.0.total_cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name))
+        });
+        ranked.truncate(limit);
+        Ok(ranked.into_iter().map(|(_, a)| a).collect())
+    }
+
     pub fn set_rating(&self, user_id: i64, track_id: &str, rating: i32) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let clamped = rating.clamp(0, 5);
@@ -5176,5 +5255,48 @@ mod tests {
         assert!(store.has_listening_history(fresh.id).unwrap());
         let pool = store.candidate_tracks_for_user(fresh.id, 50).unwrap();
         assert!(pool.iter().any(|t| t.id == local.id));
+    }
+
+    #[test]
+    fn relevant_artists_for_releases_prioritises_followed_then_listened() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("listener", "pw").unwrap();
+
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:111".into(),
+                name: "Followed Artist".into(),
+                deezer_id: "111".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:222".into(),
+                name: "Listened Artist".into(),
+                deezer_id: "222".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut followed_track = sample_track("dz:1", "Song One", "Followed Artist", "Album A");
+        followed_track.meta = r#"{"deezer_artist_id":111}"#.into();
+        let mut listened_track = sample_track("dz:2", "Song Two", "Listened Artist", "Album B");
+        listened_track.meta = r#"{"deezer_artist_id":222}"#.into();
+        store
+            .upsert_tracks(&[followed_track, listened_track.clone()])
+            .unwrap();
+
+        // Follow one artist, but only listen to the other.
+        store.follow_artist(u.id, "ar:dz:111").unwrap();
+        for _ in 0..4 {
+            store.record_event(u.id, &listened_track.id, "play", 1.0).unwrap();
+        }
+
+        let artists = store.relevant_artists_for_releases(u.id, 8).unwrap();
+        assert_eq!(artists.len(), 2);
+        assert_eq!(artists[0].id, "ar:dz:111", "followed artist should rank first");
+        assert_eq!(artists[1].id, "ar:dz:222", "listened artist should follow");
+        assert!(artists.iter().all(|a| !a.deezer_id.is_empty()));
     }
 }
