@@ -1,5 +1,6 @@
 use crate::models::{
-    AlbumSummary, ArtistSummary, Mood, PlayQueueState, Playlist, Track, User, UserTrackStats,
+    AlbumSummary, ArtistSummary, Mood, PlayQueueState, Playlist, PublicUser, Track, User,
+    UserProfile, UserTrackStats,
 };
 use crate::subsonic::AppState;
 use axum::extract::{Path, Query, State};
@@ -309,6 +310,32 @@ pub struct WebTrack {
     pub is_starred: bool,
     pub play_count: i32,
     pub rating: i32,
+}
+
+/// Track ids that are part of the listener's own rotation — used to badge
+/// personalized picks in curated mixes.
+fn personal_match_ids(state: &AppState, user_id: i64) -> HashSet<String> {
+    if user_id <= 0 {
+        return HashSet::new();
+    }
+    let mut ids: HashSet<String> = state.store.starred_ids(user_id).unwrap_or_default();
+    ids.extend(
+        state
+            .store
+            .user_frequent_tracks(user_id, 200, 0)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(t, _)| t.id),
+    );
+    ids.extend(
+        state
+            .store
+            .user_manual_playlist_tracks(user_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, _, t)| t.id),
+    );
+    ids
 }
 
 fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> Vec<Track> {
@@ -1020,6 +1047,7 @@ pub async fn explore_mix(
         .await;
     let tracks = filter_visible_tracks(&state, user.id, raw_tracks);
     let total_duration: i32 = tracks.iter().map(|t| t.duration.max(0)).sum();
+    let match_ids = personal_match_ids(&state, user.id);
     json_res(json!({
         "mix": {
             "key": spec.key,
@@ -1031,7 +1059,7 @@ pub async fn explore_mix(
             "c2": spec.c2,
             "totalDuration": total_duration,
         },
-        "tracks": to_web_tracks(&state, user.id, &tracks),
+        "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
     }))
 }
 
@@ -1049,6 +1077,7 @@ pub async fn mood_mix(
     };
     let tracks = state.taste.mood_mix_tracks(user.id, mood, 35).await;
     let (c1, c2) = mood.gradient();
+    let match_ids = personal_match_ids(&state, user.id);
     json_res(json!({
         "mood": {
             "slug": mood.slug(),
@@ -1057,7 +1086,7 @@ pub async fn mood_mix(
             "c1": c1,
             "c2": c2,
         },
-        "tracks": to_web_tracks(&state, user.id, &tracks),
+        "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
     }))
 }
 
@@ -3407,6 +3436,452 @@ fn playlist_summary_json(p: &Playlist) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Social layer — user search, following, profiles & auto-updating user radio
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct SocialSearchQuery {
+    pub q: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct ProfileUpdateReq {
+    #[serde(default, rename = "displayName")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub bio: Option<String>,
+    #[serde(default, rename = "avatarColor")]
+    pub avatar_color: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+fn public_user_json(u: &PublicUser) -> Value {
+    let name = if u.display_name.trim().is_empty() {
+        u.username.as_str()
+    } else {
+        u.display_name.as_str()
+    };
+    json!({
+        "id": u.id,
+        "username": u.username,
+        "displayName": name,
+        "bio": u.bio,
+        "avatarColor": u.avatar_color,
+        "avatarLetter": u.avatar_letter,
+        "location": u.location,
+        "created": u.created,
+        "followersCount": u.followers_count,
+        "followingCount": u.following_count,
+        "isFollowing": u.is_following,
+        "isSelf": u.is_self,
+    })
+}
+
+fn profile_json(p: &UserProfile) -> Value {
+    json!({
+        "userId": p.user_id,
+        "displayName": p.display_name,
+        "bio": p.bio,
+        "avatarColor": p.avatar_color,
+        "location": p.location,
+        "updated": p.updated,
+    })
+}
+
+
+/// `{user}` path segment accepts either a numeric id or a username.
+fn resolve_user_ref(state: &AppState, reference: &str) -> Option<i64> {
+    let trimmed = reference.trim().trim_start_matches('@');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(id) = trimmed.parse::<i64>() {
+        return state
+            .store
+            .get_public_user(id, id)
+            .ok()
+            .flatten()
+            .map(|_| id);
+    }
+    state
+        .store
+        .get_user_by_name(trimmed)
+        .ok()
+        .flatten()
+        .map(|u| u.id)
+}
+
+pub async fn social_search(
+    State(state): State<AppState>,
+    Query(q): Query<SocialSearchQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let query = q.q.unwrap_or_default();
+    let limit = q.limit.unwrap_or(20).clamp(1, 50);
+    let users = state
+        .store
+        .search_public_users(&query, user.id, limit)
+        .unwrap_or_default();
+    json_res(json!({
+        "query": query,
+        "users": users.iter().map(public_user_json).collect::<Vec<_>>(),
+    }))
+}
+
+pub async fn social_suggestions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let users = state.store.suggested_users(user.id, 8).unwrap_or_default();
+    json_res(json!({
+        "users": users.iter().map(public_user_json).collect::<Vec<_>>(),
+    }))
+}
+
+pub async fn social_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let profile = state.store.get_profile(user.id).unwrap_or_default();
+    let public = state.store.get_public_user(user.id, user.id).ok().flatten();
+    json_res(json!({
+        "user": public.as_ref().map(public_user_json).unwrap_or(Value::Null),
+        "profile": profile_json(&profile),
+    }))
+}
+
+pub async fn social_update_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ProfileUpdateReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let current = state.store.get_profile(user.id).unwrap_or_default();
+    let display_name = req
+        .display_name
+        .unwrap_or(current.display_name);
+    let bio = req.bio.unwrap_or(current.bio);
+    let avatar_color = req.avatar_color.unwrap_or(current.avatar_color);
+    let location = req.location.unwrap_or(current.location);
+    match state
+        .store
+        .update_profile(user.id, &display_name, &bio, &avatar_color, &location)
+    {
+        Ok(profile) => {
+            let public = state.store.get_public_user(user.id, user.id).ok().flatten();
+            json_res(json!({
+                "ok": true,
+                "profile": profile_json(&profile),
+                "user": public.as_ref().map(public_user_json).unwrap_or(Value::Null),
+            }))
+        }
+        Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+pub async fn social_profile(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let Some(target) = state.store.get_public_user(target_id, user.id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let profile = state.store.get_profile(target_id).unwrap_or_default();
+    let radio_saved = state
+        .store
+        .get_user_radio(user.id, target_id)
+        .ok()
+        .flatten()
+        .is_some();
+    let playlists: Vec<Value> = state
+        .store
+        .list_playlists(target_id, true)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.user_id == target_id && p.public && !p.is_auto)
+        .take(12)
+        .map(|p| playlist_summary_json(&p))
+        .collect();
+    json_res(json!({
+        "user": public_user_json(&target),
+        "profile": profile_json(&profile),
+        "radioSaved": radio_saved,
+        "playlists": playlists,
+    }))
+}
+
+pub async fn social_follow(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    match state.store.follow_user(user.id, target_id) {
+        Ok(()) => {
+            let target = state
+                .store
+                .get_public_user(target_id, user.id)
+                .ok()
+                .flatten();
+            json_res(json!({
+                "ok": true,
+                "following": true,
+                "user": target.as_ref().map(public_user_json).unwrap_or(Value::Null),
+            }))
+        }
+        Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+pub async fn social_unfollow(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    match state.store.unfollow_user(user.id, target_id) {
+        Ok(()) => {
+            let target = state
+                .store
+                .get_public_user(target_id, user.id)
+                .ok()
+                .flatten();
+            json_res(json!({
+                "ok": true,
+                "following": false,
+                "user": target.as_ref().map(public_user_json).unwrap_or(Value::Null),
+            }))
+        }
+        Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+pub async fn social_followers(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let users = state
+        .store
+        .list_followers(target_id, user.id)
+        .unwrap_or_default();
+    json_res(json!({
+        "users": users.iter().map(public_user_json).collect::<Vec<_>>(),
+    }))
+}
+
+pub async fn social_following(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let users = state
+        .store
+        .list_following(target_id, user.id)
+        .unwrap_or_default();
+    json_res(json!({
+        "users": users.iter().map(public_user_json).collect::<Vec<_>>(),
+    }))
+}
+
+fn radio_name_for(target: &PublicUser) -> String {
+    let display = if target.display_name.trim().is_empty() {
+        target.username.as_str()
+    } else {
+        target.display_name.as_str()
+    };
+    format!("{} Radio", display)
+}
+
+/// Generate a listener's radio on demand from their listening taste.
+pub async fn social_user_radio(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let Some(target) = state.store.get_public_user(target_id, user.id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let tracks = state.taste.user_radio_tracks(target_id, 40);
+    let saved_pid = state
+        .store
+        .get_user_radio(user.id, target_id)
+        .ok()
+        .flatten();
+    let playlist = saved_pid
+        .as_deref()
+        .and_then(|pid| state.store.get_playlist(pid).ok().flatten());
+    json_res(json!({
+        "user": public_user_json(&target),
+        "tracks": to_web_tracks(&state, user.id, &tracks),
+        "saved": saved_pid.is_some(),
+        "playlist": playlist.as_ref().map(playlist_summary_json).unwrap_or(Value::Null),
+    }))
+}
+
+/// Subscribe to a listener's radio: saves an auto-updating playlist in the
+/// viewer's library that the background curator rebuilds from that listener's
+/// evolving taste.
+pub async fn social_save_user_radio(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let Some(target) = state.store.get_public_user(target_id, user.id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let pid = format!("radio-u{}-t{}", user.id, target_id);
+    let ids: Vec<String> = state
+        .taste
+        .user_radio_tracks(target_id, 40)
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    if state
+        .store
+        .upsert_auto_playlist(
+            &pid,
+            user.id,
+            &radio_name_for(&target),
+            "Auto-updating mix of what this listener plays",
+            &format!("user_radio:{}", target_id),
+            &ids,
+        )
+        .is_err()
+    {
+        return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Could not save radio");
+    }
+    if state.store.save_user_radio(user.id, target_id, &pid).is_err() {
+        return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Could not save radio");
+    }
+    state.store.kv_set(
+        &format!("radio:rebuilt:{}:{}", user.id, target_id),
+        &Utc::now().timestamp().to_string(),
+    );
+    let playlist = state.store.get_playlist(&pid).ok().flatten();
+    json_res(json!({
+        "ok": true,
+        "saved": true,
+        "playlist": playlist.as_ref().map(playlist_summary_json).unwrap_or(Value::Null),
+    }))
+}
+
+pub async fn social_unsave_user_radio(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    match state.store.delete_user_radio(user.id, target_id) {
+        Ok(pid) => {
+            if let Some(pid) = pid {
+                let _ = state.store.delete_playlist(&pid);
+            }
+            json_res(json!({ "ok": true, "saved": false }))
+        }
+        Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+/// Compact radio previews from the people the viewer follows.
+pub async fn social_feed(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let following = state
+        .store
+        .list_following(user.id, user.id)
+        .unwrap_or_default();
+    let radios: Vec<Value> = following
+        .into_iter()
+        .take(6)
+        .map(|target| {
+            // Use the same generator as the profile radio. A listener can have a
+            // full radio from stars/taste/catalog without any play-count stats,
+            // which made the Community preview claim "0 tracks".
+            let full = state.taste.user_radio_tracks(target.id, 40);
+            let track_count = full.len();
+            let preview: Vec<Track> = full.into_iter().take(6).collect();
+            json!({
+                "user": public_user_json(&target),
+                "trackCount": track_count,
+                "tracks": to_web_tracks(&state, user.id, &preview),
+            })
+        })
+        .collect();
+    json_res(json!({
+        "radios": radios,
+        "count": radios.len(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3720,6 +4195,15 @@ mod tests {
         assert!(html.contains("renderStatsView"));
         assert!(html.contains("shareEntity"));
         assert!(html.contains("data-route=\"stats\""));
+        // @username searches render people in the main results view, not a popover.
+        assert!(html.contains("people-search-grid"));
+        assert!(!html.contains("mention-dropdown"));
+        // Social profiles expose auto-updating user radio, not manual recommendations.
+        assert!(html.contains("radio-panel"));
+        assert!(!html.contains("Recommend a track"));
+        // Follow buttons flip in place without a page reload.
+        assert!(html.contains("data-follow-ref"));
+        assert!(html.contains("syncFollowState"));
         assert!(!html.contains("Audio Quality &amp; Codecs"));
         assert!(!html.contains("Sources &amp; Signals"));
         assert!(!html.contains("favoriteSourceLabel"));

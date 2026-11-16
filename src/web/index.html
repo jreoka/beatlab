@@ -80,6 +80,10 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" fill="currentColor"/></svg>
             <span>Explore</span>
           </button>
+          <button class="nav-item" data-route="community" onclick="App.navigate('community')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M2.8 19.5v-1.2a5.2 5.2 0 0 1 10.4 0v1.2"/><path d="M16 5.2a3.2 3.2 0 0 1 0 6.1M17.5 14.4a4.6 4.6 0 0 1 3.7 4.5v.6"/></svg>
+            <span>Community</span>
+          </button>
           <button class="nav-item" data-route="search" onclick="App.focusSearch()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
             <span>Search</span>
@@ -91,6 +95,10 @@
           <button class="nav-item" data-route="playlists" onclick="App.navigate('playlists')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
             <span>Playlists</span>
+          </button>
+          <button class="nav-item" data-route="profile" onclick="App.openMyProfile()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.6"/><path d="M4.5 20.5v-1.6a6.5 6.5 0 0 1 13 0v1.6"/></svg>
+            <span>My Profile</span>
           </button>
           <button class="nav-item" data-route="stats" onclick="App.navigate('stats')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16"/><rect x="5.5" y="12" width="3" height="5.5" rx="0.8" fill="currentColor" stroke="none"/><rect x="10.5" y="7" width="3" height="10.5" rx="0.8" fill="currentColor" stroke="none"/><rect x="15.5" y="4" width="3" height="13.5" rx="0.8" fill="currentColor" stroke="none"/></svg>
@@ -159,7 +167,7 @@
           </div>
           <div class="search-box">
             <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-            <input id="global-search" type="search" placeholder="Search songs, artists, albums... (Press /)" autocomplete="off" />
+            <input id="global-search" type="search" placeholder="Search songs, artists, albums... or @username for people (Press /)" autocomplete="off" />
             <button id="clear-search-btn" class="icon-btn hidden" title="Clear search" onclick="App.clearSearch()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
             </button>
@@ -175,10 +183,39 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M1 14h6m2-6h6m2 8h6"/></svg>
             <span>EQ</span>
           </button>
-          <div class="user-pill" onclick="App.openSettingsModal()" title="Settings">
-            <span id="user-avatar" class="avatar-dot">B</span>
-            <span id="user-name">User</span>
-            <svg class="user-pill-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <div class="user-menu-wrap">
+            <div class="user-pill" onclick="App.toggleUserMenu(event)" title="Account menu">
+              <span id="user-avatar" class="avatar-dot">B</span>
+              <span id="user-name">User</span>
+              <svg class="user-pill-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </div>
+            <div id="user-menu" class="user-menu hidden">
+              <div class="user-menu-head">
+                <span id="user-menu-avatar" class="avatar-dot large">B</span>
+                <div>
+                  <div id="user-menu-name" class="user-menu-name">User</div>
+                  <div class="user-menu-sub">Your public profile</div>
+                </div>
+              </div>
+              <hr class="ctx-sep">
+              <button class="user-menu-item" onclick="App.openMyProfile()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.6"/><path d="M4.5 20.5v-1.6a6.5 6.5 0 0 1 13 0v1.6"/></svg>
+                <span>My Profile</span>
+              </button>
+              <button class="user-menu-item" onclick="App.goCommunity()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M2.8 19.5v-1.2a5.2 5.2 0 0 1 10.4 0v1.2"/><path d="M16 5.2a3.2 3.2 0 0 1 0 6.1M17.5 14.4a4.6 4.6 0 0 1 3.7 4.5v.6"/></svg>
+                <span>Community</span>
+              </button>
+              <button class="user-menu-item" onclick="App.goSettings()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                <span>Settings</span>
+              </button>
+              <hr class="ctx-sep">
+              <button class="user-menu-item danger" onclick="App.signOut()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+                <span>Sign out</span>
+              </button>
+            </div>
           </div>
           <button class="text-btn signout-btn" onclick="App.signOut()">Sign out</button>
         </div>
@@ -230,6 +267,10 @@
       <button class="mobile-nav-btn nav-item" data-route="explore" onclick="App.navigate('explore')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" fill="currentColor"/></svg>
         <span>Explore</span>
+      </button>
+      <button class="mobile-nav-btn nav-item" data-route="community" onclick="App.navigate('community')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M2.8 19.5v-1.2a5.2 5.2 0 0 1 10.4 0v1.2"/><path d="M16 5.2a3.2 3.2 0 0 1 0 6.1M17.5 14.4a4.6 4.6 0 0 1 3.7 4.5v.6"/></svg>
+        <span>Social</span>
       </button>
       <button class="mobile-nav-btn nav-item" data-route="search" onclick="App.focusSearch()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>

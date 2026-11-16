@@ -1,7 +1,7 @@
 use crate::models::{
     constant_time_eq, err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
-    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, RadioStation, ShareRecord,
-    Track, User, UserEventRow, UserTrackStats,
+    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, PublicUser, RadioStation,
+    ShareRecord, Track, User, UserEventRow, UserProfile, UserTrackStats,
 };
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, ToSql};
@@ -293,6 +293,44 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_chart_catalog_rank
                 ON chart_catalog(rank_pos ASC, updated DESC);
+
+            -- Social layer: public profiles, following graph and auto-updating user radio.
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id INTEGER PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                bio TEXT NOT NULL DEFAULT '',
+                avatar_color TEXT NOT NULL DEFAULT '',
+                location TEXT NOT NULL DEFAULT '',
+                updated INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS follows (
+                follower_id INTEGER NOT NULL,
+                following_id INTEGER NOT NULL,
+                created INTEGER NOT NULL,
+                PRIMARY KEY(follower_id, following_id),
+                FOREIGN KEY(follower_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(following_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_follows_following
+                ON follows(following_id, created DESC);
+            CREATE INDEX IF NOT EXISTS idx_follows_follower
+                ON follows(follower_id, created DESC);
+
+            -- A listener's saved radios: a playlist in the owner's library that
+            -- auto-refreshes from the target user's listening taste.
+            CREATE TABLE IF NOT EXISTS user_radios (
+                owner_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                playlist_id TEXT NOT NULL,
+                created INTEGER NOT NULL,
+                PRIMARY KEY(owner_id, target_id),
+                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(target_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_radios_target
+                ON user_radios(target_id);
             ",
         )?;
 
@@ -543,6 +581,301 @@ impl Store {
                 row_to_user,
             )
             .optional()?)
+    }
+
+    // -------------------------------------------------------------------------
+    // Social layer: profiles, following graph & auto-updating user radio
+    // -------------------------------------------------------------------------
+
+    /// Base SELECT for a `PublicUser`. Viewer id is always bound as `?1` so the
+    /// `is_following` flag can be computed in SQL for any caller.
+    const PUBLIC_USER_SELECT: &'static str = "
+        SELECT u.id, u.username, u.created,
+               COALESCE(p.display_name, '') AS display_name,
+               COALESCE(p.bio, '') AS bio,
+               COALESCE(p.avatar_color, '') AS avatar_color,
+               COALESCE(p.location, '') AS location,
+               (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.id) AS followers_count,
+               (SELECT COUNT(*) FROM follows f WHERE f.follower_id = u.id) AS following_count,
+               EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ?1 AND f.following_id = u.id) AS is_following
+        FROM users u
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+    ";
+
+    pub fn get_profile(&self, user_id: i64) -> AppResult<UserProfile> {
+        let conn = self.lock();
+        let profile = conn
+            .query_row(
+                "SELECT user_id, display_name, bio, avatar_color, location, updated
+                 FROM user_profiles WHERE user_id = ?1",
+                params![user_id],
+                |r| {
+                    Ok(UserProfile {
+                        user_id: r.get(0)?,
+                        display_name: r.get(1)?,
+                        bio: r.get(2)?,
+                        avatar_color: r.get(3)?,
+                        location: r.get(4)?,
+                        updated: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(profile.unwrap_or_else(|| UserProfile {
+            user_id,
+            ..Default::default()
+        }))
+    }
+
+    pub fn update_profile(
+        &self,
+        user_id: i64,
+        display_name: &str,
+        bio: &str,
+        avatar_color: &str,
+        location: &str,
+    ) -> AppResult<UserProfile> {
+        let display_name = clip_str(display_name, 40);
+        let bio = clip_str(bio, 280);
+        let avatar_color = clip_str(avatar_color, 24);
+        // Only accept real hex colors — this value is rendered into a CSS
+        // style attribute on the client.
+        let avatar_color = if is_hex_color(&avatar_color) {
+            avatar_color
+        } else {
+            String::new()
+        };
+        let location = clip_str(location, 80);
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO user_profiles(user_id, display_name, bio, avatar_color, location, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 display_name = excluded.display_name,
+                 bio = excluded.bio,
+                 avatar_color = excluded.avatar_color,
+                 location = excluded.location,
+                 updated = excluded.updated",
+            params![user_id, display_name, bio, avatar_color, location, now],
+        )?;
+        Ok(UserProfile {
+            user_id,
+            display_name,
+            bio,
+            avatar_color,
+            location,
+            updated: now,
+        })
+    }
+
+    pub fn get_public_user(&self, target_id: i64, viewer_id: i64) -> AppResult<Option<PublicUser>> {
+        let conn = self.lock();
+        let sql = format!("{} WHERE u.id = ?2", Self::PUBLIC_USER_SELECT);
+        let user = conn
+            .query_row(&sql, params![viewer_id, target_id], row_to_public_user)
+            .optional()?;
+        Ok(user.map(|mut u| {
+            u.is_self = u.id == viewer_id;
+            u
+        }))
+    }
+
+    /// Search users by username, display name or bio. A leading `@` is ignored
+    /// so `@emily` and `emily` behave identically.
+    pub fn search_public_users(
+        &self,
+        query: &str,
+        viewer_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<PublicUser>> {
+        let q = query.trim().trim_start_matches('@').trim().to_lowercase();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let sql = format!(
+            "{base}
+             WHERE instr(lower(u.username), ?2) > 0
+                OR instr(lower(COALESCE(p.display_name, '')), ?2) > 0
+                OR instr(lower(COALESCE(p.bio, '')), ?2) > 0
+             ORDER BY
+                CASE WHEN lower(u.username) = ?2 THEN 0
+                     WHEN lower(COALESCE(p.display_name, '')) = ?2 THEN 1
+                     ELSE 2 END ASC,
+                is_following DESC,
+                followers_count DESC,
+                u.username ASC
+             LIMIT ?3",
+            base = Self::PUBLIC_USER_SELECT,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![viewer_id, q, limit as i64], row_to_public_user)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|mut u| {
+                u.is_self = u.id == viewer_id;
+                u
+            })
+            .collect())
+    }
+
+    /// A handful of suggested people for the "find friends" area.
+    pub fn suggested_users(&self, viewer_id: i64, limit: usize) -> AppResult<Vec<PublicUser>> {
+        let conn = self.lock();
+        let sql = format!(
+            "{base}
+             WHERE u.id != ?1
+             ORDER BY followers_count DESC, u.username ASC
+             LIMIT ?2",
+            base = Self::PUBLIC_USER_SELECT,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![viewer_id, limit as i64], row_to_public_user)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|mut u| {
+                u.is_self = u.id == viewer_id;
+                u
+            })
+            .collect())
+    }
+
+    pub fn follow_user(&self, follower_id: i64, following_id: i64) -> AppResult<()> {
+        if follower_id == following_id {
+            return Err(err_msg("You can't follow yourself"));
+        }
+        let conn = self.lock();
+        let exists: Option<i64> = conn
+            .query_row("SELECT id FROM users WHERE id = ?1", params![following_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if exists.is_none() {
+            return Err(err_msg("User not found"));
+        }
+        conn.execute(
+            "INSERT INTO follows(follower_id, following_id, created) VALUES (?1, ?2, ?3)
+             ON CONFLICT(follower_id, following_id) DO NOTHING",
+            params![follower_id, following_id, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn unfollow_user(&self, follower_id: i64, following_id: i64) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM follows WHERE follower_id = ?1 AND following_id = ?2",
+            params![follower_id, following_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_followers(&self, user_id: i64, viewer_id: i64) -> AppResult<Vec<PublicUser>> {
+        let conn = self.lock();
+        let sql = format!(
+            "{base}
+             WHERE u.id IN (SELECT follower_id FROM follows WHERE following_id = ?2)
+             ORDER BY (SELECT created FROM follows WHERE follower_id = u.id AND following_id = ?2) DESC,
+                      u.username ASC",
+            base = Self::PUBLIC_USER_SELECT,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![viewer_id, user_id], row_to_public_user)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|mut u| {
+                u.is_self = u.id == viewer_id;
+                u
+            })
+            .collect())
+    }
+
+    pub fn list_following(&self, user_id: i64, viewer_id: i64) -> AppResult<Vec<PublicUser>> {
+        let conn = self.lock();
+        let sql = format!(
+            "{base}
+             WHERE u.id IN (SELECT following_id FROM follows WHERE follower_id = ?2)
+             ORDER BY (SELECT created FROM follows WHERE follower_id = ?2 AND following_id = u.id) DESC,
+                      u.username ASC",
+            base = Self::PUBLIC_USER_SELECT,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![viewer_id, user_id], row_to_public_user)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|mut u| {
+                u.is_self = u.id == viewer_id;
+                u
+            })
+            .collect())
+    }
+
+    /// Playlist backing a saved radio for this (owner, target) pair.
+    pub fn get_user_radio(&self, owner_id: i64, target_id: i64) -> AppResult<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT playlist_id FROM user_radios WHERE owner_id = ?1 AND target_id = ?2",
+                params![owner_id, target_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_user_radio(
+        &self,
+        owner_id: i64,
+        target_id: i64,
+        playlist_id: &str,
+    ) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO user_radios(owner_id, target_id, playlist_id, created)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(owner_id, target_id) DO UPDATE SET playlist_id = excluded.playlist_id",
+            params![owner_id, target_id, playlist_id, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a saved radio and returns its playlist id so the caller can also
+    /// delete the playlist from the owner's library.
+    pub fn delete_user_radio(&self, owner_id: i64, target_id: i64) -> AppResult<Option<String>> {
+        let conn = self.lock();
+        let pid: Option<String> = conn
+            .query_row(
+                "SELECT playlist_id FROM user_radios WHERE owner_id = ?1 AND target_id = ?2",
+                params![owner_id, target_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        conn.execute(
+            "DELETE FROM user_radios WHERE owner_id = ?1 AND target_id = ?2",
+            params![owner_id, target_id],
+        )?;
+        Ok(pid)
+    }
+
+    /// All saved radios — the background curator walks this to refresh each
+    /// playlist from its target user's evolving listening taste.
+    pub fn all_user_radios(&self) -> AppResult<Vec<(i64, i64, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT owner_id, target_id, playlist_id FROM user_radios ORDER BY created ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // -------------------------------------------------------------------------
@@ -3249,29 +3582,92 @@ fn row_to_user(row: &Row) -> rusqlite::Result<User> {
     })
 }
 
+fn clip_str(s: &str, max_chars: usize) -> String {
+    s.trim().chars().take(max_chars).collect()
+}
+
+fn is_hex_color(s: &str) -> bool {
+    let s = s.trim();
+    (s.len() == 4 || s.len() == 7)
+        && s.starts_with('#')
+        && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn avatar_color_for(id: i64) -> String {
+    const PALETTE: [&str; 10] = [
+        "#f43f5e", "#8b5cf6", "#3b82f6", "#06b6d4", "#10b981", "#f59e0b", "#ec4899", "#6366f1",
+        "#14b8a6", "#f97316",
+    ];
+    PALETTE[(id.unsigned_abs() as usize) % PALETTE.len()].to_string()
+}
+
+/// Maps the PUBLIC_USER_SELECT projection (viewer id bound as ?1).
+fn row_to_public_user(row: &Row) -> rusqlite::Result<PublicUser> {
+    let id: i64 = row.get(0)?;
+    let username: String = row.get(1)?;
+    let display_name: String = row.get(3)?;
+    let mut avatar_color: String = row.get(5)?;
+    if avatar_color.trim().is_empty() {
+        avatar_color = avatar_color_for(id);
+    }
+    let letter_source = if display_name.trim().is_empty() {
+        &username
+    } else {
+        &display_name
+    };
+    let avatar_letter = letter_source
+        .trim()
+        .chars()
+        .next()
+        .unwrap_or('?')
+        .to_uppercase()
+        .to_string();
+    let is_following: i64 = row.get(9)?;
+    Ok(PublicUser {
+        id,
+        username,
+        display_name,
+        bio: row.get(4)?,
+        avatar_color,
+        avatar_letter,
+        location: row.get(6)?,
+        created: row.get(2)?,
+        followers_count: row.get(7)?,
+        following_count: row.get(8)?,
+        is_following: is_following != 0,
+        is_self: false,
+    })
+}
+
 fn row_to_track(row: &Row) -> rusqlite::Result<Track> {
+    row_to_track_at(row, 0)
+}
+
+/// Read a Track from a row where the TRACK_COLS begin at `offset` (used when
+/// joining recommendations, shares, etc. where other columns come first).
+fn row_to_track_at(row: &Row, offset: usize) -> rusqlite::Result<Track> {
     Ok(Track {
-        id: row.get(0)?,
-        source: row.get(1)?,
-        title: row.get(2)?,
-        artist: row.get(3)?,
-        album: row.get(4)?,
-        genre: row.get(5)?,
-        moods: row.get(6)?,
-        year: row.get(7)?,
-        track_no: row.get(8)?,
-        disc_no: row.get(9)?,
-        duration: row.get(10)?,
-        bitrate: row.get(11)?,
-        sample_rate: row.get(12)?,
-        bit_depth: row.get(13)?,
-        format: row.get(14)?,
-        size: row.get(15)?,
-        stream_url: row.get(16)?,
-        cover_url: row.get(17)?,
-        meta: row.get(18)?,
-        deezer_id: row.get(19)?,
-        created: row.get(20)?,
+        id: row.get(offset)?,
+        source: row.get(offset + 1)?,
+        title: row.get(offset + 2)?,
+        artist: row.get(offset + 3)?,
+        album: row.get(offset + 4)?,
+        genre: row.get(offset + 5)?,
+        moods: row.get(offset + 6)?,
+        year: row.get(offset + 7)?,
+        track_no: row.get(offset + 8)?,
+        disc_no: row.get(offset + 9)?,
+        duration: row.get(offset + 10)?,
+        bitrate: row.get(offset + 11)?,
+        sample_rate: row.get(offset + 12)?,
+        bit_depth: row.get(offset + 13)?,
+        format: row.get(offset + 14)?,
+        size: row.get(offset + 15)?,
+        stream_url: row.get(offset + 16)?,
+        cover_url: row.get(offset + 17)?,
+        meta: row.get(offset + 18)?,
+        deezer_id: row.get(offset + 19)?,
+        created: row.get(offset + 20)?,
     })
 }
 
@@ -3845,6 +4241,89 @@ mod tests {
         let key2 = store.regenerate_api_key(alice.id).unwrap();
         assert_ne!(key1, key2);
         assert!(store.get_user_by_api_key(&key1).unwrap().is_none());
+    }
+
+    #[test]
+    fn social_profiles_follows_and_user_radios_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let (emily, _) = store.authenticate_or_create_user("emily", "pw1").unwrap();
+        let (alex, _) = store.authenticate_or_create_user("alex", "pw2").unwrap();
+        let (sam, _) = store.authenticate_or_create_user("sam", "pw3").unwrap();
+
+        // Profile editing
+        let profile = store
+            .update_profile(emily.id, "Emily C", "Synth-pop obsessive", "#8b5cf6", "Brooklyn")
+            .unwrap();
+        assert_eq!(profile.display_name, "Emily C");
+        assert_eq!(store.get_profile(emily.id).unwrap().bio, "Synth-pop obsessive");
+
+        // @mention-style search matches username, display name and bio
+        let by_handle = store.search_public_users("@em", alex.id, 10).unwrap();
+        assert!(by_handle.iter().any(|u| u.id == emily.id));
+        let by_name = store.search_public_users("emily c", alex.id, 10).unwrap();
+        assert_eq!(by_name[0].id, emily.id);
+        assert_eq!(by_name[0].avatar_letter, "E");
+        assert_eq!(by_name[0].avatar_color, "#8b5cf6");
+        assert!(store.search_public_users("@nobody", alex.id, 10).unwrap().is_empty());
+
+        // Self-follow is rejected
+        assert!(store.follow_user(emily.id, emily.id).is_err());
+
+        // Follow graph
+        store.follow_user(alex.id, emily.id).unwrap();
+        store.follow_user(alex.id, emily.id).unwrap(); // idempotent
+        store.follow_user(sam.id, emily.id).unwrap();
+        let emily_pub = store.get_public_user(emily.id, alex.id).unwrap().unwrap();
+        assert_eq!(emily_pub.followers_count, 2);
+        assert!(emily_pub.is_following);
+        assert!(!emily_pub.is_self);
+        let self_pub = store.get_public_user(alex.id, alex.id).unwrap().unwrap();
+        assert!(self_pub.is_self);
+        assert_eq!(store.list_followers(emily.id, alex.id).unwrap().len(), 2);
+        assert_eq!(store.list_following(alex.id, alex.id).unwrap().len(), 1);
+
+        // Saved user radios: a listener subscribes to another listener's
+        // auto-updating mix, which lives in their own library.
+        let track = sample_track("dz:rec", "Digital Love", "Daft Punk", "Discovery");
+        store.upsert_tracks(&[track.clone()]).unwrap();
+        let pid = "radio-u2-t1";
+        store
+            .upsert_auto_playlist(
+                pid,
+                alex.id,
+                "Emily Radio",
+                "Auto mix",
+                "user_radio:1",
+                &[track.id.clone()],
+            )
+            .unwrap();
+        store.save_user_radio(alex.id, emily.id, pid).unwrap();
+        assert_eq!(
+            store.get_user_radio(alex.id, emily.id).unwrap().as_deref(),
+            Some(pid)
+        );
+        let all = store.all_user_radios().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0], (alex.id, emily.id, pid.to_string()));
+        assert_eq!(store.playlist_tracks(pid).unwrap().len(), 1);
+
+        // Refreshing swaps the playlist contents in place.
+        store
+            .upsert_auto_playlist(pid, alex.id, "Emily Radio", "Auto mix", "user_radio:1", &[])
+            .unwrap();
+        assert!(store.playlist_tracks(pid).unwrap().is_empty());
+
+        let removed = store.delete_user_radio(alex.id, emily.id).unwrap();
+        assert_eq!(removed.as_deref(), Some(pid));
+        assert!(store.get_user_radio(alex.id, emily.id).unwrap().is_none());
+        assert!(store.all_user_radios().unwrap().is_empty());
+        store.delete_playlist(pid).unwrap();
+
+        // Non-hex colors are rejected before they can reach a CSS style attribute.
+        let bad = store
+            .update_profile(emily.id, "Emily C", "", "red;position:fixed", "")
+            .unwrap();
+        assert!(bad.avatar_color.is_empty());
     }
 
     #[test]

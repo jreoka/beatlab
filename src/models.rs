@@ -31,6 +31,49 @@ pub struct User {
     pub created: i64,
 }
 
+/// Editable social profile attached to a user. Kept in its own table so the core
+/// auth `users` table stays lean and forward-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserProfile {
+    pub user_id: i64,
+    pub display_name: String,
+    pub bio: String,
+    pub avatar_color: String,
+    pub location: String,
+    pub updated: i64,
+}
+
+impl Default for UserProfile {
+    fn default() -> Self {
+        Self {
+            user_id: 0,
+            display_name: String::new(),
+            bio: String::new(),
+            avatar_color: String::new(),
+            location: String::new(),
+            updated: 0,
+        }
+    }
+}
+
+/// A user as seen by other people on the platform (search results, profiles,
+/// follower lists). Aggregates counts and the viewer's follow relationship.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicUser {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub bio: String,
+    pub avatar_color: String,
+    pub avatar_letter: String,
+    pub location: String,
+    pub created: i64,
+    pub followers_count: i64,
+    pub following_count: i64,
+    pub is_following: bool,
+    pub is_self: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mood {

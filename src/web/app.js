@@ -155,6 +155,11 @@
     currentShareUrl: '',
     searchState: null,
     activeInstantMix: null,
+    social: {
+      profileData: null,
+      profileTab: 'radio',
+      editColor: '',
+    },
     settingsTab: 'general',
     settingsData: {
       sources: null,
@@ -1587,6 +1592,7 @@
     setExpandedPlayer(false);
     closeTrackMenu();
     hideStatsTooltip();
+    closeUserMenu();
     const clean = route.replace(/^#/, '');
     if (!isSearchHash(clean)) {
       clearTimeout(state.searchTimer);
@@ -1613,12 +1619,16 @@
         hash.startsWith(`${r}?`) ||
         hash.startsWith(`${r}/`) ||
         (r === 'playlists' && hash.startsWith('playlist/')) ||
+        (r === 'profile' && hash.startsWith('user/')) ||
         (r === 'library' && (hash === 'liked' || hash === 'history'));
       el.classList.toggle('active', match);
     });
 
     if (hash === 'home') return renderHome();
     if (hash === 'explore') return renderExplore();
+    if (hash === 'community') return renderCommunity();
+    if (hash === 'profile') return renderProfileView('me');
+    if (hash.startsWith('user/')) return renderProfileView(safeDecodeUri(hash.slice(5)));
     if (hash.startsWith('explore-mix/')) return renderExploreMix(safeDecodeUri(hash.slice(12)));
     if (hash === 'mix' || hash.startsWith('mix?')) {
       const qIdx = hash.indexOf('?');
@@ -1923,7 +1933,7 @@
           </div>
         </div>
       </div>
-      ${tracks.length ? `<div class="track-table">${renderTrackRows(tracks)}</div>` : `<p class="muted-center">No tracks available for this mix yet. Check back shortly while the curator refreshes.</p>`}`;
+      ${tracks.length ? `<div class="track-table">${renderTrackRows(tracks, tracks, null, false, 'explore')}</div>` : `<p class="muted-center">No tracks available for this mix yet. Check back shortly while the curator refreshes.</p>`}`;
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
@@ -1937,11 +1947,17 @@
       return renderExplore();
     }
     const { reqToken, signal } = beginViewRequest();
+    const personQuery = cleanQ.startsWith('@');
     state.searchFetchingQuery = cleanQ;
     state.searchLoadingUi = true;
-    setMainLoading(`Searching "${cleanQ}"...`);
+    setMainLoading(personQuery ? `Finding people for "${cleanQ}"...` : `Searching "${cleanQ}"...`);
     try {
-      const d = await api(`/api/web/search?q=${encodeURIComponent(cleanQ)}`, { signal });
+      const [d, social] = await Promise.all([
+        personQuery
+          ? Promise.resolve({ tracks: [], albums: [], artists: [], refinements: null })
+          : api(`/api/web/search?q=${encodeURIComponent(cleanQ)}`, { signal }),
+        api(`/api/web/social/search?q=${encodeURIComponent(cleanQ)}&limit=20`, { signal }).catch(() => ({ users: [] })),
+      ]);
       if (!isViewRequestCurrent(reqToken, signal)) return;
       state.searchFetchingQuery = '';
       state.searchLoadingUi = false;
@@ -1949,14 +1965,16 @@
       const tracks = cacheTracks(d.tracks || []);
       const albums = d.albums || [];
       const artists = d.artists || [];
+      const users = social.users || [];
       const refinements = d.refinements || null;
 
-      if (!tracks.length && !albums.length && !artists.length) {
+      if (!tracks.length && !albums.length && !artists.length && !users.length) {
         state.searchState = {
           query: cleanQ,
           tracks: [],
           albums: [],
           artists: [],
+          users,
           instantMix: null,
           instantMixLoading: false,
           instantMixError: '',
@@ -1975,6 +1993,7 @@
         tracks,
         albums,
         artists,
+        users,
         instantMix: null,
         instantMixLoading: false,
         instantMixError: '',
@@ -2187,8 +2206,25 @@
   function renderSearchView() {
     const s = state.searchState;
     if (!s) return;
-    const { query, albums, artists, instantMix, instantMixLoading, instantMixError, refinements, activeFilter, mixExpanded } = s;
+    const { query, albums, artists, users, instantMix, instantMixLoading, instantMixError, refinements, activeFilter, mixExpanded } = s;
     const tracks = applySearchFilter(s.tracks, activeFilter);
+
+    // "@username" searches render people directly in the main results view.
+    if (String(query || '').trim().startsWith('@')) {
+      const term = String(query).trim();
+      const people = users || [];
+      let personHtml = `<div class="people-search-head">
+        <div class="hero-kicker">PEOPLE</div>
+        <h1 class="hero-title">Listeners matching “${esc(term)}”</h1>
+        <p class="hero-sub">Follow people to hear their auto-updating radios in your Community feed.</p>
+      </div>`;
+      personHtml += people.length
+        ? `<div class="people-search-grid">${people.map(personCardHtml).join('')}</div>`
+        : emptyState('No listeners found', `Nobody matched “${esc(term)}”. Try a different name or a partial username.`);
+      $('main-view').innerHTML = personHtml;
+      $('main-view').scrollTop = 0;
+      return;
+    }
 
     let html = '';
 
@@ -2241,7 +2277,14 @@
       html += renderInstantMixCard(instantMix, refinements, query, mixExpanded);
     }
 
-    if (!s.tracks.length && !albums.length && !artists.length) {
+    if (activeFilter === 'all' && users && users.length) {
+      html += `<section class="section">
+        <div class="section-head"><h2>People</h2><span style="color:var(--text-dim);font-size:12px">Matching “@${esc(query)}”</span></div>
+        <div class="user-grid">${users.map(userCardHtml).join('')}</div>
+      </section>`;
+    }
+
+    if (!s.tracks.length && !albums.length && !artists.length && !(users && users.length)) {
       html += `<p class="muted-center">No matches found for "${esc(query)}".</p>`;
       $('main-view').innerHTML = html;
       return;
@@ -2557,7 +2600,7 @@
           </div>
         </div>
       </div>
-      ${tracks.length ? `<div class="track-table">${renderTrackRows(tracks)}</div>` : `<p class="muted-center">Still curating tracks for ${esc(m.label)} — try refreshing in a moment.</p>`}`;
+      ${tracks.length ? `<div class="track-table">${renderTrackRows(tracks, tracks, null, false, 'explore')}</div>` : `<p class="muted-center">Still curating tracks for ${esc(m.label)} — try refreshing in a moment.</p>`}`;
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
@@ -5081,7 +5124,6 @@
         ${ICONS.share}
         <span>Share Song Link</span>
       </button>
-      <hr class="ctx-sep">
       <button class="ctx-item" onclick="App.closeTrackMenu();App.playNext(${tidArg})">Play Next</button>
       <button class="ctx-item" onclick="App.closeTrackMenu();App.addToQueue(${tidArg})">Add to Queue</button>
       <button class="ctx-item" onclick="App.closeTrackMenu();App.startRadioForId(${tidArg})">Start Song Radio</button>
@@ -5687,6 +5729,7 @@
             <div class="settings-row-desc">Web, OpenSubsonic &amp; Navidrome account</div>
           </div>
         </div>
+        <button class="btn-secondary" style="margin-top:12px;width:100%" onclick="App.closeModal();App.openMyProfile()">View my public profile →</button>
       </div>
       <div class="settings-section">
         <div class="settings-section-title">Security</div>
@@ -5789,9 +5832,506 @@
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // SOCIAL — @mentions, following, public profiles & auto-updating user radio
+  // ---------------------------------------------------------------------------
+  const SOCIAL_COLORS = [
+    '#f43f5e', '#8b5cf6', '#3b82f6', '#06b6d4', '#10b981',
+    '#f59e0b', '#ec4899', '#6366f1', '#14b8a6', '#f97316',
+  ];
+
+  function timeAgo(ts) {
+    const secs = Math.floor(Date.now() / 1000 - Number(ts || 0));
+    if (!Number.isFinite(secs) || secs < 0) return '';
+    if (secs < 60) return 'just now';
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+    if (secs < 2592000) return `${Math.floor(secs / 86400)}d ago`;
+    return new Date(Number(ts) * 1000).toLocaleDateString();
+  }
+
+  function joinedText(ts) {
+    try {
+      return new Date(Number(ts) * 1000).toLocaleDateString(undefined, {
+        month: 'long', year: 'numeric',
+      });
+    } catch {
+      return '';
+    }
+  }
+
+  function personCardHtml(u) {
+    const ref = esc(JSON.stringify(u.username));
+    const following = !!u.isFollowing;
+    return `<div class="person-card">
+      <div class="person-card-top">
+        <span class="person-avatar" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${esc(u.avatarLetter)}</span>
+        <div class="person-card-name-wrap" onclick="App.openUserProfile(${ref})">
+          <div class="person-card-name">${esc(u.displayName || u.username)}</div>
+          <div class="person-card-handle">@${esc(u.username)}</div>
+        </div>
+        ${u.isSelf
+          ? '<span class="mention-you">YOU</span>'
+          : `<button class="btn-follow ${following ? 'following' : ''}" data-follow-ref="${esc(u.username)}" onclick="App.toggleFollowUser(${ref}, ${!following})">${following ? '✓ Following' : '+ Follow'}</button>`}
+      </div>
+      ${u.bio ? `<div class="person-card-bio">${esc(u.bio)}</div>` : ''}
+      <div class="person-card-stats">
+        <span onclick="App.openUserProfile(${ref})"><b>${u.followersCount}</b> followers</span>
+        <span onclick="App.openUserProfile(${ref})"><b>${u.followingCount}</b> following</span>
+        <span onclick="App.playUserRadio(${ref})">▶ Play radio</span>
+      </div>
+    </div>`;
+  }
+
+  function userCardHtml(u) {
+    const ref = esc(JSON.stringify(u.username));
+    const following = !!u.isFollowing;
+    return `<div class="user-card">
+      <span class="mention-avatar" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${esc(u.avatarLetter)}</span>
+      <div class="user-card-info" onclick="App.openUserProfile(${ref})">
+        <div class="user-card-name">${esc(u.displayName || u.username)}</div>
+        <div class="user-card-handle">@${esc(u.username)} · ${u.followersCount} followers</div>
+      </div>
+      ${u.isSelf ? '<span class="mention-you">YOU</span>' :
+        `<button class="mention-follow ${following ? 'following' : ''}" data-follow-ref="${esc(u.username)}" onclick="App.toggleFollowUser(${ref}, ${!following})">${following ? 'Following' : 'Follow'}</button>`}
+    </div>`;
+  }
+
+  function emptyState(title, msg) {
+    return `<div class="social-empty"><h3>${esc(title)}</h3><div>${esc(msg)}</div></div>`;
+  }
+
+  function radioPanelHtml(data) {
+    const radio = data.radio || {};
+    const u = data.user;
+    const ref = esc(JSON.stringify(u.username));
+    const name = u.displayName || u.username;
+    const tracks = cacheTracks(radio.tracks || []);
+    const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+    const saved = !!radio.saved;
+    return `<div class="radio-panel">
+      <div class="radio-hero">
+        <div class="radio-art">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="7" width="19" height="13" rx="2.5"/><path d="m7 7 11.5-4.2a1 1 0 0 1 1.3.9V7"/><circle cx="8" cy="13.5" r="2.6"/><path d="M15 11h3.5M15 15h3.5"/></svg>
+        </div>
+        <div class="radio-copy">
+          <div class="hero-kicker">USER RADIO · AUTO-UPDATING</div>
+          <h2>${esc(name)}'s Radio</h2>
+          <p>An evolving mix of what ${esc(name)} actually listens to. Beatlab quietly rebuilds it as their taste changes.</p>
+          <div class="hero-actions">
+            <button class="btn-primary" onclick="App.playUserRadio(${ref})">${ICONS.play} Play Radio</button>
+            ${tracks.length > 1 ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
+            <button class="btn-secondary" onclick="App.refreshUserRadio(${ref})">↻ Refresh</button>
+            <button class="btn-secondary ${saved ? 'active' : ''}" onclick="App.toggleSaveRadio(${ref}, ${!saved})">${saved ? '✓ In your library' : '+ Save to library'}</button>
+          </div>
+        </div>
+      </div>
+      ${tracks.length
+        ? `<section class="section">
+            <div class="section-head"><h2>On the air</h2><span style="color:var(--text-dim);font-size:12px">${tracks.length} tracks · updates automatically</span></div>
+            <div class="track-table">${renderTrackRows(tracks)}</div>
+          </section>`
+        : emptyState('Silent for now', 'This listener has not built up enough listening history for a radio yet.')}
+    </div>`;
+  }
+
+  function playUserRadio(reference) {
+    const tracks = (state.social.profileData?.radio?.tracks || []).filter(Boolean);
+    playUserRadioFromData(tracks.map((t) => t.id), reference);
+  }
+
+  function playUserRadioFromData(ids, reference) {
+    const trackIds = Array.isArray(ids) ? ids.filter(Boolean) : [];
+    if (!trackIds.length) {
+      showToast('This radio has no tracks yet');
+      return;
+    }
+    playListByIds(trackIds, 0);
+    showToast(`Playing @${reference}'s Radio`);
+  }
+
+  async function refreshUserRadio(reference) {
+    await loadUserRadio(reference, true);
+  }
+
+  async function loadUserRadio(reference, announce = false) {
+    try {
+      const d = await api(`/api/web/social/radio/${encodeURIComponent(reference)}`);
+      cacheTracks(d.tracks || []);
+      if (state.social.profileData) state.social.profileData.radio = d;
+      const body = $('profile-tab-body');
+      if (body && state.social.profileData) {
+        body.innerHTML = renderProfileTabBody(state.social.profileData);
+      }
+      if (announce) showToast(`Radio refreshed — ${(d.tracks || []).length} tracks`);
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  async function toggleSaveRadio(reference, save) {
+    try {
+      const res = await api(`/api/web/social/radio/${encodeURIComponent(reference)}/save`, {
+        method: save ? 'POST' : 'DELETE',
+      });
+      showToast(
+        save
+          ? `Saved ${res.playlist?.name || 'radio'} to your library`
+          : 'Radio removed from your library'
+      );
+      if (state.social.profileData && state.social.profileData.radio) {
+        state.social.profileData.radio.saved = !!res.saved;
+      }
+      renderCurrentHash();
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  function openUserProfile(reference) {
+    closeUserMenu();
+    navigate(`user/${encodeURIComponent(reference)}`);
+  }
+
+  function openMyProfile() {
+    closeUserMenu();
+    navigate('profile');
+  }
+
+  function setProfileTab(tab) {
+    haptic('tap');
+    state.social.profileTab = tab;
+    const data = state.social.profileData;
+    if (!data) return;
+    data.tab = tab;
+    const body = $('profile-tab-body');
+    if (body) {
+      body.innerHTML = renderProfileTabBody(data);
+      body.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+    document.querySelectorAll('#profile-tabs .tab-chip').forEach((el) => {
+      el.classList.toggle('active', el.dataset.ptab === tab);
+    });
+  }
+
+  function renderProfileTabBody(data) {
+    const tab = data.tab || state.social.profileTab;
+    if (tab === 'radio') {
+      return radioPanelHtml(data);
+    }
+    if (tab === 'playlists') {
+      const pls = data.playlists || [];
+      return pls.length
+        ? `<div class="card-grid">${pls.map(renderPlaylistCard).join('')}</div>`
+        : emptyState('No public playlists', 'Public playlists will appear here.');
+    }
+    const people = tab === 'following' ? data.following || [] : data.followers || [];
+    return people.length
+      ? `<div class="user-grid">${people.map(userCardHtml).join('')}</div>`
+      : emptyState(tab === 'following' ? 'Not following anyone' : 'No followers yet', tab === 'following' ? 'Find people with @mentions in the search bar.' : 'Share your profile to gain followers.');
+  }
+
+  async function renderProfileView(reference) {
+    const { reqToken, signal } = beginViewRequest();
+    setMainLoading('Loading profile...');
+    const selfRef = reference === 'me';
+    const ref = selfRef ? (state.user && state.user.id) : reference;
+    const root = encodeURIComponent(String(ref));
+    try {
+      const emptyRadio = { tracks: [], saved: false, playlist: null, user: null };
+      const results = await Promise.all([
+        api(`/api/web/social/profile/${root}`, { signal }),
+        api(`/api/web/social/followers/${root}`, { signal }).catch(() => ({ users: [] })),
+        api(`/api/web/social/following/${root}`, { signal }).catch(() => ({ users: [] })),
+        api(`/api/web/social/radio/${root}`, { signal }).catch(() => emptyRadio),
+      ]);
+      if (!isViewRequestCurrent(reqToken, signal)) return;
+      const profileRes = results[0];
+      const u = profileRes.user;
+      const radio = results[3] || emptyRadio;
+      cacheTracks(radio.tracks || []);
+      const isSelf = selfRef || !!u.isSelf;
+      const defaultTab = 'radio';
+      if (state.social.profileData && state.social.profileData.user.id !== u.id) {
+        state.social.profileTab = defaultTab;
+      }
+      const data = {
+        user: u,
+        profile: profileRes.profile || {},
+        playlists: profileRes.playlists || [],
+        radio,
+        followers: results[1]?.users || [],
+        following: results[2]?.users || [],
+        isSelf,
+        tab: state.social.profileTab || defaultTab,
+      };
+      state.social.profileData = data;
+
+      const color = u.avatarColor || '#1ed760';
+      const tabs = [
+        ['radio', isSelf ? 'Your Radio' : 'Radio'],
+        ['playlists', 'Playlists'],
+        ['followers', 'Followers'],
+        ['following', 'Following'],
+      ];
+      const name = u.displayName || u.username;
+
+      let html = `<div class="hero-header" style="border-color:${esc(color)}55;background:${esc(color)}14">
+        <div class="profile-avatar" style="background:${esc(color)}">${esc(u.avatarLetter)}</div>
+        <div class="hero-info">
+          <div class="profile-verified">${isSelf ? 'Your public profile' : 'Beatlab listener'}</div>
+          <h1 class="hero-title">${esc(name)}</h1>
+          <div class="hero-sub"><span class="profile-handle">@${esc(u.username)}</span> · Joined ${esc(joinedText(u.created))}</div>
+          ${u.bio ? `<div class="profile-bio">${esc(u.bio)}</div>` : ''}
+          ${u.location ? `<div class="profile-location">📍 ${esc(u.location)}</div>` : ''}
+          <div class="profile-stats">
+            <button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('followers')"><strong>${u.followersCount}</strong><span>Followers</span></button>
+            <button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('following')"><strong>${u.followingCount}</strong><span>Following</span></button>
+            <button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('radio')"><strong>${(radio.tracks || []).length}</strong><span>Radio tracks</span></button>
+          </div>
+          <div class="hero-actions">
+            <button class="btn-primary" onclick="App.playUserRadio(${esc(JSON.stringify(u.username))})">${ICONS.play} Play ${isSelf ? 'My' : '@' + u.username + "'s"} Radio</button>
+            ${isSelf
+              ? `<button class="btn-secondary" onclick="App.openProfileEditor()">✎ Edit profile</button>`
+              : `<button class="btn-follow ${u.isFollowing ? 'following' : ''}" data-follow-ref="${esc(u.username)}" onclick="App.toggleFollowUser(${esc(JSON.stringify(u.username))}, ${!u.isFollowing})">${u.isFollowing ? '✓ Following' : '+ Follow'}</button>`}
+          </div>
+        </div>
+      </div>
+      <div class="tabs-bar" id="profile-tabs">
+        ${tabs.map(([key, label]) => `<button class="tab-chip ${data.tab === key ? 'active' : ''}" data-ptab="${key}" onclick="App.setProfileTab('${key}')">${label}</button>`).join('')}
+      </div>
+      <div id="profile-tab-body">${renderProfileTabBody(data)}</div>`;
+
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      handleViewFetchError(e, reqToken, signal);
+    }
+  }
+
+  function syncFollowState(reference, updated, following) {
+    const ref = String(reference || '').toLowerCase();
+    // Flip every visible follow button for this user, whichever view is open.
+    document.querySelectorAll('[data-follow-ref]').forEach((btn) => {
+      if (String(btn.dataset.followRef || '').toLowerCase() !== ref) return;
+      btn.classList.toggle('following', following);
+      btn.textContent = btn.classList.contains('btn-follow')
+        ? following ? '✓ Following' : '+ Follow'
+        : following ? 'Following' : 'Follow';
+    });
+    // Keep cached user objects consistent so later renders are correct too.
+    const patch = (u) => {
+      if (u && String(u.username || '').toLowerCase() === ref) {
+        u.isFollowing = following;
+        if (updated && typeof updated.followersCount === 'number') {
+          u.followersCount = updated.followersCount;
+        }
+      }
+    };
+    (state.searchState?.users || []).forEach(patch);
+    const pdata = state.social.profileData;
+    if (pdata) {
+      patch(pdata.user);
+      (pdata.followers || []).forEach(patch);
+      (pdata.following || []).forEach(patch);
+      if (pdata.user && String(pdata.user.username || '').toLowerCase() === ref && updated) {
+        document.querySelectorAll('.profile-stats .profile-stat').forEach((stat) => {
+          const label = stat.querySelector('span');
+          if (label && label.textContent.trim() === 'Followers') {
+            const strong = stat.querySelector('strong');
+            if (strong) strong.textContent = updated.followersCount;
+          }
+        });
+      }
+    }
+  }
+
+  async function toggleFollowUser(reference, following) {
+    haptic('select');
+    try {
+      const res = await api(`/api/web/social/follow/${encodeURIComponent(reference)}`, {
+        method: following ? 'POST' : 'DELETE',
+      });
+      const updated = res.user;
+      showToast(following ? `Now following @${updated?.username || reference}` : `Unfollowed @${reference}`);
+      syncFollowState(reference, updated, following);
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  function openProfileEditor() {
+    const p = state.social.profileData?.profile || {};
+    state.social.editColor = p.avatarColor || '';
+    openModal(`
+      <div class="modal-head">
+        <h3>Edit your profile</h3>
+        <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+      </div>
+      <div class="social-edit-row">
+        <label>Display name</label>
+        <input id="prof-name" maxlength="40" value="${esc(p.displayName || state.user.username)}" />
+      </div>
+      <div class="social-edit-row">
+        <label>Bio</label>
+        <textarea id="prof-bio" maxlength="280" rows="3" placeholder="Tell people about your taste...">${esc(p.bio || '')}</textarea>
+      </div>
+      <div class="social-edit-row">
+        <label>Location</label>
+        <input id="prof-location" maxlength="80" value="${esc(p.location || '')}" placeholder="Where are you listening from?" />
+      </div>
+      <div class="social-edit-row">
+        <label>Avatar color</label>
+        <div class="social-color-row">
+          ${SOCIAL_COLORS.map((c) => `<button type="button" class="social-color-swatch ${c === state.social.editColor ? 'selected' : ''}" style="background:${c}" onclick="App.pickProfileColor('${c}')" title="${c}"></button>`).join('')}
+        </div>
+      </div>
+      <button class="btn-primary" style="width:100%;margin-top:6px" onclick="App.submitProfileUpdate(event)">Save profile</button>
+    `);
+  }
+
+  function pickProfileColor(color) {
+    state.social.editColor = color;
+    document.querySelectorAll('.social-color-swatch').forEach((el) => {
+      el.classList.toggle('selected', el.style.background.includes(color) || el.getAttribute('title') === color);
+    });
+  }
+
+  async function submitProfileUpdate(e) {
+    if (e) e.preventDefault();
+    try {
+      await api('/api/web/social/me', {
+        method: 'POST',
+        body: JSON.stringify({
+          displayName: $('prof-name')?.value || '',
+          bio: $('prof-bio')?.value || '',
+          location: $('prof-location')?.value || '',
+          avatarColor: state.social.editColor || '',
+        }),
+      });
+      closeModal();
+      showToast('Profile updated');
+      renderCurrentHash();
+    } catch (err) {
+      showToast(err.message);
+    }
+  }
+
+  async function renderCommunity() {
+    const { reqToken, signal } = beginViewRequest();
+    setMainLoading('Loading community...');
+    try {
+      const [feedRes, sugRes] = await Promise.all([
+        api('/api/web/social/feed', { signal }),
+        api('/api/web/social/suggestions', { signal }),
+      ]);
+      if (!isViewRequestCurrent(reqToken, signal)) return;
+      const radios = feedRes.radios || [];
+      radios.forEach((r) => cacheTracks(r.tracks || []));
+      const suggestions = sugRes.users || [];
+      let html = `<div class="community-intro">
+        <div>
+          <h2>Your community</h2>
+          <p>Live radios from the people you follow. Each one is an evolving mix of what that listener actually plays, refreshed automatically as their taste changes.</p>
+        </div>
+        <button class="btn-primary" onclick="App.openMyProfile()">${ICONS.play} My Radio</button>
+      </div>`;
+      html += `<section class="section">
+        <div class="section-head"><h2>People to follow</h2><button class="mini-btn" onclick="App.focusSearch()">Find people with @</button></div>
+        ${suggestions.length ? `<div class="user-grid">${suggestions.map(userCardHtml).join('')}</div>` : emptyState('No suggestions yet', 'Invite friends or search with @ to find listeners.')}
+      </section>`;
+      html += `<section class="section">
+        <div class="section-head"><h2>Radios from people you follow</h2></div>
+        ${radios.length
+          ? `<div class="community-radios">${radios.map((r) => {
+              const u = r.user;
+              const ref = esc(JSON.stringify(u.username));
+              const tracks = r.tracks || [];
+              const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+              return `<div class="community-radio-card">
+                <div class="community-radio-head">
+                  <span class="person-avatar small" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${esc(u.avatarLetter)}</span>
+                  <div class="community-radio-meta" onclick="App.openUserProfile(${ref})">
+                    <b>${esc(u.displayName || u.username)}'s Radio</b>
+                    <span>@${esc(u.username)} · ${typeof r.trackCount === 'number' ? r.trackCount : tracks.length} tracks · updates automatically</span>
+                  </div>
+                  <div class="community-radio-actions">
+                    <button class="btn-secondary" onclick="App.playUserRadioFromData(${idsJson}, ${ref})">Play</button>
+                    ${tracks.length > 1 ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
+                  </div>
+                </div>
+                ${tracks.length ? `<div class="track-table compact">${renderTrackRows(tracks.slice(0, 5))}</div>` : ''}
+              </div>`;
+            }).join('')}</div>`
+          : emptyState('No radios yet', 'Follow some listeners to see their radios here.')}
+      </section>`;
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      handleViewFetchError(e, reqToken, signal);
+    }
+  }
+
+  let userMenuDocWired = false;
+  function toggleUserMenu(event) {
+    if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+    const menu = $('user-menu');
+    if (!menu) return;
+    haptic('tap');
+    const opening = menu.classList.contains('hidden');
+    menu.classList.toggle('hidden', !opening);
+    if (opening) {
+      const name = state.user ? state.user.username : 'User';
+      $('user-menu-name').textContent = name;
+      $('user-menu-avatar').textContent = (name[0] || 'B').toUpperCase();
+    }
+    if (!userMenuDocWired) {
+      userMenuDocWired = true;
+      document.addEventListener('click', (e) => {
+        if (!e.target.closest('.user-menu-wrap')) closeUserMenu();
+      });
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeUserMenu();
+      });
+    }
+  }
+
+  function closeUserMenu() {
+    const menu = $('user-menu');
+    if (menu) menu.classList.add('hidden');
+  }
+
+  function goCommunity() {
+    closeUserMenu();
+    navigate('community');
+  }
+
+  function goSettings() {
+    closeUserMenu();
+    openSettingsModal();
+  }
+
   // Expose public handlers for template onclick attributes
   window.App = {
     navigate,
+    // Social
+    openUserProfile,
+    openMyProfile,
+    setProfileTab,
+    toggleFollowUser,
+    playUserRadio,
+    playUserRadioFromData,
+    refreshUserRadio,
+    loadUserRadio,
+    toggleSaveRadio,
+    openProfileEditor,
+    pickProfileColor,
+    submitProfileUpdate,
+    renderCommunity,
+    toggleUserMenu,
+    closeUserMenu,
+    goCommunity,
+    goSettings,
     focusSearch: () => {
       haptic('tap');
       setExpandedPlayer(false);

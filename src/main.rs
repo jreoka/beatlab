@@ -219,6 +219,26 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/cover/{id}", get(webapp::cover_art))
         .route("/api/web/sources", get(webapp::sources_info))
         .route("/api/web/share", post(webapp::create_share))
+        // Social layer — @mention user search, following, profiles & user radio
+        .route("/api/web/social/search", get(webapp::social_search))
+        .route("/api/web/social/suggestions", get(webapp::social_suggestions))
+        .route(
+            "/api/web/social/me",
+            get(webapp::social_me).post(webapp::social_update_profile),
+        )
+        .route("/api/web/social/profile/{user}", get(webapp::social_profile))
+        .route(
+            "/api/web/social/follow/{user}",
+            post(webapp::social_follow).delete(webapp::social_unfollow),
+        )
+        .route("/api/web/social/followers/{user}", get(webapp::social_followers))
+        .route("/api/web/social/following/{user}", get(webapp::social_following))
+        .route("/api/web/social/radio/{user}", get(webapp::social_user_radio))
+        .route(
+            "/api/web/social/radio/{user}/save",
+            post(webapp::social_save_user_radio).delete(webapp::social_unsave_user_radio),
+        )
+        .route("/api/web/social/feed", get(webapp::social_feed))
         // Public Share Pages & Discord-Compatible Embed Endpoints
         .route("/s/{id}", get(webapp::public_share_page))
         .route("/s/{id}/embed", get(webapp::public_share_embed_page))
