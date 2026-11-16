@@ -1202,12 +1202,14 @@ pub async fn instant_mix(
             .unwrap_or_default();
             return (curated, Vec::new());
         }
-        let mut pl_queries = intent.playlist_search_queries();
+        let mut fetch_intent = intent.clone();
+        fetch_intent.is_theme_mix = true;
+        let mut pl_queries = fetch_intent.playlist_search_queries();
         if pl_queries.is_empty() {
             pl_queries.push(base_query.clone());
         }
-        let tr_queries = intent.expanded_track_queries();
-        let genre_hints = intent.deezer_genre_hints();
+        let tr_queries = fetch_intent.expanded_track_queries();
+        let genre_hints = fetch_intent.deezer_genre_hints();
 
         let pl_futs = pl_queries.iter().map(|pq| {
             let dz = state.sources.deezer.clone();
@@ -1354,15 +1356,36 @@ pub async fn instant_mix(
                 .await;
         if ctx.anchor_artist.is_none() && curated_batches.is_empty() {
             use crate::sources::MusicSource;
-            let ytm_topic = tokio::time::timeout(
-                std::time::Duration::from_millis(2500),
-                state.sources.ytm.search(&format!("{} music", query), 15),
-            )
-            .await
-            .unwrap_or_default();
+            let (ytm_topic, dz_music_curated) = tokio::join!(
+                async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(2500),
+                        state.sources.ytm.search(&format!("{} music", query), 15),
+                    )
+                    .await
+                    .unwrap_or_default()
+                },
+                async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(3000),
+                        state
+                            .sources
+                            .deezer
+                            .fetch_curated_mix_tracks(&format!("{} music", query), 3, 24),
+                    )
+                    .await
+                    .unwrap_or_default()
+                }
+            );
             if !ytm_topic.is_empty() {
                 let _ = state.store.upsert_tracks(&ytm_topic);
                 combined.extend(ytm_topic);
+            }
+            if !dz_music_curated.is_empty() {
+                for (_, batch) in &dz_music_curated {
+                    let _ = state.store.upsert_tracks(batch);
+                }
+                curated_batches.extend(dz_music_curated);
             }
         }
         ctx

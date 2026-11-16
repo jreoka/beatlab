@@ -4210,11 +4210,7 @@ impl TasteEngine {
                     {
                         return false;
                     }
-                    if e.curated_prior == 0.0
-                        && e.era_match <= 0.0
-                        && e.theme_match < 0.25
-                        && !(promoted_topic && e.lex >= 100.0)
-                    {
+                    if e.curated_prior == 0.0 && e.era_match <= 0.0 && e.theme_match < 0.25 {
                         return false;
                     }
                     true
@@ -4248,6 +4244,13 @@ impl TasteEngine {
                         .any(|&d| d != want_dec && contains_term(&hay, d));
                     mentions_other && !contains_term(&hay, want_dec)
                 };
+                let e_genre_or_theme_needed = |q_norm: &str, t: &Track, ag: &str, theme_m: f64| -> bool {
+                    if theme_m >= 0.25 {
+                        return false;
+                    }
+                    let g_low = format!("{} {}", t.genre, ag).to_lowercase();
+                    !q_norm.is_empty() && !contains_term(&g_low, q_norm) && mix_ctx.ytm_radio.is_empty() && t.source != "ytm"
+                };
                 let is_fallback_compatible = |t: &Track, ag: &str, era_m: f64, theme_m: f64| -> bool {
                     if is_junk_track_for_query(t, &intent.normalized)
                         || is_strongly_disliked(t, &sctx.prof, &sctx.stats)
@@ -4271,6 +4274,11 @@ impl TasteEngine {
                         return false;
                     }
                     if !intent.themes.is_empty() && theme_m < 0.35 && mix_ctx.ytm_radio.is_empty() {
+                        return false;
+                    }
+                    if promoted_topic
+                        && e_genre_or_theme_needed(&intent.normalized, t, ag, theme_m)
+                    {
                         return false;
                     }
                     true
