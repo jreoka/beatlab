@@ -157,7 +157,7 @@ impl StreamEngine {
             cache_sem: Arc::new(Semaphore::new(3)),
             stream_proc_sem: Arc::new(Semaphore::new(8)),
             embed_sem: Arc::new(Semaphore::new(2)),
-            loudness_sem: Arc::new(Semaphore::new(1)),
+            loudness_sem: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -433,7 +433,9 @@ impl StreamEngine {
     /// Deduplicates and bounds background warm hints so rapid track skipping cannot pile up tasks.
     pub fn spawn_warm_track(&self, track: Track) {
         if let Ok(Some(entry)) = self.store.get_cache_entry(&track.id) {
-            if Path::new(&entry.path).exists() {
+            let p = Path::new(&entry.path);
+            if p.exists() {
+                self.spawn_background_loudness_scan(&track.id, p);
                 return;
             }
         }
@@ -1025,15 +1027,12 @@ impl StreamEngine {
         if self.store.get_track_loudness(track_id).is_some() {
             return;
         }
-        let Ok(permit) = self.loudness_sem.clone().try_acquire_owned() else {
-            return;
-        };
         {
             let mut set = self
                 .in_flight_loudness
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if !set.insert(track_id.to_string()) {
+            if set.len() >= 16 || !set.insert(track_id.to_string()) {
                 return;
             }
         }
@@ -1043,10 +1042,12 @@ impl StreamEngine {
         let file_path = path.to_path_buf();
 
         tokio::spawn(async move {
-            let _permit = permit;
             let _guard = InFlightSetGuard {
                 set: Arc::clone(&this.in_flight_loudness),
                 key: tid.clone(),
+            };
+            let Ok(_permit) = this.loudness_sem.clone().acquire_owned().await else {
+                return;
             };
 
             let tag_path = file_path.clone();

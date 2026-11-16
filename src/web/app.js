@@ -17,8 +17,10 @@
   let audioSource = null;
   let eqFilters = [];
   let analyser = null;
-  let meterAnalyser = null;
-  let meterBuf = null;
+  let meterAnalyserL = null;
+  let meterAnalyserR = null;
+  let meterBufL = null;
+  let meterBufR = null;
   let normGainNode = null;
   let masterGainNode = null;
   let normTimer = null;
@@ -27,7 +29,7 @@
   const NORM_TARGET_LUFS = -14.0;
   const NORM_MIN_DB = -12.0;
   const NORM_MAX_DB = 8.5;
-  const NORM_CACHE_KEY = 'beatlab_norm_cache_v1';
+  const NORM_CACHE_KEY = 'beatlab_norm_cache_v2';
   const normState = {
     trackId: '',
     energySum: 0,
@@ -36,6 +38,7 @@
     shortTermSq: 0,
     currentDb: 0,
     hasServerHint: false,
+    hasAnyHint: false,
     lastSavedAtFrame: 0,
   };
 
@@ -658,12 +661,13 @@
         : null;
     const hint = serverHint !== null ? serverHint : loadCachedTrackGainDb(track.id);
     normState.hasServerHint = serverHint !== null;
+    normState.hasAnyHint = hint !== null;
 
     if (hint !== null) {
       const expectedLufs = NORM_TARGET_LUFS - hint;
       const expectedSq = Math.pow(10, (expectedLufs + 0.691) / 10);
-      normState.energySum = expectedSq * 45;
-      normState.weightSum = 45;
+      normState.energySum = expectedSq * 60;
+      normState.weightSum = 60;
       normState.shortTermSq = expectedSq;
       normState.currentDb = hint;
     } else {
@@ -671,35 +675,82 @@
     }
 
     if (normGainNode && audioCtx) {
-      normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.035);
+      normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.012);
     }
   }
 
-  function stepLoudnessNormalizer() {
-    if (!audioCtx || !meterAnalyser || !normGainNode) return;
-    if (audio.paused || audio.ended || audio.readyState < 2) return;
-
-    if (!meterBuf || meterBuf.length !== meterAnalyser.fftSize) {
-      meterBuf = new Float32Array(meterAnalyser.fftSize);
+  function applyServerLoudnessHint(trackId, gainDb) {
+    if (!trackId || typeof gainDb !== 'number' || !Number.isFinite(gainDb)) return;
+    const clamped = clampNormDb(gainDb);
+    const cached = state.trackMap[trackId];
+    if (cached) cached.normGainDb = clamped;
+    for (const qTrack of state.queue) {
+      if (qTrack && qTrack.id === trackId) qTrack.normGainDb = clamped;
     }
-    if (typeof meterAnalyser.getFloatTimeDomainData === 'function') {
-      meterAnalyser.getFloatTimeDomainData(meterBuf);
-    } else {
-      const bytes = new Uint8Array(meterAnalyser.fftSize);
-      meterAnalyser.getByteTimeDomainData(bytes);
-      for (let i = 0; i < bytes.length; i++) {
-        meterBuf[i] = (bytes[i] - 128) / 128;
+    if (normState.trackId === trackId && !normState.hasServerHint) {
+      normState.hasServerHint = true;
+      normState.hasAnyHint = true;
+      normState.currentDb = clamped;
+      if (normGainNode && audioCtx) {
+        normGainNode.gain.setTargetAtTime(dbToGain(clamped), audioCtx.currentTime, 0.45);
       }
     }
+  }
 
+  async function refreshQueueLoudness(tracks) {
+    const missing = [];
+    for (const t of tracks) {
+      if (t && t.id && !(typeof t.normGainDb === 'number' && Number.isFinite(t.normGainDb))) {
+        if (!missing.includes(t.id)) missing.push(t.id);
+      }
+    }
+    if (!missing.length) return;
+    try {
+      const res = await api(`/api/web/tracks/loudness?ids=${encodeURIComponent(missing.join(','))}`);
+      const gains = res && res.gains;
+      if (gains && typeof gains === 'object') {
+        for (const [tid, db] of Object.entries(gains)) {
+          applyServerLoudnessHint(tid, db);
+        }
+      }
+    } catch {}
+  }
+
+  function analyserMeanSq(node, bufRef) {
+    if (!node) return { meanSq: 0, buf: bufRef };
+    const buf =
+      bufRef && bufRef.length === node.fftSize ? bufRef : new Float32Array(node.fftSize);
+    if (typeof node.getFloatTimeDomainData === 'function') {
+      node.getFloatTimeDomainData(buf);
+    } else {
+      const bytes = new Uint8Array(node.fftSize);
+      node.getByteTimeDomainData(bytes);
+      for (let i = 0; i < bytes.length; i++) {
+        buf[i] = (bytes[i] - 128) / 128;
+      }
+    }
     let sumSq = 0;
-    for (let i = 0; i < meterBuf.length; i++) {
-      const s = meterBuf[i];
+    for (let i = 0; i < buf.length; i++) {
+      const s = buf[i];
       sumSq += s * s;
     }
-    const meanSq = sumSq / meterBuf.length;
+    return { meanSq: sumSq / buf.length, buf };
+  }
+
+  function stepLoudnessNormalizer() {
+    if (!audioCtx || !meterAnalyserL || !normGainNode) return;
+    if (normState.hasServerHint) return;
+    if (audio.paused || audio.ended || audio.readyState < 2) return;
+
+    const leftRes = analyserMeanSq(meterAnalyserL, meterBufL);
+    meterBufL = leftRes.buf;
+    const rightRes = analyserMeanSq(meterAnalyserR, meterBufR);
+    meterBufR = rightRes.buf;
+
+    // ITU-R BS.1770 sums channel powers (L^2 + R^2) rather than downmixing (L+R)/2.
+    const meanSq = leftRes.meanSq + rightRes.meanSq;
     const momentaryLufs = meanSq > 1e-9 ? -0.691 + 10 * Math.log10(meanSq) : -100;
-    if (momentaryLufs < -46) return;
+    if (momentaryLufs < -50) return;
 
     normState.activeFrames++;
     normState.shortTermSq =
@@ -709,7 +760,7 @@
       normState.weightSum > 0
         ? -0.691 + 10 * Math.log10(normState.energySum / normState.weightSum)
         : momentaryLufs;
-    if (normState.activeFrames <= 20 || momentaryLufs >= curIntLufs - 10) {
+    if (normState.activeFrames <= 15 || momentaryLufs >= curIntLufs - 10) {
       normState.energySum += meanSq;
       normState.weightSum += 1;
       if (normState.weightSum > 1800) {
@@ -725,9 +776,13 @@
     const shortTermLufs =
       normState.shortTermSq > 1e-9 ? -0.691 + 10 * Math.log10(normState.shortTermSq) : momentaryLufs;
 
-    const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.5);
+    const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.0);
     let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
-    if (effectiveLufs < -24) {
+    if (!normState.hasAnyHint) {
+      // Never blast quiet intros before real song energy arrives, and cap unconfirmed live boost.
+      const liveMaxBoost = normState.activeFrames < 25 ? 0.0 : 4.5;
+      desiredDb = Math.min(desiredDb, liveMaxBoost);
+    } else if (effectiveLufs < -24) {
       const maxBoost = Math.max(0, NORM_MAX_DB - (-24 - effectiveLufs) * 0.6);
       desiredDb = Math.min(desiredDb, maxBoost);
     }
@@ -735,18 +790,19 @@
 
     const tau =
       desiredDb < normState.currentDb
-        ? normState.currentDb - desiredDb > 3.0
-          ? 0.22
-          : 0.45
-        : 2.0;
-    normState.currentDb = desiredDb;
+        ? normState.currentDb - desiredDb > 2.5
+          ? 0.14
+          : 0.35
+        : 2.5;
+    const alpha = 1 - Math.exp(-0.1 / tau);
+    normState.currentDb += (desiredDb - normState.currentDb) * alpha;
     normGainNode.gain.setTargetAtTime(dbToGain(desiredDb), audioCtx.currentTime, tau);
 
     if (
       !normState.hasServerHint &&
       normState.trackId &&
-      normState.activeFrames >= 60 &&
-      normState.activeFrames - normState.lastSavedAtFrame >= 50
+      normState.activeFrames >= 150 &&
+      normState.activeFrames - normState.lastSavedAtFrame >= 60
     ) {
       normState.lastSavedAtFrame = normState.activeFrames;
       saveCachedTrackGainDb(normState.trackId, clampNormDb(NORM_TARGET_LUFS - integratedLufs));
@@ -766,34 +822,40 @@
       audioCtx = new AC();
       audioSource = audioCtx.createMediaElementSource(audio);
 
-      // ITU-R BS.1770-style K-weighted sidechain meter (pre-gain, pre-EQ)
+      // ITU-R BS.1770 stereo K-weighted sidechain meter (pre-gain, pre-EQ)
       const kHighPass = audioCtx.createBiquadFilter();
       kHighPass.type = 'highpass';
-      kHighPass.frequency.value = 85;
-      kHighPass.Q.value = 0.707;
+      kHighPass.frequency.value = 38;
+      kHighPass.Q.value = 0.5;
       const kHighShelf = audioCtx.createBiquadFilter();
       kHighShelf.type = 'highshelf';
-      kHighShelf.frequency.value = 1680;
+      kHighShelf.frequency.value = 1500;
       kHighShelf.gain.value = 4.0;
-      meterAnalyser = audioCtx.createAnalyser();
-      meterAnalyser.fftSize = 2048;
+      const splitter = audioCtx.createChannelSplitter(2);
+      meterAnalyserL = audioCtx.createAnalyser();
+      meterAnalyserL.fftSize = 2048;
+      meterAnalyserR = audioCtx.createAnalyser();
+      meterAnalyserR.fftSize = 2048;
       const silentSink = audioCtx.createGain();
       silentSink.gain.value = 0;
       audioSource.connect(kHighPass);
       kHighPass.connect(kHighShelf);
-      kHighShelf.connect(meterAnalyser);
-      meterAnalyser.connect(silentSink);
+      kHighShelf.connect(splitter);
+      splitter.connect(meterAnalyserL, 0);
+      splitter.connect(meterAnalyserR, 1);
+      meterAnalyserL.connect(silentSink);
+      meterAnalyserR.connect(silentSink);
       silentSink.connect(audioCtx.destination);
 
       normGainNode = audioCtx.createGain();
       normGainNode.gain.value = dbToGain(normState.currentDb);
 
       const safetyLimiter = audioCtx.createDynamicsCompressor();
-      safetyLimiter.threshold.value = -1.5;
-      safetyLimiter.knee.value = 3.0;
-      safetyLimiter.ratio.value = 12.0;
-      safetyLimiter.attack.value = 0.002;
-      safetyLimiter.release.value = 0.08;
+      safetyLimiter.threshold.value = -1.0;
+      safetyLimiter.knee.value = 0.5;
+      safetyLimiter.ratio.value = 20.0;
+      safetyLimiter.attack.value = 0.001;
+      safetyLimiter.release.value = 0.06;
 
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 128;
@@ -3924,13 +3986,21 @@
     state.lastCommittedTrackId = track.id;
     sendTrackEvent(track.id, 'play', 1);
 
-    // Pre-warm next track only once the user settles on the current track!
+    // Pre-warm next track and fetch server-scanned loudness hints for upcoming queue tracks
+    const upcoming = state.queue.slice(state.queueIndex, state.queueIndex + 5);
+    refreshQueueLoudness(upcoming);
     const next = state.queue[state.queueIndex + 1];
     if (next) {
       state.queueWarmTimer = setTimeout(() => {
         state.queueWarmTimer = null;
         if (loadToken !== state.activeAudioToken) return;
-        api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
+        api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' })
+          .then((d) => {
+            if (d && typeof d.normGainDb === 'number') {
+              applyServerLoudnessHint(next.id, d.normGainDb);
+            }
+          })
+          .catch(() => {});
       }, 450);
     }
   }

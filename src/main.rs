@@ -211,6 +211,7 @@ async fn main() -> models::AppResult<()> {
             get(webapp::get_queue).put(webapp::save_queue),
         )
         .route("/api/web/warm/{id}", post(webapp::warm_track))
+        .route("/api/web/tracks/loudness", get(webapp::tracks_loudness))
         .route("/api/web/stream/{id}", get(webapp::stream_track))
         .route("/api/web/cover/{id}", get(webapp::cover_art))
         .route("/api/web/sources", get(webapp::sources_info))

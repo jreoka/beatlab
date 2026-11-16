@@ -955,8 +955,10 @@ pub fn render_share_html(
 
     let audioCtx = null;
     let analyser = null;
-    let meterAnalyser = null;
-    let meterBuf = null;
+    let meterAnalyserL = null;
+    let meterAnalyserR = null;
+    let meterBufL = null;
+    let meterBufR = null;
     let normGainNode = null;
     let masterGainNode = null;
     let normTimer = null;
@@ -1002,8 +1004,8 @@ pub fn render_share_html(
       if (hint !== null) {{
         const expectedLufs = NORM_TARGET_LUFS - hint;
         const expectedSq = Math.pow(10, (expectedLufs + 0.691) / 10);
-        normState.energySum = expectedSq * 45;
-        normState.weightSum = 45;
+        normState.energySum = expectedSq * 60;
+        normState.weightSum = 60;
         normState.shortTermSq = expectedSq;
         normState.currentDb = hint;
         normState.hasHint = true;
@@ -1012,30 +1014,37 @@ pub fn render_share_html(
         normState.hasHint = false;
       }}
       if (normGainNode && audioCtx) {{
-        normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.035);
+        normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.012);
       }}
     }}
-    function stepNormalizer() {{
-      if (!audioCtx || !meterAnalyser || !normGainNode) return;
-      if (audio.paused || audio.ended || audio.readyState < 2) return;
-      if (!meterBuf || meterBuf.length !== meterAnalyser.fftSize) {{
-        meterBuf = new Float32Array(meterAnalyser.fftSize);
-      }}
-      if (typeof meterAnalyser.getFloatTimeDomainData === 'function') {{
-        meterAnalyser.getFloatTimeDomainData(meterBuf);
+    function analyserMeanSq(node, bufRef) {{
+      if (!node) return {{ meanSq: 0, buf: bufRef }};
+      const buf = (bufRef && bufRef.length === node.fftSize) ? bufRef : new Float32Array(node.fftSize);
+      if (typeof node.getFloatTimeDomainData === 'function') {{
+        node.getFloatTimeDomainData(buf);
       }} else {{
-        const b = new Uint8Array(meterAnalyser.fftSize);
-        meterAnalyser.getByteTimeDomainData(b);
-        for (let i = 0; i < b.length; i++) meterBuf[i] = (b[i] - 128) / 128;
+        const b = new Uint8Array(node.fftSize);
+        node.getByteTimeDomainData(b);
+        for (let i = 0; i < b.length; i++) buf[i] = (b[i] - 128) / 128;
       }}
       let sumSq = 0;
-      for (let i = 0; i < meterBuf.length; i++) {{
-        const s = meterBuf[i];
+      for (let i = 0; i < buf.length; i++) {{
+        const s = buf[i];
         sumSq += s * s;
       }}
-      const meanSq = sumSq / meterBuf.length;
+      return {{ meanSq: sumSq / buf.length, buf }};
+    }}
+    function stepNormalizer() {{
+      if (!audioCtx || !meterAnalyserL || !normGainNode) return;
+      if (normState.hasHint) return;
+      if (audio.paused || audio.ended || audio.readyState < 2) return;
+      const leftRes = analyserMeanSq(meterAnalyserL, meterBufL);
+      meterBufL = leftRes.buf;
+      const rightRes = analyserMeanSq(meterAnalyserR, meterBufR);
+      meterBufR = rightRes.buf;
+      const meanSq = leftRes.meanSq + rightRes.meanSq;
       const momentaryLufs = meanSq > 1e-9 ? (-0.691 + 10 * Math.log10(meanSq)) : -100;
-      if (momentaryLufs < -46) return;
+      if (momentaryLufs < -50) return;
 
       normState.activeFrames++;
       normState.shortTermSq = normState.shortTermSq > 0
@@ -1045,7 +1054,7 @@ pub fn render_share_html(
       const curIntLufs = normState.weightSum > 0
         ? (-0.691 + 10 * Math.log10(normState.energySum / normState.weightSum))
         : momentaryLufs;
-      if (normState.activeFrames <= 20 || momentaryLufs >= curIntLufs - 10) {{
+      if (normState.activeFrames <= 15 || momentaryLufs >= curIntLufs - 10) {{
         normState.energySum += meanSq;
         normState.weightSum += 1;
         if (normState.weightSum > 1800) {{
@@ -1059,17 +1068,16 @@ pub fn render_share_html(
       const shortTermLufs = normState.shortTermSq > 1e-9
         ? (-0.691 + 10 * Math.log10(normState.shortTermSq))
         : momentaryLufs;
-      const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.5);
+      const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.0);
       let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
-      if (effectiveLufs < -24) {{
-        const maxBoost = Math.max(0, NORM_MAX_DB - (-24 - effectiveLufs) * 0.6);
-        desiredDb = Math.min(desiredDb, maxBoost);
-      }}
+      const liveMaxBoost = normState.activeFrames < 25 ? 0.0 : 4.5;
+      desiredDb = Math.min(desiredDb, liveMaxBoost);
       desiredDb = Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, desiredDb));
       const tau = desiredDb < normState.currentDb
-        ? (normState.currentDb - desiredDb > 3.0 ? 0.22 : 0.45)
-        : 2.0;
-      normState.currentDb = desiredDb;
+        ? (normState.currentDb - desiredDb > 2.5 ? 0.14 : 0.35)
+        : 2.5;
+      const alpha = 1 - Math.exp(-0.1 / tau);
+      normState.currentDb += (desiredDb - normState.currentDb) * alpha;
       normGainNode.gain.setTargetAtTime(dbToGain(desiredDb), audioCtx.currentTime, tau);
     }}
 
@@ -1131,31 +1139,37 @@ pub fn render_share_html(
 
         const kHighPass = audioCtx.createBiquadFilter();
         kHighPass.type = 'highpass';
-        kHighPass.frequency.value = 85;
-        kHighPass.Q.value = 0.707;
+        kHighPass.frequency.value = 38;
+        kHighPass.Q.value = 0.5;
         const kHighShelf = audioCtx.createBiquadFilter();
         kHighShelf.type = 'highshelf';
-        kHighShelf.frequency.value = 1680;
+        kHighShelf.frequency.value = 1500;
         kHighShelf.gain.value = 4.0;
-        meterAnalyser = audioCtx.createAnalyser();
-        meterAnalyser.fftSize = 2048;
+        const splitter = audioCtx.createChannelSplitter(2);
+        meterAnalyserL = audioCtx.createAnalyser();
+        meterAnalyserL.fftSize = 2048;
+        meterAnalyserR = audioCtx.createAnalyser();
+        meterAnalyserR.fftSize = 2048;
         const silentSink = audioCtx.createGain();
         silentSink.gain.value = 0;
         src.connect(kHighPass);
         kHighPass.connect(kHighShelf);
-        kHighShelf.connect(meterAnalyser);
-        meterAnalyser.connect(silentSink);
+        kHighShelf.connect(splitter);
+        splitter.connect(meterAnalyserL, 0);
+        splitter.connect(meterAnalyserR, 1);
+        meterAnalyserL.connect(silentSink);
+        meterAnalyserR.connect(silentSink);
         silentSink.connect(audioCtx.destination);
 
         normGainNode = audioCtx.createGain();
         normGainNode.gain.value = dbToGain(normState.currentDb);
 
         const safetyLimiter = audioCtx.createDynamicsCompressor();
-        safetyLimiter.threshold.value = -1.5;
-        safetyLimiter.knee.value = 3.0;
-        safetyLimiter.ratio.value = 12.0;
-        safetyLimiter.attack.value = 0.002;
-        safetyLimiter.release.value = 0.08;
+        safetyLimiter.threshold.value = -1.0;
+        safetyLimiter.knee.value = 0.5;
+        safetyLimiter.ratio.value = 20.0;
+        safetyLimiter.attack.value = 0.001;
+        safetyLimiter.release.value = 0.06;
 
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 128;

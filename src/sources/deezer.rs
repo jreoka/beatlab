@@ -3,12 +3,18 @@ use crate::sources::MusicSource;
 use crate::taste::classify_moods_str;
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, Semaphore};
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct DeezerSource {
     http: reqwest::Client,
+    http_sem: Arc<Semaphore>,
+    genres_cache: Arc<RwLock<Option<(Instant, Vec<DeezerGenre>)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,14 +31,71 @@ impl DeezerSource {
             .user_agent("Beatlab/0.3 (MusicDiscovery)")
             .build()
             .unwrap_or_default();
-        Self { http }
+        Self {
+            http,
+            http_sem: Arc::new(Semaphore::new(4)),
+            genres_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
+        for attempt in 0..2 {
+            let permit = self.http_sem.acquire().await.ok();
+            let resp = match self.http.get(url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(permit);
+                    if attempt == 0 {
+                        warn!(error = %e, url, "deezer request failed");
+                    }
+                    return None;
+                }
+            };
+            let status = resp.status();
+            if status.as_u16() == 429 {
+                drop(permit);
+                if attempt == 0 {
+                    warn!(url, "deezer HTTP 429 rate limited; retrying");
+                    tokio::time::sleep(Duration::from_millis(380)).await;
+                    continue;
+                }
+                return None;
+            }
+            if !status.is_success() {
+                drop(permit);
+                warn!(status = %status, url, "deezer HTTP non-success");
+                return None;
+            }
+            let val = match resp.json::<serde_json::Value>().await {
+                Ok(v) => v,
+                Err(e) => {
+                    drop(permit);
+                    warn!(error = %e, url, "deezer invalid JSON");
+                    return None;
+                }
+            };
+            drop(permit);
+            if let Some(err_obj) = val.get("error") {
+                let code = err_obj.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown deezer error");
+                if code == 4 && attempt == 0 {
+                    warn!(code, msg, url, "deezer quota limit; backing off");
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+                warn!(code, msg, url, "deezer API error");
+                return None;
+            }
+            return serde_json::from_value::<T>(val).ok();
+        }
+        None
     }
 
     async fn fetch_track_list(&self, url: &str, fallback_genre: &str) -> Vec<Track> {
-        let Ok(resp) = self.http.get(url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzTrack>>().await else {
+        let Some(parsed) = self.get_json::<DzDataList<DzTrack>>(url).await else {
             return vec![];
         };
         parsed
@@ -63,10 +126,7 @@ impl DeezerSource {
 
     pub async fn fetch_chart_albums(&self, limit: usize) -> Vec<AlbumSummary> {
         let url = format!("https://api.deezer.com/chart/0/albums?limit={}", limit.clamp(5, 60));
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzAlbum>>().await else {
+        let Some(parsed) = self.get_json::<DzDataList<DzAlbum>>(&url).await else {
             return vec![];
         };
         parsed
@@ -78,10 +138,7 @@ impl DeezerSource {
 
     pub async fn fetch_chart_artists(&self, limit: usize) -> Vec<ArtistSummary> {
         let url = format!("https://api.deezer.com/chart/0/artists?limit={}", limit.clamp(5, 60));
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzArtist>>().await else {
+        let Some(parsed) = self.get_json::<DzDataList<DzArtist>>(&url).await else {
             return vec![];
         };
         parsed
@@ -97,17 +154,7 @@ impl DeezerSource {
             urlencoding::encode(query.trim()),
             limit.clamp(5, 50)
         );
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzTrack>>().await else {
-            return vec![];
-        };
-        parsed
-            .data
-            .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, 0, ""))
-            .collect()
+        self.fetch_track_list(&url, "").await
     }
 
     pub async fn search_albums(&self, query: &str, limit: usize) -> Vec<AlbumSummary> {
@@ -116,10 +163,7 @@ impl DeezerSource {
             urlencoding::encode(query.trim()),
             limit.clamp(3, 30)
         );
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzAlbum>>().await else {
+        let Some(parsed) = self.get_json::<DzDataList<DzAlbum>>(&url).await else {
             return vec![];
         };
         parsed
@@ -135,10 +179,7 @@ impl DeezerSource {
             urlencoding::encode(query.trim()),
             limit.clamp(3, 30)
         );
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzArtist>>().await else {
+        let Some(parsed) = self.get_json::<DzDataList<DzArtist>>(&url).await else {
             return vec![];
         };
         parsed
@@ -163,11 +204,7 @@ impl DeezerSource {
 
     pub async fn fetch_album(&self, deezer_album_id: &str) -> Option<(AlbumSummary, Vec<Track>)> {
         let url = format!("https://api.deezer.com/album/{}", urlencoding::encode(deezer_album_id));
-        let resp = self.http.get(&url).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let album: DzAlbumFull = resp.json().await.ok()?;
+        let album: DzAlbumFull = self.get_json(&url).await?;
         if album.id == 0 || album.title.trim().is_empty() {
             return None;
         }
@@ -259,57 +296,42 @@ impl DeezerSource {
         let u_related = format!("https://api.deezer.com/artist/{}/related?limit=12", eid);
 
         let (r_info, r_top, r_albums, r_related) = tokio::join!(
-            self.http.get(&u_info).send(),
-            self.http.get(&u_top).send(),
-            self.http.get(&u_albums).send(),
-            self.http.get(&u_related).send(),
+            self.get_json::<DzArtist>(&u_info),
+            self.get_json::<DzDataList<DzTrack>>(&u_top),
+            self.get_json::<DzDataList<DzAlbum>>(&u_albums),
+            self.get_json::<DzDataList<DzArtist>>(&u_related),
         );
 
-        let artist_obj: DzArtist = r_info.ok()?.json().await.ok()?;
+        let artist_obj: DzArtist = r_info?;
         let mut summary = artist_obj.clone().into_summary()?;
 
-        let top_tracks: Vec<Track> = match r_top {
-            Ok(resp) => resp
-                .json::<DzDataList<DzTrack>>()
-                .await
-                .map(|d| {
-                    d.data
-                        .into_iter()
-                        .filter_map(|t| t.into_track(None, &summary.name, artist_obj.id, 0, ""))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Err(_) => vec![],
-        };
+        let top_tracks: Vec<Track> = r_top
+            .map(|d| {
+                d.data
+                    .into_iter()
+                    .filter_map(|t| t.into_track(None, &summary.name, artist_obj.id, 0, ""))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let mut albums: Vec<AlbumSummary> = match r_albums {
-            Ok(resp) => resp
-                .json::<DzDataList<DzAlbum>>()
-                .await
-                .map(|d| {
-                    d.data
-                        .into_iter()
-                        .filter_map(|mut a| {
-                            if a.artist.is_none() {
-                                a.artist = Some(artist_obj.clone());
-                            }
-                            a.into_summary()
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Err(_) => vec![],
-        };
+        let mut albums: Vec<AlbumSummary> = r_albums
+            .map(|d| {
+                d.data
+                    .into_iter()
+                    .filter_map(|mut a| {
+                        if a.artist.is_none() {
+                            a.artist = Some(artist_obj.clone());
+                        }
+                        a.into_summary()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         albums.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
 
-        let related: Vec<ArtistSummary> = match r_related {
-            Ok(resp) => resp
-                .json::<DzDataList<DzArtist>>()
-                .await
-                .map(|d| d.data.into_iter().filter_map(|a| a.into_summary()).collect())
-                .unwrap_or_default(),
-            Err(_) => vec![],
-        };
+        let related: Vec<ArtistSummary> = r_related
+            .map(|d| d.data.into_iter().filter_map(|a| a.into_summary()).collect())
+            .unwrap_or_default();
 
         summary.album_count = albums.len();
         summary.song_count = top_tracks.len();
@@ -317,13 +339,21 @@ impl DeezerSource {
     }
 
     pub async fn fetch_genres(&self) -> Vec<DeezerGenre> {
-        let Ok(resp) = self.http.get("https://api.deezer.com/genre").send().await else {
+        {
+            let guard = self.genres_cache.read().await;
+            if let Some((ts, cached)) = guard.as_ref() {
+                if ts.elapsed() < Duration::from_secs(3600) && !cached.is_empty() {
+                    return cached.clone();
+                }
+            }
+        }
+        let Some(parsed) = self
+            .get_json::<DzDataList<DzGenreRaw>>("https://api.deezer.com/genre")
+            .await
+        else {
             return vec![];
         };
-        let Ok(parsed) = resp.json::<DzDataList<DzGenreRaw>>().await else {
-            return vec![];
-        };
-        parsed
+        let genres: Vec<DeezerGenre> = parsed
             .data
             .into_iter()
             .filter(|g| g.id > 0 && !g.name.trim().is_empty())
@@ -332,7 +362,12 @@ impl DeezerSource {
                 name: g.name.trim().to_string(),
                 picture_url: first_non_empty(&[g.picture_xl, g.picture_big, g.picture_medium]),
             })
-            .collect()
+            .collect();
+        if !genres.is_empty() {
+            let mut guard = self.genres_cache.write().await;
+            *guard = Some((Instant::now(), genres.clone()));
+        }
+        genres
     }
 
     pub async fn fetch_artist_radio(&self, deezer_artist_id: &str) -> Vec<Track> {
@@ -362,10 +397,7 @@ impl DeezerSource {
             urlencoding::encode(q),
             limit.clamp(3, 25)
         );
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzPlaylist>>().await else {
+        let Some(parsed) = self.get_json::<DzDataList<DzPlaylist>>(&url).await else {
             return vec![];
         };
         parsed
@@ -384,17 +416,7 @@ impl DeezerSource {
             playlist_id,
             limit.clamp(5, 60)
         );
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return vec![];
-        };
-        let Ok(parsed) = resp.json::<DzDataList<DzTrack>>().await else {
-            return vec![];
-        };
-        parsed
-            .data
-            .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, 0, ""))
-            .collect()
+        self.fetch_track_list(&url, "").await
     }
 
     /// Searches public Deezer playlists matching `query` and concurrently fetches their tracks

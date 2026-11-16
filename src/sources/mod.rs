@@ -107,7 +107,18 @@ impl SourceRegistry {
             v
         };
 
-        let futs = sources.into_iter().map(|s| s.search(q, per_source));
+        let futs = sources.into_iter().map(|s| {
+            let per_src_timeout = match s.name() {
+                "local" => std::time::Duration::from_secs(3),
+                "archive" | "soulseek" => std::time::Duration::from_secs(5),
+                _ => std::time::Duration::from_secs(7),
+            };
+            async move {
+                tokio::time::timeout(per_src_timeout, s.search(q, per_source))
+                    .await
+                    .unwrap_or_default()
+            }
+        });
         let batches = join_all(futs).await;
         let combined: Vec<Track> = batches
             .into_iter()

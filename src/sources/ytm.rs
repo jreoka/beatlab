@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tracing::{debug, warn};
+use tracing::warn;
 
 const INNERTUBE_SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const INNERTUBE_NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
@@ -75,26 +75,26 @@ impl YtmSource {
         {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                debug!(status = %r.status(), url, "youtube music innertube non-success");
+                warn!(status = %r.status(), url, "youtube music innertube non-success");
                 return None;
             }
             Err(e) => {
-                debug!(error = %e, url, "youtube music innertube error");
+                warn!(error = %e, url, "youtube music innertube error");
                 return None;
             }
         };
         resp.json::<Value>().await.ok()
     }
 
-    pub async fn search_innertube(
+    async fn search_innertube_checked(
         &self,
         query: &str,
         songs_only: bool,
         limit: usize,
-    ) -> Vec<YtmCandidate> {
+    ) -> Option<Vec<YtmCandidate>> {
         let q = query.trim();
         if q.is_empty() {
-            return vec![];
+            return Some(vec![]);
         }
         let mut body = serde_json::json!({
             "context": innertube_client_context(),
@@ -104,12 +104,21 @@ impl YtmSource {
             body["params"] = Value::String(YTM_SONGS_PARAMS.to_string());
         }
 
-        let Some(val) = self.innertube_post(INNERTUBE_SEARCH_URL, body).await else {
-            return vec![];
-        };
+        let val = self.innertube_post(INNERTUBE_SEARCH_URL, body).await?;
         let mut out = parse_innertube_results(&val);
         out.truncate(limit);
-        out
+        Some(out)
+    }
+
+    pub async fn search_innertube(
+        &self,
+        query: &str,
+        songs_only: bool,
+        limit: usize,
+    ) -> Vec<YtmCandidate> {
+        self.search_innertube_checked(query, songs_only, limit)
+            .await
+            .unwrap_or_default()
     }
 
     /// Fetch official YouTube Music "Up Next" / Track Radio mix tracks seeded by `video_id`.
@@ -356,10 +365,11 @@ impl MusicSource for YtmSource {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
-        let mut items = self.search_innertube(query, true, limit).await;
-        if items.is_empty() {
-            items = self.search_innertube(query, false, limit).await;
-        }
+        let items = match self.search_innertube_checked(query, true, limit).await {
+            Some(v) if !v.is_empty() => v,
+            Some(_) => self.search_innertube(query, false, limit).await,
+            None => return vec![],
+        };
         let now = Utc::now().timestamp();
         items
             .into_iter()

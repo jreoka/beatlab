@@ -1048,40 +1048,68 @@ pub async fn instant_mix(
         let tr_queries = intent.expanded_track_queries();
         let genre_hints = intent.deezer_genre_hints();
 
-        let pl_futs = pl_queries
-            .iter()
-            .map(|pq| state.sources.deezer.fetch_curated_mix_tracks(pq, 2, 24));
-        let dz_extra_futs = tr_queries
-            .iter()
-            .map(|tq| state.sources.deezer.search_tracks(tq, 18));
+        let pl_futs = pl_queries.iter().map(|pq| {
+            let dz = state.sources.deezer.clone();
+            let pq_owned = pq.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(6),
+                    dz.fetch_curated_mix_tracks(&pq_owned, 2, 24),
+                )
+                .await
+                .unwrap_or_default()
+            }
+        });
+        let dz_extra_futs = tr_queries.iter().map(|tq| {
+            let dz = state.sources.deezer.clone();
+            let tq_owned = tq.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dz.search_tracks(&tq_owned, 18),
+                )
+                .await
+                .unwrap_or_default()
+            }
+        });
         let ytm_extra_futs = tr_queries.iter().map(|tq| {
-            use crate::sources::MusicSource;
-            state.sources.ytm.search(tq, 15)
+            let ytm = state.sources.ytm.clone();
+            let tq_owned = tq.clone();
+            async move {
+                use crate::sources::MusicSource;
+                tokio::time::timeout(std::time::Duration::from_secs(5), ytm.search(&tq_owned, 15))
+                    .await
+                    .unwrap_or_default()
+            }
         });
         let genre_chart_fut = async {
             if genre_hints.is_empty() {
                 return Vec::new();
             }
-            let dz_genres = state.sources.deezer.fetch_genres().await;
-            let matched: Vec<_> = dz_genres
-                .into_iter()
-                .filter(|g| {
-                    let gl = g.name.to_lowercase();
-                    genre_hints
-                        .iter()
-                        .any(|want| crate::taste::contains_term(&gl, want))
-                })
-                .take(2)
-                .collect();
-            let chart_futs = matched.into_iter().map(|g| {
-                let dz = state.sources.deezer.clone();
-                async move { dz.fetch_genre_chart_tracks(g.id, &g.name, 22).await }
-            });
-            futures::future::join_all(chart_futs)
-                .await
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let dz_genres = state.sources.deezer.fetch_genres().await;
+                let matched: Vec<_> = dz_genres
+                    .into_iter()
+                    .filter(|g| {
+                        let gl = g.name.to_lowercase();
+                        genre_hints
+                            .iter()
+                            .any(|want| crate::taste::contains_term(&gl, want))
+                    })
+                    .take(2)
+                    .collect();
+                let chart_futs = matched.into_iter().map(|g| {
+                    let dz = state.sources.deezer.clone();
+                    async move { dz.fetch_genre_chart_tracks(g.id, &g.name, 22).await }
+                });
+                futures::future::join_all(chart_futs)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
         };
 
         let (pl_batches, dz_extra, ytm_extra, genre_tracks) = tokio::join!(
@@ -1108,7 +1136,7 @@ pub async fn instant_mix(
         }
     };
 
-    let (((all_tracks, mut ytm_hints), dz_artists, (raw_tracks_extra, raw_ytm_hints)), mix_res) =
+    let (((all_tracks, mut ytm_hints), dz_artists, (raw_tracks_extra, raw_ytm_hints)), (curated_batches, extra_tracks)) =
         tokio::join!(
             async {
                 tokio::join!(
@@ -1117,14 +1145,13 @@ pub async fn instant_mix(
                     raw_radio_fut,
                 )
             },
-            tokio::time::timeout(std::time::Duration::from_secs(4), mix_future)
+            mix_future
         );
 
     for (k, v) in raw_ytm_hints {
         ytm_hints.entry(k).or_insert(v);
     }
 
-    let (curated_batches, extra_tracks) = mix_res.unwrap_or_default();
     let mut combined = [all_tracks, raw_tracks_extra, extra_tracks].concat();
     crate::sources::disambiguate_batch_tracks(&mut combined, &dz_artists);
 
@@ -1142,6 +1169,56 @@ pub async fn instant_mix(
 
     let mix_ctx = if !intent.is_theme_mix {
         expand_entity_mix_context(&state, user.id, &query, &combined, &dz_artists, &ytm_hints).await
+    } else if curated_batches.is_empty() {
+        // Fallback when Deezer curated playlists returned empty (e.g. rate-limited or offline):
+        // expand YouTube Music radio from the top YTM search hits.
+        let mut seed_vids: Vec<String> = Vec::new();
+        for t in &combined {
+            if t.source == "ytm" || t.id.starts_with("ytm:") {
+                let vid = t.id.trim_start_matches("ytm:").to_string();
+                if !vid.is_empty() && !seed_vids.contains(&vid) {
+                    seed_vids.push(vid);
+                    if seed_vids.len() >= 2 {
+                        break;
+                    }
+                }
+            } else if let Some(vid) = ytm_hints.get(&t.song_key()) {
+                if !vid.is_empty() && !seed_vids.contains(vid) {
+                    seed_vids.push(vid.clone());
+                    if seed_vids.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        let ytm_radio = if seed_vids.is_empty() {
+            Vec::new()
+        } else {
+            let futs = seed_vids.into_iter().map(|vid| {
+                let ytm = state.sources.ytm.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(3500),
+                        ytm.fetch_radio_tracks(&vid, 22),
+                    )
+                    .await
+                    .unwrap_or_default()
+                }
+            });
+            let radio_tracks: Vec<Track> = futures::future::join_all(futs)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            if !radio_tracks.is_empty() {
+                let _ = state.store.upsert_tracks(&radio_tracks);
+            }
+            radio_tracks
+        };
+        crate::taste::SearchMixContext {
+            ytm_radio,
+            ..Default::default()
+        }
     } else {
         crate::taste::SearchMixContext::default()
     };
@@ -1214,7 +1291,12 @@ async fn expand_entity_mix_context(
                 })
                 .map(|t| t.id.trim_start_matches("ytm:").to_string())
             {
-                let hop_tracks = ytm.fetch_radio_tracks(&hop_vid, 20).await;
+                let hop_tracks = tokio::time::timeout(
+                    std::time::Duration::from_millis(2000),
+                    ytm.fetch_radio_tracks(&hop_vid, 20),
+                )
+                .await
+                .unwrap_or_default();
                 radio.extend(hop_tracks);
             }
         }
@@ -1266,14 +1348,20 @@ async fn expand_entity_mix_context(
                 let dz_c = dz.clone();
                 async move { dz_c.fetch_artist_top_tracks(&rel.deezer_id, 5).await }
             });
-            for batch in futures::future::join_all(rel_futs).await {
+            let batches = tokio::time::timeout(
+                std::time::Duration::from_millis(2200),
+                futures::future::join_all(rel_futs),
+            )
+            .await
+            .unwrap_or_default();
+            for batch in batches {
                 related_tracks.extend(batch);
             }
         }
         (top_tracks, radio_res, related_tracks, related_artists)
     };
 
-    let budget = std::time::Duration::from_millis(2600);
+    let budget = std::time::Duration::from_secs(5);
     let (ytm_res, dz_res) = tokio::join!(
         tokio::time::timeout(budget, ytm_branch),
         tokio::time::timeout(budget, dz_branch),
@@ -1425,6 +1513,12 @@ async fn build_instant_mix_response(
     curated_batches: Vec<(String, Vec<Track>)>,
     mix_ctx: crate::taste::SearchMixContext,
 ) -> Response {
+    let combined_len = combined.len();
+    let curated_len = curated_batches.len();
+    let radio_len = mix_ctx.ytm_radio.len()
+        + mix_ctx.dz_artist_top.len()
+        + mix_ctx.dz_artist_radio.len()
+        + mix_ctx.dz_related_tracks.len();
     let taste = state.taste.clone();
     let q_clone = query.clone();
     let refined = tokio::task::spawn_blocking(move || {
@@ -1438,6 +1532,17 @@ async fn build_instant_mix_response(
     })
     .await
     .unwrap_or_else(|_| state.taste.search_and_refine(uid, &query, vec![], vec![]));
+
+    if refined.instant_mix.is_none() {
+        tracing::warn!(
+            query = %query,
+            combined_len,
+            curated_len,
+            radio_len,
+            ranked_len = refined.tracks.len(),
+            "instant mix returned empty"
+        );
+    }
 
     let instant_mix_json = refined.instant_mix.as_ref().map(|mix| {
         json!({
@@ -2256,7 +2361,35 @@ pub async fn warm_track(
     if let Some(t) = state.store.get_track(&id).ok().flatten() {
         state.engine.spawn_warm_track(t);
     }
-    json_res(json!({ "ok": true }))
+    let norm_gain = state.store.get_track_loudness(&id);
+    json_res(json!({ "ok": true, "normGainDb": norm_gain }))
+}
+
+#[derive(Deserialize)]
+pub struct LoudnessBatchQuery {
+    #[serde(default)]
+    pub ids: Option<String>,
+}
+
+pub async fn tracks_loudness(
+    State(state): State<AppState>,
+    Query(q): Query<LoudnessBatchQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = require_web_user(&state, &headers) {
+        return r;
+    }
+    let ids: Vec<String> = q
+        .ids
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .take(50)
+        .map(str::to_string)
+        .collect();
+    let gains = state.store.track_loudness_map(&ids);
+    json_res(json!({ "gains": gains }))
 }
 
 pub async fn stream_track(
@@ -3868,6 +4001,22 @@ mod tests {
         let v2 = serde_json::to_value(w2).unwrap();
         assert_eq!(v1["normGainDb"], -4.25);
         assert!(v2.get("normGainDb").is_none());
+
+        // Batch loudness endpoint returns cached track gains
+        let l_resp = tracks_loudness(
+            State(state.clone()),
+            Query(LoudnessBatchQuery {
+                ids: Some("loc:80s-a,loc:80s-b".into()),
+            }),
+            hdrs.clone(),
+        )
+        .await;
+        assert_eq!(l_resp.status(), StatusCode::OK);
+        let l_body: Value =
+            serde_json::from_slice(&to_bytes(l_resp.into_body(), 1024 * 64).await.unwrap())
+                .unwrap();
+        assert_eq!(l_body["gains"]["loc:80s-a"], -4.25);
+        assert!(l_body["gains"].get("loc:80s-b").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

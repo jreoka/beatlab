@@ -2969,6 +2969,101 @@ impl TasteEngine {
                 .map(|e| (e.mix_score, e.track.clone()))
                 .collect();
 
+            if mix_pool.len() < 2 {
+                let mut seen_fallback_keys: HashSet<String> = mix_pool
+                    .iter()
+                    .map(|(_, t)| t.song_key())
+                    .collect();
+                let all_decades = ["50s", "60s", "70s", "80s", "90s", "00s", "10s", "20s"];
+                let has_conflicting_decade = |t: &Track| -> bool {
+                    let Some(want_dec) = intent.decade_label else {
+                        return false;
+                    };
+                    let hay = format!("{} {}", t.title, t.album)
+                        .to_lowercase()
+                        .replace("'s", "s")
+                        .replace("1950s", "50s")
+                        .replace("1960s", "60s")
+                        .replace("1970s", "70s")
+                        .replace("1980s", "80s")
+                        .replace("1990s", "90s")
+                        .replace("2000s", "00s")
+                        .replace("2010s", "10s")
+                        .replace("2020s", "20s");
+                    let mentions_other = all_decades
+                        .iter()
+                        .any(|&d| d != want_dec && contains_term(&hay, d));
+                    mentions_other && !contains_term(&hay, want_dec)
+                };
+                let is_fallback_compatible = |t: &Track, ag: &str, era_m: f64, theme_m: f64| -> bool {
+                    if is_junk_track_for_query(t, &intent.normalized)
+                        || is_strongly_disliked(t, &sctx.prof, &sctx.stats)
+                        || is_mix_clutter_track(t, &intent.normalized)
+                        || has_conflicting_decade(t)
+                    {
+                        return false;
+                    }
+                    if intent.year_range.is_some() && era_m < 0.0 {
+                        return false;
+                    }
+                    if !intent.moods.is_empty()
+                        && !intent
+                            .moods
+                            .iter()
+                            .all(|m| is_track_compatible_with_mood(t, ag, *m))
+                    {
+                        return false;
+                    }
+                    if !intent.genres.is_empty() && has_genre_clash(t, ag, &intent.genres) {
+                        return false;
+                    }
+                    if !intent.themes.is_empty() && theme_m < 0.35 && mix_ctx.ytm_radio.is_empty() {
+                        return false;
+                    }
+                    true
+                };
+
+                for (idx, t) in mix_ctx.ytm_radio.iter().enumerate() {
+                    if is_hidden_track(t, &sctx.prof) {
+                        continue;
+                    }
+                    let ag = artist_genres
+                        .get(&primary_artist(&t.artist).to_lowercase())
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    let era_m = compute_query_era_match(t, &intent);
+                    let theme_m = compute_query_theme_match_with_artist(t, ag, &intent);
+                    if !is_fallback_compatible(t, ag, era_m, theme_m) {
+                        continue;
+                    }
+                    if seen_fallback_keys.insert(t.song_key()) {
+                        let radio_score = 3.6 - (idx as f64) * 0.06 + era_m.max(0.0) * 2.0 + theme_m * 2.0;
+                        mix_pool.push((radio_score, t.clone()));
+                    }
+                }
+
+                if mix_pool.len() < 8 {
+                    for e in &evals {
+                        if e.is_junk || e.disliked {
+                            continue;
+                        }
+                        let ag = artist_genres
+                            .get(&primary_artist(&e.track.artist).to_lowercase())
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        if !is_fallback_compatible(&e.track, ag, e.era_match, e.theme_match) {
+                            continue;
+                        }
+                        // For era-only queries without curated playlists, avoid generic tracks
+                        // unless we got them from the query search itself or they match era/theme.
+                        if seen_fallback_keys.insert(e.track.song_key()) {
+                            let s = e.mix_score + (e.lex / 220.0).min(2.0);
+                            mix_pool.push((s, e.track.clone()));
+                        }
+                    }
+                }
+            }
+
             mix_pool.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             let mix_ranked: Vec<Track> = mix_pool.into_iter().map(|(_, t)| t).collect();
             let mix_tracks = dedup_and_interleave(mix_ranked, 25, 2);
@@ -3338,8 +3433,20 @@ impl TasteEngine {
             }
             ordered.extend(scored_mix.into_iter().map(|(_, t)| t));
 
-            let anchor_cap = if mix_ctx.is_artist_query { 4 } else { 3 };
             let anchor_slug = slug(&primary_artist(anchor_art));
+            let has_other_artists = ordered
+                .iter()
+                .any(|t| {
+                    let s = slug(&primary_artist(&t.artist));
+                    !s.is_empty() && s != anchor_slug
+                });
+            let anchor_cap = if !has_other_artists {
+                15
+            } else if mix_ctx.is_artist_query {
+                4
+            } else {
+                3
+            };
             let mix_tracks =
                 dedup_and_interleave_with_anchor(ordered, 25, 2, Some((&anchor_slug, anchor_cap)));
 
@@ -4124,6 +4231,23 @@ fn compute_query_era_match(t: &Track, intent: &SearchIntent) -> f64 {
             }
             return -1.0;
         }
+        if let Some(dec) = intent.decade_label {
+            let g_low = t
+                .genre
+                .to_lowercase()
+                .replace("'s", "s")
+                .replace("1950s", "50s")
+                .replace("1960s", "60s")
+                .replace("1970s", "70s")
+                .replace("1980s", "80s")
+                .replace("1990s", "90s")
+                .replace("2000s", "00s")
+                .replace("2010s", "10s")
+                .replace("2020s", "20s");
+            if contains_term(&g_low, dec) {
+                return 0.75;
+            }
+        }
         return 0.0;
     }
 
@@ -4208,6 +4332,15 @@ fn is_junk_track_for_query(t: &Track, query_low: &str) -> bool {
         "music box",
     ] {
         if hay.contains(junk) && !query_low.contains(junk) {
+            return true;
+        }
+    }
+    let artist_low = t.artist.to_lowercase();
+    if contains_term(&artist_low, "covers") && !query_low.contains("cover") {
+        return true;
+    }
+    for spam_artist in ["hits guys", "super hits", "greatest hits", "party hits"] {
+        if artist_low.contains(spam_artist) && !query_low.contains(spam_artist) {
             return true;
         }
     }
@@ -6651,5 +6784,138 @@ mod tests {
             "recently heard song should be deprioritized below fresh tracks in upcoming: {:?}",
             upcoming_ids
         );
+    }
+
+    #[test]
+    fn theme_instant_mix_recovers_with_ytm_fallback_when_curated_playlists_unavailable() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("fallback80s", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let ytm_1 = Track {
+            id: "ytm:takeonme".into(),
+            source: "ytm".into(),
+            title: "Take On Me".into(),
+            artist: "a-ha".into(),
+            duration: 225,
+            ..Default::default()
+        };
+        let ytm_2 = Track {
+            id: "ytm:ebtrtw".into(),
+            source: "ytm".into(),
+            title: "Everybody Wants To Rule The World".into(),
+            artist: "Tears For Fears".into(),
+            duration: 251,
+            ..Default::default()
+        };
+        let ytm_radio_1 = Track {
+            id: "ytm:sweetdreams".into(),
+            source: "ytm".into(),
+            title: "Sweet Dreams (Are Made of This)".into(),
+            artist: "Eurythmics".into(),
+            duration: 216,
+            ..Default::default()
+        };
+        let spam_cover = Track {
+            id: "dz:spam".into(),
+            source: "deezer".into(),
+            title: "Nothing's Gonna Stop Us Now".into(),
+            artist: "80s Hits Guys".into(),
+            duration: 240,
+            ..Default::default()
+        };
+        let modern_wrong_era = Track {
+            id: "dz:2022".into(),
+            source: "deezer".into(),
+            title: "80s Vibes".into(),
+            artist: "Modern Artist".into(),
+            year: 2022,
+            duration: 200,
+            ..Default::default()
+        };
+
+        let mix_ctx = SearchMixContext {
+            ytm_radio: vec![ytm_radio_1.clone()],
+            ..Default::default()
+        };
+        let res = taste.search_and_refine_with_context(
+            u.id,
+            "80s hits",
+            vec![ytm_1.clone(), ytm_2.clone(), spam_cover.clone(), modern_wrong_era.clone()],
+            vec![],
+            mix_ctx,
+        );
+        let mix = res.instant_mix.expect("80s hits mix should recover when curated playlists are empty");
+        assert_eq!(mix.title, "80s Hits Mix");
+        let ids: Vec<&str> = mix.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&ytm_radio_1.id.as_str()), "ids={:?}", ids);
+        assert!(ids.contains(&ytm_1.id.as_str()), "ids={:?}", ids);
+        assert!(ids.contains(&ytm_2.id.as_str()), "ids={:?}", ids);
+        assert!(!ids.contains(&spam_cover.id.as_str()), "ids={:?}", ids);
+        assert!(!ids.contains(&modern_wrong_era.id.as_str()), "ids={:?}", ids);
+    }
+
+    #[test]
+    fn entity_instant_mix_builds_single_artist_essential_mix_when_radio_is_empty() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("daftfan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: "Daft Punk".into(),
+            album: "Discovery".into(),
+            genre: "Electronic".into(),
+            duration: 240,
+            bitrate: 256,
+            meta: r#"{"deezer_artist_id":27,"rank":900000}"#.into(),
+            ..Default::default()
+        };
+        let raw = vec![
+            mk("dz:1", "One More Time"),
+            mk("dz:2", "Harder, Better, Faster, Stronger"),
+            mk("dz:3", "Around the World"),
+            mk("dz:4", "Digital Love"),
+            mk("dz:5", "Get Lucky"),
+            mk("dz:6", "Instant Crush"),
+        ];
+        let dz_artists = vec![ArtistSummary {
+            id: "ar:dz:27".into(),
+            name: "Daft Punk".into(),
+            deezer_id: "27".into(),
+            ..Default::default()
+        }];
+        let plan = taste
+            .plan_entity_mix_anchor(u.id, "Daft Punk", &raw, &dz_artists)
+            .expect("anchor plan should match Daft Punk");
+        let mix_ctx = SearchMixContext {
+            anchor_artist: Some(plan.artist_name),
+            anchor_deezer_artist_id: plan.deezer_artist_id,
+            anchor_track_key: plan.seed_track.as_ref().map(Track::song_key),
+            is_artist_query: plan.is_artist_query,
+            ..Default::default()
+        };
+        let res = taste.search_and_refine_with_context(u.id, "Daft Punk", raw, vec![], mix_ctx);
+        let mix = res
+            .instant_mix
+            .expect("single-artist mix should succeed when >= 5 anchor tracks exist");
+        assert_eq!(mix.title, "Daft Punk Mix");
+        assert!(mix.tracks.len() >= 5, "tracks={}", mix.tracks.len());
     }
 }
