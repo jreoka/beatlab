@@ -30,6 +30,7 @@ pub struct YtmCandidate {
     pub artist: String,
     pub artist_id: String,
     pub album: String,
+    pub year: i32,
     pub duration: i32,
     pub cover_url: String,
 }
@@ -236,6 +237,7 @@ impl YtmSource {
                         .unwrap_or("")
                         .to_string(),
                     album: String::new(),
+                    year: 0,
                     duration: v.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0) as i32,
                     cover_url: String::new(),
                 });
@@ -415,7 +417,7 @@ fn candidate_to_track(c: YtmCandidate, created: i64) -> Option<Track> {
         album,
         genre: String::new(),
         moods,
-        year: 0,
+        year: c.year,
         track_no: 0,
         disc_no: 1,
         duration: dur,
@@ -554,6 +556,7 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
     let mut artist = String::new();
     let mut artist_id = String::new();
     let mut album = String::new();
+    let mut year = 0i32;
     let mut duration = item
         .pointer("/lengthText/runs")
         .and_then(join_runs_text)
@@ -600,10 +603,12 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
                 }
                 continue;
             }
-            let is_year = part.len() == 4 && part.chars().all(|c| c.is_ascii_digit());
+            if let Some(y) = parse_release_year(part) {
+                year = y;
+                continue;
+            }
             let low = part.to_lowercase();
-            if is_year
-                || low == "song"
+            if low == "song"
                 || low == "video"
                 || low.ends_with("plays")
                 || low.ends_with("views")
@@ -628,6 +633,7 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
         artist,
         artist_id,
         album,
+        year,
         duration,
         cover_url,
     })
@@ -665,6 +671,7 @@ fn extract_candidate(item: &Value) -> Option<YtmCandidate> {
     let mut artist = String::new();
     let mut artist_id = String::new();
     let mut album = String::new();
+    let mut year = 0i32;
     let mut duration = 0i32;
 
     if let Some(runs) = subtitle_runs {
@@ -706,6 +713,10 @@ fn extract_candidate(item: &Value) -> Option<YtmCandidate> {
                 duration = d;
                 continue;
             }
+            if let Some(y) = parse_release_year(part) {
+                year = y;
+                continue;
+            }
             if low == "song"
                 || low == "video"
                 || low == "single"
@@ -737,9 +748,21 @@ fn extract_candidate(item: &Value) -> Option<YtmCandidate> {
         artist,
         artist_id,
         album,
+        year,
         duration,
         cover_url,
     })
+}
+
+fn parse_release_year(s: &str) -> Option<i32> {
+    let trimmed = s.trim();
+    if trimmed.len() == 4 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        let y = trimmed.parse::<i32>().ok()?;
+        if (1920..=2035).contains(&y) {
+            return Some(y);
+        }
+    }
+    None
 }
 
 fn find_watch_video_id(v: &Value) -> Option<&str> {
@@ -1016,10 +1039,83 @@ mod tests {
         assert_eq!(items[0].video_id, "BRPQDDAUeMY");
         assert_eq!(items[0].artist, "Rokudenashi");
         assert_eq!(items[0].album, "The Flame of Love");
+        assert_eq!(items[0].year, 2023);
         assert_eq!(items[0].duration, 202);
         assert_eq!(
             items[0].cover_url,
             "https://yt3.googleusercontent.com/abc=w1080-h1080-l90-rj"
         );
+    }
+
+    #[test]
+    fn innertube_parser_extracts_release_year_without_confusing_album_1984() {
+        let payload = serde_json::json!({
+            "contents": {
+                "tabbedSearchResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicShelfRenderer": {
+                                            "contents": [{
+                                                "musicResponsiveListItemRenderer": {
+                                                    "playlistItemData": { "videoId": "jump84" },
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": { "runs": [{ "text": "Jump" }] }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [
+                                                                        {
+                                                                            "text": "Van Halen",
+                                                                            "navigationEndpoint": {
+                                                                                "browseEndpoint": {
+                                                                                    "browseEndpointContextSupportedConfigs": {
+                                                                                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        },
+                                                                        { "text": " • " },
+                                                                        {
+                                                                            "text": "1984",
+                                                                            "navigationEndpoint": {
+                                                                                "browseEndpoint": {
+                                                                                    "browseEndpointContextSupportedConfigs": {
+                                                                                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ALBUM" }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        },
+                                                                        { "text": " • " },
+                                                                        { "text": "1983" },
+                                                                        { "text": " • " },
+                                                                        { "text": "4:01" }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let items = parse_innertube_results(&payload);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].album, "1984");
+        assert_eq!(items[0].year, 1983);
+        assert_eq!(items[0].duration, 241);
     }
 }

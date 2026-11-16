@@ -273,13 +273,6 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_shares_user_kind_target
                 ON shares(user_id, kind, target_id);
-
-            CREATE TABLE IF NOT EXISTS track_loudness (
-                track_id TEXT PRIMARY KEY,
-                gain_db REAL NOT NULL,
-                source TEXT NOT NULL DEFAULT 'measured',
-                updated INTEGER NOT NULL
-            );
             ",
         )?;
 
@@ -2584,86 +2577,6 @@ impl Store {
             "DELETE FROM cache_entries WHERE track_id = ?1",
             params![track_id],
         )?;
-        Ok(())
-    }
-
-    pub fn get_track_loudness(&self, track_id: &str) -> Option<f64> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT gain_db FROM track_loudness WHERE track_id = ?1",
-            params![track_id],
-            |r| r.get::<_, f64>(0),
-        )
-        .ok()
-        .filter(|g| g.is_finite())
-    }
-
-    pub fn track_loudness_map(&self, track_ids: &[String]) -> HashMap<String, f64> {
-        let mut out = HashMap::new();
-        if track_ids.is_empty() {
-            return out;
-        }
-        let conn = self.lock();
-        for chunk in track_ids.chunks(250) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT track_id, gain_db FROM track_loudness WHERE track_id IN ({})",
-                placeholders
-            );
-            if let Ok(mut stmt) = conn.prepare(&sql) {
-                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-                });
-                if let Ok(rows) = rows {
-                    for row in rows.flatten() {
-                        if row.1.is_finite() {
-                            out.insert(row.0, row.1);
-                        }
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    pub fn upsert_track_loudness(&self, track_id: &str, gain_db: f64, source: &str) -> AppResult<()> {
-        if !gain_db.is_finite() {
-            return Ok(());
-        }
-        let now = Utc::now().timestamp();
-        let clamped = (gain_db.clamp(-12.0, 8.5) * 100.0).round() / 100.0;
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO track_loudness(track_id, gain_db, source, updated) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(track_id) DO UPDATE SET gain_db = excluded.gain_db, source = excluded.source, updated = excluded.updated",
-            params![track_id, clamped, source, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn upsert_track_loudness_batch(&self, items: &[(String, f64, String)]) -> AppResult<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        let now = Utc::now().timestamp();
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO track_loudness(track_id, gain_db, source, updated) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(track_id) DO UPDATE SET gain_db = excluded.gain_db, source = excluded.source, updated = excluded.updated",
-            )?;
-            for (track_id, gain_db, source) in items {
-                if !gain_db.is_finite() {
-                    continue;
-                }
-                let clamped = (gain_db.clamp(-12.0, 8.5) * 100.0).round() / 100.0;
-                stmt.execute(params![track_id, clamped, source, now])?;
-            }
-        }
-        tx.commit()?;
         Ok(())
     }
 

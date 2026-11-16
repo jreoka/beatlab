@@ -309,8 +309,6 @@ pub struct WebTrack {
     pub is_starred: bool,
     pub play_count: i32,
     pub rating: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub norm_gain_db: Option<f64>,
 }
 
 fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> Vec<Track> {
@@ -335,7 +333,6 @@ fn to_web_track_with_maps(
     starred: &HashSet<String>,
     stats: &HashMap<String, UserTrackStats>,
     ratings: &HashMap<String, i32>,
-    loudness: &HashMap<String, f64>,
     is_taste_match: bool,
 ) -> WebTrack {
     WebTrack {
@@ -362,7 +359,6 @@ fn to_web_track_with_maps(
         is_starred: starred.contains(&t.id),
         play_count: stats.get(&t.id).map(|s| s.play_count).unwrap_or(0),
         rating: ratings.get(&t.id).copied().unwrap_or(0),
-        norm_gain_db: loudness.get(&t.id).copied(),
     }
 }
 
@@ -391,8 +387,6 @@ fn to_web_tracks_with_taste(
     } else {
         Default::default()
     };
-    let track_ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
-    let loudness = state.store.track_loudness_map(&track_ids);
 
     tracks
         .iter()
@@ -402,7 +396,6 @@ fn to_web_tracks_with_taste(
                 &starred,
                 &stats,
                 &ratings,
-                &loudness,
                 taste_match_ids.contains(&t.id),
             )
         })
@@ -834,10 +827,12 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         Ok(u) => u,
         Err(r) => return r,
     };
-    let (dz_genres, chart_tracks, chart_albums) = tokio::join!(
+    let uid = user.id;
+    let (dz_genres, chart_tracks, chart_albums, chart_artists) = tokio::join!(
         state.sources.deezer.fetch_genres(),
         state.sources.deezer.fetch_chart_tracks(30),
         state.sources.deezer.fetch_chart_albums(18),
+        state.sources.deezer.fetch_chart_artists(14),
     );
     if !chart_tracks.is_empty() {
         let _ = state.store.upsert_tracks(&chart_tracks);
@@ -845,23 +840,52 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     for a in &chart_albums {
         let _ = state.store.upsert_album_meta(a);
     }
+    for ar in &chart_artists {
+        let _ = state.store.upsert_artist_meta(ar);
+    }
 
     let moods: Vec<Value> = Mood::ALL
         .iter()
         .map(|m| {
             let (c1, c2) = m.gradient();
+            let (track_count, covers) = state.taste.curated_mood_preview(*m);
             json!({
                 "slug": m.slug(),
                 "label": m.label(),
                 "subtitle": m.subtitle(),
                 "c1": c1,
                 "c2": c2,
+                "trackCount": track_count,
+                "covers": covers,
             })
         })
         .collect();
 
+    let mut moments: Vec<Value> = Vec::new();
+    let mut decades: Vec<Value> = Vec::new();
+    for spec in crate::taste::EXPLORE_MIX_SPECS {
+        let (track_count, covers) = state.taste.curated_explore_preview(spec);
+        let item = json!({
+            "key": spec.key,
+            "kind": spec.kind,
+            "title": spec.title,
+            "subtitle": spec.subtitle,
+            "query": spec.query,
+            "c1": spec.c1,
+            "c2": spec.c2,
+            "trackCount": track_count,
+            "covers": covers,
+        });
+        if spec.kind == "decade" {
+            decades.push(item);
+        } else {
+            moments.push(item);
+        }
+    }
+
     let genres: Vec<Value> = dz_genres
         .into_iter()
+        .filter(|g| !g.name.eq_ignore_ascii_case("all"))
         .map(|g| {
             json!({
                 "id": g.id,
@@ -871,13 +895,98 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         })
         .collect();
 
-    let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
-    let visible_charts = filter_visible_tracks(&state, user.id, chart_tracks);
+    let discovery_raw = {
+        let mut d = state.taste.discover_weekly(uid, 12);
+        if d.len() < 6 {
+            let extra = state.taste.for_you_tracks(uid, 12);
+            for t in extra {
+                if !d.iter().any(|x| x.id == t.id) {
+                    d.push(t);
+                }
+            }
+        }
+        d.truncate(12);
+        d
+    };
+    let discovery_picks = filter_visible_tracks(&state, uid, discovery_raw);
+
+    let albums = if !chart_albums.is_empty() {
+        chart_albums
+    } else {
+        state
+            .store
+            .build_album_summaries(uid)
+            .unwrap_or_default()
+            .into_iter()
+            .take(18)
+            .collect()
+    };
+    let artists = if !chart_artists.is_empty() {
+        chart_artists
+    } else {
+        state
+            .store
+            .build_artist_summaries()
+            .unwrap_or_default()
+            .into_iter()
+            .take(14)
+            .collect()
+    };
+
+    let saved = state.store.saved_album_ids(uid).unwrap_or_default();
+    let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
+    let visible_charts = filter_visible_tracks(
+        &state,
+        uid,
+        if !chart_tracks.is_empty() {
+            chart_tracks
+        } else {
+            state.store.newest_tracks(30, 0).unwrap_or_default()
+        },
+    );
+
     json_res(json!({
         "moods": moods,
+        "moments": moments,
+        "decades": decades,
+        "discoveryPicks": to_web_tracks(&state, uid, &discovery_picks),
+        "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "genres": genres,
-        "charts": to_web_tracks(&state, user.id, &visible_charts),
-        "newAlbums": chart_albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
+        "charts": to_web_tracks(&state, uid, &visible_charts),
+        "newAlbums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
+        "curator": state.taste.curator_status_snapshot(),
+    }))
+}
+
+pub async fn explore_mix(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(spec) = crate::taste::find_explore_mix_spec(&key) else {
+        return err_res(StatusCode::NOT_FOUND, "Explore mix not found");
+    };
+    let tracks = state
+        .taste
+        .get_curated_explore_mix_tracks(user.id, spec, 35)
+        .await;
+    let total_duration: i32 = tracks.iter().map(|t| t.duration.max(0)).sum();
+    json_res(json!({
+        "mix": {
+            "key": spec.key,
+            "kind": spec.kind,
+            "title": spec.title,
+            "subtitle": spec.subtitle,
+            "query": spec.query,
+            "c1": spec.c1,
+            "c2": spec.c2,
+            "totalDuration": total_duration,
+        },
+        "tracks": to_web_tracks(&state, user.id, &tracks),
     }))
 }
 
@@ -1136,7 +1245,7 @@ pub async fn instant_mix(
         }
     };
 
-    let (((all_tracks, mut ytm_hints), dz_artists, (raw_tracks_extra, raw_ytm_hints)), (curated_batches, extra_tracks)) =
+    let (((all_tracks, mut ytm_hints), dz_artists, (raw_tracks_extra, raw_ytm_hints)), (mut curated_batches, extra_tracks)) =
         tokio::join!(
             async {
                 tokio::join!(
@@ -1167,27 +1276,72 @@ pub async fn instant_mix(
         let _ = state.store.upsert_artist_meta(ar);
     }
 
+    if intent.is_theme_mix && curated_batches.is_empty() {
+        let pre_curated = state.taste.load_curated_query_tracks(&intent.normalized);
+        if pre_curated.len() >= 5 {
+            curated_batches.push((query.clone(), pre_curated));
+        }
+    }
+
     let mix_ctx = if !intent.is_theme_mix {
         expand_entity_mix_context(&state, user.id, &query, &combined, &dz_artists, &ytm_hints).await
     } else if curated_batches.is_empty() {
         // Fallback when Deezer curated playlists returned empty (e.g. rate-limited or offline):
-        // expand YouTube Music radio from the top YTM search hits.
-        let mut seed_vids: Vec<String> = Vec::new();
-        for t in &combined {
-            if t.source == "ytm" || t.id.starts_with("ytm:") {
-                let vid = t.id.trim_start_matches("ytm:").to_string();
-                if !vid.is_empty() && !seed_vids.contains(&vid) {
-                    seed_vids.push(vid);
-                    if seed_vids.len() >= 2 {
-                        break;
-                    }
+        // expand YouTube Music radio from verified, non-spam YTM search hits matching the era.
+        let is_bad_seed = |t: &Track| -> bool {
+            let art_low = t.artist.to_lowercase();
+            if art_low.is_empty()
+                || art_low == "unknown artist"
+                || art_low.ends_with(" hits")
+                || art_low.contains("hits guys")
+                || art_low.contains("super hits")
+                || art_low.contains("unforgettable hits")
+                || art_low.contains("cover")
+                || art_low.contains("karaoke")
+                || art_low.contains("dj gotta")
+                || art_low.contains("kiggo")
+            {
+                return true;
+            }
+            if let Some((min_y, max_y)) = intent.year_range {
+                if t.year > 1920 && (t.year < min_y - 2 || t.year > max_y + 2) {
+                    return true;
                 }
-            } else if let Some(vid) = ytm_hints.get(&t.song_key()) {
-                if !vid.is_empty() && !seed_vids.contains(vid) {
-                    seed_vids.push(vid.clone());
-                    if seed_vids.len() >= 2 {
-                        break;
-                    }
+            }
+            false
+        };
+
+        let mut ranked_seed_cands: Vec<(i32, String)> = Vec::new();
+        for (idx, t) in combined.iter().enumerate() {
+            if is_bad_seed(t) {
+                continue;
+            }
+            let vid = if t.source == "ytm" || t.id.starts_with("ytm:") {
+                t.id.trim_start_matches("ytm:").to_string()
+            } else if let Some(v) = ytm_hints.get(&t.song_key()) {
+                v.clone()
+            } else {
+                continue;
+            };
+            if vid.is_empty() {
+                continue;
+            }
+            let mut prio = 100 - (idx as i32);
+            if let Some((min_y, max_y)) = intent.year_range {
+                if t.year >= min_y && t.year <= max_y {
+                    prio += 200;
+                }
+            }
+            ranked_seed_cands.push((prio, vid));
+        }
+        ranked_seed_cands.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut seed_vids: Vec<String> = Vec::new();
+        for (_, vid) in ranked_seed_cands {
+            if !seed_vids.contains(&vid) {
+                seed_vids.push(vid);
+                if seed_vids.len() >= 3 {
+                    break;
                 }
             }
         }
@@ -1198,7 +1352,7 @@ pub async fn instant_mix(
                 let ytm = state.sources.ytm.clone();
                 async move {
                     tokio::time::timeout(
-                        std::time::Duration::from_millis(3500),
+                        std::time::Duration::from_millis(4000),
                         ytm.fetch_radio_tracks(&vid, 22),
                     )
                     .await
@@ -1533,7 +1687,13 @@ async fn build_instant_mix_response(
     .await
     .unwrap_or_else(|_| state.taste.search_and_refine(uid, &query, vec![], vec![]));
 
-    if refined.instant_mix.is_none() {
+    if let Some(ref mix) = refined.instant_mix {
+        if mix.is_theme_mix && curated_len > 0 && mix.tracks.len() >= 8 {
+            state
+                .taste
+                .save_curated_query_tracks(&query.trim().to_lowercase(), &mix.tracks);
+        }
+    } else {
         tracing::warn!(
             query = %query,
             combined_len,
@@ -1678,23 +1838,21 @@ pub async fn stats(
     let store = state.store.clone();
     let user_clone = user.clone();
 
-    let Ok((computed, starred, track_stats, ratings, loudness)) =
+    let Ok((computed, starred, track_stats, ratings)) =
         tokio::task::spawn_blocking(move || {
             let now_ts = Utc::now().timestamp();
             let c = crate::stats::build_user_stats(&store, &user_clone, range, tz, now_ts);
             let st = store.starred_ids(uid).unwrap_or_default();
             let ts = store.track_stats_map(uid).unwrap_or_default();
             let rt = store.user_ratings(uid).unwrap_or_default();
-            let ids: Vec<String> = c.top_tracks.iter().map(|it| it.track.id.clone()).collect();
-            let ld = store.track_loudness_map(&ids);
-            (c, st, ts, rt, ld)
+            (c, st, ts, rt)
         })
         .await
     else {
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute stats");
     };
 
-    let wrap_track = |t: &Track| to_web_track_with_maps(t, &starred, &track_stats, &ratings, &loudness, false);
+    let wrap_track = |t: &Track| to_web_track_with_maps(t, &starred, &track_stats, &ratings, false);
 
     let top_tracks: Vec<Value> = computed
         .top_tracks
@@ -2361,35 +2519,7 @@ pub async fn warm_track(
     if let Some(t) = state.store.get_track(&id).ok().flatten() {
         state.engine.spawn_warm_track(t);
     }
-    let norm_gain = state.store.get_track_loudness(&id);
-    json_res(json!({ "ok": true, "normGainDb": norm_gain }))
-}
-
-#[derive(Deserialize)]
-pub struct LoudnessBatchQuery {
-    #[serde(default)]
-    pub ids: Option<String>,
-}
-
-pub async fn tracks_loudness(
-    State(state): State<AppState>,
-    Query(q): Query<LoudnessBatchQuery>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(r) = require_web_user(&state, &headers) {
-        return r;
-    }
-    let ids: Vec<String> = q
-        .ids
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .take(50)
-        .map(str::to_string)
-        .collect();
-    let gains = state.store.track_loudness_map(&ids);
-    json_res(json!({ "gains": gains }))
+    json_res(json!({ "ok": true }))
 }
 
 pub async fn stream_track(
@@ -2727,13 +2857,10 @@ pub async fn public_share_page(
         .unwrap_or("audio/mpeg");
 
     let origin = request_origin(&headers);
-    let track_ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
-    let loudness_map = state.store.track_loudness_map(&track_ids);
     let html = crate::share_page::render_share_html(
         &origin,
         &share,
         &tracks,
-        &loudness_map,
         has_embed_video,
         primary_mime,
     );
@@ -3989,34 +4116,42 @@ mod tests {
             ]
         );
 
-        // WebTrack includes normGainDb when cached in store and omits it when absent
-        store.upsert_track_loudness("loc:80s-a", -4.25, "ebur128").unwrap();
-        let stored_tracks = store.get_tracks_by_ids(&["loc:80s-a".into(), "loc:80s-b".into()]).unwrap();
-        let web_list = to_web_tracks(&state, u.id, &stored_tracks);
-        let w1 = web_list.iter().find(|t| t.id == "loc:80s-a").unwrap();
-        let w2 = web_list.iter().find(|t| t.id == "loc:80s-b").unwrap();
-        assert_eq!(w1.norm_gain_db, Some(-4.25));
-        assert_eq!(w2.norm_gain_db, None);
-        let v1 = serde_json::to_value(w1).unwrap();
-        let v2 = serde_json::to_value(w2).unwrap();
-        assert_eq!(v1["normGainDb"], -4.25);
-        assert!(v2.get("normGainDb").is_none());
-
-        // Batch loudness endpoint returns cached track gains
-        let l_resp = tracks_loudness(
+        // Explore mix endpoint serves pre-curated moment/decade mixes cleanly
+        let exp_tracks: Vec<Track> = (0..8)
+            .map(|i| Track {
+                id: format!("loc:exp80_{}", i),
+                source: "local".into(),
+                title: format!("80s Anthem {}", i),
+                artist: format!("80s Artist {}", i),
+                year: 1980 + i,
+                duration: 220,
+                bitrate: 900,
+                format: "flac".into(),
+                ..Default::default()
+            })
+            .collect();
+        store.upsert_tracks(&exp_tracks).unwrap();
+        let exp_ids: Vec<String> = exp_tracks.iter().map(|t| t.id.clone()).collect();
+        state.taste.save_curated_query_tracks("80s hits", &exp_tracks);
+        if let Ok(json_s) = serde_json::to_string(&serde_json::json!({
+            "updated_at": chrono::Utc::now().timestamp(),
+            "track_ids": exp_ids,
+        })) {
+            store.kv_set("curated:explore:80s_hits", &json_s);
+        }
+        let exp_resp = explore_mix(
             State(state.clone()),
-            Query(LoudnessBatchQuery {
-                ids: Some("loc:80s-a,loc:80s-b".into()),
-            }),
+            Path("80s_hits".into()),
             hdrs.clone(),
         )
         .await;
-        assert_eq!(l_resp.status(), StatusCode::OK);
-        let l_body: Value =
-            serde_json::from_slice(&to_bytes(l_resp.into_body(), 1024 * 64).await.unwrap())
+        assert_eq!(exp_resp.status(), StatusCode::OK);
+        let exp_body: Value =
+            serde_json::from_slice(&to_bytes(exp_resp.into_body(), 1024 * 128).await.unwrap())
                 .unwrap();
-        assert_eq!(l_body["gains"]["loc:80s-a"], -4.25);
-        assert!(l_body["gains"].get("loc:80s-b").is_none());
+        assert_eq!(exp_body["mix"]["key"], "80s_hits");
+        assert_eq!(exp_body["mix"]["title"], "80s Hits");
+        assert_eq!(exp_body["tracks"].as_array().unwrap().len(), 8);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

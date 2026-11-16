@@ -17,33 +17,8 @@
   let audioSource = null;
   let eqFilters = [];
   let analyser = null;
-  let meterAnalyserL = null;
-  let meterAnalyserR = null;
-  let meterBufL = null;
-  let meterBufR = null;
-  let normGainNode = null;
   let masterGainNode = null;
-  let normTimer = null;
   let rafVisualizer = null;
-
-  const NORM_TARGET_LUFS = -11.0;
-  const NORM_SERVER_REF_LUFS = -14.0;
-  const NORM_SERVER_OFFSET_DB = NORM_TARGET_LUFS - NORM_SERVER_REF_LUFS;
-  const NORM_MIN_DB = -12.0;
-  const NORM_MAX_DB = 8.5;
-  const NORM_UNMEASURED_INIT_DB = -1.5;
-  const NORM_CACHE_KEY = 'beatlab_norm_cache_v3';
-  const normState = {
-    trackId: '',
-    energySum: 0,
-    weightSum: 0,
-    activeFrames: 0,
-    shortTermSq: 0,
-    currentDb: 0,
-    hasServerHint: false,
-    hasAnyHint: false,
-    lastSavedAtFrame: 0,
-  };
 
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
@@ -598,44 +573,8 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Web Audio Equalizer, Automatic Loudness Leveler & Visualizer
+  // Web Audio Equalizer & Visualizer
   // ---------------------------------------------------------------------------
-  function dbToGain(db) {
-    return Math.pow(10, db / 20);
-  }
-
-  function clampNormDb(db) {
-    return Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, db));
-  }
-
-  function loadCachedTrackGainDb(trackId) {
-    if (!trackId) return null;
-    try {
-      const raw = JSON.parse(localStorage.getItem(NORM_CACHE_KEY) || '{}');
-      const v = raw && typeof raw === 'object' ? raw[trackId] : null;
-      return typeof v === 'number' && Number.isFinite(v) ? clampNormDb(v) : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function saveCachedTrackGainDb(trackId, gainDb) {
-    if (!trackId || !Number.isFinite(gainDb)) return;
-    try {
-      const raw = JSON.parse(localStorage.getItem(NORM_CACHE_KEY) || '{}');
-      const map = raw && typeof raw === 'object' ? raw : {};
-      delete map[trackId];
-      map[trackId] = Math.round(clampNormDb(gainDb) * 100) / 100;
-      const keys = Object.keys(map);
-      if (keys.length > 300) {
-        for (let i = 0; i < keys.length - 300; i++) {
-          delete map[keys[i]];
-        }
-      }
-      localStorage.setItem(NORM_CACHE_KEY, JSON.stringify(map));
-    } catch {}
-  }
-
   function applyOutputVolume() {
     const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
     if (masterGainNode && audioCtx) {
@@ -645,172 +584,6 @@
     } else {
       audio.muted = state.muted;
       audio.volume = effectiveVol;
-    }
-  }
-
-  function syncNormalizerTrack(track) {
-    if (!track || !track.id) return;
-    if (normState.trackId === track.id) return;
-    normState.trackId = track.id;
-    normState.energySum = 0;
-    normState.weightSum = 0;
-    normState.activeFrames = 0;
-    normState.shortTermSq = 0;
-    normState.lastSavedAtFrame = 0;
-
-    const serverHint =
-      typeof track.normGainDb === 'number' && Number.isFinite(track.normGainDb)
-        ? clampNormDb(track.normGainDb + NORM_SERVER_OFFSET_DB)
-        : null;
-    const hint = serverHint !== null ? serverHint : loadCachedTrackGainDb(track.id);
-    normState.hasServerHint = serverHint !== null;
-    normState.hasAnyHint = hint !== null;
-
-    if (hint !== null) {
-      const expectedLufs = NORM_TARGET_LUFS - hint;
-      const expectedSq = Math.pow(10, (expectedLufs + 0.691) / 10);
-      normState.energySum = expectedSq * 60;
-      normState.weightSum = 60;
-      normState.shortTermSq = expectedSq;
-      normState.currentDb = hint;
-    } else {
-      // Unmeasured modern streams average ~ -9.5 LUFS (-1.5 dB relative to -11 LUFS target).
-      normState.currentDb = NORM_UNMEASURED_INIT_DB;
-    }
-
-    if (normGainNode && audioCtx) {
-      normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.012);
-    }
-  }
-
-  function applyServerLoudnessHint(trackId, gainDb) {
-    if (!trackId || typeof gainDb !== 'number' || !Number.isFinite(gainDb)) return;
-    const rawClamped = clampNormDb(gainDb);
-    const cached = state.trackMap[trackId];
-    if (cached) cached.normGainDb = rawClamped;
-    for (const qTrack of state.queue) {
-      if (qTrack && qTrack.id === trackId) qTrack.normGainDb = rawClamped;
-    }
-    const targetDb = clampNormDb(gainDb + NORM_SERVER_OFFSET_DB);
-    if (normState.trackId === trackId && !normState.hasServerHint) {
-      normState.hasServerHint = true;
-      normState.hasAnyHint = true;
-      normState.currentDb = targetDb;
-      if (normGainNode && audioCtx) {
-        normGainNode.gain.setTargetAtTime(dbToGain(targetDb), audioCtx.currentTime, 0.45);
-      }
-    }
-  }
-
-  async function refreshQueueLoudness(tracks) {
-    const missing = [];
-    for (const t of tracks) {
-      if (t && t.id && !(typeof t.normGainDb === 'number' && Number.isFinite(t.normGainDb))) {
-        if (!missing.includes(t.id)) missing.push(t.id);
-      }
-    }
-    if (!missing.length) return;
-    try {
-      const res = await api(`/api/web/tracks/loudness?ids=${encodeURIComponent(missing.join(','))}`);
-      const gains = res && res.gains;
-      if (gains && typeof gains === 'object') {
-        for (const [tid, db] of Object.entries(gains)) {
-          applyServerLoudnessHint(tid, db);
-        }
-      }
-    } catch {}
-  }
-
-  function analyserMeanSq(node, bufRef) {
-    if (!node) return { meanSq: 0, buf: bufRef };
-    const buf =
-      bufRef && bufRef.length === node.fftSize ? bufRef : new Float32Array(node.fftSize);
-    if (typeof node.getFloatTimeDomainData === 'function') {
-      node.getFloatTimeDomainData(buf);
-    } else {
-      const bytes = new Uint8Array(node.fftSize);
-      node.getByteTimeDomainData(bytes);
-      for (let i = 0; i < bytes.length; i++) {
-        buf[i] = (bytes[i] - 128) / 128;
-      }
-    }
-    let sumSq = 0;
-    for (let i = 0; i < buf.length; i++) {
-      const s = buf[i];
-      sumSq += s * s;
-    }
-    return { meanSq: sumSq / buf.length, buf };
-  }
-
-  function stepLoudnessNormalizer() {
-    if (!audioCtx || !meterAnalyserL || !normGainNode) return;
-    if (normState.hasServerHint) return;
-    if (audio.paused || audio.ended || audio.readyState < 2) return;
-
-    const leftRes = analyserMeanSq(meterAnalyserL, meterBufL);
-    meterBufL = leftRes.buf;
-    const rightRes = analyserMeanSq(meterAnalyserR, meterBufR);
-    meterBufR = rightRes.buf;
-
-    // ITU-R BS.1770 sums channel powers (L^2 + R^2) rather than downmixing (L+R)/2.
-    const meanSq = leftRes.meanSq + rightRes.meanSq;
-    const momentaryLufs = meanSq > 1e-9 ? -0.691 + 10 * Math.log10(meanSq) : -100;
-    if (momentaryLufs < -50) return;
-
-    normState.activeFrames++;
-    normState.shortTermSq =
-      normState.shortTermSq > 0 ? normState.shortTermSq * 0.90 + meanSq * 0.10 : meanSq;
-
-    const curIntLufs =
-      normState.weightSum > 0
-        ? -0.691 + 10 * Math.log10(normState.energySum / normState.weightSum)
-        : momentaryLufs;
-    if (normState.activeFrames <= 15 || momentaryLufs >= curIntLufs - 10) {
-      normState.energySum += meanSq;
-      normState.weightSum += 1;
-      if (normState.weightSum > 1800) {
-        normState.energySum *= 0.995;
-        normState.weightSum *= 0.995;
-      }
-    }
-
-    const integratedLufs =
-      normState.weightSum > 0
-        ? -0.691 + 10 * Math.log10(normState.energySum / normState.weightSum)
-        : momentaryLufs;
-    const shortTermLufs =
-      normState.shortTermSq > 1e-9 ? -0.691 + 10 * Math.log10(normState.shortTermSq) : momentaryLufs;
-
-    const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.0);
-    let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
-    if (!normState.hasAnyHint) {
-      // Never blast quiet intros before real song energy arrives, while allowing full leveling after 2s.
-      const liveMaxBoost = normState.activeFrames < 20 ? 0.0 : 5.5;
-      desiredDb = Math.min(desiredDb, liveMaxBoost);
-    } else if (effectiveLufs < -21) {
-      const maxBoost = Math.max(0, NORM_MAX_DB - (-21 - effectiveLufs) * 0.6);
-      desiredDb = Math.min(desiredDb, maxBoost);
-    }
-    desiredDb = clampNormDb(desiredDb);
-
-    const tau =
-      desiredDb < normState.currentDb
-        ? normState.activeFrames < 40 || normState.currentDb - desiredDb > 2.5
-          ? 0.12
-          : 0.35
-        : 2.5;
-    const alpha = 1 - Math.exp(-0.1 / tau);
-    normState.currentDb += (desiredDb - normState.currentDb) * alpha;
-    normGainNode.gain.setTargetAtTime(dbToGain(desiredDb), audioCtx.currentTime, tau);
-
-    if (
-      !normState.hasServerHint &&
-      normState.trackId &&
-      normState.activeFrames >= 150 &&
-      normState.activeFrames - normState.lastSavedAtFrame >= 60
-    ) {
-      normState.lastSavedAtFrame = normState.activeFrames;
-      saveCachedTrackGainDb(normState.trackId, clampNormDb(NORM_TARGET_LUFS - integratedLufs));
     }
   }
 
@@ -827,41 +600,6 @@
       audioCtx = new AC();
       audioSource = audioCtx.createMediaElementSource(audio);
 
-      // ITU-R BS.1770 stereo K-weighted sidechain meter (pre-gain, pre-EQ)
-      const kHighPass = audioCtx.createBiquadFilter();
-      kHighPass.type = 'highpass';
-      kHighPass.frequency.value = 38;
-      kHighPass.Q.value = 0.5;
-      const kHighShelf = audioCtx.createBiquadFilter();
-      kHighShelf.type = 'highshelf';
-      kHighShelf.frequency.value = 1500;
-      kHighShelf.gain.value = 4.0;
-      const splitter = audioCtx.createChannelSplitter(2);
-      meterAnalyserL = audioCtx.createAnalyser();
-      meterAnalyserL.fftSize = 2048;
-      meterAnalyserR = audioCtx.createAnalyser();
-      meterAnalyserR.fftSize = 2048;
-      const silentSink = audioCtx.createGain();
-      silentSink.gain.value = 0;
-      audioSource.connect(kHighPass);
-      kHighPass.connect(kHighShelf);
-      kHighShelf.connect(splitter);
-      splitter.connect(meterAnalyserL, 0);
-      splitter.connect(meterAnalyserR, 1);
-      meterAnalyserL.connect(silentSink);
-      meterAnalyserR.connect(silentSink);
-      silentSink.connect(audioCtx.destination);
-
-      normGainNode = audioCtx.createGain();
-      normGainNode.gain.value = dbToGain(normState.currentDb);
-
-      const safetyLimiter = audioCtx.createDynamicsCompressor();
-      safetyLimiter.threshold.value = -1.0;
-      safetyLimiter.knee.value = 0.5;
-      safetyLimiter.ratio.value = 20.0;
-      safetyLimiter.attack.value = 0.001;
-      safetyLimiter.release.value = 0.06;
-
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 128;
 
@@ -877,23 +615,15 @@
       });
 
       let node = audioSource;
-      node.connect(normGainNode);
-      node = normGainNode;
       for (const f of eqFilters) {
         node.connect(f);
         node = f;
       }
-      node.connect(safetyLimiter);
-      safetyLimiter.connect(analyser);
+      node.connect(analyser);
       analyser.connect(masterGainNode);
       masterGainNode.connect(audioCtx.destination);
 
       applyOutputVolume();
-      const cur = currentTrack();
-      if (cur) syncNormalizerTrack(cur);
-      if (!normTimer) {
-        normTimer = setInterval(stepLoudnessNormalizer, 100);
-      }
     } catch (e) {
       console.warn('WebAudio init skipped:', e);
     }
@@ -1665,7 +1395,6 @@
         updateNowPlayingUI(cur, false);
         renderQueuePanel();
         if (cur) {
-          syncNormalizerTrack(cur);
           audio.src = buildStreamUrl(cur);
           if (savedSec > 0) {
             const total = cur.duration > 0 ? cur.duration : savedSec;
@@ -1819,6 +1548,7 @@
 
     if (hash === 'home') return renderHome();
     if (hash === 'explore') return renderExplore();
+    if (hash.startsWith('explore-mix/')) return renderExploreMix(safeDecodeUri(hash.slice(12)));
     if (hash === 'mix' || hash.startsWith('mix?')) {
       const qIdx = hash.indexOf('?');
       const mixQ = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)).get('q') || '' : '';
@@ -1942,25 +1672,86 @@
     }
   }
 
+  function renderExploreMixCard(item) {
+    const covers = Array.isArray(item.covers) ? item.covers.filter(Boolean) : [];
+    const artHtml = covers.length >= 4
+      ? `<div class="explore-collage">${covers.slice(0, 4).map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`
+      : covers.length >= 1
+        ? `<img class="explore-single-art" src="${esc(covers[0])}" loading="lazy" alt="" />`
+        : `<div class="explore-art-fallback" style="background:${esc(item.c2)};box-shadow:inset 0 -3px 0 ${esc(item.c1)}"><span>${esc(item.title.slice(0, 2).toUpperCase())}</span></div>`;
+    const countLabel = item.trackCount > 0 ? `${item.trackCount} curated tracks` : 'Curating on demand';
+    return `<div class="explore-mix-card" style="border-color:${esc(item.c1)}44" onclick="App.navigate('explore-mix/${encodeURIComponent(item.key)}')">
+      <div class="explore-mix-art" style="background:${esc(item.c2)}">${artHtml}</div>
+      <div class="explore-mix-body">
+        <div class="explore-mix-kicker" style="color:${esc(item.c1)}">${item.kind === 'decade' ? 'ERA MIX' : 'MOMENT'}</div>
+        <h3>${esc(item.title)}</h3>
+        <p>${esc(item.subtitle)}</p>
+        <div class="explore-mix-meta">${esc(countLabel)}</div>
+      </div>
+    </div>`;
+  }
+
   async function renderExplore() {
     const { reqToken, signal } = beginViewRequest();
-    setMainLoading('Exploring charts & genres...');
+    setMainLoading('Exploring charts, moments & genres...');
     try {
       const d = await api('/api/web/explore', { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const charts = cacheTracks(d.charts || []);
-      let html = `<div class="section-head" style="margin-bottom:18px">
-        <h1 class="page-greeting" style="margin-bottom:0">Explore</h1>
+      const discoveryPicks = cacheTracks(d.discoveryPicks || []);
+      const moments = d.moments || [];
+      const decades = d.decades || [];
+      const artists = d.artists || [];
+      const curator = d.curator || null;
+      const curatorBadge = curator
+        ? `<span class="curator-pill" title="Server continuously curates moods, moments, and discovery pools in the background"><span class="curator-dot"></span>Live Curator · ${Number(curator.catalogTracks || 0).toLocaleString()} tracks · ${curator.readyMoods || 0}/${curator.totalMoods || 10} moods ready</span>`
+        : '';
+
+      let html = `<div class="section-head" style="margin-bottom:18px;gap:12px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <h1 class="page-greeting" style="margin-bottom:0">Explore</h1>
+          ${curatorBadge}
+        </div>
         <button class="btn-secondary" onclick="App.promptInstantMix()">Create Instant Mix</button>
       </div>`;
+
+      if (moments.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Moments &amp; Activities</h2></div>
+          <div class="explore-mix-grid">${moments.map(renderExploreMixCard).join('')}</div>
+        </section>`;
+      }
+
       html += `<section class="section">
-        <div class="section-head"><h2>Moods &amp; Moments</h2></div>
+        <div class="section-head"><h2>Moods &amp; Vibes</h2></div>
         <div class="mood-grid">${(d.moods || []).map(renderMoodTile).join('')}</div>
       </section>`;
+
+      if (decades.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Decades &amp; Time Machine</h2></div>
+          <div class="explore-mix-grid">${decades.map(renderExploreMixCard).join('')}</div>
+        </section>`;
+      }
+
+      if (discoveryPicks.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Fresh Discovery Picks</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(discoveryPicks.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="track-table">${renderTrackRows(discoveryPicks)}</div>
+        </section>`;
+      }
+
+      if (artists.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Featured Artists</h2></div>
+          <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
+        </section>`;
+      }
+
       if ((d.genres || []).length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Genres</h2></div>
-          <div class="card-grid">${d.genres.slice(0, 18).map((g) => `
+          <div class="card-grid">${d.genres.slice(0, 24).map((g) => `
             <div class="media-card" onclick="App.navigate('genre/${encodeURIComponent(g.name)}')">
               <div class="card-art-wrap"><img src="${esc(g.coverUrl)}" loading="lazy" alt="${esc(g.name)}" /></div>
               <div class="card-title">${esc(g.name)}</div>
@@ -1968,18 +1759,65 @@
             </div>`).join('')}</div>
         </section>`;
       }
+
       if ((d.newAlbums || []).length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Chart Albums</h2></div>
           <div class="card-grid">${d.newAlbums.map(renderAlbumCard).join('')}</div>
         </section>`;
       }
+
       if (charts.length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Top 30 Charts</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(charts.map((t) => t.id)))}, 0)">Play Charts</button></div>
           <div class="track-table">${renderTrackRows(charts)}</div>
         </section>`;
       }
+      $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      handleViewFetchError(e, reqToken, signal);
+    }
+  }
+
+  async function renderExploreMix(key) {
+    const { reqToken, signal } = beginViewRequest();
+    setMainLoading('Preparing curated mix...');
+    try {
+      const d = await api(`/api/web/explore/mix/${encodeURIComponent(key)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
+      const m = d.mix;
+      const tracks = cacheTracks(d.tracks || []);
+      state.currentMoodShare = {
+        kind: 'mix',
+        targetId: `explore:${m.key}`,
+        title: m.title,
+        subtitle: m.subtitle || 'Curated Mix',
+        trackIds: tracks.map((t) => t.id),
+        coverUrl: tracks[0]?.coverUrl || '/api/web/cover/default',
+      };
+      const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+      const covers = [...new Set(tracks.map((t) => t.coverUrl).filter(Boolean))].slice(0, 4);
+      const artHtml = covers.length >= 4
+        ? `<div class="hero-collage">${covers.map((c) => `<img src="${esc(c)}" alt="" />`).join('')}</div>`
+        : covers.length >= 1
+          ? `<img class="hero-art" src="${esc(covers[0])}" alt="" />`
+          : '';
+      let html = `<div class="hero-header" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)};">
+        ${artHtml}
+        <div class="hero-info">
+          <div class="hero-kicker" style="color:#fff">${m.kind === 'decade' ? 'ERA MIX' : 'CURATED MOMENT'}</div>
+          <h1 class="hero-title">${esc(m.title)}</h1>
+          <div class="hero-sub" style="color:rgba(255,255,255,0.88)">${esc(m.subtitle)} · ${tracks.length} tracks · ${fmtTotalDur(m.totalDuration || 0)}</div>
+          <div class="hero-actions">
+            ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Mix</button>` : ''}
+            ${tracks.length ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
+            ${tracks.length ? `<button class="btn-secondary" onclick="App.shareCurrentMoodMix()">${ICONS.share} Share Mix</button>` : ''}
+            <button class="btn-secondary" onclick="App.navigate('explore')">Back to Explore</button>
+          </div>
+        </div>
+      </div>
+      ${tracks.length ? `<div class="track-table">${renderTrackRows(tracks)}</div>` : `<p class="muted-center">No tracks available for this mix yet. Check back shortly while the curator refreshes.</p>`}`;
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
@@ -2560,19 +2398,26 @@
         coverUrl: tracks[0]?.coverUrl || '/api/web/cover/default',
       };
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
+      const covers = [...new Set(tracks.map((t) => t.coverUrl).filter(Boolean))].slice(0, 4);
+      const artHtml = covers.length >= 4
+        ? `<div class="hero-collage">${covers.map((c) => `<img src="${esc(c)}" alt="" />`).join('')}</div>`
+        : covers.length >= 1
+          ? `<img class="hero-art" src="${esc(covers[0])}" alt="" />`
+          : '';
       let html = `<div class="hero-header" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)};">
+        ${artHtml}
         <div class="hero-info">
           <div class="hero-kicker" style="color:#fff">MOOD MIX</div>
           <h1 class="hero-title">${esc(m.label)}</h1>
           <div class="hero-sub" style="color:rgba(255,255,255,0.88)">${esc(m.subtitle)} · ${tracks.length} tracks</div>
           <div class="hero-actions">
-            <button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Mix</button>
-            <button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>
+            ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Mix</button>` : `<button class="btn-primary" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">Refresh Mix</button>`}
+            ${tracks.length ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
             ${tracks.length ? `<button class="btn-secondary" onclick="App.shareCurrentMoodMix()">${ICONS.share} Share Mix</button>` : ''}
           </div>
         </div>
       </div>
-      <div class="track-table">${renderTrackRows(tracks)}</div>`;
+      ${tracks.length ? `<div class="track-table">${renderTrackRows(tracks)}</div>` : `<p class="muted-center">Still curating tracks for ${esc(m.label)} — try refreshing in a moment.</p>`}`;
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
     } catch (e) {
@@ -3830,9 +3675,18 @@
   }
 
   function renderMoodTile(m) {
+    const covers = Array.isArray(m.covers) ? m.covers.filter(Boolean).slice(0, 3) : [];
+    const thumbs = covers.length
+      ? `<div class="mood-tile-thumbs">${covers.map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`
+      : '';
+    const countTag = m.trackCount > 0 ? `<span class="mood-tile-count">${m.trackCount} tracks</span>` : '';
     return `<div class="mood-tile" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)}" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">
-      <h3>${esc(m.label)}</h3>
+      <div class="mood-tile-top">
+        <h3>${esc(m.label)}</h3>
+        ${countTag}
+      </div>
       <p>${esc(m.subtitle)}</p>
+      ${thumbs}
     </div>`;
   }
 
@@ -3979,7 +3833,6 @@
       if (!audio.paused) audio.pause();
     } catch {}
     ensureAudioGraph();
-    syncNormalizerTrack(track);
     audio.src = buildStreamUrl(track);
     audio.play().catch((e) => {
       if (loadToken !== state.activeAudioToken) return;
@@ -3992,27 +3845,13 @@
     state.lastCommittedTrackId = track.id;
     sendTrackEvent(track.id, 'play', 1);
 
-    // Pre-warm next track and fetch server-scanned loudness hints for upcoming queue tracks
-    const upcoming = state.queue.slice(state.queueIndex, state.queueIndex + 5);
-    refreshQueueLoudness(upcoming);
+    // Pre-warm next track
     const next = state.queue[state.queueIndex + 1];
     if (next) {
       state.queueWarmTimer = setTimeout(() => {
         state.queueWarmTimer = null;
         if (loadToken !== state.activeAudioToken) return;
-        api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' })
-          .then((d) => {
-            if (d && typeof d.normGainDb === 'number') {
-              applyServerLoudnessHint(next.id, d.normGainDb);
-            } else {
-              setTimeout(() => {
-                if (loadToken === state.activeAudioToken) {
-                  refreshQueueLoudness([next]);
-                }
-              }, 3500);
-            }
-          })
-          .catch(() => {});
+        api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
       }, 450);
     }
   }
@@ -4454,7 +4293,6 @@
     haptic('medium');
     ensureAudioGraph();
     if (!audio.getAttribute('src')) {
-      syncNormalizerTrack(cur);
       audio.src = buildStreamUrl(cur);
     }
     if (audio.paused) {

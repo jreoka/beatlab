@@ -3,9 +3,9 @@ use crate::sources::MusicSource;
 use crate::store::Store;
 use crate::taste::classify_moods_str;
 use async_trait::async_trait;
-use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
+use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::{Accessor, ItemKey};
+use lofty::tag::Accessor;
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -52,7 +52,6 @@ impl LocalSource {
         }
         let mut count = 0usize;
         let mut batch = Vec::new();
-        let mut loudness_batch: Vec<(String, f64, String)> = Vec::new();
         for root in dirs {
             if !root.exists() {
                 continue;
@@ -70,19 +69,12 @@ impl LocalSource {
                 if !AUDIO_EXTS.contains(&ext.as_str()) {
                     continue;
                 }
-                if let Some((track, norm_db)) = read_local_track(path, &ext) {
-                    if let Some(db) = norm_db {
-                        loudness_batch.push((track.id.clone(), db, "tag".to_string()));
-                    }
+                if let Some(track) = read_local_track(path, &ext) {
                     batch.push(track);
                     count += 1;
                     if batch.len() >= 100 {
                         if let Err(e) = self.store.upsert_tracks(&batch) {
                             warn!(error = %e, "upsert_tracks batch failed");
-                        }
-                        if !loudness_batch.is_empty() {
-                            let _ = self.store.upsert_track_loudness_batch(&loudness_batch);
-                            loudness_batch.clear();
                         }
                         batch.clear();
                     }
@@ -93,9 +85,6 @@ impl LocalSource {
             if let Err(e) = self.store.upsert_tracks(&batch) {
                 warn!(error = %e, "upsert_tracks final batch failed");
             }
-        }
-        if !loudness_batch.is_empty() {
-            let _ = self.store.upsert_track_loudness_batch(&loudness_batch);
         }
         info!(tracks = count, "local library scan complete");
         count
@@ -133,7 +122,7 @@ impl MusicSource for LocalSource {
     }
 }
 
-fn read_local_track(path: &Path, ext: &str) -> Option<(Track, Option<f64>)> {
+fn read_local_track(path: &Path, ext: &str) -> Option<Track> {
     let meta = std::fs::metadata(path).ok()?;
     let size = meta.len() as i64;
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -161,7 +150,6 @@ fn read_local_track(path: &Path, ext: &str) -> Option<(Track, Option<f64>)> {
     let mut sample_rate = 0i32;
     let mut bit_depth = 0i32;
     let mut has_cover = false;
-    let mut norm_gain_db: Option<f64> = None;
 
     if let Ok(tagged) = Probe::open(path).and_then(|p| p.read()) {
         let props = tagged.properties();
@@ -169,7 +157,6 @@ fn read_local_track(path: &Path, ext: &str) -> Option<(Track, Option<f64>)> {
         bitrate = props.overall_bitrate().unwrap_or(0) as i32;
         sample_rate = props.sample_rate().unwrap_or(0) as i32;
         bit_depth = props.bit_depth().unwrap_or(0) as i32;
-        norm_gain_db = extract_loudness_gain_from_tags(&tagged);
 
         if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
             if let Some(t) = tag.title() {
@@ -212,113 +199,29 @@ fn read_local_track(path: &Path, ext: &str) -> Option<(Track, Option<f64>)> {
         String::new()
     };
 
-    Some((
-        Track {
-            id,
-            source: "local".to_string(),
-            title,
-            artist,
-            album,
-            genre,
-            moods,
-            year,
-            track_no,
-            disc_no,
-            duration,
-            bitrate,
-            sample_rate,
-            bit_depth,
-            format: ext.to_string(),
-            size,
-            stream_url: format!("file:{}", abs_str),
-            cover_url,
-            meta: String::new(),
-            deezer_id: String::new(),
-            created: chrono::Utc::now().timestamp(),
-        },
-        norm_gain_db,
-    ))
-}
-
-pub fn parse_replaygain_db(raw: &str) -> Option<f64> {
-    let trimmed = raw
-        .trim()
-        .trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
-    let val: f64 = trimmed.trim().parse().ok()?;
-    if !val.is_finite() {
-        return None;
-    }
-    // ReplayGain 1.0/2.0 references -18 LUFS; target is -14 LUFS (+4.0 dB offset).
-    Some((val + 4.0).clamp(-12.0, 8.5))
-}
-
-pub fn parse_r128_track_gain_db(raw: &str) -> Option<f64> {
-    let val: f64 = raw.trim().parse().ok()?;
-    if !val.is_finite() {
-        return None;
-    }
-    // RFC 7845 R128_TRACK_GAIN is Q7.8 fixed-point relative to -23 LUFS; target is -14 LUFS (+9.0 dB).
-    Some(((val / 256.0) + 9.0).clamp(-12.0, 8.5))
-}
-
-pub fn parse_itunnorm_db(raw: &str) -> Option<f64> {
-    let mut vals = raw
-        .split_whitespace()
-        .take(2)
-        .filter_map(|tok| u32::from_str_radix(tok.trim(), 16).ok())
-        .filter(|&v| v > 0);
-    let left = vals.next()?;
-    let peak_val = vals.next().map(|right| left.max(right)).unwrap_or(left) as f64;
-    // Apple SoundCheck: 1000 == 0 dB relative to -18 LUFS; +4 dB adjusts to -14 LUFS.
-    let db_18 = -10.0 * (peak_val / 1000.0).log10();
-    if !db_18.is_finite() {
-        return None;
-    }
-    Some((db_18 + 4.0).clamp(-12.0, 8.5))
-}
-
-pub fn extract_loudness_gain_from_tags(tagged: &TaggedFile) -> Option<f64> {
-    for tag in tagged.tags() {
-        for item in tag.items() {
-            let Some(val) = item.value().text() else {
-                continue;
-            };
-            match item.key() {
-                ItemKey::ReplayGainTrackGain => {
-                    if let Some(db) = parse_replaygain_db(val) {
-                        return Some(db);
-                    }
-                }
-                ItemKey::Unknown(k) => {
-                    let key_low = k.to_ascii_lowercase();
-                    if key_low == "replaygain_track_gain"
-                        || key_low.ends_with(":replaygain_track_gain")
-                    {
-                        if let Some(db) = parse_replaygain_db(val) {
-                            return Some(db);
-                        }
-                    } else if key_low == "r128_track_gain"
-                        || key_low.ends_with(":r128_track_gain")
-                    {
-                        if let Some(db) = parse_r128_track_gain_db(val) {
-                            return Some(db);
-                        }
-                    } else if key_low == "itunnorm" || key_low.ends_with(":itunnorm") {
-                        if let Some(db) = parse_itunnorm_db(val) {
-                            return Some(db);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    None
-}
-
-pub fn extract_loudness_gain_from_file(path: &Path) -> Option<f64> {
-    let tagged = Probe::open(path).ok()?.read().ok()?;
-    extract_loudness_gain_from_tags(&tagged)
+    Some(Track {
+        id,
+        source: "local".to_string(),
+        title,
+        artist,
+        album,
+        genre,
+        moods,
+        year,
+        track_no,
+        disc_no,
+        duration,
+        bitrate,
+        sample_rate,
+        bit_depth,
+        format: ext.to_string(),
+        size,
+        stream_url: format!("file:{}", abs_str),
+        cover_url,
+        meta: String::new(),
+        deezer_id: String::new(),
+        created: chrono::Utc::now().timestamp(),
+    })
 }
 
 pub fn extract_embedded_cover(file_path: &Path) -> Option<(Vec<u8>, String)> {

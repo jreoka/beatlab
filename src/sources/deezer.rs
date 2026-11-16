@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
@@ -15,6 +16,7 @@ pub struct DeezerSource {
     http: reqwest::Client,
     http_sem: Arc<Semaphore>,
     genres_cache: Arc<RwLock<Option<(Instant, Vec<DeezerGenre>)>>>,
+    json_cache: Arc<RwLock<HashMap<String, (Instant, serde_json::Value)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,11 +37,23 @@ impl DeezerSource {
             http,
             http_sem: Arc::new(Semaphore::new(4)),
             genres_cache: Arc::new(RwLock::new(None)),
+            json_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
-        for attempt in 0..2 {
+        {
+            let guard = self.json_cache.read().await;
+            if let Some((ts, cached)) = guard.get(url) {
+                if ts.elapsed() < Duration::from_secs(600) {
+                    if let Ok(parsed) = serde_json::from_value::<T>(cached.clone()) {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+
+        for attempt in 0..3 {
             let permit = self.http_sem.acquire().await.ok();
             let resp = match self.http.get(url).send().await {
                 Ok(r) => r,
@@ -54,9 +68,10 @@ impl DeezerSource {
             let status = resp.status();
             if status.as_u16() == 429 {
                 drop(permit);
-                if attempt == 0 {
-                    warn!(url, "deezer HTTP 429 rate limited; retrying");
-                    tokio::time::sleep(Duration::from_millis(380)).await;
+                if attempt < 2 {
+                    let wait_ms = 420 * (attempt as u64 + 1);
+                    warn!(url, attempt, "deezer HTTP 429 rate limited; retrying");
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     continue;
                 }
                 return None;
@@ -81,15 +96,27 @@ impl DeezerSource {
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("unknown deezer error");
-                if code == 4 && attempt == 0 {
-                    warn!(code, msg, url, "deezer quota limit; backing off");
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                if code == 4 && attempt < 2 {
+                    let wait_ms = 450 * (attempt as u64 + 1);
+                    warn!(code, msg, url, attempt, "deezer quota limit; backing off");
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     continue;
                 }
                 warn!(code, msg, url, "deezer API error");
                 return None;
             }
-            return serde_json::from_value::<T>(val).ok();
+            if let Ok(parsed) = serde_json::from_value::<T>(val.clone()) {
+                let mut guard = self.json_cache.write().await;
+                if guard.len() >= 300 {
+                    guard.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(600));
+                    if guard.len() >= 300 {
+                        guard.clear();
+                    }
+                }
+                guard.insert(url.to_string(), (Instant::now(), val));
+                return Some(parsed);
+            }
+            return None;
         }
         None
     }
@@ -440,9 +467,15 @@ impl DeezerSource {
             })
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut seen_ids = HashSet::new();
+        let mut seen_titles = HashSet::new();
         let chosen: Vec<DzPlaylist> = scored
             .into_iter()
             .map(|(_, p)| p)
+            .filter(|p| {
+                let norm = p.title.trim().to_lowercase();
+                seen_ids.insert(p.id) && seen_titles.insert(norm)
+            })
             .take(max_playlists.max(1))
             .collect();
         if chosen.is_empty() {
@@ -484,6 +517,7 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         "8-bit",
         "8 bit",
         "lullaby",
+        "lullabies",
         "instrumental cover",
         "music box",
         "type beat",
@@ -491,10 +525,33 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         "nightcore",
         "8d audio",
         "sped up",
+        "white noise",
+        "binaural",
+        "asmr",
+        "tantric",
+        "massage",
+        "setlist",
     ] {
         if title_low.contains(bad) && !query_low.contains(bad) {
             return false;
         }
+    }
+    if (crate::taste::contains_term(&title_low, "cover")
+        || crate::taste::contains_term(&title_low, "covers"))
+        && !query_low.contains("cover")
+    {
+        return false;
+    }
+    if crate::taste::contains_term(&title_low, "instrumental")
+        && !query_low.contains("instrumental")
+        && !query_low.contains("focus")
+        && !query_low.contains("ambient")
+        && !query_low.contains("study")
+    {
+        return false;
+    }
+    if crate::taste::contains_term(&title_low, "sex") && !query_low.contains("sex") {
+        return false;
     }
     true
 }
@@ -918,5 +975,26 @@ mod tests {
         assert!(playlist_title_relevance_score("Best of 2020s", "80s").is_none());
         assert!(playlist_title_relevance_score("90s Rock Classics", "90s rock").is_some());
         assert!(playlist_title_relevance_score("Workout Mix", "90s rock").is_none());
+    }
+
+    #[test]
+    fn playlist_filter_rejects_covers_lullabies_and_spam() {
+        let mk = |title: &str, nb_tracks: usize| DzPlaylist {
+            id: 1,
+            title: title.into(),
+            nb_tracks,
+        };
+        assert!(!is_usable_mix_playlist(&mk("Sad Covers", 60), "sad songs"));
+        assert!(!is_usable_mix_playlist(&mk("Piano lullabies", 40), "deep focus"));
+        assert!(!is_usable_mix_playlist(
+            &mk("BAISE Stimulation Tantric Pure Massage Sex ChillOut DownTempo", 68),
+            "chillout downtempo"
+        ));
+        assert!(!is_usable_mix_playlist(&mk("Upbeat INSTRUMENTAL POP HITS", 45), "upbeat hits"));
+        assert!(is_usable_mix_playlist(
+            &mk("Ambient Instrumentals - Atmospheric Vibes", 121),
+            "ambient instrumental"
+        ));
+        assert!(is_usable_mix_playlist(&mk("Melancholy Indie Folk", 45), "melancholy indie"));
     }
 }

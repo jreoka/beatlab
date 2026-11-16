@@ -128,15 +128,17 @@ async fn main() -> models::AppResult<()> {
         now_playing: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    // Fast startup catalog warming + periodic refresh every 45 mins
+    // Fast startup catalog warming + continuous background curation even when idle
     let warm_taste = taste.clone();
     tokio::spawn(async move {
         warm_taste.warm_catalog().await;
-        let mut interval = tokio::time::interval(Duration::from_secs(45 * 60));
+        let mut interval = tokio::time::interval(Duration::from_secs(120));
         interval.tick().await;
+        let mut tick: usize = 0;
         loop {
             interval.tick().await;
-            warm_taste.warm_catalog().await;
+            warm_taste.curate_background_step(tick).await;
+            tick = tick.wrapping_add(1);
         }
     });
 
@@ -164,6 +166,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/account/password", post(webapp::change_password))
         .route("/api/web/home", get(webapp::home))
         .route("/api/web/explore", get(webapp::explore))
+        .route("/api/web/explore/mix/{key}", get(webapp::explore_mix))
         .route("/api/web/mood/{slug}", get(webapp::mood_mix))
         .route("/api/web/genre/{name}", get(webapp::genre_detail))
         .route("/api/web/search", get(webapp::search))
@@ -211,7 +214,6 @@ async fn main() -> models::AppResult<()> {
             get(webapp::get_queue).put(webapp::save_queue),
         )
         .route("/api/web/warm/{id}", post(webapp::warm_track))
-        .route("/api/web/tracks/loudness", get(webapp::tracks_loudness))
         .route("/api/web/stream/{id}", get(webapp::stream_track))
         .route("/api/web/cover/{id}", get(webapp::cover_art))
         .route("/api/web/sources", get(webapp::sources_info))

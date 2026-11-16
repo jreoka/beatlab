@@ -1054,16 +1054,33 @@ a {
 .mood-tile {
   border-radius: var(--radius);
   border: 1px solid var(--border);
-  padding: 16px;
+  padding: 15px 16px;
   cursor: pointer;
-  min-height: 88px;
+  min-height: 98px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  transition: filter 0.14s;
+  gap: 6px;
+  transition: filter 0.14s, transform 0.14s;
 }
 .mood-tile:hover {
   filter: brightness(1.1);
+  transform: translateY(-1px);
+}
+.mood-tile-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.mood-tile-count {
+  font-size: 11px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(0, 0, 0, 0.28);
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
 }
 .mood-tile h3 {
   font-size: 16px;
@@ -1073,6 +1090,146 @@ a {
 .mood-tile p {
   font-size: 12px;
   color: rgba(255, 255, 255, 0.86);
+}
+.mood-tile-thumbs {
+  display: flex;
+  align-items: center;
+  margin-top: 4px;
+}
+.mood-tile-thumbs img {
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  margin-left: -6px;
+}
+.mood-tile-thumbs img:first-child {
+  margin-left: 0;
+}
+
+/* Explore Curator Status & Featured Moment / Decade Cards */
+.curator-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 12px;
+}
+.curator-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+.explore-mix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(265px, 1fr));
+  gap: 12px;
+}
+.explore-mix-card {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  cursor: pointer;
+  transition: background 0.14s, transform 0.14s, border-color 0.14s;
+}
+.explore-mix-card:hover {
+  background: var(--surface-hover);
+  transform: translateY(-1px);
+}
+.explore-mix-art {
+  width: 76px;
+  height: 76px;
+  border-radius: 8px;
+  overflow: hidden;
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.explore-collage {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+.explore-collage img,
+.explore-single-art {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.explore-art-fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 20px;
+  color: #fff;
+  letter-spacing: 0.04em;
+}
+.explore-mix-body {
+  min-width: 0;
+  flex: 1;
+}
+.explore-mix-kicker {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+.explore-mix-body h3 {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.explore-mix-body p {
+  font-size: 12px;
+  color: var(--text-dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-top: 2px;
+}
+.explore-mix-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.hero-collage {
+  width: 184px;
+  height: 184px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  flex-shrink: 0;
+}
+.hero-collage img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 /* Hero Banner (Album / Artist / Playlist / Mood) */

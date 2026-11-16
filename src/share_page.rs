@@ -1,6 +1,5 @@
 use crate::models::{ShareRecord, Track};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 pub fn html_escape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -131,7 +130,6 @@ pub fn render_share_html(
     origin: &str,
     share: &ShareRecord,
     tracks: &[Track],
-    loudness_map: &HashMap<String, f64>,
     has_embed_video: bool,
     primary_audio_mime: &str,
 ) -> String {
@@ -205,7 +203,6 @@ pub fn render_share_html(
                 "qualityBadge": t.quality_badge(),
                 "coverUrl": format!("/api/web/cover/{}?v=2", urlencoding::encode(&t.id)),
                 "streamUrl": format!("/s/{}/stream/{}", share.id, urlencoding::encode(&t.id)),
-                "normGainDb": loudness_map.get(&t.id).copied(),
             })
         })
         .collect();
@@ -955,35 +952,10 @@ pub fn render_share_html(
 
     let audioCtx = null;
     let analyser = null;
-    let meterAnalyserL = null;
-    let meterAnalyserR = null;
-    let meterBufL = null;
-    let meterBufR = null;
-    let normGainNode = null;
     let masterGainNode = null;
-    let normTimer = null;
     let vizStarted = false;
     let masterVolume = 0.9;
 
-    const NORM_TARGET_LUFS = -11.0;
-    const NORM_SERVER_REF_LUFS = -14.0;
-    const NORM_SERVER_OFFSET_DB = NORM_TARGET_LUFS - NORM_SERVER_REF_LUFS;
-    const NORM_MIN_DB = -12.0;
-    const NORM_MAX_DB = 8.5;
-    const NORM_UNMEASURED_INIT_DB = -1.5;
-    const normState = {{
-      trackId: '',
-      energySum: 0,
-      weightSum: 0,
-      activeFrames: 0,
-      shortTermSq: 0,
-      currentDb: 0,
-      hasHint: false,
-    }};
-
-    function dbToGain(db) {{
-      return Math.pow(10, db / 20);
-    }}
     function applyOutputVolume() {{
       const v = Math.max(0, Math.min(1, Number(masterVolume) || 0));
       if (masterGainNode && audioCtx) {{
@@ -994,94 +966,6 @@ pub fn render_share_html(
         audio.volume = v;
         audio.muted = v === 0;
       }}
-    }}
-    function syncNormalizerTrack(t) {{
-      if (!t || !t.id) return;
-      if (normState.trackId === t.id) return;
-      normState.trackId = t.id;
-      normState.energySum = 0;
-      normState.weightSum = 0;
-      normState.activeFrames = 0;
-      normState.shortTermSq = 0;
-      const hint = Number.isFinite(t.normGainDb) ? Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, t.normGainDb + NORM_SERVER_OFFSET_DB)) : null;
-      if (hint !== null) {{
-        const expectedLufs = NORM_TARGET_LUFS - hint;
-        const expectedSq = Math.pow(10, (expectedLufs + 0.691) / 10);
-        normState.energySum = expectedSq * 60;
-        normState.weightSum = 60;
-        normState.shortTermSq = expectedSq;
-        normState.currentDb = hint;
-        normState.hasHint = true;
-      }} else {{
-        normState.currentDb = NORM_UNMEASURED_INIT_DB;
-        normState.hasHint = false;
-      }}
-      if (normGainNode && audioCtx) {{
-        normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.012);
-      }}
-    }}
-    function analyserMeanSq(node, bufRef) {{
-      if (!node) return {{ meanSq: 0, buf: bufRef }};
-      const buf = (bufRef && bufRef.length === node.fftSize) ? bufRef : new Float32Array(node.fftSize);
-      if (typeof node.getFloatTimeDomainData === 'function') {{
-        node.getFloatTimeDomainData(buf);
-      }} else {{
-        const b = new Uint8Array(node.fftSize);
-        node.getByteTimeDomainData(b);
-        for (let i = 0; i < b.length; i++) buf[i] = (b[i] - 128) / 128;
-      }}
-      let sumSq = 0;
-      for (let i = 0; i < buf.length; i++) {{
-        const s = buf[i];
-        sumSq += s * s;
-      }}
-      return {{ meanSq: sumSq / buf.length, buf }};
-    }}
-    function stepNormalizer() {{
-      if (!audioCtx || !meterAnalyserL || !normGainNode) return;
-      if (normState.hasHint) return;
-      if (audio.paused || audio.ended || audio.readyState < 2) return;
-      const leftRes = analyserMeanSq(meterAnalyserL, meterBufL);
-      meterBufL = leftRes.buf;
-      const rightRes = analyserMeanSq(meterAnalyserR, meterBufR);
-      meterBufR = rightRes.buf;
-      const meanSq = leftRes.meanSq + rightRes.meanSq;
-      const momentaryLufs = meanSq > 1e-9 ? (-0.691 + 10 * Math.log10(meanSq)) : -100;
-      if (momentaryLufs < -50) return;
-
-      normState.activeFrames++;
-      normState.shortTermSq = normState.shortTermSq > 0
-        ? (normState.shortTermSq * 0.90 + meanSq * 0.10)
-        : meanSq;
-
-      const curIntLufs = normState.weightSum > 0
-        ? (-0.691 + 10 * Math.log10(normState.energySum / normState.weightSum))
-        : momentaryLufs;
-      if (normState.activeFrames <= 15 || momentaryLufs >= curIntLufs - 10) {{
-        normState.energySum += meanSq;
-        normState.weightSum += 1;
-        if (normState.weightSum > 1800) {{
-          normState.energySum *= 0.995;
-          normState.weightSum *= 0.995;
-        }}
-      }}
-      const integratedLufs = normState.weightSum > 0
-        ? (-0.691 + 10 * Math.log10(normState.energySum / normState.weightSum))
-        : momentaryLufs;
-      const shortTermLufs = normState.shortTermSq > 1e-9
-        ? (-0.691 + 10 * Math.log10(normState.shortTermSq))
-        : momentaryLufs;
-      const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.0);
-      let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
-      const liveMaxBoost = normState.activeFrames < 20 ? 0.0 : 5.5;
-      desiredDb = Math.min(desiredDb, liveMaxBoost);
-      desiredDb = Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, desiredDb));
-      const tau = desiredDb < normState.currentDb
-        ? ((normState.activeFrames < 40 || normState.currentDb - desiredDb > 2.5) ? 0.12 : 0.35)
-        : 2.5;
-      const alpha = 1 - Math.exp(-0.1 / tau);
-      normState.currentDb += (desiredDb - normState.currentDb) * alpha;
-      normGainNode.gain.setTargetAtTime(dbToGain(desiredDb), audioCtx.currentTime, tau);
     }}
 
     function esc(s) {{
@@ -1140,51 +1024,14 @@ pub fn render_share_html(
         audioCtx = new AC();
         const src = audioCtx.createMediaElementSource(audio);
 
-        const kHighPass = audioCtx.createBiquadFilter();
-        kHighPass.type = 'highpass';
-        kHighPass.frequency.value = 38;
-        kHighPass.Q.value = 0.5;
-        const kHighShelf = audioCtx.createBiquadFilter();
-        kHighShelf.type = 'highshelf';
-        kHighShelf.frequency.value = 1500;
-        kHighShelf.gain.value = 4.0;
-        const splitter = audioCtx.createChannelSplitter(2);
-        meterAnalyserL = audioCtx.createAnalyser();
-        meterAnalyserL.fftSize = 2048;
-        meterAnalyserR = audioCtx.createAnalyser();
-        meterAnalyserR.fftSize = 2048;
-        const silentSink = audioCtx.createGain();
-        silentSink.gain.value = 0;
-        src.connect(kHighPass);
-        kHighPass.connect(kHighShelf);
-        kHighShelf.connect(splitter);
-        splitter.connect(meterAnalyserL, 0);
-        splitter.connect(meterAnalyserR, 1);
-        meterAnalyserL.connect(silentSink);
-        meterAnalyserR.connect(silentSink);
-        silentSink.connect(audioCtx.destination);
-
-        normGainNode = audioCtx.createGain();
-        normGainNode.gain.value = dbToGain(normState.currentDb);
-
-        const safetyLimiter = audioCtx.createDynamicsCompressor();
-        safetyLimiter.threshold.value = -1.0;
-        safetyLimiter.knee.value = 0.5;
-        safetyLimiter.ratio.value = 20.0;
-        safetyLimiter.attack.value = 0.001;
-        safetyLimiter.release.value = 0.06;
-
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 128;
 
         masterGainNode = audioCtx.createGain();
-        src.connect(normGainNode);
-        normGainNode.connect(safetyLimiter);
-        safetyLimiter.connect(analyser);
+        src.connect(analyser);
         analyser.connect(masterGainNode);
         masterGainNode.connect(audioCtx.destination);
         applyOutputVolume();
-        if (!normTimer) normTimer = setInterval(stepNormalizer, 100);
       }} catch {{}}
     }}
     function drawViz() {{
@@ -1284,7 +1131,6 @@ pub fn render_share_html(
       try {{
         if (!audio.paused) audio.pause();
       }} catch {{}}
-      syncNormalizerTrack(t);
       audio.src = buildUrl(t, false);
       if (state.lyricsOpen) loadLyrics(t);
       if (autoplay) {{
