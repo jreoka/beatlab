@@ -166,6 +166,22 @@ impl Mood {
         }
     }
 
+    /// Short, card-friendly name used by the personalized "Mixed for you" mixes.
+    pub fn mix_name(&self) -> &'static str {
+        match self {
+            Mood::Chill => "Chill",
+            Mood::Focus => "Focus",
+            Mood::Energy => "Energy",
+            Mood::LateNight => "Late Night",
+            Mood::Upbeat => "Feel Good",
+            Mood::Melancholy => "Melancholy",
+            Mood::Party => "Party",
+            Mood::Acoustic => "Acoustic",
+            Mood::Groove => "Groove",
+            Mood::RockIndie => "Indie Rock",
+        }
+    }
+
     pub fn from_slug(s: &str) -> Option<Mood> {
         let low = s.trim().to_lowercase().replace('-', "_");
         Self::ALL.iter().copied().find(|m| m.slug() == low)

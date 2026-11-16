@@ -941,13 +941,15 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
 
     // Ensure auto-mixes exist and refresh cleanly whenever user feedback/playlists changed them.
     if state.store.count_tracks().unwrap_or(0) > 0 {
+        // Mixed-for-you first: rebuilding generic auto mixes clears the dirty flag.
+        state.taste.refresh_mixed_for_you_if_stale_async(uid, 900).await;
         state.taste.refresh_auto_playlists_if_stale_async(uid, 900).await;
     }
     let playlists = state.store.list_playlists(uid, false).unwrap_or_default();
 
     let auto_mixes: Vec<Value> = playlists
         .into_iter()
-        .filter(|p| p.is_auto)
+        .filter(|p| p.is_auto && !p.kind.starts_with("mixed_for_you:"))
         .map(|p| playlist_summary_json(&p))
         .collect();
 
@@ -1036,6 +1038,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
         "quickPicks": to_web_tracks(&state, uid, &quick_picks),
         "newReleases": new_releases.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "recent": to_web_tracks(&state, uid, &recent),
+        "mixedForYou": json!(state.taste.mixed_for_you_cards(uid)),
         "madeForYou": auto_mixes,
         "relatedTracks": to_web_tracks(&state, uid, &related_tracks),
         "recommendedArtists": recommended_artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
@@ -2507,6 +2510,9 @@ pub async fn get_playlist(
         return err_res(StatusCode::FORBIDDEN, "Permission denied");
     }
     let pl = if pl.is_auto && pl.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
+        if pl.kind.starts_with("mixed_for_you:") {
+            state.taste.refresh_mixed_for_you_if_stale_async(user.id, 900).await;
+        }
         state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
         state.store.get_playlist(&id).ok().flatten().unwrap_or(pl)
     } else {
@@ -4490,7 +4496,9 @@ mod tests {
         assert!(html.contains(".mobile-brand {"));
         assert!(html.contains(".stats-page {"));
         assert!(html.contains(".loading-spinner {"));
+        assert!(html.contains(".mixed-for-you-grid {"));
         assert!(html.contains("<script>\n"));
+        assert!(html.contains("renderMixedForYouCard"));
         assert!(html.contains("openSettingsModal"));
         assert!(html.contains("renderStatsView"));
         assert!(html.contains("shareEntity"));

@@ -478,6 +478,23 @@ impl RecentHeardPenalties {
     }
 }
 
+/// One card in the personalized "Mixed for you" rail. The artwork, artist list
+/// and track ids are all prepared server-side so the client never has to build
+/// a mix itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct MixedForYouCard {
+    pub id: String,
+    pub title: String,
+    pub art_title: String,
+    pub number: String,
+    pub is_super: bool,
+    pub subtitle: String,
+    pub covers: Vec<String>,
+    pub c1: String,
+    pub c2: String,
+    pub track_count: usize,
+}
+
 #[derive(Default)]
 struct PlaylistCentroid {
     artists: HashMap<String, f64>,
@@ -1829,6 +1846,244 @@ impl TasteEngine {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Personalized "Mixed for you" rails (YouTube-Music-style numbered mixes)
+    // -----------------------------------------------------------------------
+
+    const MIXED_FOR_YOU_PARTS: [&'static str; 4] = ["1", "2", "3", "supermix"];
+
+    fn mixed_for_you_playlist_id(user_id: i64, mood_slug: &str, part: &str) -> String {
+        format!("mixfu-u{}-{}-{}", user_id, mood_slug, part)
+    }
+
+    fn mixed_for_you_kind(mood_slug: &str, part: &str) -> String {
+        format!("mixed_for_you:{}:{}", mood_slug, part)
+    }
+
+    /// The mood the user leans into most, from both listening history and their
+    /// own playlists. Cold users get an upbeat starter theme.
+    fn featured_mixed_for_you_mood(&self, user_id: i64) -> Mood {
+        let prof = self.user_profile(user_id);
+        let mut best: Option<(f64, Mood)> = None;
+        for &mood in Mood::ALL.iter() {
+            let affinity = prof.mood_affinity.get(&mood).copied().unwrap_or(0.0)
+                + prof
+                    .playlist_mood_affinity
+                    .get(&mood)
+                    .copied()
+                    .unwrap_or(0.0)
+                    * 1.25;
+            if !affinity.is_finite() || affinity <= 0.0 {
+                continue;
+            }
+            if best.map_or(true, |(score, _)| affinity > score) {
+                best = Some((affinity, mood));
+            }
+        }
+        best.map(|(_, mood)| mood).unwrap_or(Mood::Energy)
+    }
+
+    fn mixed_for_you_needs_refresh(&self, user_id: i64, max_age_secs: i64) -> bool {
+        if user_id <= 0 {
+            return false;
+        }
+        let dirty = self
+            .store
+            .kv_get(&format!("taste:dirty:{user_id}"))
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let last_rebuilt = self
+            .store
+            .kv_get(&format!("mix4u:rebuilt_at:{user_id}"))
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let has_mixes = self
+            .store
+            .list_playlists(user_id, false)
+            .map(|pls| pls.iter().any(|p| p.kind.starts_with("mixed_for_you:")))
+            .unwrap_or(false);
+
+        !has_mixes || dirty || (Utc::now().timestamp() - last_rebuilt) >= max_age_secs
+    }
+
+    /// Rebuild the four personalized mixes in the background. Called by the
+    /// curator and, on first sign-up, by `prime_new_user`.
+    pub async fn rebuild_mixed_for_you(&self, user_id: i64) {
+        if user_id <= 0 {
+            return;
+        }
+        let mood = self.featured_mixed_for_you_mood(user_id);
+        let slug = mood.slug();
+
+        // If the user's dominant mood changed, drop the old theme's cards so a
+        // single rail never shows two different moods at once.
+        let previous = self.store.kv_get(&format!("mix4u:mood:{user_id}"));
+        if let Some(old) = previous {
+            if old != slug {
+                for part in Self::MIXED_FOR_YOU_PARTS {
+                    let _ = self
+                        .store
+                        .delete_playlist(&Self::mixed_for_you_playlist_id(user_id, &old, part));
+                }
+            }
+        }
+
+        let mut pool = self.mood_mix_tracks(user_id, mood, 90).await;
+        if pool.len() < 24 {
+            pool = self.mood_mix_tracks(user_id, mood, 120).await;
+        }
+        if pool.len() < 12 {
+            return;
+        }
+        let pool = dedup_and_interleave(pool, 96, 2);
+        if pool.len() < 12 {
+            return;
+        }
+
+        // Three overlapping but distinct windows over the same ranked pool,
+        // plus a best-of "Supermix" — the shape listeners expect from a
+        // personalized mix rail.
+        let part_len = (pool.len() / 3).max(12).min(40);
+        for (idx, part) in ["1", "2", "3"].iter().enumerate() {
+            let start = (idx * part_len) % pool.len();
+            let ids: Vec<String> = (0..part_len)
+                .map(|i| pool[(start + i) % pool.len()].id.clone())
+                .collect();
+            let _ = self.store.upsert_auto_playlist(
+                &Self::mixed_for_you_playlist_id(user_id, slug, part),
+                user_id,
+                &format!("{} Mix {}", mood.mix_name(), idx + 1),
+                &format!(
+                    "A {} mix picked for you and refreshed in the background",
+                    mood.label()
+                ),
+                &Self::mixed_for_you_kind(slug, part),
+                &ids,
+            );
+        }
+
+        let super_ids: Vec<String> = dedup_and_interleave(pool, 50, 2)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        let _ = self.store.upsert_auto_playlist(
+            &Self::mixed_for_you_playlist_id(user_id, slug, "supermix"),
+            user_id,
+            &format!("{} Supermix", mood.mix_name()),
+            &format!(
+                "The best of your {} mixes, kept fresh by the background curator",
+                mood.label()
+            ),
+            &Self::mixed_for_you_kind(slug, "supermix"),
+            &super_ids,
+        );
+
+        self.store
+            .kv_set(&format!("mix4u:mood:{user_id}"), slug);
+        self.store.kv_set(
+            &format!("mix4u:rebuilt_at:{user_id}"),
+            &Utc::now().timestamp().to_string(),
+        );
+    }
+
+    pub async fn refresh_mixed_for_you_if_stale_async(&self, user_id: i64, max_age_secs: i64) {
+        if !self.mixed_for_you_needs_refresh(user_id, max_age_secs) {
+            return;
+        }
+        let engine = self.clone();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), async move {
+            engine.rebuild_mixed_for_you(user_id).await;
+        })
+        .await;
+    }
+
+    /// Ready-to-render cards for the home rail, including collage covers and a
+    /// short artist line derived from each mix's actual tracks.
+    pub fn mixed_for_you_cards(&self, user_id: i64) -> Vec<MixedForYouCard> {
+        if user_id <= 0 {
+            return Vec::new();
+        }
+        let Ok(playlists) = self.store.list_playlists(user_id, false) else {
+            return Vec::new();
+        };
+        let mut mixes: Vec<_> = playlists
+            .into_iter()
+            .filter(|p| p.kind.starts_with("mixed_for_you:"))
+            .collect();
+        mixes.sort_by_key(|p| {
+            let part = p.kind.split(':').nth(2).unwrap_or("");
+            if part == "supermix" {
+                99
+            } else {
+                part.parse::<usize>().unwrap_or(50)
+            }
+        });
+
+        let mut cards = Vec::with_capacity(mixes.len());
+        for p in mixes {
+            let mut parts = p.kind.split(':');
+            let _ = parts.next();
+            let mood = Mood::from_slug(parts.next().unwrap_or("")).unwrap_or(Mood::Energy);
+            let part = parts.next().unwrap_or("");
+            let is_super = part == "supermix";
+            let (c1, c2) = mood.gradient();
+            let tracks = self.store.playlist_tracks(&p.id).unwrap_or_default();
+
+            let mut covers: Vec<String> = Vec::new();
+            for t in &tracks {
+                if !t.cover_url.trim().is_empty() && !covers.contains(&t.cover_url) {
+                    covers.push(t.cover_url.clone());
+                    if covers.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+            let mut artists: Vec<String> = Vec::new();
+            for t in tracks.iter().take(16) {
+                let artist = primary_artist(&t.artist);
+                if artist.trim().is_empty() || artist.eq_ignore_ascii_case("Unknown Artist") {
+                    continue;
+                }
+                if artists
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(artist.as_str()))
+                {
+                    continue;
+                }
+                artists.push(artist.to_string());
+                if artists.len() >= 4 {
+                    break;
+                }
+            }
+
+            cards.push(MixedForYouCard {
+                id: p.id,
+                title: p.name,
+                art_title: if is_super {
+                    format!("{} Supermix", mood.mix_name())
+                } else {
+                    format!("{} Mix", mood.mix_name())
+                },
+                number: if is_super {
+                    String::new()
+                } else {
+                    format!("{:02}", part.parse::<usize>().unwrap_or(0))
+                },
+                is_super,
+                subtitle: if artists.is_empty() {
+                    mood.subtitle().to_string()
+                } else {
+                    artists.join(", ")
+                },
+                covers,
+                c1: c1.to_string(),
+                c2: c2.to_string(),
+                track_count: tracks.len(),
+            });
+        }
+        cards
+    }
+
     /// Seeds a brand-new account from external, currently-popular charts only.
     /// No instance-wide listening history, no local files, no cached search or
     /// listen results ever enter a fresh user's starter auto-playlists.
@@ -1858,6 +2113,8 @@ impl TasteEngine {
         }
         // Rebuild from the clean, chart-only slate produced above.
         self.rebuild_auto_playlists(user_id);
+        // Bounded so a cold catalog never slows down account creation.
+        self.refresh_mixed_for_you_if_stale_async(user_id, 900).await;
     }
 
     /// Cold-start / periodic background warming using pure HTTP Deezer global + multi-genre charts,
@@ -2069,6 +2326,9 @@ impl TasteEngine {
                 let _ = self
                     .expand_taste_candidates_async(uid, std::time::Duration::from_secs(4))
                     .await;
+                // Refresh personalized mixes first: rebuilding the generic auto
+                // mixes clears the shared "taste dirty" flag.
+                self.refresh_mixed_for_you_if_stale_async(uid, 900).await;
                 self.refresh_auto_playlists_if_stale_async(uid, 900).await;
             }
         }
@@ -9885,6 +10145,73 @@ mod tests {
         assert_eq!(snap["active"], true);
         assert_eq!(snap["readyMoods"], 1);
         assert_eq!(snap["totalMoods"], 10);
+    }
+
+    #[tokio::test]
+    async fn mixed_for_you_builds_numbered_mixes_supermix_and_cards() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("mixfan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(
+                store.clone(),
+                vec![],
+            )),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let tracks: Vec<Track> = (0..30)
+            .map(|i| Track {
+                id: format!("dz:e{i}"),
+                source: "deezer".into(),
+                title: format!("Loud Track {i}"),
+                artist: format!("Energy Artist {i}"),
+                album: "Loud".into(),
+                genre: "Rock".into(),
+                moods: "energy".into(),
+                cover_url: format!("https://example.com/e{i}.jpg"),
+                duration: 200,
+                bitrate: 256,
+                stream_url: format!("dz:e{i}"),
+                ..Default::default()
+            })
+            .collect();
+        store.upsert_tracks(&tracks).unwrap();
+        let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+        taste.save_curated_pool(&mood_cache_key(Mood::Energy), &ids);
+
+        taste.rebuild_mixed_for_you(u.id).await;
+
+        let cards = taste.mixed_for_you_cards(u.id);
+        assert_eq!(cards.len(), 4, "cards: {:?}", cards.iter().map(|c| &c.title).collect::<Vec<_>>());
+        assert_eq!(cards[0].title, "Energy Mix 1");
+        assert_eq!(cards[0].number, "01");
+        assert_eq!(cards[3].title, "Energy Supermix");
+        assert!(cards[3].is_super);
+        assert!(cards[3].number.is_empty());
+        assert_eq!(cards[0].covers.len(), 4);
+        assert!(cards[0].subtitle.contains("Energy Artist"));
+
+        let p1 = store.playlist_tracks(&cards[0].id).unwrap();
+        let p2 = store.playlist_tracks(&cards[1].id).unwrap();
+        assert!(p1.len() >= 12);
+        assert_ne!(
+            p1.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            p2.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            "numbered mixes should not be identical"
+        );
+
+        // The rail is separate from the generic auto-playlist list.
+        let generic_auto = store
+            .list_playlists(u.id, false)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.is_auto && !p.kind.starts_with("mixed_for_you:"))
+            .count();
+        assert_eq!(generic_auto, 0);
     }
 
     #[test]

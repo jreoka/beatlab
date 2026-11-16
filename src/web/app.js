@@ -1600,6 +1600,7 @@
       const recent = cacheTracks(d.recent || []);
       const relatedTracks = cacheTracks(d.relatedTracks || []);
       const mixes = d.madeForYou || [];
+      const mixedForYou = d.mixedForYou || [];
       const albums = d.albums || [];
       const artists = d.artists || [];
       const recommendedArtists = d.recommendedArtists || [];
@@ -1611,6 +1612,16 @@
         html += `<section class="section">
           <div class="section-head"><h2>Quick Picks</h2></div>
           <div class="quick-picks-grid">${quickPicks.map(renderQuickTile).join('')}</div>
+        </section>`;
+      }
+
+      if (mixedForYou.length > 0) {
+        html += `<section class="section">
+          <div class="section-head">
+            <h2>Mixed for you</h2>
+            <span class="section-hint">Rebuilt on the server from the music you listen to</span>
+          </div>
+          <div class="mixed-for-you-grid">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;
       }
 
@@ -1702,6 +1713,26 @@
         <h3>${esc(item.title)}</h3>
         <p>${esc(item.subtitle)}</p>
         <div class="explore-mix-meta">${esc(countLabel)}</div>
+      </div>
+    </div>`;
+  }
+
+  function renderMixedForYouCard(m) {
+    const covers = Array.isArray(m.covers) ? m.covers.filter(Boolean) : [];
+    const artHtml = covers.length
+      ? `<div class="mixfor-collage${covers.length < 4 ? ' sparse' : ''}">${covers.slice(0, 4).map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`
+      : `<div class="mixfor-fallback"></div>`;
+    const sub = `${m.trackCount || 0} tracks · ${m.subtitle || ''}`;
+    return `<div class="mixfor-card" data-share-kind="playlist" data-share-id="${esc(m.id)}" data-share-title="${esc(m.title)}" data-share-sub="${esc(sub)}" onclick="App.navigate('playlist/${encodeURIComponent(m.id)}')">
+      <div class="mixfor-art" style="--mix-c1:${esc(m.c1)};--mix-c2:${esc(m.c2)}">
+        ${artHtml}
+        <div class="mixfor-overlay"></div>
+        <div class="mixfor-art-title"><span>${esc(m.art_title)}</span>${m.is_super ? '' : `<span class="mixfor-num">${esc(m.number || '')}</span>`}</div>
+        <button class="mixfor-play" title="Play ${esc(m.title)}" aria-label="Play ${esc(m.title)}" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(m.id))})">${ICONS.play}</button>
+      </div>
+      <div class="mixfor-info">
+        <div class="mixfor-name">${esc(m.title)}</div>
+        <div class="mixfor-artists">${esc(m.subtitle || '')}</div>
       </div>
     </div>`;
   }
