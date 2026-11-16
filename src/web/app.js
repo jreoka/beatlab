@@ -26,10 +26,13 @@
   let normTimer = null;
   let rafVisualizer = null;
 
-  const NORM_TARGET_LUFS = -14.0;
+  const NORM_TARGET_LUFS = -11.0;
+  const NORM_SERVER_REF_LUFS = -14.0;
+  const NORM_SERVER_OFFSET_DB = NORM_TARGET_LUFS - NORM_SERVER_REF_LUFS;
   const NORM_MIN_DB = -12.0;
   const NORM_MAX_DB = 8.5;
-  const NORM_CACHE_KEY = 'beatlab_norm_cache_v2';
+  const NORM_UNMEASURED_INIT_DB = -1.5;
+  const NORM_CACHE_KEY = 'beatlab_norm_cache_v3';
   const normState = {
     trackId: '',
     energySum: 0,
@@ -657,7 +660,7 @@
 
     const serverHint =
       typeof track.normGainDb === 'number' && Number.isFinite(track.normGainDb)
-        ? clampNormDb(track.normGainDb)
+        ? clampNormDb(track.normGainDb + NORM_SERVER_OFFSET_DB)
         : null;
     const hint = serverHint !== null ? serverHint : loadCachedTrackGainDb(track.id);
     normState.hasServerHint = serverHint !== null;
@@ -671,7 +674,8 @@
       normState.shortTermSq = expectedSq;
       normState.currentDb = hint;
     } else {
-      normState.currentDb = 0;
+      // Unmeasured modern streams average ~ -9.5 LUFS (-1.5 dB relative to -11 LUFS target).
+      normState.currentDb = NORM_UNMEASURED_INIT_DB;
     }
 
     if (normGainNode && audioCtx) {
@@ -681,18 +685,19 @@
 
   function applyServerLoudnessHint(trackId, gainDb) {
     if (!trackId || typeof gainDb !== 'number' || !Number.isFinite(gainDb)) return;
-    const clamped = clampNormDb(gainDb);
+    const rawClamped = clampNormDb(gainDb);
     const cached = state.trackMap[trackId];
-    if (cached) cached.normGainDb = clamped;
+    if (cached) cached.normGainDb = rawClamped;
     for (const qTrack of state.queue) {
-      if (qTrack && qTrack.id === trackId) qTrack.normGainDb = clamped;
+      if (qTrack && qTrack.id === trackId) qTrack.normGainDb = rawClamped;
     }
+    const targetDb = clampNormDb(gainDb + NORM_SERVER_OFFSET_DB);
     if (normState.trackId === trackId && !normState.hasServerHint) {
       normState.hasServerHint = true;
       normState.hasAnyHint = true;
-      normState.currentDb = clamped;
+      normState.currentDb = targetDb;
       if (normGainNode && audioCtx) {
-        normGainNode.gain.setTargetAtTime(dbToGain(clamped), audioCtx.currentTime, 0.45);
+        normGainNode.gain.setTargetAtTime(dbToGain(targetDb), audioCtx.currentTime, 0.45);
       }
     }
   }
@@ -779,19 +784,19 @@
     const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.0);
     let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
     if (!normState.hasAnyHint) {
-      // Never blast quiet intros before real song energy arrives, and cap unconfirmed live boost.
-      const liveMaxBoost = normState.activeFrames < 25 ? 0.0 : 4.5;
+      // Never blast quiet intros before real song energy arrives, while allowing full leveling after 2s.
+      const liveMaxBoost = normState.activeFrames < 20 ? 0.0 : 5.5;
       desiredDb = Math.min(desiredDb, liveMaxBoost);
-    } else if (effectiveLufs < -24) {
-      const maxBoost = Math.max(0, NORM_MAX_DB - (-24 - effectiveLufs) * 0.6);
+    } else if (effectiveLufs < -21) {
+      const maxBoost = Math.max(0, NORM_MAX_DB - (-21 - effectiveLufs) * 0.6);
       desiredDb = Math.min(desiredDb, maxBoost);
     }
     desiredDb = clampNormDb(desiredDb);
 
     const tau =
       desiredDb < normState.currentDb
-        ? normState.currentDb - desiredDb > 2.5
-          ? 0.14
+        ? normState.activeFrames < 40 || normState.currentDb - desiredDb > 2.5
+          ? 0.12
           : 0.35
         : 2.5;
     const alpha = 1 - Math.exp(-0.1 / tau);
@@ -3973,6 +3978,7 @@
     try {
       if (!audio.paused) audio.pause();
     } catch {}
+    ensureAudioGraph();
     syncNormalizerTrack(track);
     audio.src = buildStreamUrl(track);
     audio.play().catch((e) => {
@@ -3998,6 +4004,12 @@
           .then((d) => {
             if (d && typeof d.normGainDb === 'number') {
               applyServerLoudnessHint(next.id, d.normGainDb);
+            } else {
+              setTimeout(() => {
+                if (loadToken === state.activeAudioToken) {
+                  refreshQueueLoudness([next]);
+                }
+              }, 3500);
             }
           })
           .catch(() => {});

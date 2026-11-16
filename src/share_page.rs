@@ -965,9 +965,12 @@ pub fn render_share_html(
     let vizStarted = false;
     let masterVolume = 0.9;
 
-    const NORM_TARGET_LUFS = -14.0;
+    const NORM_TARGET_LUFS = -11.0;
+    const NORM_SERVER_REF_LUFS = -14.0;
+    const NORM_SERVER_OFFSET_DB = NORM_TARGET_LUFS - NORM_SERVER_REF_LUFS;
     const NORM_MIN_DB = -12.0;
     const NORM_MAX_DB = 8.5;
+    const NORM_UNMEASURED_INIT_DB = -1.5;
     const normState = {{
       trackId: '',
       energySum: 0,
@@ -1000,7 +1003,7 @@ pub fn render_share_html(
       normState.weightSum = 0;
       normState.activeFrames = 0;
       normState.shortTermSq = 0;
-      const hint = Number.isFinite(t.normGainDb) ? Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, t.normGainDb)) : null;
+      const hint = Number.isFinite(t.normGainDb) ? Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, t.normGainDb + NORM_SERVER_OFFSET_DB)) : null;
       if (hint !== null) {{
         const expectedLufs = NORM_TARGET_LUFS - hint;
         const expectedSq = Math.pow(10, (expectedLufs + 0.691) / 10);
@@ -1010,7 +1013,7 @@ pub fn render_share_html(
         normState.currentDb = hint;
         normState.hasHint = true;
       }} else {{
-        normState.currentDb = 0;
+        normState.currentDb = NORM_UNMEASURED_INIT_DB;
         normState.hasHint = false;
       }}
       if (normGainNode && audioCtx) {{
@@ -1070,11 +1073,11 @@ pub fn render_share_html(
         : momentaryLufs;
       const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.0);
       let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
-      const liveMaxBoost = normState.activeFrames < 25 ? 0.0 : 4.5;
+      const liveMaxBoost = normState.activeFrames < 20 ? 0.0 : 5.5;
       desiredDb = Math.min(desiredDb, liveMaxBoost);
       desiredDb = Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, desiredDb));
       const tau = desiredDb < normState.currentDb
-        ? (normState.currentDb - desiredDb > 2.5 ? 0.14 : 0.35)
+        ? ((normState.activeFrames < 40 || normState.currentDb - desiredDb > 2.5) ? 0.12 : 0.35)
         : 2.5;
       const alpha = 1 - Math.exp(-0.1 / tau);
       normState.currentDb += (desiredDb - normState.currentDb) * alpha;
