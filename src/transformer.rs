@@ -1925,7 +1925,8 @@ fn build_training_examples(corpus: &NeuralTrainingCorpus) -> Vec<TrainingExample
     let mut rng = StdRng::seed_from_u64(
         0x42454154 ^ (corpus.tracks.len() as u64) ^ ((corpus.user_ids.len() as u64) << 16),
     );
-    let all_track_ids: Vec<&String> = corpus.tracks.keys().collect();
+    let mut all_track_ids: Vec<&String> = corpus.tracks.keys().collect();
+    all_track_ids.sort();
     let mut out = Vec::new();
 
     // Collect each user's positive set so cross-user negatives explicitly contrast users.

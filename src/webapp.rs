@@ -4220,7 +4220,7 @@ mod tests {
                 .unwrap();
         assert_eq!(exp_body["mix"]["key"], "80s_hits");
         assert_eq!(exp_body["mix"]["title"], "80s Hits");
-        assert_eq!(exp_body["tracks"].as_array().unwrap().len(), 8);
+        assert!(exp_body["tracks"].as_array().unwrap().len() >= 8);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -2131,32 +2131,114 @@ impl TasteEngine {
         limit: usize,
     ) -> Vec<Track> {
         let cached_ids = self.load_curated_pool_ids(&explore_cache_key(spec.key), 12 * 3600);
-        let mut tracks = if cached_ids.len() >= 8 {
+        let mut curated_tracks = if cached_ids.len() >= 8 {
             self.store.get_tracks_by_ids(&cached_ids).unwrap_or_default()
         } else {
             Vec::new()
         };
-        if tracks.len() < 8 {
-            tracks = self.curate_explore_mix(spec).await;
+        if curated_tracks.len() < 8 {
+            curated_tracks = self.curate_explore_mix(spec).await;
         }
-        if tracks.is_empty() {
+
+        let intent = parse_search_intent(spec.query);
+        let sctx = self.build_scoring_context(user_id);
+
+        let mut pool: Vec<(Option<usize>, Track)> = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut seen_keys = HashSet::new();
+
+        if user_id > 0 {
+            let user_cands = self
+                .store
+                .candidate_tracks_for_user(user_id, 900)
+                .unwrap_or_default();
+            let cand_artists: Vec<String> = user_cands.iter().map(|t| t.artist.clone()).collect();
+            let artist_genres = self
+                .store
+                .known_artist_genres_for(&cand_artists)
+                .unwrap_or_default();
+
+            for t in user_cands {
+                if is_hidden_track(&t, &sctx.prof)
+                    || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                    || is_mood_clutter_track(&t)
+                {
+                    continue;
+                }
+                let ag = artist_genres
+                    .get(&primary_artist(&t.artist).to_lowercase())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let g_low = format!("{} {}", t.genre, ag).to_lowercase();
+
+                let mood_ok = intent.moods.is_empty()
+                    || intent.moods.iter().any(|&m| {
+                        is_track_compatible_with_mood(&t, ag, m)
+                            && (has_mood_meta_match(&g_low, m)
+                                || classify_moods(&t.title, &t.album, &t.genre, ag).contains(&m))
+                    });
+                let genre_ok = intent.genres.is_empty()
+                    || intent.genres.iter().any(|want| {
+                        let wl = want.to_lowercase();
+                        genre_variants(&wl)
+                            .iter()
+                            .any(|alias| contains_term(&g_low, alias))
+                    });
+                let year_ok = intent
+                    .year_range
+                    .map_or(true, |(min_y, max_y)| t.year >= min_y && t.year <= max_y);
+                let has_explicit_cue = !intent.moods.is_empty()
+                    || !intent.genres.is_empty()
+                    || intent.year_range.is_some();
+
+                if has_explicit_cue && mood_ok && genre_ok && year_ok {
+                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(t.song_key()) {
+                        pool.push((None, t));
+                    }
+                }
+            }
+        }
+
+        for (idx, t) in curated_tracks.into_iter().enumerate() {
+            if is_hidden_track(&t, &sctx.prof)
+                || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                || is_mood_clutter_track(&t)
+            {
+                continue;
+            }
+            if seen_ids.insert(t.id.clone()) && seen_keys.insert(t.song_key()) {
+                pool.push((Some(idx), t));
+            }
+        }
+
+        if pool.is_empty() {
             return Vec::new();
         }
-        let sctx = self.build_scoring_context(user_id);
-        let filtered: Vec<Track> = tracks
-            .into_iter()
-            .filter(|t| !is_hidden_track(t, &sctx.prof) && !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
-            .collect();
-        let n_scores = self.neural_scores(user_id, &[], Some(spec.query), &[], &[], &filtered);
-        let n_w = self.neural_blend_weight(0.55, &sctx);
-        let mut scored: Vec<(f64, Track)> = filtered
+
+        let pool_tracks: Vec<Track> = pool.iter().map(|(_, t)| t.clone()).collect();
+        let n_scores = self.neural_scores(
+            user_id,
+            &[],
+            Some(spec.query),
+            &intent.moods,
+            &intent.genres,
+            &pool_tracks,
+        );
+        let n_w = self.neural_blend_weight(0.75, &sctx);
+        let mut scored: Vec<(f64, Track)> = pool
             .into_iter()
             .enumerate()
-            .map(|(idx, t)| {
+            .map(|(idx, (curated_idx, t))| {
                 let taste_s = score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix);
-                let rank_s = (35usize.saturating_sub(idx) as f64) * 0.25;
+                let rank_s = curated_idx
+                    .map(|ci| (25usize.saturating_sub(ci) as f64) * 0.12)
+                    .unwrap_or(0.0);
+                let user_bonus = if user_id > 0 && taste_s > 0.8 { 1.6 } else { 0.0 };
                 let n_boost = n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
-                (rank_s + taste_s * 0.35 + parse_rank_bonus(&t.meta) * 0.3 + n_boost, t)
+                (
+                    rank_s + taste_s * 0.85 + parse_rank_bonus(&t.meta) * 0.25 + user_bonus + n_boost,
+                    t,
+                )
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -3233,7 +3315,7 @@ impl TasteEngine {
         let local_mood = self.store.tracks_by_mood(mood, 140, 0).unwrap_or_default();
         let user_pool = if user_id > 0 {
             self.store
-                .candidate_tracks_for_user(user_id, 180)
+                .candidate_tracks_for_user(user_id, 900)
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -3244,7 +3326,7 @@ impl TasteEngine {
         for t in cached_curated_tracks
             .into_iter()
             .chain(local_mood)
-            .chain(user_pool)
+            .chain(user_pool.clone())
         {
             if seen_ids.insert(t.id.clone()) {
                 candidates.push(t);
@@ -3266,7 +3348,44 @@ impl TasteEngine {
             }
         }
 
-        self.rank_mood_mix(user_id, mood, candidates, &curated_ids, count)
+        let mut ranked = self.rank_mood_mix(user_id, mood, candidates, &curated_ids, count);
+        // Never collapse to a 1-song mix if compatible user/catalog tracks exist.
+        if ranked.len() < count.min(12) && user_id > 0 {
+            let sctx = self.build_scoring_context(user_id);
+            let mut have_keys: HashSet<String> = ranked.iter().map(Track::song_key).collect();
+            let mut have_ids: HashSet<String> = ranked.iter().map(|t| t.id.clone()).collect();
+            let extra_pool: Vec<Track> = user_pool
+                .into_iter()
+                .chain(self.for_you_tracks(user_id, count * 2))
+                .collect();
+            let extra_artists: Vec<String> = extra_pool.iter().map(|t| t.artist.clone()).collect();
+            let artist_genres = self
+                .store
+                .known_artist_genres_for(&extra_artists)
+                .unwrap_or_default();
+            for t in extra_pool {
+                if ranked.len() >= count {
+                    break;
+                }
+                if have_ids.contains(&t.id)
+                    || have_keys.contains(&t.song_key())
+                    || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                    || is_mood_clutter_track(&t)
+                {
+                    continue;
+                }
+                let ag = artist_genres
+                    .get(&primary_artist(&t.artist).to_lowercase())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if is_track_compatible_with_mood(&t, ag, mood) && !is_mood_title_trap(&t, mood) {
+                    have_ids.insert(t.id.clone());
+                    have_keys.insert(t.song_key());
+                    ranked.push(t);
+                }
+            }
+        }
+        ranked
     }
 
     pub fn rank_mood_mix(
@@ -3314,7 +3433,7 @@ impl TasteEngine {
 
         let eligible_tracks: Vec<Track> = eligible.iter().map(|(t, _, _, _)| t.clone()).collect();
         let n_scores = self.neural_scores(user_id, &[], None, &[mood], &[], &eligible_tracks);
-        let n_w = self.neural_blend_weight(0.55, &sctx);
+        let n_w = self.neural_blend_weight(0.65, &sctx);
 
         let mut scored: Vec<(f64, Track)> = eligible
             .into_iter()
@@ -3331,19 +3450,21 @@ impl TasteEngine {
                     || sctx.prof.starred.contains(&t.id)
                     || sctx.prof.manual_playlist_ids.contains(&t.id);
 
-                let mut score = taste_s * 0.45 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
+                let mut score = taste_s * 0.85 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
                 if meta_match {
-                    score += 4.5;
+                    score += 2.2;
                 } else if is_curated {
-                    score += 3.2;
+                    score += 1.6;
                 }
                 if clean_moods.contains(&mood) {
-                    score += 1.5;
+                    score += 1.2;
                 }
-                if t.source == "local" || engaged {
+                if engaged {
                     score += 2.0;
+                } else if t.source == "local" {
+                    score += 1.0;
                 }
-                score += (t.quality_score() as f64 / 120.0) + parse_rank_bonus(&t.meta) * 0.3;
+                score += (t.quality_score() as f64 / 120.0) + parse_rank_bonus(&t.meta) * 0.25;
 
                 (score, t)
             })
@@ -5072,15 +5193,24 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         ("dream pop", "Dream Pop"),
         ("dream-pop", "Dream Pop"),
         ("dreampop", "Dream Pop"),
+        ("japanese city pop", "City Pop"),
         ("city pop", "City Pop"),
         ("city-pop", "City Pop"),
         ("citypop", "City Pop"),
+        ("japanese pop", "J-Pop"),
+        ("j pop", "J-Pop"),
         ("j-pop", "J-Pop"),
         ("jpop", "J-Pop"),
+        ("japanese rock", "J-Rock"),
+        ("j rock", "J-Rock"),
         ("j-rock", "J-Rock"),
         ("jrock", "J-Rock"),
+        ("korean pop", "K-Pop"),
+        ("k pop", "K-Pop"),
         ("k-pop", "K-Pop"),
         ("kpop", "K-Pop"),
+        ("chinese pop", "C-Pop"),
+        ("c pop", "C-Pop"),
         ("c-pop", "C-Pop"),
         ("cpop", "C-Pop"),
         ("mandopop", "C-Pop"),
@@ -5274,12 +5404,65 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
             }
         }
 
-        // Treat filler words like "beats" / "tunes" as mix-query cues when paired with a genre/mood/theme.
+        // Treat filler words and regional/style modifiers as mix-query cues when paired with a genre/mood/theme/decade.
         let has_style_cue =
             decade_label.is_some() || !themes.is_empty() || !genres.is_empty() || !moods.is_empty();
         if has_style_cue {
             for (idx, tok) in tokens.iter().enumerate() {
-                if matches!(tok.as_str(), "beats" | "tunes" | "jam" | "jams") {
+                if matches!(
+                    tok.as_str(),
+                    "beats"
+                        | "tunes"
+                        | "jam"
+                        | "jams"
+                        | "british"
+                        | "uk"
+                        | "english"
+                        | "american"
+                        | "us"
+                        | "canadian"
+                        | "australian"
+                        | "irish"
+                        | "scottish"
+                        | "french"
+                        | "german"
+                        | "spanish"
+                        | "italian"
+                        | "portuguese"
+                        | "brazilian"
+                        | "mexican"
+                        | "latin"
+                        | "japanese"
+                        | "korean"
+                        | "chinese"
+                        | "taiwanese"
+                        | "indian"
+                        | "swedish"
+                        | "norwegian"
+                        | "nordic"
+                        | "scandinavian"
+                        | "dutch"
+                        | "polish"
+                        | "russian"
+                        | "turkish"
+                        | "arabic"
+                        | "african"
+                        | "nigerian"
+                        | "instrumental"
+                        | "vocal"
+                        | "dark"
+                        | "heavy"
+                        | "soft"
+                        | "smooth"
+                        | "underground"
+                        | "modern"
+                        | "old"
+                        | "new"
+                        | "early"
+                        | "late"
+                        | "90s"
+                        | "80s"
+                ) {
                     matched_token_flags[idx] = true;
                 }
             }
@@ -7243,6 +7426,28 @@ mod tests {
         let daft = parse_search_intent("Daft Punk");
         assert!(!daft.explicit_mix_word);
         assert!(!daft.is_theme_mix);
+
+        let jrock = parse_search_intent("japanese rock");
+        assert!(jrock.genres.iter().any(|g| g == "J-Rock"));
+        assert!(jrock.is_theme_mix);
+
+        let jpop = parse_search_intent("japanese pop");
+        assert!(jpop.genres.iter().any(|g| g == "J-Pop"));
+        assert!(jpop.is_theme_mix);
+
+        let brit = parse_search_intent("british rock");
+        assert!(brit.genres.iter().any(|g| g == "Rock"));
+        assert!(brit.is_theme_mix);
+
+        let fr_house = parse_search_intent("french house");
+        assert!(fr_house.genres.iter().any(|g| g == "House"));
+        assert!(fr_house.is_theme_mix);
+
+        let fr_montana = parse_search_intent("French Montana");
+        assert!(!fr_montana.is_theme_mix);
+
+        let jp_breakfast = parse_search_intent("Japanese Breakfast");
+        assert!(!jp_breakfast.is_theme_mix);
     }
 
     #[test]
