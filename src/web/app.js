@@ -17,7 +17,27 @@
   let audioSource = null;
   let eqFilters = [];
   let analyser = null;
+  let meterAnalyser = null;
+  let meterBuf = null;
+  let normGainNode = null;
+  let masterGainNode = null;
+  let normTimer = null;
   let rafVisualizer = null;
+
+  const NORM_TARGET_LUFS = -14.0;
+  const NORM_MIN_DB = -12.0;
+  const NORM_MAX_DB = 8.5;
+  const NORM_CACHE_KEY = 'beatlab_norm_cache_v1';
+  const normState = {
+    trackId: '',
+    energySum: 0,
+    weightSum: 0,
+    activeFrames: 0,
+    shortTermSq: 0,
+    currentDb: 0,
+    hasServerHint: false,
+    lastSavedAtFrame: 0,
+  };
 
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
@@ -572,8 +592,167 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Web Audio Equalizer & Visualizer
+  // Web Audio Equalizer, Automatic Loudness Leveler & Visualizer
   // ---------------------------------------------------------------------------
+  function dbToGain(db) {
+    return Math.pow(10, db / 20);
+  }
+
+  function clampNormDb(db) {
+    return Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, db));
+  }
+
+  function loadCachedTrackGainDb(trackId) {
+    if (!trackId) return null;
+    try {
+      const raw = JSON.parse(localStorage.getItem(NORM_CACHE_KEY) || '{}');
+      const v = raw && typeof raw === 'object' ? raw[trackId] : null;
+      return typeof v === 'number' && Number.isFinite(v) ? clampNormDb(v) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveCachedTrackGainDb(trackId, gainDb) {
+    if (!trackId || !Number.isFinite(gainDb)) return;
+    try {
+      const raw = JSON.parse(localStorage.getItem(NORM_CACHE_KEY) || '{}');
+      const map = raw && typeof raw === 'object' ? raw : {};
+      delete map[trackId];
+      map[trackId] = Math.round(clampNormDb(gainDb) * 100) / 100;
+      const keys = Object.keys(map);
+      if (keys.length > 300) {
+        for (let i = 0; i < keys.length - 300; i++) {
+          delete map[keys[i]];
+        }
+      }
+      localStorage.setItem(NORM_CACHE_KEY, JSON.stringify(map));
+    } catch {}
+  }
+
+  function applyOutputVolume() {
+    const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
+    if (masterGainNode && audioCtx) {
+      audio.muted = false;
+      audio.volume = 1;
+      masterGainNode.gain.setTargetAtTime(effectiveVol, audioCtx.currentTime, 0.015);
+    } else {
+      audio.muted = state.muted;
+      audio.volume = effectiveVol;
+    }
+  }
+
+  function syncNormalizerTrack(track) {
+    if (!track || !track.id) return;
+    if (normState.trackId === track.id) return;
+    normState.trackId = track.id;
+    normState.energySum = 0;
+    normState.weightSum = 0;
+    normState.activeFrames = 0;
+    normState.shortTermSq = 0;
+    normState.lastSavedAtFrame = 0;
+
+    const serverHint =
+      typeof track.normGainDb === 'number' && Number.isFinite(track.normGainDb)
+        ? clampNormDb(track.normGainDb)
+        : null;
+    const hint = serverHint !== null ? serverHint : loadCachedTrackGainDb(track.id);
+    normState.hasServerHint = serverHint !== null;
+
+    if (hint !== null) {
+      const expectedLufs = NORM_TARGET_LUFS - hint;
+      const expectedSq = Math.pow(10, (expectedLufs + 0.691) / 10);
+      normState.energySum = expectedSq * 45;
+      normState.weightSum = 45;
+      normState.shortTermSq = expectedSq;
+      normState.currentDb = hint;
+    } else {
+      normState.currentDb = 0;
+    }
+
+    if (normGainNode && audioCtx) {
+      normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.035);
+    }
+  }
+
+  function stepLoudnessNormalizer() {
+    if (!audioCtx || !meterAnalyser || !normGainNode) return;
+    if (audio.paused || audio.ended || audio.readyState < 2) return;
+
+    if (!meterBuf || meterBuf.length !== meterAnalyser.fftSize) {
+      meterBuf = new Float32Array(meterAnalyser.fftSize);
+    }
+    if (typeof meterAnalyser.getFloatTimeDomainData === 'function') {
+      meterAnalyser.getFloatTimeDomainData(meterBuf);
+    } else {
+      const bytes = new Uint8Array(meterAnalyser.fftSize);
+      meterAnalyser.getByteTimeDomainData(bytes);
+      for (let i = 0; i < bytes.length; i++) {
+        meterBuf[i] = (bytes[i] - 128) / 128;
+      }
+    }
+
+    let sumSq = 0;
+    for (let i = 0; i < meterBuf.length; i++) {
+      const s = meterBuf[i];
+      sumSq += s * s;
+    }
+    const meanSq = sumSq / meterBuf.length;
+    const momentaryLufs = meanSq > 1e-9 ? -0.691 + 10 * Math.log10(meanSq) : -100;
+    if (momentaryLufs < -46) return;
+
+    normState.activeFrames++;
+    normState.shortTermSq =
+      normState.shortTermSq > 0 ? normState.shortTermSq * 0.90 + meanSq * 0.10 : meanSq;
+
+    const curIntLufs =
+      normState.weightSum > 0
+        ? -0.691 + 10 * Math.log10(normState.energySum / normState.weightSum)
+        : momentaryLufs;
+    if (normState.activeFrames <= 20 || momentaryLufs >= curIntLufs - 10) {
+      normState.energySum += meanSq;
+      normState.weightSum += 1;
+      if (normState.weightSum > 1800) {
+        normState.energySum *= 0.995;
+        normState.weightSum *= 0.995;
+      }
+    }
+
+    const integratedLufs =
+      normState.weightSum > 0
+        ? -0.691 + 10 * Math.log10(normState.energySum / normState.weightSum)
+        : momentaryLufs;
+    const shortTermLufs =
+      normState.shortTermSq > 1e-9 ? -0.691 + 10 * Math.log10(normState.shortTermSq) : momentaryLufs;
+
+    const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.5);
+    let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
+    if (effectiveLufs < -24) {
+      const maxBoost = Math.max(0, NORM_MAX_DB - (-24 - effectiveLufs) * 0.6);
+      desiredDb = Math.min(desiredDb, maxBoost);
+    }
+    desiredDb = clampNormDb(desiredDb);
+
+    const tau =
+      desiredDb < normState.currentDb
+        ? normState.currentDb - desiredDb > 3.0
+          ? 0.22
+          : 0.45
+        : 2.0;
+    normState.currentDb = desiredDb;
+    normGainNode.gain.setTargetAtTime(dbToGain(desiredDb), audioCtx.currentTime, tau);
+
+    if (
+      !normState.hasServerHint &&
+      normState.trackId &&
+      normState.activeFrames >= 60 &&
+      normState.activeFrames - normState.lastSavedAtFrame >= 50
+    ) {
+      normState.lastSavedAtFrame = normState.activeFrames;
+      saveCachedTrackGainDb(normState.trackId, clampNormDb(NORM_TARGET_LUFS - integratedLufs));
+    }
+  }
+
   function ensureAudioGraph() {
     if (audioCtx) {
       if (audioCtx.state === 'suspended') {
@@ -586,8 +765,40 @@
       if (!AC) return;
       audioCtx = new AC();
       audioSource = audioCtx.createMediaElementSource(audio);
+
+      // ITU-R BS.1770-style K-weighted sidechain meter (pre-gain, pre-EQ)
+      const kHighPass = audioCtx.createBiquadFilter();
+      kHighPass.type = 'highpass';
+      kHighPass.frequency.value = 85;
+      kHighPass.Q.value = 0.707;
+      const kHighShelf = audioCtx.createBiquadFilter();
+      kHighShelf.type = 'highshelf';
+      kHighShelf.frequency.value = 1680;
+      kHighShelf.gain.value = 4.0;
+      meterAnalyser = audioCtx.createAnalyser();
+      meterAnalyser.fftSize = 2048;
+      const silentSink = audioCtx.createGain();
+      silentSink.gain.value = 0;
+      audioSource.connect(kHighPass);
+      kHighPass.connect(kHighShelf);
+      kHighShelf.connect(meterAnalyser);
+      meterAnalyser.connect(silentSink);
+      silentSink.connect(audioCtx.destination);
+
+      normGainNode = audioCtx.createGain();
+      normGainNode.gain.value = dbToGain(normState.currentDb);
+
+      const safetyLimiter = audioCtx.createDynamicsCompressor();
+      safetyLimiter.threshold.value = -1.5;
+      safetyLimiter.knee.value = 3.0;
+      safetyLimiter.ratio.value = 12.0;
+      safetyLimiter.attack.value = 0.002;
+      safetyLimiter.release.value = 0.08;
+
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = 128;
+
+      masterGainNode = audioCtx.createGain();
 
       eqFilters = EQ_FREQS.map((freq, idx) => {
         const f = audioCtx.createBiquadFilter();
@@ -599,12 +810,23 @@
       });
 
       let node = audioSource;
+      node.connect(normGainNode);
+      node = normGainNode;
       for (const f of eqFilters) {
         node.connect(f);
         node = f;
       }
-      node.connect(analyser);
-      analyser.connect(audioCtx.destination);
+      node.connect(safetyLimiter);
+      safetyLimiter.connect(analyser);
+      analyser.connect(masterGainNode);
+      masterGainNode.connect(audioCtx.destination);
+
+      applyOutputVolume();
+      const cur = currentTrack();
+      if (cur) syncNormalizerTrack(cur);
+      if (!normTimer) {
+        normTimer = setInterval(stepLoudnessNormalizer, 100);
+      }
     } catch (e) {
       console.warn('WebAudio init skipped:', e);
     }
@@ -1187,7 +1409,7 @@
   }
 
   async function init() {
-    audio.volume = state.volume;
+    applyOutputVolume();
     $('pb-volume').value = String(state.volume);
     updateVolumeIcon();
     localStorage.removeItem('beatlab_quality');
@@ -1376,6 +1598,7 @@
         updateNowPlayingUI(cur, false);
         renderQueuePanel();
         if (cur) {
+          syncNormalizerTrack(cur);
           audio.src = buildStreamUrl(cur);
           if (savedSec > 0) {
             const total = cur.duration > 0 ? cur.duration : savedSec;
@@ -3688,6 +3911,7 @@
     try {
       if (!audio.paused) audio.pause();
     } catch {}
+    syncNormalizerTrack(track);
     audio.src = buildStreamUrl(track);
     audio.play().catch((e) => {
       if (loadToken !== state.activeAudioToken) return;
@@ -4148,6 +4372,7 @@
     haptic('medium');
     ensureAudioGraph();
     if (!audio.getAttribute('src')) {
+      syncNormalizerTrack(cur);
       audio.src = buildStreamUrl(cur);
     }
     if (audio.paused) {
@@ -4214,7 +4439,10 @@
   }
 
   function wireAudioEvents() {
-    audio.addEventListener('play', () => updatePlayButton(true));
+    audio.addEventListener('play', () => {
+      ensureAudioGraph();
+      updatePlayButton(true);
+    });
     audio.addEventListener('pause', () => {
       updatePlayButton(false);
       if (!audio.ended && state.queue.length) saveServerQueue();
@@ -4324,8 +4552,7 @@
     $('pb-volume').addEventListener('input', (e) => {
       state.volume = parseFloat(e.target.value);
       state.muted = state.volume === 0;
-      audio.muted = state.muted;
-      audio.volume = state.volume;
+      applyOutputVolume();
       localStorage.setItem('beatlab_vol', String(state.volume));
       updateVolumeIcon();
     });
@@ -5393,7 +5620,7 @@
     },
     toggleMute: () => {
       state.muted = !state.muted;
-      audio.muted = state.muted;
+      applyOutputVolume();
       updateVolumeIcon();
     },
     toggleCurrentLike: () => {

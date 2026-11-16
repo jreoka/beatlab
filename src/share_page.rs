@@ -1,5 +1,6 @@
 use crate::models::{ShareRecord, Track};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 pub fn html_escape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -130,6 +131,7 @@ pub fn render_share_html(
     origin: &str,
     share: &ShareRecord,
     tracks: &[Track],
+    loudness_map: &HashMap<String, f64>,
     has_embed_video: bool,
     primary_audio_mime: &str,
 ) -> String {
@@ -203,6 +205,7 @@ pub fn render_share_html(
                 "qualityBadge": t.quality_badge(),
                 "coverUrl": format!("/api/web/cover/{}?v=2", urlencoding::encode(&t.id)),
                 "streamUrl": format!("/s/{}/stream/{}", share.id, urlencoding::encode(&t.id)),
+                "normGainDb": loudness_map.get(&t.id).copied(),
             })
         })
         .collect();
@@ -952,7 +955,123 @@ pub fn render_share_html(
 
     let audioCtx = null;
     let analyser = null;
+    let meterAnalyser = null;
+    let meterBuf = null;
+    let normGainNode = null;
+    let masterGainNode = null;
+    let normTimer = null;
     let vizStarted = false;
+    let masterVolume = 0.9;
+
+    const NORM_TARGET_LUFS = -14.0;
+    const NORM_MIN_DB = -12.0;
+    const NORM_MAX_DB = 8.5;
+    const normState = {{
+      trackId: '',
+      energySum: 0,
+      weightSum: 0,
+      activeFrames: 0,
+      shortTermSq: 0,
+      currentDb: 0,
+      hasHint: false,
+    }};
+
+    function dbToGain(db) {{
+      return Math.pow(10, db / 20);
+    }}
+    function applyOutputVolume() {{
+      const v = Math.max(0, Math.min(1, Number(masterVolume) || 0));
+      if (masterGainNode && audioCtx) {{
+        audio.muted = false;
+        audio.volume = 1;
+        masterGainNode.gain.setTargetAtTime(v, audioCtx.currentTime, 0.015);
+      }} else {{
+        audio.volume = v;
+        audio.muted = v === 0;
+      }}
+    }}
+    function syncNormalizerTrack(t) {{
+      if (!t || !t.id) return;
+      if (normState.trackId === t.id) return;
+      normState.trackId = t.id;
+      normState.energySum = 0;
+      normState.weightSum = 0;
+      normState.activeFrames = 0;
+      normState.shortTermSq = 0;
+      const hint = Number.isFinite(t.normGainDb) ? Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, t.normGainDb)) : null;
+      if (hint !== null) {{
+        const expectedLufs = NORM_TARGET_LUFS - hint;
+        const expectedSq = Math.pow(10, (expectedLufs + 0.691) / 10);
+        normState.energySum = expectedSq * 45;
+        normState.weightSum = 45;
+        normState.shortTermSq = expectedSq;
+        normState.currentDb = hint;
+        normState.hasHint = true;
+      }} else {{
+        normState.currentDb = 0;
+        normState.hasHint = false;
+      }}
+      if (normGainNode && audioCtx) {{
+        normGainNode.gain.setTargetAtTime(dbToGain(normState.currentDb), audioCtx.currentTime, 0.035);
+      }}
+    }}
+    function stepNormalizer() {{
+      if (!audioCtx || !meterAnalyser || !normGainNode) return;
+      if (audio.paused || audio.ended || audio.readyState < 2) return;
+      if (!meterBuf || meterBuf.length !== meterAnalyser.fftSize) {{
+        meterBuf = new Float32Array(meterAnalyser.fftSize);
+      }}
+      if (typeof meterAnalyser.getFloatTimeDomainData === 'function') {{
+        meterAnalyser.getFloatTimeDomainData(meterBuf);
+      }} else {{
+        const b = new Uint8Array(meterAnalyser.fftSize);
+        meterAnalyser.getByteTimeDomainData(b);
+        for (let i = 0; i < b.length; i++) meterBuf[i] = (b[i] - 128) / 128;
+      }}
+      let sumSq = 0;
+      for (let i = 0; i < meterBuf.length; i++) {{
+        const s = meterBuf[i];
+        sumSq += s * s;
+      }}
+      const meanSq = sumSq / meterBuf.length;
+      const momentaryLufs = meanSq > 1e-9 ? (-0.691 + 10 * Math.log10(meanSq)) : -100;
+      if (momentaryLufs < -46) return;
+
+      normState.activeFrames++;
+      normState.shortTermSq = normState.shortTermSq > 0
+        ? (normState.shortTermSq * 0.90 + meanSq * 0.10)
+        : meanSq;
+
+      const curIntLufs = normState.weightSum > 0
+        ? (-0.691 + 10 * Math.log10(normState.energySum / normState.weightSum))
+        : momentaryLufs;
+      if (normState.activeFrames <= 20 || momentaryLufs >= curIntLufs - 10) {{
+        normState.energySum += meanSq;
+        normState.weightSum += 1;
+        if (normState.weightSum > 1800) {{
+          normState.energySum *= 0.995;
+          normState.weightSum *= 0.995;
+        }}
+      }}
+      const integratedLufs = normState.weightSum > 0
+        ? (-0.691 + 10 * Math.log10(normState.energySum / normState.weightSum))
+        : momentaryLufs;
+      const shortTermLufs = normState.shortTermSq > 1e-9
+        ? (-0.691 + 10 * Math.log10(normState.shortTermSq))
+        : momentaryLufs;
+      const effectiveLufs = Math.max(integratedLufs, shortTermLufs - 1.5);
+      let desiredDb = NORM_TARGET_LUFS - effectiveLufs;
+      if (effectiveLufs < -24) {{
+        const maxBoost = Math.max(0, NORM_MAX_DB - (-24 - effectiveLufs) * 0.6);
+        desiredDb = Math.min(desiredDb, maxBoost);
+      }}
+      desiredDb = Math.max(NORM_MIN_DB, Math.min(NORM_MAX_DB, desiredDb));
+      const tau = desiredDb < normState.currentDb
+        ? (normState.currentDb - desiredDb > 3.0 ? 0.22 : 0.45)
+        : 2.0;
+      normState.currentDb = desiredDb;
+      normGainNode.gain.setTargetAtTime(dbToGain(desiredDb), audioCtx.currentTime, tau);
+    }}
 
     function esc(s) {{
       return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -1009,10 +1128,46 @@ pub fn render_share_html(
         if (!AC) return;
         audioCtx = new AC();
         const src = audioCtx.createMediaElementSource(audio);
+
+        const kHighPass = audioCtx.createBiquadFilter();
+        kHighPass.type = 'highpass';
+        kHighPass.frequency.value = 85;
+        kHighPass.Q.value = 0.707;
+        const kHighShelf = audioCtx.createBiquadFilter();
+        kHighShelf.type = 'highshelf';
+        kHighShelf.frequency.value = 1680;
+        kHighShelf.gain.value = 4.0;
+        meterAnalyser = audioCtx.createAnalyser();
+        meterAnalyser.fftSize = 2048;
+        const silentSink = audioCtx.createGain();
+        silentSink.gain.value = 0;
+        src.connect(kHighPass);
+        kHighPass.connect(kHighShelf);
+        kHighShelf.connect(meterAnalyser);
+        meterAnalyser.connect(silentSink);
+        silentSink.connect(audioCtx.destination);
+
+        normGainNode = audioCtx.createGain();
+        normGainNode.gain.value = dbToGain(normState.currentDb);
+
+        const safetyLimiter = audioCtx.createDynamicsCompressor();
+        safetyLimiter.threshold.value = -1.5;
+        safetyLimiter.knee.value = 3.0;
+        safetyLimiter.ratio.value = 12.0;
+        safetyLimiter.attack.value = 0.002;
+        safetyLimiter.release.value = 0.08;
+
         analyser = audioCtx.createAnalyser();
         analyser.fftSize = 128;
-        src.connect(analyser);
-        analyser.connect(audioCtx.destination);
+
+        masterGainNode = audioCtx.createGain();
+        src.connect(normGainNode);
+        normGainNode.connect(safetyLimiter);
+        safetyLimiter.connect(analyser);
+        analyser.connect(masterGainNode);
+        masterGainNode.connect(audioCtx.destination);
+        applyOutputVolume();
+        if (!normTimer) normTimer = setInterval(stepNormalizer, 100);
       }} catch {{}}
     }}
     function drawViz() {{
@@ -1112,6 +1267,7 @@ pub fn render_share_html(
       try {{
         if (!audio.paused) audio.pause();
       }} catch {{}}
+      syncNormalizerTrack(t);
       audio.src = buildUrl(t, false);
       if (state.lyricsOpen) loadLyrics(t);
       if (autoplay) {{
@@ -1239,8 +1395,8 @@ pub fn render_share_html(
       }}
     }}
 
-    audio.volume = 0.9;
-    audio.addEventListener('play', () => updatePlayBtn(true));
+    applyOutputVolume();
+    audio.addEventListener('play', () => {{ ensureVisualizer(); updatePlayBtn(true); }});
     audio.addEventListener('pause', () => updatePlayBtn(false));
     audio.addEventListener('ended', () => {{
       if (state.loadCommitTimer) return;
@@ -1297,8 +1453,8 @@ pub fn render_share_html(
       if (total > 0) audio.currentTime = (parseFloat(e.target.value) / 100) * total;
     }});
     $('vol-slider').addEventListener('input', (e) => {{
-      audio.volume = parseFloat(e.target.value);
-      audio.muted = audio.volume === 0;
+      masterVolume = parseFloat(e.target.value);
+      applyOutputVolume();
     }});
 
     window.ShareApp = {{

@@ -1,5 +1,5 @@
 use crate::models::{err_msg, primary_artist, upgrade_cover_url, AppResult, LyricLine, LyricsData, Track};
-use crate::sources::local::extract_embedded_cover;
+use crate::sources::local::{extract_embedded_cover, extract_loudness_gain_from_file};
 use crate::sources::SourceRegistry;
 use crate::store::Store;
 use axum::body::Body;
@@ -90,11 +90,13 @@ pub struct StreamEngine {
     in_flight_resolutions: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     in_flight_downloads: Arc<StdMutex<HashSet<String>>>,
     in_flight_warms: Arc<StdMutex<HashSet<String>>>,
+    in_flight_loudness: Arc<StdMutex<HashSet<String>>>,
     in_flight_embeds: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     warm_sem: Arc<Semaphore>,
     cache_sem: Arc<Semaphore>,
     stream_proc_sem: Arc<Semaphore>,
     embed_sem: Arc<Semaphore>,
+    loudness_sem: Arc<Semaphore>,
 }
 
 impl StreamEngine {
@@ -149,11 +151,13 @@ impl StreamEngine {
             in_flight_resolutions: Arc::new(StdMutex::new(HashMap::new())),
             in_flight_downloads: Arc::new(StdMutex::new(HashSet::new())),
             in_flight_warms: Arc::new(StdMutex::new(HashSet::new())),
+            in_flight_loudness: Arc::new(StdMutex::new(HashSet::new())),
             in_flight_embeds: Arc::new(StdMutex::new(HashMap::new())),
             warm_sem: Arc::new(Semaphore::new(2)),
             cache_sem: Arc::new(Semaphore::new(3)),
             stream_proc_sem: Arc::new(Semaphore::new(8)),
             embed_sem: Arc::new(Semaphore::new(2)),
+            loudness_sem: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -516,6 +520,9 @@ impl StreamEngine {
         };
 
         let resolved_ext = play_target_ext(&resolved, track);
+        if let PlayTarget::LocalFile { ref path, .. } = resolved {
+            self.spawn_background_loudness_scan(&track.id, path);
+        }
         let is_alac = is_alac_m4a(&resolved_ext, track);
         let needs_compat = force_compat
             || !is_browser_native_ext(&resolved_ext)
@@ -1007,8 +1014,86 @@ impl StreamEngine {
         self.store
             .upsert_cache_entry(track_id, &final_path.to_string_lossy(), final_bytes)?;
         let _ = self.store.prune_cache(self.max_cache_bytes);
+        self.spawn_background_loudness_scan(track_id, &final_path);
         debug!(track_id = %track_id, bytes = final_bytes, "cached track to disk");
         Ok(())
+    }
+
+    /// Measures per-track loudness in the background (tag-first, then EBU R128 via ffmpeg)
+    /// and caches the gain offset in SQLite so subsequent plays start at consistent volume.
+    pub fn spawn_background_loudness_scan(&self, track_id: &str, path: &Path) {
+        if self.store.get_track_loudness(track_id).is_some() {
+            return;
+        }
+        let Ok(permit) = self.loudness_sem.clone().try_acquire_owned() else {
+            return;
+        };
+        {
+            let mut set = self
+                .in_flight_loudness
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !set.insert(track_id.to_string()) {
+                return;
+            }
+        }
+
+        let this = self.clone();
+        let tid = track_id.to_string();
+        let file_path = path.to_path_buf();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _guard = InFlightSetGuard {
+                set: Arc::clone(&this.in_flight_loudness),
+                key: tid.clone(),
+            };
+
+            let tag_path = file_path.clone();
+            let tag_gain = tokio::task::spawn_blocking(move || extract_loudness_gain_from_file(&tag_path))
+                .await
+                .ok()
+                .flatten();
+            if let Some(gain_db) = tag_gain {
+                let _ = this.store.upsert_track_loudness(&tid, gain_db, "tag");
+                return;
+            }
+
+            if !this.ffmpeg_available {
+                return;
+            }
+            let mut cmd = Command::new("ffmpeg");
+            cmd.kill_on_drop(true)
+                .args([
+                    "-nostdin",
+                    "-hide_banner",
+                    "-i",
+                    &file_path.to_string_lossy(),
+                    "-vn",
+                    "-sn",
+                    "-dn",
+                    "-af",
+                    "ebur128=framelog=quiet",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            let Ok(child) = cmd.spawn() else {
+                return;
+            };
+            let Ok(Ok(output)) =
+                tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await
+            else {
+                return;
+            };
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if let Some(gain_db) = parse_ebur128_integrated_lufs(&stderr) {
+                let _ = this.store.upsert_track_loudness(&tid, gain_db, "ebur128");
+            }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -1757,6 +1842,25 @@ fn is_safari_unfriendly_ext(ext: &str) -> bool {
     )
 }
 
+fn parse_ebur128_integrated_lufs(stderr: &str) -> Option<f64> {
+    // Parse the final summary `I:   -14.2 LUFS` line from ffmpeg ebur128 output.
+    for line in stderr.lines().rev() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("I:") {
+            let num_str = rest
+                .trim()
+                .trim_end_matches("LUFS")
+                .trim();
+            if let Ok(lufs) = num_str.parse::<f64>() {
+                if lufs.is_finite() && lufs > -55.0 && lufs <= 0.0 {
+                    return Some((-14.0 - lufs).clamp(-12.0, 8.5));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn is_safari_ua(headers: &HeaderMap) -> bool {
     let Some(ua) = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) else {
         return false;
@@ -2485,5 +2589,31 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert!(engine.in_flight_warms.lock().unwrap().len() <= 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loudness_parsers_normalize_to_minus_14_lufs_target() {
+        use crate::sources::local::{parse_itunnorm_db, parse_r128_track_gain_db, parse_replaygain_db};
+
+        // ReplayGain (-18 LUFS ref) -> +4 dB offset to -14 LUFS
+        assert!((parse_replaygain_db("-6.00 dB").unwrap() - (-2.0)).abs() < 0.01);
+        assert!((parse_replaygain_db("+4.0 dB").unwrap() - 8.0).abs() < 0.01);
+        assert_eq!(parse_replaygain_db("+12.0 dB").unwrap(), 8.5);
+        assert_eq!(parse_replaygain_db("-20.0 dB").unwrap(), -12.0);
+
+        // RFC 7845 R128_TRACK_GAIN (-23 LUFS ref, Q7.8) -> +9 dB offset to -14 LUFS
+        // -9.0 dB * 256 = -2304 => 0.0 dB relative to -14 LUFS
+        assert!((parse_r128_track_gain_db("-2304").unwrap() - 0.0).abs() < 0.01);
+
+        // Apple SoundCheck iTunNORM: 00000FA0 (4000 => -6.02 dB at -18 LUFS => -2.02 dB at -14 LUFS)
+        let itun = parse_itunnorm_db("00000FA0 00000FA0 00000000 00000000").unwrap();
+        assert!((itun - (-2.02)).abs() < 0.05);
+
+        // ffmpeg ebur128 summary parsing
+        let sample_stderr = "[Parsed_ebur128_0 @ 0x1] Summary:\n\n  Integrated loudness:\n    I:         -9.5 LUFS\n    Threshold: -19.6 LUFS\n";
+        assert!((parse_ebur128_integrated_lufs(sample_stderr).unwrap() - (-4.5)).abs() < 0.01);
+
+        let silent_stderr = "  Integrated loudness:\n    I:         -70.0 LUFS\n";
+        assert!(parse_ebur128_integrated_lufs(silent_stderr).is_none());
     }
 }

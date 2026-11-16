@@ -309,6 +309,8 @@ pub struct WebTrack {
     pub is_starred: bool,
     pub play_count: i32,
     pub rating: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub norm_gain_db: Option<f64>,
 }
 
 fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> Vec<Track> {
@@ -333,6 +335,7 @@ fn to_web_track_with_maps(
     starred: &HashSet<String>,
     stats: &HashMap<String, UserTrackStats>,
     ratings: &HashMap<String, i32>,
+    loudness: &HashMap<String, f64>,
     is_taste_match: bool,
 ) -> WebTrack {
     WebTrack {
@@ -359,6 +362,7 @@ fn to_web_track_with_maps(
         is_starred: starred.contains(&t.id),
         play_count: stats.get(&t.id).map(|s| s.play_count).unwrap_or(0),
         rating: ratings.get(&t.id).copied().unwrap_or(0),
+        norm_gain_db: loudness.get(&t.id).copied(),
     }
 }
 
@@ -387,6 +391,8 @@ fn to_web_tracks_with_taste(
     } else {
         Default::default()
     };
+    let track_ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+    let loudness = state.store.track_loudness_map(&track_ids);
 
     tracks
         .iter()
@@ -396,6 +402,7 @@ fn to_web_tracks_with_taste(
                 &starred,
                 &stats,
                 &ratings,
+                &loudness,
                 taste_match_ids.contains(&t.id),
             )
         })
@@ -1311,6 +1318,7 @@ async fn expand_entity_mix_context(
     }
 }
 
+#[cfg(test)]
 async fn build_search_response(
     state: AppState,
     uid: i64,
@@ -1565,21 +1573,23 @@ pub async fn stats(
     let store = state.store.clone();
     let user_clone = user.clone();
 
-    let Ok((computed, starred, track_stats, ratings)) =
+    let Ok((computed, starred, track_stats, ratings, loudness)) =
         tokio::task::spawn_blocking(move || {
             let now_ts = Utc::now().timestamp();
             let c = crate::stats::build_user_stats(&store, &user_clone, range, tz, now_ts);
             let st = store.starred_ids(uid).unwrap_or_default();
             let ts = store.track_stats_map(uid).unwrap_or_default();
             let rt = store.user_ratings(uid).unwrap_or_default();
-            (c, st, ts, rt)
+            let ids: Vec<String> = c.top_tracks.iter().map(|it| it.track.id.clone()).collect();
+            let ld = store.track_loudness_map(&ids);
+            (c, st, ts, rt, ld)
         })
         .await
     else {
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute stats");
     };
 
-    let wrap_track = |t: &Track| to_web_track_with_maps(t, &starred, &track_stats, &ratings, false);
+    let wrap_track = |t: &Track| to_web_track_with_maps(t, &starred, &track_stats, &ratings, &loudness, false);
 
     let top_tracks: Vec<Value> = computed
         .top_tracks
@@ -2584,10 +2594,13 @@ pub async fn public_share_page(
         .unwrap_or("audio/mpeg");
 
     let origin = request_origin(&headers);
+    let track_ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+    let loudness_map = state.store.track_loudness_map(&track_ids);
     let html = crate::share_page::render_share_html(
         &origin,
         &share,
         &tracks,
+        &loudness_map,
         has_embed_video,
         primary_mime,
     );
@@ -3842,6 +3855,19 @@ mod tests {
                 ("loc:80s-a".to_string(), 0),
             ]
         );
+
+        // WebTrack includes normGainDb when cached in store and omits it when absent
+        store.upsert_track_loudness("loc:80s-a", -4.25, "ebur128").unwrap();
+        let stored_tracks = store.get_tracks_by_ids(&["loc:80s-a".into(), "loc:80s-b".into()]).unwrap();
+        let web_list = to_web_tracks(&state, u.id, &stored_tracks);
+        let w1 = web_list.iter().find(|t| t.id == "loc:80s-a").unwrap();
+        let w2 = web_list.iter().find(|t| t.id == "loc:80s-b").unwrap();
+        assert_eq!(w1.norm_gain_db, Some(-4.25));
+        assert_eq!(w2.norm_gain_db, None);
+        let v1 = serde_json::to_value(w1).unwrap();
+        let v2 = serde_json::to_value(w2).unwrap();
+        assert_eq!(v1["normGainDb"], -4.25);
+        assert!(v2.get("normGainDb").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
