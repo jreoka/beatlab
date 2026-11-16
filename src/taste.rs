@@ -1848,10 +1848,21 @@ impl TasteEngine {
         // playlists, distill personalized discoveries for every user (even inactive ones), and
         // expand taste graphs & auto-playlists in preparation.
         let train_engine = self.clone();
-        let _train_stats =
+        let train_stats =
             tokio::task::spawn_blocking(move || train_engine.train_and_distill_background(18))
                 .await
                 .unwrap_or_default();
+        if train_stats.steps_run > 0 {
+            info!(
+                tick = tick,
+                steps_run = train_stats.steps_run,
+                total_steps = train_stats.total_steps,
+                avg_loss = train_stats.avg_loss,
+                examples = train_stats.examples_used,
+                distilled_users = train_stats.distilled_users,
+                "transformer background training & distillation tick complete"
+            );
+        }
 
         if let Ok(uids) = self.store.all_user_ids() {
             for uid in uids {

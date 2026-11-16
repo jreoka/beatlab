@@ -1424,7 +1424,6 @@ pub struct TrainEpochStats {
     pub steps_run: usize,
     pub total_steps: u64,
     pub avg_loss: f32,
-    #[allow(dead_code)]
     pub examples_used: usize,
     pub distilled_users: usize,
 }
