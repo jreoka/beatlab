@@ -152,31 +152,122 @@ pub fn merge_track_pair(a: Track, b: Track) -> Track {
     if winner.deezer_id.is_empty() && !loser.deezer_id.is_empty() {
         winner.deezer_id = loser.deezer_id;
     }
-    if winner.meta.is_empty() && !loser.meta.is_empty() {
-        winner.meta = loser.meta;
-    }
+    winner.meta = crate::models::merge_meta_json(&winner.meta, &loser.meta);
     if (winner.album.is_empty() || winner.album == winner.title) && !loser.album.is_empty() {
         winner.album = loser.album;
     }
     winner
 }
 
-/// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality
-/// and clean metadata.
-pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
-    let mut best_by_key: HashMap<String, Track> = HashMap::new();
-    for t in tracks {
-        let key = t.song_key();
-        match best_by_key.remove(&key) {
-            Some(existing) => {
-                best_by_key.insert(key, merge_track_pair(t, existing));
-            }
-            None => {
-                best_by_key.insert(key, t);
+/// Propagates `deezer_artist_id` across a batch of tracks using:
+/// 1) `ytm_artist_id -> deezer_artist_id` learned from cross-source merged tracks,
+/// 2) unambiguous exact case-sensitive artist display name (`"LiSA"` vs `"LISA"`),
+/// 3) unambiguous case-insensitive artist slug (only when a single Deezer artist has that slug).
+pub fn disambiguate_batch_tracks(
+    tracks: &mut [Track],
+    known_artists: &[crate::models::ArtistSummary],
+) {
+    let mut ytm_to_dz: HashMap<String, Option<String>> = HashMap::new();
+    let mut exact_to_dz: HashMap<String, Option<String>> = HashMap::new();
+    let mut slug_to_dz: HashMap<String, Option<String>> = HashMap::new();
+
+    let mut record_mapping = |name: &str, dz_id: &str| {
+        let pa = crate::models::primary_artist(name);
+        if pa.is_empty() || dz_id.is_empty() || dz_id == "0" {
+            return;
+        }
+        exact_to_dz
+            .entry(pa.clone())
+            .and_modify(|cur| {
+                if cur.as_deref() != Some(dz_id) {
+                    *cur = None;
+                }
+            })
+            .or_insert_with(|| Some(dz_id.to_string()));
+
+        let sl = crate::models::slug(&pa);
+        if !sl.is_empty() {
+            slug_to_dz
+                .entry(sl)
+                .and_modify(|cur| {
+                    if cur.as_deref() != Some(dz_id) {
+                        *cur = None;
+                    }
+                })
+                .or_insert_with(|| Some(dz_id.to_string()));
+        }
+    };
+
+    for ar in known_artists {
+        if !ar.deezer_id.is_empty() {
+            record_mapping(&ar.name, &ar.deezer_id);
+        }
+    }
+
+    for t in tracks.iter() {
+        if let Some(dz_id) = t.deezer_artist_id() {
+            record_mapping(&t.artist, &dz_id);
+            if let Some(ytm_id) = t.ytm_artist_id() {
+                ytm_to_dz
+                    .entry(ytm_id)
+                    .and_modify(|cur| {
+                        if cur.as_deref() != Some(dz_id.as_str()) {
+                            *cur = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(dz_id));
             }
         }
     }
-    best_by_key.into_values().collect()
+
+    for t in tracks.iter_mut() {
+        if t.deezer_artist_id().is_some() {
+            continue;
+        }
+        if let Some(ytm_id) = t.ytm_artist_id() {
+            if let Some(Some(dz_id)) = ytm_to_dz.get(&ytm_id) {
+                t.set_deezer_artist_id(dz_id);
+                continue;
+            }
+        }
+        let pa = crate::models::primary_artist(&t.artist);
+        if pa.is_empty() {
+            continue;
+        }
+        if let Some(Some(dz_id)) = exact_to_dz.get(&pa) {
+            t.set_deezer_artist_id(dz_id);
+            continue;
+        }
+        let sl = crate::models::slug(&pa);
+        if let Some(Some(dz_id)) = slug_to_dz.get(&sl) {
+            t.set_deezer_artist_id(dz_id);
+        }
+    }
+}
+
+/// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality
+/// and clean metadata, while never merging tracks from conflicting external artist IDs.
+pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
+    let mut index_by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut out: Vec<Track> = Vec::with_capacity(tracks.len());
+    for t in tracks {
+        let key = t.song_key();
+        if let Some(indices) = index_by_key.get(&key) {
+            if let Some(&idx) = indices
+                .iter()
+                .find(|&&i| !crate::models::tracks_conflict_artist(&out[i], &t))
+            {
+                let existing = std::mem::take(&mut out[idx]);
+                out[idx] = merge_track_pair(t, existing);
+                continue;
+            }
+        }
+        let new_idx = out.len();
+        index_by_key.entry(key).or_default().push(new_idx);
+        out.push(t);
+    }
+    disambiguate_batch_tracks(&mut out, &[]);
+    out
 }
 
 /// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality

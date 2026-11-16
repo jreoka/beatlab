@@ -38,7 +38,7 @@ impl DeezerSource {
         parsed
             .data
             .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, fallback_genre))
+            .filter_map(|d| d.into_track(None, "", 0, 0, fallback_genre))
             .collect()
     }
 
@@ -106,7 +106,7 @@ impl DeezerSource {
         parsed
             .data
             .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, ""))
+            .filter_map(|d| d.into_track(None, "", 0, 0, ""))
             .collect()
     }
 
@@ -171,6 +171,7 @@ impl DeezerSource {
         if album.id == 0 || album.title.trim().is_empty() {
             return None;
         }
+        let artist_dz_id = album.artist.as_ref().map(|a| a.id).unwrap_or(0);
         let artist_name = album
             .artist
             .as_ref()
@@ -198,7 +199,7 @@ impl DeezerSource {
         let mut tracks = Vec::with_capacity(raw_tracks.len());
         let mut total_dur = 0i32;
         for (idx, dt) in raw_tracks.into_iter().enumerate() {
-            let mut tr = dt.into_track(Some(&fallback_album), &artist_name, year, &genre)?;
+            let mut tr = dt.into_track(Some(&fallback_album), &artist_name, artist_dz_id, year, &genre)?;
             if tr.track_no == 0 {
                 tr.track_no = (idx + 1) as i32;
             }
@@ -212,16 +213,25 @@ impl DeezerSource {
             tracks.push(tr);
         }
 
-        let summary_id = tracks
-            .first()
-            .map(|t| t.album_id())
-            .unwrap_or_else(|| format!("al:{}", slug(&format!("{}|{}", artist_name, album.title))));
+        let artist_id = if artist_dz_id > 0 {
+            format!("ar:dz:{}", artist_dz_id)
+        } else {
+            format!("ar:{}", slug(&artist_name))
+        };
+        let summary_id = if artist_dz_id > 0 {
+            format!("al:dz-{}-{}", artist_dz_id, slug(&album.title))
+        } else {
+            tracks
+                .first()
+                .map(|t| t.album_id())
+                .unwrap_or_else(|| format!("al:{}", slug(&format!("{}|{}", artist_name, album.title))))
+        };
         let cover_id = tracks.first().map(|t| t.id.clone()).unwrap_or_else(|| summary_id.clone());
 
         let summary = AlbumSummary {
             id: summary_id,
             name: album.title,
-            artist_id: format!("ar:{}", slug(&artist_name)),
+            artist_id,
             artist: artist_name,
             cover_id,
             cover_url,
@@ -265,7 +275,7 @@ impl DeezerSource {
                 .map(|d| {
                     d.data
                         .into_iter()
-                        .filter_map(|t| t.into_track(None, &summary.name, 0, ""))
+                        .filter_map(|t| t.into_track(None, &summary.name, artist_obj.id, 0, ""))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -383,7 +393,7 @@ impl DeezerSource {
         parsed
             .data
             .into_iter()
-            .filter_map(|d| d.into_track(None, "", 0, ""))
+            .filter_map(|d| d.into_track(None, "", 0, 0, ""))
             .collect()
     }
 
@@ -627,7 +637,7 @@ impl DzArtist {
             String::new()
         };
         Some(ArtistSummary {
-            id: format!("ar:{}", slug(&name)),
+            id: format!("ar:dz:{}", self.id),
             name,
             cover_url,
             bio,
@@ -688,17 +698,27 @@ impl DzAlbum {
         if name.is_empty() || self.id == 0 {
             return None;
         }
+        let artist_dz_id = self.artist.as_ref().map(|a| a.id).unwrap_or(0);
         let artist = self
             .artist
             .map(|a| a.name.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Unknown Artist".to_string());
         let cover_url = first_non_empty(&[self.cover_xl, self.cover_big, self.cover_medium]);
-        let aid = format!("al:{}", slug(&format!("{}|{}", artist, name)));
+        let artist_id = if artist_dz_id > 0 {
+            format!("ar:dz:{}", artist_dz_id)
+        } else {
+            format!("ar:{}", slug(&artist))
+        };
+        let aid = if artist_dz_id > 0 {
+            format!("al:dz-{}-{}", artist_dz_id, slug(&name))
+        } else {
+            format!("al:{}", slug(&format!("{}|{}", artist, name)))
+        };
         Some(AlbumSummary {
             id: aid.clone(),
             name,
-            artist_id: format!("ar:{}", slug(&artist)),
+            artist_id,
             artist,
             cover_id: aid,
             cover_url,
@@ -784,6 +804,7 @@ impl DzTrack {
         self,
         fallback_album: Option<&DzTrackAlbum>,
         fallback_artist: &str,
+        fallback_artist_id: u64,
         fallback_year: i32,
         fallback_genre: &str,
     ) -> Option<Track> {
@@ -791,6 +812,12 @@ impl DzTrack {
         if self.id == 0 || title.is_empty() {
             return None;
         }
+        let artist_dz_id = self
+            .artist
+            .as_ref()
+            .map(|a| a.id)
+            .filter(|&id| id > 0)
+            .unwrap_or(fallback_artist_id);
         let artist = self
             .artist
             .map(|a| a.name.trim().to_string())
@@ -810,6 +837,7 @@ impl DzTrack {
         let meta = serde_json::json!({
             "deezer_track_id": self.id,
             "deezer_album_id": alb_ref.map(|a| a.id).unwrap_or(0),
+            "deezer_artist_id": artist_dz_id,
             "rank": self.rank,
             "explicit": self.explicit_lyrics,
         })

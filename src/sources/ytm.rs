@@ -23,11 +23,12 @@ pub struct ResolvedStream {
     pub source_webpage_url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct YtmCandidate {
     pub video_id: String,
     pub title: String,
     pub artist: String,
+    pub artist_id: String,
     pub album: String,
     pub duration: i32,
     pub cover_url: String,
@@ -219,6 +220,12 @@ impl YtmSource {
                         .and_then(|s| s.as_str())
                         .unwrap_or("")
                         .to_string(),
+                    artist_id: v
+                        .get("channel_id")
+                        .or_else(|| v.get("uploader_id"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     album: String::new(),
                     duration: v.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0) as i32,
                     cover_url: String::new(),
@@ -379,6 +386,17 @@ fn candidate_to_track(c: YtmCandidate, created: i64) -> Option<Track> {
     };
     let moods = classify_moods_str(&c.title, &album, "", "");
     let cover_url = upgrade_cover_url(&c.cover_url);
+    let watch_url = format!("https://music.youtube.com/watch?v={}", c.video_id);
+    let meta = if c.artist_id.trim().is_empty() {
+        watch_url
+    } else {
+        serde_json::json!({
+            "ytm_video_id": c.video_id,
+            "ytm_artist_id": c.artist_id.trim(),
+            "webpage_url": watch_url,
+        })
+        .to_string()
+    };
     Some(Track {
         id: format!("ytm:{}", c.video_id),
         source: "ytm".to_string(),
@@ -398,7 +416,7 @@ fn candidate_to_track(c: YtmCandidate, created: i64) -> Option<Track> {
         size: 0,
         stream_url: format!("ytm:{}", c.video_id),
         cover_url,
-        meta: format!("https://music.youtube.com/watch?v={}", c.video_id),
+        meta,
         deezer_id: String::new(),
         created,
     })
@@ -524,6 +542,7 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
         .and_then(|r| r.as_array());
 
     let mut artist = String::new();
+    let mut artist_id = String::new();
     let mut album = String::new();
     let mut duration = item
         .pointer("/lengthText/runs")
@@ -543,9 +562,17 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
                 .pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
                 .and_then(|p| p.as_str())
                 .unwrap_or("");
+            let browse_id = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|b| b.as_str())
+                .map(str::trim)
+                .unwrap_or("");
             if page_type == "MUSIC_PAGE_TYPE_ARTIST" {
                 if artist.is_empty() {
                     artist = part.to_string();
+                    if !browse_id.is_empty() {
+                        artist_id = browse_id.to_string();
+                    }
                 } else if !artist.contains(part) {
                     artist = format!("{}, {}", artist, part);
                 }
@@ -575,6 +602,9 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
             }
             if artist.is_empty() {
                 artist = part.to_string();
+                if artist_id.is_empty() && browse_id.starts_with("UC") {
+                    artist_id = browse_id.to_string();
+                }
             } else if album.is_empty() && page_type.is_empty() {
                 album = part.to_string();
             }
@@ -586,6 +616,7 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
         video_id,
         title,
         artist,
+        artist_id,
         album,
         duration,
         cover_url,
@@ -622,20 +653,46 @@ fn extract_candidate(item: &Value) -> Option<YtmCandidate> {
         .and_then(|r| r.as_array());
 
     let mut artist = String::new();
+    let mut artist_id = String::new();
     let mut album = String::new();
     let mut duration = 0i32;
 
     if let Some(runs) = subtitle_runs {
-        let parts: Vec<String> = runs
-            .iter()
-            .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && s != "•" && s != "·" && s != "&" && s != ",")
-            .collect();
-
-        for part in parts {
+        for r in runs {
+            let Some(part) = r.get("text").and_then(|t| t.as_str()).map(str::trim) else {
+                continue;
+            };
+            if part.is_empty() || part == "•" || part == "·" || part == "&" || part == "," {
+                continue;
+            }
+            let page_type = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            let browse_id = r
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(|b| b.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if page_type == "MUSIC_PAGE_TYPE_ARTIST" {
+                if artist.is_empty() {
+                    artist = part.to_string();
+                    if !browse_id.is_empty() {
+                        artist_id = browse_id.to_string();
+                    }
+                } else if !artist.contains(part) {
+                    artist = format!("{}, {}", artist, part);
+                }
+                continue;
+            }
+            if page_type == "MUSIC_PAGE_TYPE_ALBUM" {
+                if album.is_empty() {
+                    album = part.to_string();
+                }
+                continue;
+            }
             let low = part.to_lowercase();
-            if let Some(d) = parse_mm_ss(&part) {
+            if let Some(d) = parse_mm_ss(part) {
                 duration = d;
                 continue;
             }
@@ -649,9 +706,12 @@ fn extract_candidate(item: &Value) -> Option<YtmCandidate> {
                 continue;
             }
             if artist.is_empty() {
-                artist = part;
+                artist = part.to_string();
+                if artist_id.is_empty() && browse_id.starts_with("UC") {
+                    artist_id = browse_id.to_string();
+                }
             } else if album.is_empty() {
-                album = part;
+                album = part.to_string();
             }
         }
     }
@@ -665,6 +725,7 @@ fn extract_candidate(item: &Value) -> Option<YtmCandidate> {
         video_id,
         title,
         artist,
+        artist_id,
         album,
         duration,
         cover_url,
@@ -850,6 +911,7 @@ mod tests {
             album: "Discovery".into(),
             duration: 320,
             cover_url: String::new(),
+            ..Default::default()
         };
         let bad = YtmCandidate {
             video_id: "bad".into(),
@@ -858,6 +920,7 @@ mod tests {
             album: String::new(),
             duration: 210,
             cover_url: String::new(),
+            ..Default::default()
         };
         assert!(
             score_ytm_candidate(&studio, "Daft Punk", "One More Time", 320)

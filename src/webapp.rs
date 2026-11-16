@@ -587,6 +587,8 @@ pub struct RadioQuery {
     pub seed: Option<String>,
     pub playlist: Option<String>,
     pub exclude: Option<String>,
+    #[serde(default)]
+    pub recent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -958,6 +960,79 @@ pub async fn search(
         .unwrap_or(&query)
         .to_string();
 
+    let raw_radio_fut = async {
+        if intent.has_trailing_radio_ambiguity && !base_query.eq_ignore_ascii_case(&query) {
+            state.sources.search_all_with_ytm_hints(&query, 10).await
+        } else {
+            (Vec::new(), std::collections::HashMap::new())
+        }
+    };
+
+    let ((all_tracks, _ytm_hints), (dz_albums, dz_artists), (raw_tracks_extra, _raw_ytm_hints)) =
+        tokio::join!(
+            state.sources.search_all_with_ytm_hints(&base_query, 20),
+            async {
+                tokio::join!(
+                    state.sources.deezer.search_albums(&base_query, 12),
+                    state.sources.deezer.search_artists(&base_query, 12),
+                )
+            },
+            raw_radio_fut,
+        );
+
+    let mut combined = [all_tracks, raw_tracks_extra].concat();
+    crate::sources::disambiguate_batch_tracks(&mut combined, &dz_artists);
+
+    if !combined.is_empty() {
+        let _ = state.store.upsert_tracks(&combined);
+    }
+    for a in &dz_albums {
+        let _ = state.store.upsert_album_meta(a);
+    }
+    for ar in &dz_artists {
+        let _ = state.store.upsert_artist_meta(ar);
+    }
+
+    build_search_response_with_options(
+        state,
+        user.id,
+        query,
+        base_query,
+        combined,
+        Vec::new(),
+        crate::taste::SearchMixContext::default(),
+        dz_albums,
+        dz_artists,
+        false,
+    )
+    .await
+}
+
+pub async fn instant_mix(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let query = q.q.unwrap_or_default().trim().to_string();
+    if query.is_empty() {
+        return json_res(json!({
+            "query": "",
+            "instantMix": Value::Null,
+            "refinements": Value::Null,
+        }));
+    }
+
+    let intent = crate::taste::parse_search_intent(&query);
+    let base_query = intent
+        .entity_query
+        .as_deref()
+        .unwrap_or(&query)
+        .to_string();
+
     let mix_future = async {
         if !intent.is_theme_mix {
             return (Vec::new(), Vec::new());
@@ -1026,17 +1101,12 @@ pub async fn search(
         }
     };
 
-    let (((all_tracks, mut ytm_hints), (dz_albums, dz_artists), (raw_tracks_extra, raw_ytm_hints)), mix_res) =
+    let (((all_tracks, mut ytm_hints), dz_artists, (raw_tracks_extra, raw_ytm_hints)), mix_res) =
         tokio::join!(
             async {
                 tokio::join!(
                     state.sources.search_all_with_ytm_hints(&base_query, 20),
-                    async {
-                        tokio::join!(
-                            state.sources.deezer.search_albums(&base_query, 12),
-                            state.sources.deezer.search_artists(&base_query, 12),
-                        )
-                    },
+                    state.sources.deezer.search_artists(&base_query, 12),
                     raw_radio_fut,
                 )
             },
@@ -1048,18 +1118,16 @@ pub async fn search(
     }
 
     let (curated_batches, extra_tracks) = mix_res.unwrap_or_default();
-    let combined = [all_tracks, raw_tracks_extra, extra_tracks].concat();
+    let mut combined = [all_tracks, raw_tracks_extra, extra_tracks].concat();
+    crate::sources::disambiguate_batch_tracks(&mut combined, &dz_artists);
 
-    // Persist initial search hits before entity-radio expansion.
     let mut to_upsert = combined.clone();
     for (_, batch) in &curated_batches {
         to_upsert.extend(batch.iter().cloned());
     }
+    crate::sources::disambiguate_batch_tracks(&mut to_upsert, &dz_artists);
     if !to_upsert.is_empty() {
         let _ = state.store.upsert_tracks(&to_upsert);
-    }
-    for a in &dz_albums {
-        let _ = state.store.upsert_album_meta(a);
     }
     for ar in &dz_artists {
         let _ = state.store.upsert_artist_meta(ar);
@@ -1071,18 +1139,7 @@ pub async fn search(
         crate::taste::SearchMixContext::default()
     };
 
-    build_search_response(
-        state,
-        user.id,
-        query,
-        base_query,
-        combined,
-        curated_batches,
-        mix_ctx,
-        dz_albums,
-        dz_artists,
-    )
-    .await
+    build_instant_mix_response(state, user.id, query, combined, curated_batches, mix_ctx).await
 }
 
 async fn expand_entity_mix_context(
@@ -1164,9 +1221,14 @@ async fn expand_entity_mix_context(
             _ => {
                 let found = dz.search_artists(&artist_name, 4).await;
                 found
-                    .into_iter()
-                    .find(|a| crate::models::slug(&a.name) == artist_slug)
-                    .map(|a| a.deezer_id)
+                    .iter()
+                    .find(|a| a.name == artist_name)
+                    .or_else(|| {
+                        found
+                            .iter()
+                            .find(|a| crate::models::slug(&a.name) == artist_slug)
+                    })
+                    .map(|a| a.deezer_id.clone())
                     .filter(|id| !id.is_empty())
             }
         };
@@ -1221,6 +1283,7 @@ async fn expand_entity_mix_context(
     to_upsert.extend(dz_artist_top.iter().cloned());
     to_upsert.extend(dz_artist_radio.iter().cloned());
     to_upsert.extend(dz_related_tracks.iter().cloned());
+    crate::sources::disambiguate_batch_tracks(&mut to_upsert, &related_artists);
     if !to_upsert.is_empty() {
         let _ = state.store.upsert_tracks(&to_upsert);
     }
@@ -1237,6 +1300,7 @@ async fn expand_entity_mix_context(
 
     crate::taste::SearchMixContext {
         anchor_artist: Some(plan.artist_name),
+        anchor_deezer_artist_id: plan.deezer_artist_id,
         anchor_track_key: seed_track.as_ref().map(Track::song_key),
         anchor_genres,
         is_artist_query: plan.is_artist_query,
@@ -1252,11 +1316,38 @@ async fn build_search_response(
     uid: i64,
     query: String,
     catalog_query: String,
+    combined: Vec<Track>,
+    curated_batches: Vec<(String, Vec<Track>)>,
+    mix_ctx: crate::taste::SearchMixContext,
+    dz_albums: Vec<AlbumSummary>,
+    dz_artists: Vec<ArtistSummary>,
+) -> Response {
+    build_search_response_with_options(
+        state,
+        uid,
+        query,
+        catalog_query,
+        combined,
+        curated_batches,
+        mix_ctx,
+        dz_albums,
+        dz_artists,
+        true,
+    )
+    .await
+}
+
+async fn build_search_response_with_options(
+    state: AppState,
+    uid: i64,
+    query: String,
+    catalog_query: String,
     mut combined: Vec<Track>,
     curated_batches: Vec<(String, Vec<Track>)>,
     mix_ctx: crate::taste::SearchMixContext,
     dz_albums: Vec<AlbumSummary>,
     dz_artists: Vec<ArtistSummary>,
+    include_instant_mix: bool,
 ) -> Response {
     let taste = state.taste.clone();
     let q_clone = query.clone();
@@ -1292,6 +1383,54 @@ async fn build_search_response(
             .unwrap_or_default()
     };
 
+    let instant_mix_json = if include_instant_mix {
+        refined.instant_mix.as_ref().map(|mix| {
+            json!({
+                "title": mix.title,
+                "subtitle": mix.subtitle,
+                "query": mix.query,
+                "isThemeMix": mix.is_theme_mix,
+                "prominent": mix.prominent,
+                "totalDuration": mix.total_duration,
+                "tracks": to_web_tracks_with_taste(&state, uid, &mix.tracks, &refined.taste_match_ids),
+            })
+        })
+    } else {
+        None
+    };
+
+    json_res(json!({
+        "query": query,
+        "tracks": to_web_tracks_with_taste(&state, uid, &refined.tracks, &refined.taste_match_ids),
+        "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
+        "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
+        "instantMix": instant_mix_json,
+        "refinements": refined.refinements,
+    }))
+}
+
+async fn build_instant_mix_response(
+    state: AppState,
+    uid: i64,
+    query: String,
+    mut combined: Vec<Track>,
+    curated_batches: Vec<(String, Vec<Track>)>,
+    mix_ctx: crate::taste::SearchMixContext,
+) -> Response {
+    let taste = state.taste.clone();
+    let q_clone = query.clone();
+    let refined = tokio::task::spawn_blocking(move || {
+        taste.search_and_refine_with_context(
+            uid,
+            &q_clone,
+            std::mem::take(&mut combined),
+            curated_batches,
+            mix_ctx,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| state.taste.search_and_refine(uid, &query, vec![], vec![]));
+
     let instant_mix_json = refined.instant_mix.as_ref().map(|mix| {
         json!({
             "title": mix.title,
@@ -1306,9 +1445,6 @@ async fn build_search_response(
 
     json_res(json!({
         "query": query,
-        "tracks": to_web_tracks_with_taste(&state, uid, &refined.tracks, &refined.taste_match_ids),
-        "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
-        "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "instantMix": instant_mix_json,
         "refinements": refined.refinements,
     }))
@@ -1962,6 +2098,31 @@ pub async fn get_lyrics(
     json_res(json!(data))
 }
 
+fn parse_recent_param(raw: Option<&str>) -> Vec<(String, i64)> {
+    let Some(s) = raw else {
+        return Vec::new();
+    };
+    s.split(',')
+        .filter_map(|entry| {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Some((id, age_str)) = trimmed.rsplit_once('@') {
+                let id = id.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                let age = age_str.trim().parse::<i64>().unwrap_or(0).clamp(0, 7200);
+                Some((id.to_string(), age))
+            } else {
+                Some((trimmed.to_string(), 0))
+            }
+        })
+        .take(60)
+        .collect()
+}
+
 pub async fn radio(
     State(state): State<AppState>,
     Query(q): Query<RadioQuery>,
@@ -1982,6 +2143,7 @@ pub async fn radio(
                 .collect()
         })
         .unwrap_or_default();
+    let recent = parse_recent_param(q.recent.as_deref());
 
     let next = if let Some(pid) = q.playlist.as_deref().filter(|s| !s.trim().is_empty()) {
         let Some(pl) = state.store.get_playlist(pid).ok().flatten() else {
@@ -1992,7 +2154,7 @@ pub async fn radio(
         }
         state
             .taste
-            .playlist_radio_tracks(user.id, pid, &exclude, 18)
+            .playlist_radio_tracks_with_recent(user.id, pid, &exclude, &recent, 18)
             .await
     } else {
         let seed = q
@@ -2001,7 +2163,13 @@ pub async fn radio(
             .and_then(|id| state.store.get_track(id).ok().flatten());
         state
             .taste
-            .radio_next_tracks_with_exclusions(user.id, seed.as_ref(), &exclude, 18)
+            .radio_next_tracks_with_exclusions_and_recent(
+                user.id,
+                seed.as_ref(),
+                &exclude,
+                &recent,
+                18,
+            )
             .await
     };
     json_res(json!({
@@ -3551,6 +3719,130 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn search_omits_instant_mix_and_on_demand_endpoint_builds_it_and_radio_parses_recent() {
+        use crate::engine::StreamEngine;
+        use crate::sources::{
+            archive::ArchiveSource, deezer::DeezerSource, local::LocalSource,
+            soulseek::SoulseekSource, ytm::YtmSource, SourceRegistry,
+        };
+        use crate::store::Store;
+        use axum::body::to_bytes;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "beatlab_ondemand_mix_test_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open_memory().unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.clone()),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(crate::taste::TasteEngine::new(store.clone(), sources.clone()));
+
+        let t1 = Track {
+            id: "loc:80s-a".into(),
+            source: "local".into(),
+            title: "Take On Me".into(),
+            artist: "a-ha".into(),
+            album: "Hunting High and Low".into(),
+            genre: "Synthpop, 80s".into(),
+            moods: "upbeat".into(),
+            year: 1985,
+            duration: 225,
+            bitrate: 900,
+            format: "flac".into(),
+            meta: "{\"rank\":900000}".into(),
+            ..Default::default()
+        };
+        let t2 = Track {
+            id: "loc:80s-b".into(),
+            source: "local".into(),
+            title: "Blue Monday".into(),
+            artist: "New Order".into(),
+            album: "Power, Corruption & Lies".into(),
+            genre: "New Wave, Electronic, 80s".into(),
+            moods: "groove,night".into(),
+            year: 1983,
+            duration: 449,
+            bitrate: 900,
+            format: "flac".into(),
+            meta: "{\"rank\":810000}".into(),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[t1, t2]).unwrap();
+        let (u, _) = store.authenticate_or_create_user("ondemanduser", "pw123").unwrap();
+        let tok = store.create_session(u.id, "web", 3600).unwrap();
+
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+        };
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
+
+        // Search response no longer auto-populates instantMix
+        let search_resp = build_search_response_with_options(
+            state.clone(),
+            u.id,
+            "80s".into(),
+            "80s".into(),
+            vec![],
+            vec![],
+            crate::taste::SearchMixContext::default(),
+            vec![],
+            vec![],
+            false,
+        )
+        .await;
+        assert_eq!(search_resp.status(), StatusCode::OK);
+        let search_body: Value =
+            serde_json::from_slice(&to_bytes(search_resp.into_body(), 1024 * 128).await.unwrap())
+                .unwrap();
+        assert!(search_body["instantMix"].is_null());
+        assert!(!search_body["tracks"].as_array().unwrap().is_empty());
+
+        // On-demand instant mix builder returns the mix without persisting any playlist
+        let mix_resp = build_instant_mix_response(
+            state.clone(),
+            u.id,
+            "80s".into(),
+            vec![],
+            vec![],
+            crate::taste::SearchMixContext::default(),
+        )
+        .await;
+        assert_eq!(mix_resp.status(), StatusCode::OK);
+        let mix_body: Value =
+            serde_json::from_slice(&to_bytes(mix_resp.into_body(), 1024 * 128).await.unwrap())
+                .unwrap();
+        assert_eq!(mix_body["instantMix"]["title"], "80s Hits Mix");
+        assert!(mix_body["instantMix"]["tracks"].as_array().unwrap().len() >= 2);
+        assert!(store.list_playlists(u.id, false).unwrap().is_empty());
+
+        // Radio recent param parsing handles track IDs containing colons with @age
+        let parsed = parse_recent_param(Some("dz:123@15, ytm:abc@42, loc:80s-a"));
+        assert_eq!(
+            parsed,
+            vec![
+                ("dz:123".to_string(), 15),
+                ("ytm:abc".to_string(), 42),
+                ("loc:80s-a".to_string(), 0),
+            ]
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

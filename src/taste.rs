@@ -444,6 +444,40 @@ struct ScoringContext {
     stats: HashMap<String, UserTrackStats>,
 }
 
+const RECENT_HEARD_WINDOW_SECS: i64 = 7200;
+const RECENT_HEARD_HALF_LIFE_SECS: f64 = 1800.0;
+const RECENT_HEARD_MAX_PENALTY: f64 = 12.0;
+
+struct RecentHeardPenalties {
+    now: i64,
+    by_id: HashMap<String, i64>,
+    by_key: HashMap<String, i64>,
+}
+
+impl RecentHeardPenalties {
+    fn is_empty(&self) -> bool {
+        self.by_id.is_empty() && self.by_key.is_empty()
+    }
+
+    fn penalty_for(&self, track: &Track) -> f64 {
+        let ts_id = self.by_id.get(&track.id).copied();
+        let ts_key = self.by_key.get(&track.song_key()).copied();
+        let Some(heard_at) = (match (ts_id, ts_key) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }) else {
+            return 0.0;
+        };
+        let age = (self.now - heard_at).max(0);
+        if age >= RECENT_HEARD_WINDOW_SECS {
+            return 0.0;
+        }
+        RECENT_HEARD_MAX_PENALTY * (-(age as f64) / RECENT_HEARD_HALF_LIFE_SECS).exp()
+    }
+}
+
 #[derive(Default)]
 struct PlaylistCentroid {
     artists: HashMap<String, f64>,
@@ -485,6 +519,7 @@ pub struct InstantMix {
 #[derive(Debug, Clone, Default)]
 pub struct SearchMixContext {
     pub anchor_artist: Option<String>,
+    pub anchor_deezer_artist_id: Option<String>,
     pub anchor_track_key: Option<String>,
     pub anchor_genres: Vec<String>,
     pub is_artist_query: bool,
@@ -954,6 +989,12 @@ impl TasteEngine {
         for artist_id in &followed_artists {
             let norm = artist_id.strip_prefix("ar:").unwrap_or(artist_id);
             *prof.artist_affinity.entry(norm.to_string()).or_insert(0.0) += 2.8;
+            let with_prefix = if artist_id.starts_with("ar:") {
+                artist_id.clone()
+            } else {
+                format!("ar:{}", artist_id)
+            };
+            *prof.artist_affinity.entry(with_prefix).or_insert(0.0) += 2.8;
         }
         for alb_id in &saved_albums {
             for t in self.store.album_tracks(alb_id).unwrap_or_default().iter().take(6) {
@@ -1543,8 +1584,9 @@ impl TasteEngine {
                 vec![]
             }
         };
+        let seed_dz_artist_id = seed.deezer_artist_id();
         let dz_search_fut = async {
-            if !pa.is_empty() {
+            if seed_dz_artist_id.is_none() && !pa.is_empty() {
                 self.sources.deezer.search_artists(&pa, 4).await
             } else {
                 vec![]
@@ -1552,21 +1594,26 @@ impl TasteEngine {
         };
         let (ytm_radio, dz_artists) = tokio::join!(ytm_fut, dz_search_fut);
 
-        let matched_dz = if !is_ytm {
-            dz_artists
-                .iter()
-                .find(|a| slug(&a.name) == pa_slug)
-                .or_else(|| dz_artists.first())
-        } else {
-            dz_artists.iter().find(|a| slug(&a.name) == pa_slug)
-        };
+        let resolved_dz_artist_id = seed_dz_artist_id.or_else(|| {
+            let exact = dz_artists.iter().find(|a| a.name == pa);
+            let matched_dz = if !is_ytm {
+                exact
+                    .or_else(|| dz_artists.iter().find(|a| slug(&a.name) == pa_slug))
+                    .or_else(|| dz_artists.first())
+            } else {
+                exact.or_else(|| dz_artists.iter().find(|a| slug(&a.name) == pa_slug))
+            };
+            matched_dz
+                .map(|a| a.deezer_id.clone())
+                .filter(|id| !id.is_empty())
+        });
 
         let mut dz_direct_count = 0usize;
-        if let Some(art) = matched_dz {
-            if !art.deezer_id.is_empty() {
+        if let Some(dz_artist_id) = resolved_dz_artist_id {
+            if !dz_artist_id.is_empty() {
                 let (artist_res, radio_res) = tokio::join!(
-                    self.sources.deezer.fetch_artist(&art.deezer_id),
-                    self.sources.deezer.fetch_artist_radio(&art.deezer_id),
+                    self.sources.deezer.fetch_artist(&dz_artist_id),
+                    self.sources.deezer.fetch_artist_radio(&dz_artist_id),
                 );
                 if let Some((_meta, top_tracks, _albums, related)) = artist_res {
                     dz_direct_count += top_tracks.len();
@@ -1818,14 +1865,19 @@ impl TasteEngine {
             }
             if let Some(base) = base_by_key.get(&h.song_key()) {
                 enrich_slsk_hit_with_base(&mut h, base, false);
+                matched.push(h);
+            } else if tracks.is_empty() {
+                if !meta.deezer_id.is_empty() {
+                    h.set_deezer_artist_id(&meta.deezer_id);
+                }
+                matched.push(h);
             }
-            matched.push(h);
         }
         if matched.is_empty() {
             return tracks;
         }
         let _ = self.store.upsert_tracks(&matched);
-        merge_tracks_dedup(matched, tracks)
+        merge_tracks_dedup(tracks, matched)
     }
 
     /// Loads full artist profile + top tracks + albums + related artists, hydrating live from Deezer when available.
@@ -1835,11 +1887,19 @@ impl TasteEngine {
         user_id: i64,
     ) -> Option<(ArtistSummary, Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
         let local_summary = self.store.artist_summary_by_id(artist_id).ok().flatten();
-        let dz_artist_id = local_summary
-            .as_ref()
-            .map(|a| a.deezer_id.clone())
+        let stored_for_id = self.store.artist_tracks(artist_id).unwrap_or_default();
+        let dz_artist_id = artist_id
+            .strip_prefix("ar:dz:")
+            .or_else(|| artist_id.strip_prefix("dz:"))
+            .map(|s| s.trim().to_string())
             .filter(|id| !id.is_empty())
-            .or_else(|| artist_id.strip_prefix("dz:").map(|s| s.to_string()));
+            .or_else(|| {
+                local_summary
+                    .as_ref()
+                    .map(|a| a.deezer_id.clone())
+                    .filter(|id| !id.is_empty())
+            })
+            .or_else(|| stored_for_id.iter().find_map(Track::deezer_artist_id));
 
         let resolved_dz_id = match dz_artist_id {
             Some(id) => Some(id),
@@ -1852,13 +1912,15 @@ impl TasteEngine {
                             .trim_start_matches("ar:")
                             .replace('-', " ")
                     });
-                self.sources
-                    .deezer
-                    .search_artists(&name, 3)
-                    .await
-                    .into_iter()
-                    .find(|a| a.id == artist_id || slug(&a.name) == slug(&name))
-                    .map(|a| a.deezer_id)
+                let candidates = self.sources.deezer.search_artists(&name, 6).await;
+                let exact_id = candidates.iter().find(|a| a.id == artist_id);
+                let exact_case = candidates.iter().find(|a| a.name == name);
+                let slug_match = candidates.iter().find(|a| slug(&a.name) == slug(&name));
+                exact_id
+                    .or(exact_case)
+                    .or(slug_match)
+                    .map(|a| a.deezer_id.clone())
+                    .filter(|id| !id.is_empty())
             }
         };
 
@@ -1875,13 +1937,13 @@ impl TasteEngine {
                     let _ = self.store.upsert_artist_meta(r);
                 }
                 let merged_tracks = merge_tracks_dedup(
-                    self.store.artist_tracks(&meta.id).unwrap_or_default(),
                     top_tracks,
+                    self.store.artist_tracks(&meta.id).unwrap_or_default(),
                 );
                 let upgraded_tracks = self.upgrade_artist_from_soulseek(&meta, merged_tracks).await;
                 let merged_albums = merge_albums_dedup(
-                    self.store.artist_albums(user_id, &meta.id).unwrap_or_default(),
                     dz_albums,
+                    self.store.artist_albums(user_id, &meta.id).unwrap_or_default(),
                 );
                 return Some((meta, upgraded_tracks, merged_albums, related));
             }
@@ -1914,20 +1976,26 @@ impl TasteEngine {
         // 2. For Deezer/local/archive seeds (or when YTM radio yielded almost nothing),
         //    match an exact Deezer artist and pull artist radio.
         if (!is_ytm_seed || out.len() < 4) && !pa.is_empty() {
-            let artists = self.sources.deezer.search_artists(&pa, 5).await;
-            let matched = if !is_ytm_seed {
-                artists
-                    .iter()
-                    .find(|a| slug(&a.name) == pa_slug)
-                    .or_else(|| artists.first())
-            } else {
-                artists.iter().find(|a| slug(&a.name) == pa_slug)
-            };
-            if let Some(art) = matched {
-                if !art.deezer_id.is_empty() {
-                    let radio = self.sources.deezer.fetch_artist_radio(&art.deezer_id).await;
-                    self.push_radio_tracks(&mut seen_keys, &mut out, radio);
+            let resolved_dz_id = match seed.deezer_artist_id() {
+                Some(id) => Some(id),
+                None => {
+                    let artists = self.sources.deezer.search_artists(&pa, 5).await;
+                    let exact = artists.iter().find(|a| a.name == pa);
+                    let matched = if !is_ytm_seed {
+                        exact
+                            .or_else(|| artists.iter().find(|a| slug(&a.name) == pa_slug))
+                            .or_else(|| artists.first())
+                    } else {
+                        exact.or_else(|| artists.iter().find(|a| slug(&a.name) == pa_slug))
+                    };
+                    matched
+                        .map(|a| a.deezer_id.clone())
+                        .filter(|id| !id.is_empty())
                 }
+            };
+            if let Some(dz_id) = resolved_dz_id {
+                let radio = self.sources.deezer.fetch_artist_radio(&dz_id).await;
+                self.push_radio_tracks(&mut seen_keys, &mut out, radio);
             }
         }
 
@@ -2300,11 +2368,12 @@ impl TasteEngine {
         dedup_and_interleave(ranked, limit, 2)
     }
 
-    pub async fn playlist_radio_tracks(
+    pub async fn playlist_radio_tracks_with_recent(
         &self,
         user_id: i64,
         playlist_id: &str,
         exclude_ids: &HashSet<String>,
+        client_recent: &[(String, i64)],
         count: usize,
     ) -> Vec<Track> {
         let recs = self
@@ -2312,21 +2381,32 @@ impl TasteEngine {
             .await;
         let pl_tracks = self.store.playlist_tracks(playlist_id).unwrap_or_default();
         let sctx = self.build_scoring_context(user_id);
+        let recent_penalties = self.build_recent_heard_penalties(user_id, &sctx, client_recent);
 
         let mut familiar: Vec<Track> = pl_tracks
             .into_iter()
             .filter(|t| !exclude_ids.contains(&t.id) && !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
             .collect();
         familiar.sort_by(|a, b| {
-            let sa = score_track_core(a, &sctx.prof, &sctx.stats, ScoreMode::Supermix);
-            let sb = score_track_core(b, &sctx.prof, &sctx.stats, ScoreMode::Supermix);
+            let sa = score_track_core(a, &sctx.prof, &sctx.stats, ScoreMode::Supermix)
+                - recent_penalties.penalty_for(a);
+            let sb = score_track_core(b, &sctx.prof, &sctx.stats, ScoreMode::Supermix)
+                - recent_penalties.penalty_for(b);
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let fresh: Vec<Track> = recs
+        let mut fresh_scored: Vec<(f64, Track)> = recs
             .into_iter()
             .filter(|t| !exclude_ids.contains(&t.id))
+            .enumerate()
+            .map(|(idx, t)| {
+                let order_prior = -(idx as f64) * 0.2;
+                let s = order_prior - recent_penalties.penalty_for(&t);
+                (s, t)
+            })
             .collect();
+        fresh_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let fresh: Vec<Track> = fresh_scored.into_iter().map(|(_, t)| t).collect();
 
         // Interleave ~3 fresh discoveries per 1 familiar playlist track so radio feels cohesive yet new.
         let mut combined = Vec::new();
@@ -2349,18 +2429,27 @@ impl TasteEngine {
             }
         }
         if combined.is_empty() {
-            return self.for_you_tracks(user_id, count);
+            let fallback: Vec<Track> = self
+                .for_you_tracks(user_id, count * 2)
+                .into_iter()
+                .filter(|t| !exclude_ids.contains(&t.id))
+                .collect();
+            return self.rank_fallback_with_recent(fallback, &recent_penalties, count);
         }
         dedup_and_interleave(combined, count, 2)
     }
 
-    pub async fn radio_next_tracks_with_exclusions(
+    pub async fn radio_next_tracks_with_exclusions_and_recent(
         &self,
         user_id: i64,
         seed: Option<&Track>,
         exclude_ids: &HashSet<String>,
+        client_recent: &[(String, i64)],
         count: usize,
     ) -> Vec<Track> {
+        let sctx = self.build_scoring_context(user_id);
+        let recent_penalties = self.build_recent_heard_penalties(user_id, &sctx, client_recent);
+
         if let Some(s) = seed {
             let sims = self.similar_songs_async(s, (count * 2).max(20)).await;
             let mut filtered: Vec<Track> = Vec::new();
@@ -2395,25 +2484,25 @@ impl TasteEngine {
             }
 
             if !filtered.is_empty() {
-                if user_id <= 0 {
+                if user_id <= 0 && recent_penalties.is_empty() {
                     return dedup_and_interleave(filtered, count, 2);
                 }
-                let sctx = self.build_scoring_context(user_id);
                 let total = filtered.len().max(1) as f64;
                 let mut scored: Vec<(f64, Track)> = filtered
                     .into_iter()
                     .enumerate()
                     .filter(|(_, t)| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
                     .map(|(idx, t)| {
-                        // Preserve strong similarity prior while tailoring order to user taste & skips.
+                        // Preserve strong similarity prior while tailoring order to user taste & skips,
+                        // and applying a temporary negative weight to songs the user just heard.
                         let sim_prior = ((total - idx as f64) / total) * 4.5;
-                        let user_fit = score_track_core(
-                            &t,
-                            &sctx.prof,
-                            &sctx.stats,
-                            ScoreMode::Supermix,
-                        ) * 0.45;
-                        (sim_prior + user_fit, t)
+                        let user_fit = if user_id > 0 {
+                            score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix) * 0.45
+                        } else {
+                            0.0
+                        };
+                        let temp_recent_penalty = recent_penalties.penalty_for(&t);
+                        (sim_prior + user_fit - temp_recent_penalty, t)
                     })
                     .collect();
                 if !scored.is_empty() {
@@ -2428,7 +2517,107 @@ impl TasteEngine {
             .into_iter()
             .filter(|t| !exclude_ids.contains(&t.id))
             .collect();
-        dedup_and_interleave(picks, count, 2)
+        self.rank_fallback_with_recent(picks, &recent_penalties, count)
+    }
+
+    fn rank_fallback_with_recent(
+        &self,
+        picks: Vec<Track>,
+        recent_penalties: &RecentHeardPenalties,
+        count: usize,
+    ) -> Vec<Track> {
+        if picks.is_empty() || recent_penalties.is_empty() {
+            return dedup_and_interleave(picks, count, 2);
+        }
+        let total = picks.len().max(1) as f64;
+        let mut scored: Vec<(f64, Track)> = picks
+            .into_iter()
+            .enumerate()
+            .map(|(idx, t)| {
+                let base = ((total - idx as f64) / total) * 4.5;
+                (base - recent_penalties.penalty_for(&t), t)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        dedup_and_interleave(ranked, count, 2)
+    }
+
+    fn build_recent_heard_penalties(
+        &self,
+        user_id: i64,
+        sctx: &ScoringContext,
+        client_recent: &[(String, i64)],
+    ) -> RecentHeardPenalties {
+        let now = Utc::now().timestamp();
+        let mut by_id: HashMap<String, i64> = HashMap::new();
+        let mut by_key: HashMap<String, i64> = HashMap::new();
+
+        if user_id > 0 {
+            for (tid, st) in &sctx.stats {
+                if st.last_played > 0 && (now - st.last_played) < RECENT_HEARD_WINDOW_SECS {
+                    by_id
+                        .entry(tid.clone())
+                        .and_modify(|ts| *ts = (*ts).max(st.last_played))
+                        .or_insert(st.last_played);
+                }
+            }
+            if let Ok(recent_tracks) = self.store.user_recent_tracks(user_id, 60, 0) {
+                for (t, st) in recent_tracks {
+                    if st.last_played > 0 && (now - st.last_played) < RECENT_HEARD_WINDOW_SECS {
+                        let key = t.song_key();
+                        by_key
+                            .entry(key)
+                            .and_modify(|ts| *ts = (*ts).max(st.last_played))
+                            .or_insert(st.last_played);
+                    }
+                }
+            }
+        }
+
+        if !client_recent.is_empty() {
+            let mut client_ids: Vec<String> = Vec::with_capacity(client_recent.len());
+            let mut client_ts_by_id: HashMap<String, i64> = HashMap::new();
+            for (tid, age_secs) in client_recent {
+                let clean_id = tid.trim();
+                if clean_id.is_empty() {
+                    continue;
+                }
+                let clamped_age = (*age_secs).clamp(0, RECENT_HEARD_WINDOW_SECS);
+                if clamped_age >= RECENT_HEARD_WINDOW_SECS {
+                    continue;
+                }
+                let heard_at = now - clamped_age;
+                by_id
+                    .entry(clean_id.to_string())
+                    .and_modify(|ts| *ts = (*ts).max(heard_at))
+                    .or_insert(heard_at);
+                client_ts_by_id
+                    .entry(clean_id.to_string())
+                    .and_modify(|ts| *ts = (*ts).max(heard_at))
+                    .or_insert(heard_at);
+                client_ids.push(clean_id.to_string());
+            }
+            if !client_ids.is_empty() {
+                if let Ok(resolved) = self.store.get_tracks_by_ids(&client_ids) {
+                    for t in resolved {
+                        if let Some(&heard_at) = client_ts_by_id.get(&t.id) {
+                            let key = t.song_key();
+                            by_key
+                                .entry(key)
+                                .and_modify(|ts| *ts = (*ts).max(heard_at))
+                                .or_insert(heard_at);
+                        }
+                    }
+                }
+            }
+        }
+
+        RecentHeardPenalties {
+            now,
+            by_id,
+            by_key,
+        }
     }
 
     /// Pulls local & cached SQLite tracks matching a parsed search intent (e.g., 1980s year tags
@@ -2531,13 +2720,29 @@ impl TasteEngine {
             })
             .map(|e| &e.track);
 
-        let matched_dz_artist = dz_artists
-            .iter()
-            .find(|a| !entity_slug.is_empty() && slug(&a.name) == entity_slug);
-
         let top_matches_artist = top_track
             .map(|t| !entity_slug.is_empty() && slug(&primary_artist(&t.artist)) == entity_slug)
             .unwrap_or(false);
+        let top_dz_artist_id = top_track
+            .filter(|_| top_matches_artist)
+            .and_then(Track::deezer_artist_id);
+
+        let matched_dz_artist = dz_artists
+            .iter()
+            .find(|a| a.name == entity_q)
+            .or_else(|| {
+                top_dz_artist_id.as_ref().and_then(|dz_id| {
+                    dz_artists
+                        .iter()
+                        .find(|a| !a.deezer_id.is_empty() && &a.deezer_id == dz_id)
+                })
+            })
+            .or_else(|| {
+                dz_artists
+                    .iter()
+                    .find(|a| !entity_slug.is_empty() && slug(&a.name) == entity_slug)
+            });
+
         let top_exact_title = top_track
             .map(|t| {
                 let tl = t.title.to_lowercase();
@@ -2559,17 +2764,34 @@ impl TasteEngine {
                 .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("Unknown Artist"))?;
             let deezer_artist_id = matched_dz_artist
                 .map(|a| a.deezer_id.clone())
-                .filter(|id| !id.is_empty());
+                .filter(|id| !id.is_empty())
+                .or(top_dz_artist_id);
             let seed_track = evals
                 .iter()
                 .find(|e| {
                     !e.is_junk
                         && !e.disliked
                         && is_same_or_featured_artist(&e.track.artist, &artist_name)
+                        && deezer_artist_id.as_ref().map_or(true, |want_dz| {
+                            e.track
+                                .deezer_artist_id()
+                                .as_ref()
+                                .map_or(true, |tid| tid == want_dz)
+                        })
                         && !is_mix_clutter_track(&e.track, &intent.normalized)
                 })
                 .map(|e| e.track.clone())
-                .or_else(|| top_track.cloned());
+                .or_else(|| {
+                    top_track
+                        .filter(|t| {
+                            deezer_artist_id.as_ref().map_or(true, |want_dz| {
+                                t.deezer_artist_id()
+                                    .as_ref()
+                                    .map_or(true, |tid| tid == want_dz)
+                            })
+                        })
+                        .cloned()
+                });
             return Some(EntityAnchorPlan {
                 artist_name,
                 deezer_artist_id,
@@ -2584,11 +2806,18 @@ impl TasteEngine {
             return None;
         }
         let anchor_slug = slug(&artist_name);
-        let deezer_artist_id = dz_artists
-            .iter()
-            .find(|a| !anchor_slug.is_empty() && slug(&a.name) == anchor_slug)
-            .map(|a| a.deezer_id.clone())
-            .filter(|id| !id.is_empty());
+        let deezer_artist_id = seed.deezer_artist_id().or_else(|| {
+            dz_artists
+                .iter()
+                .find(|a| a.name == artist_name)
+                .or_else(|| {
+                    dz_artists
+                        .iter()
+                        .find(|a| !anchor_slug.is_empty() && slug(&a.name) == anchor_slug)
+                })
+                .map(|a| a.deezer_id.clone())
+                .filter(|id| !id.is_empty())
+        });
 
         Some(EntityAnchorPlan {
             artist_name,
@@ -2793,7 +3022,16 @@ impl TasteEngine {
             .trim();
         let entity_slug = slug(entity_q);
 
-        let fallback_anchor_track = ranked_tracks.first().and_then(|t| {
+        let fallback_anchor_track = ranked_tracks.iter().find_map(|t| {
+            if let Some(ref want_dz) = mix_ctx.anchor_deezer_artist_id {
+                if !want_dz.is_empty() {
+                    if let Some(ref t_dz) = t.deezer_artist_id() {
+                        if t_dz != want_dz {
+                            return None;
+                        }
+                    }
+                }
+            }
             let lex = search_match_score(t, entity_q);
             let slug_match = !entity_slug.is_empty()
                 && slug(&format!("{} {}", t.artist, t.title)).contains(&entity_slug);
@@ -2815,6 +3053,35 @@ impl TasteEngine {
                     .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("Unknown Artist"))
             });
 
+        let anchor_dz_id = mix_ctx
+            .anchor_deezer_artist_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| {
+                fallback_anchor_track
+                    .as_ref()
+                    .and_then(Track::deezer_artist_id)
+            })
+            .or_else(|| {
+                mix_ctx
+                    .dz_artist_top
+                    .iter()
+                    .find_map(Track::deezer_artist_id)
+            });
+
+        let matches_anchor_artist = |t: &Track, anchor_art: &str| -> bool {
+            if !is_same_or_featured_artist(&t.artist, anchor_art) {
+                return false;
+            }
+            if let (Some(ref want_dz), Some(ref track_dz)) = (&anchor_dz_id, &t.deezer_artist_id())
+            {
+                if want_dz != track_dz {
+                    return false;
+                }
+            }
+            true
+        };
+
         let anchor_track_key = mix_ctx
             .anchor_track_key
             .clone()
@@ -2824,7 +3091,7 @@ impl TasteEngine {
                     mix_ctx
                         .dz_artist_top
                         .iter()
-                        .find(|t| is_same_or_featured_artist(&t.artist, art))
+                        .find(|t| matches_anchor_artist(t, art))
                         .map(Track::song_key)
                 })
             });
@@ -2836,17 +3103,28 @@ impl TasteEngine {
                 .flat_map(|g| split_genres(g))
                 .collect();
             if let Some(ref seed) = fallback_anchor_track {
-                for g in split_genres(&seed.genre) {
-                    anchor_genres.insert(g);
+                if matches_anchor_artist(seed, anchor_art) {
+                    for g in split_genres(&seed.genre) {
+                        anchor_genres.insert(g);
+                    }
                 }
             }
-            let known_anchor_g = self
-                .store
-                .known_artist_genres_for(&[anchor_art.clone()])
-                .unwrap_or_default();
-            if let Some(g_str) = known_anchor_g.get(&primary_artist(anchor_art).to_lowercase()) {
-                for g in split_genres(g_str) {
-                    anchor_genres.insert(g);
+            for t in mix_ctx.dz_artist_top.iter().chain(ranked_tracks.iter()) {
+                if matches_anchor_artist(t, anchor_art) {
+                    for g in split_genres(&t.genre) {
+                        anchor_genres.insert(g);
+                    }
+                }
+            }
+            if anchor_genres.is_empty() && anchor_dz_id.is_none() {
+                let known_anchor_g = self
+                    .store
+                    .known_artist_genres_for(&[anchor_art.clone()])
+                    .unwrap_or_default();
+                if let Some(g_str) = known_anchor_g.get(&primary_artist(anchor_art).to_lowercase()) {
+                    for g in split_genres(g_str) {
+                        anchor_genres.insert(g);
+                    }
                 }
             }
 
@@ -2870,7 +3148,13 @@ impl TasteEngine {
                 {
                     return;
                 }
-                let k = t.song_key();
+                let base_k = t.song_key();
+                let k = match map.get(&base_k).and_then(|e| e.track.as_ref()) {
+                    Some(existing) if crate::models::tracks_conflict_artist(existing, &t) => {
+                        format!("{}|{}", base_k, t.artist_id())
+                    }
+                    _ => base_k,
+                };
                 let entry = map.entry(k).or_default();
                 apply(entry, &t);
                 match &mut entry.track {
@@ -2929,7 +3213,7 @@ impl TasteEngine {
             }
 
             for t in mix_ctx.dz_artist_top.iter().cloned() {
-                if is_same_or_featured_artist(&t.artist, anchor_art) {
+                if matches_anchor_artist(&t, anchor_art) {
                     let pop = parse_rank_bonus(&t.meta);
                     let prior = 4.4 + pop * 0.25;
                     merge_into(&mut by_key, t, &|e, _| {
@@ -2942,8 +3226,13 @@ impl TasteEngine {
 
             // Include anchor track and same-artist tracks from ranked_tracks (never unrelated search noise!).
             for t in &ranked_tracks {
-                let is_anchor_key = anchor_track_key.as_deref() == Some(t.song_key().as_str());
-                let is_anchor_art = is_same_or_featured_artist(&t.artist, anchor_art);
+                let is_anchor_art = matches_anchor_artist(t, anchor_art);
+                let is_anchor_key = anchor_track_key.as_deref() == Some(t.song_key().as_str())
+                    && anchor_dz_id.as_ref().map_or(true, |want_dz| {
+                        t.deezer_artist_id()
+                            .as_ref()
+                            .map_or(true, |tid| tid == want_dz)
+                    });
                 if is_anchor_key || is_anchor_art {
                     let pop = parse_rank_bonus(&t.meta);
                     let prior = if is_anchor_key { 10.0 } else { 4.2 + pop * 0.25 };
@@ -2961,14 +3250,15 @@ impl TasteEngine {
             if radio_count < 10 {
                 let cat = self.store.all_tracks(1000, 0).unwrap_or_default();
                 for t in cat {
-                    if is_same_or_featured_artist(&t.artist, anchor_art) {
+                    if matches_anchor_artist(&t, anchor_art) {
                         let prior = 3.8 + parse_rank_bonus(&t.meta) * 0.2;
                         merge_into(&mut by_key, t, &|e, _| {
                             if prior > e.anchor_prior {
                                 e.anchor_prior = prior;
                             }
                         });
-                    } else if !anchor_genres.is_empty()
+                    } else if !is_same_or_featured_artist(&t.artist, anchor_art)
+                        && !anchor_genres.is_empty()
                         && split_genres(&t.genre).iter().any(|g| anchor_genres.contains(g))
                     {
                         let prior = 2.6 + parse_rank_bonus(&t.meta) * 0.2;
@@ -2986,7 +3276,12 @@ impl TasteEngine {
 
             for (key, entry) in by_key {
                 let Some(t) = entry.track else { continue };
-                let is_seed_track = anchor_track_key.as_deref() == Some(key.as_str());
+                let is_seed_track = anchor_track_key.as_deref() == Some(key.as_str())
+                    && anchor_dz_id.as_ref().map_or(true, |want_dz| {
+                        t.deezer_artist_id()
+                            .as_ref()
+                            .map_or(true, |tid| tid == want_dz)
+                    });
                 if is_seed_track {
                     pinned_seed = Some(t);
                     continue;
@@ -3007,7 +3302,7 @@ impl TasteEngine {
                     let tg = split_genres(&t.genre);
                     if tg.iter().any(|g| anchor_genres.contains(g)) {
                         0.75
-                    } else if !tg.is_empty() && !is_same_or_featured_artist(&t.artist, anchor_art) {
+                    } else if !tg.is_empty() && !matches_anchor_artist(&t, anchor_art) {
                         -1.0
                     } else {
                         0.0
@@ -3266,13 +3561,17 @@ fn evaluate_search_candidates(
 }
 
 fn apply_track_affinity_delta(prof: &mut TasteProfile, t: &Track, w: f64, playlist_layer: bool) {
+    let artist_id = t.artist_id();
+    let has_ext_id = artist_id.starts_with("ar:dz:") || artist_id.starts_with("ar:ytm:");
     let a_key = slug(&primary_artist(&t.artist));
     let target_artist = if playlist_layer {
         &mut prof.playlist_artist_affinity
     } else {
         &mut prof.artist_affinity
     };
-    if !a_key.is_empty() {
+    if has_ext_id {
+        *target_artist.entry(artist_id).or_insert(0.0) += w;
+    } else if !a_key.is_empty() {
         *target_artist.entry(a_key).or_insert(0.0) += w;
     }
 
@@ -3296,13 +3595,43 @@ fn apply_track_affinity_delta(prof: &mut TasteProfile, t: &Track, w: f64, playli
 }
 
 fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
+    let artist_id = t.artist_id();
+    let has_ext_id = artist_id.starts_with("ar:dz:") || artist_id.starts_with("ar:ytm:");
     let artist_slug = slug(&primary_artist(&t.artist));
-    let artist_affinity = prof.artist_affinity.get(&artist_slug).copied().unwrap_or(0.0);
-    let playlist_artist_affinity = prof
-        .playlist_artist_affinity
-        .get(&artist_slug)
-        .copied()
-        .unwrap_or(0.0);
+    let artist_affinity = if has_ext_id {
+        prof.artist_affinity
+            .get(&artist_id)
+            .copied()
+            .unwrap_or_else(|| {
+                let any_ext_in_prof = prof
+                    .artist_affinity
+                    .keys()
+                    .any(|k| k.starts_with("ar:dz:") || k.starts_with("ar:ytm:"));
+                if any_ext_in_prof {
+                    0.0
+                } else {
+                    prof.artist_affinity.get(&artist_slug).copied().unwrap_or(0.0)
+                }
+            })
+    } else {
+        prof.artist_affinity
+            .get(&artist_id)
+            .or_else(|| prof.artist_affinity.get(&artist_slug))
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let playlist_artist_affinity = if has_ext_id {
+        prof.playlist_artist_affinity
+            .get(&artist_id)
+            .copied()
+            .unwrap_or(0.0)
+    } else {
+        prof.playlist_artist_affinity
+            .get(&artist_id)
+            .or_else(|| prof.playlist_artist_affinity.get(&artist_slug))
+            .copied()
+            .unwrap_or(0.0)
+    };
 
     let genres = split_genres(&t.genre);
     let genre_affinity = genres
@@ -3334,9 +3663,13 @@ fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
             / (moods.len() as f64)
     };
 
-    let followed_artist = prof.followed_artists.contains(&t.artist_id())
-        || prof.followed_artists.contains(&format!("ar:{}", artist_slug))
-        || prof.followed_artists.contains(&artist_slug);
+    let followed_artist = if has_ext_id {
+        prof.followed_artists.contains(&artist_id)
+    } else {
+        prof.followed_artists.contains(&artist_id)
+            || prof.followed_artists.contains(&format!("ar:{}", artist_slug))
+            || prof.followed_artists.contains(&artist_slug)
+    };
     let saved_album = prof.saved_albums.contains(&t.album_id());
 
     TrackAffinities {
@@ -4135,10 +4468,8 @@ fn merge_track_metadata(winner: &mut Track, loser: &Track) {
     if winner.deezer_id.is_empty() && !loser.deezer_id.is_empty() {
         winner.deezer_id = loser.deezer_id.clone();
     }
-    if (winner.meta.is_empty() || parse_rank_bonus(&winner.meta) == 0.0)
-        && parse_rank_bonus(&loser.meta) > 0.0
-    {
-        winner.meta = loser.meta.clone();
+    if !loser.meta.is_empty() {
+        winner.meta = crate::models::merge_meta_json(&winner.meta, &loser.meta);
     }
     if (winner.album.is_empty() || winner.album == winner.title) && !loser.album.is_empty() {
         winner.album = loser.album.clone();
@@ -5020,15 +5351,22 @@ fn enrich_slsk_hit_with_base(hit: &mut Track, base: &Track, lock_album_track_pos
 }
 
 fn merge_tracks_dedup(primary: Vec<Track>, secondary: Vec<Track>) -> Vec<Track> {
-    let mut index_by_key: HashMap<String, usize> = HashMap::new();
+    let mut indices_by_key: HashMap<String, Vec<usize>> = HashMap::new();
     let mut out: Vec<Track> = Vec::new();
     for t in primary.into_iter().chain(secondary) {
         let key = t.song_key();
-        if let Some(&idx) = index_by_key.get(&key) {
+        let existing_idx = indices_by_key.get(&key).and_then(|indices| {
+            indices
+                .iter()
+                .copied()
+                .find(|&idx| !crate::models::tracks_conflict_artist(&out[idx], &t))
+        });
+        if let Some(idx) = existing_idx {
             let existing = std::mem::take(&mut out[idx]);
             out[idx] = merge_track_pair(existing, t);
         } else {
-            index_by_key.insert(key, out.len());
+            let idx = out.len();
+            indices_by_key.entry(key).or_default().push(idx);
             out.push(t);
         }
     }
@@ -5939,6 +6277,7 @@ mod tests {
 
         let mix_ctx = SearchMixContext {
             anchor_artist: Some(plan.artist_name),
+            anchor_deezer_artist_id: plan.deezer_artist_id,
             anchor_track_key: plan.seed_track.as_ref().map(Track::song_key),
             anchor_genres: vec!["J-Pop".into()],
             is_artist_query: plan.is_artist_query,
@@ -6022,5 +6361,295 @@ mod tests {
         assert!(!ids.contains(&"dz:80sbaby"), "ids={:?}", ids);
         assert!(!ids.contains(&"ytm:slowed"), "ids={:?}", ids);
         assert!(!ids.contains(&"dz:trap24"), "ids={:?}", ids);
+    }
+
+    #[test]
+    fn homonym_artists_lisa_kr_and_lisa_jp_never_cross_contaminate_mix_or_affinities() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("lisa_fan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let kr_money = Track {
+            id: "dz:kr_money".into(),
+            source: "deezer".into(),
+            title: "MONEY".into(),
+            artist: "LISA".into(),
+            album: "LALISA".into(),
+            genre: "K-Pop".into(),
+            duration: 168,
+            bitrate: 256,
+            meta: r#"{"rank":920000,"deezer_artist_id":14559887}"#.into(),
+            ..Default::default()
+        };
+        let kr_lalisa = Track {
+            id: "dz:kr_lalisa".into(),
+            source: "deezer".into(),
+            title: "LALISA".into(),
+            artist: "LISA".into(),
+            album: "LALISA".into(),
+            genre: "K-Pop".into(),
+            duration: 200,
+            bitrate: 256,
+            meta: r#"{"rank":880000,"deezer_artist_id":14559887}"#.into(),
+            ..Default::default()
+        };
+        let jp_gurenge = Track {
+            id: "dz:jp_gurenge".into(),
+            source: "deezer".into(),
+            title: "Gurenge".into(),
+            artist: "LiSA".into(),
+            album: "LEO-NiNE".into(),
+            genre: "J-Rock".into(),
+            duration: 238,
+            bitrate: 256,
+            meta: r#"{"rank":910000,"deezer_artist_id":418196}"#.into(),
+            ..Default::default()
+        };
+        let jp_homura = Track {
+            id: "dz:jp_homura".into(),
+            source: "deezer".into(),
+            title: "Homura".into(),
+            artist: "LiSA".into(),
+            album: "Homura".into(),
+            genre: "J-Rock".into(),
+            duration: 275,
+            bitrate: 256,
+            meta: r#"{"rank":895000,"deezer_artist_id":418196}"#.into(),
+            ..Default::default()
+        };
+
+        let jp_crossing = Track {
+            id: "dz:jp_crossing".into(),
+            source: "deezer".into(),
+            title: "Crossing Field".into(),
+            artist: "LiSA".into(),
+            album: "LANDSPACE".into(),
+            genre: "J-Rock".into(),
+            duration: 249,
+            bitrate: 256,
+            meta: r#"{"rank":870000,"deezer_artist_id":418196}"#.into(),
+            ..Default::default()
+        };
+        let rel_aimer = Track {
+            id: "dz:aimer".into(),
+            source: "deezer".into(),
+            title: "Zankyousanka".into(),
+            artist: "Aimer".into(),
+            album: "Walpurgis".into(),
+            genre: "J-Rock".into(),
+            duration: 182,
+            bitrate: 256,
+            meta: r#"{"rank":860000,"deezer_artist_id":999001}"#.into(),
+            ..Default::default()
+        };
+        let rel_yoasobi = Track {
+            id: "dz:yoasobi".into(),
+            source: "deezer".into(),
+            title: "Idol".into(),
+            artist: "YOASOBI".into(),
+            album: "THE BOOK".into(),
+            genre: "J-Pop".into(),
+            duration: 213,
+            bitrate: 256,
+            meta: r#"{"rank":930000,"deezer_artist_id":999002}"#.into(),
+            ..Default::default()
+        };
+
+        store
+            .upsert_tracks(&[
+                kr_money.clone(),
+                kr_lalisa.clone(),
+                jp_gurenge.clone(),
+                jp_homura.clone(),
+                jp_crossing.clone(),
+                rel_aimer.clone(),
+                rel_yoasobi.clone(),
+            ])
+            .unwrap();
+
+        // Starring Korean LISA's track must not give artist affinity to Japanese LiSA.
+        store.star_track(u.id, &kr_money.id).unwrap();
+        let prof = taste.user_profile(u.id);
+        let aff_kr = build_track_affinities(&kr_lalisa, &prof);
+        let aff_jp = build_track_affinities(&jp_gurenge, &prof);
+        assert!(aff_kr.artist_affinity > 0.0, "kr affinity should be positive");
+        assert_eq!(aff_jp.artist_affinity, 0.0, "jp affinity should remain 0.0");
+
+        let dz_artists = vec![
+            ArtistSummary {
+                id: "ar:dz:14559887".into(),
+                name: "LISA".into(),
+                deezer_id: "14559887".into(),
+                ..Default::default()
+            },
+            ArtistSummary {
+                id: "ar:dz:418196".into(),
+                name: "LiSA".into(),
+                deezer_id: "418196".into(),
+                ..Default::default()
+            },
+        ];
+
+        // Entity anchor for Japanese "LiSA" selects deezer_artist_id 418196 and her seed track.
+        let raw_tracks = vec![
+            kr_money.clone(),
+            kr_lalisa.clone(),
+            jp_gurenge.clone(),
+            jp_homura.clone(),
+        ];
+        let jp_plan = taste
+            .plan_entity_mix_anchor(u.id, "LiSA", &raw_tracks, &dz_artists)
+            .expect("LiSA anchor plan should resolve");
+        assert_eq!(jp_plan.deezer_artist_id.as_deref(), Some("418196"));
+        assert_eq!(
+            jp_plan.seed_track.as_ref().and_then(Track::deezer_artist_id).as_deref(),
+            Some("418196")
+        );
+
+        let mix_ctx = SearchMixContext {
+            anchor_artist: Some(jp_plan.artist_name),
+            anchor_deezer_artist_id: jp_plan.deezer_artist_id,
+            anchor_track_key: jp_plan.seed_track.as_ref().map(Track::song_key),
+            anchor_genres: vec!["J-Rock".into()],
+            is_artist_query: true,
+            ytm_radio: vec![rel_aimer.clone(), rel_yoasobi.clone()],
+            dz_artist_top: vec![jp_gurenge.clone(), jp_homura.clone(), jp_crossing.clone()],
+            dz_artist_radio: vec![rel_aimer.clone()],
+            dz_related_tracks: vec![rel_yoasobi.clone()],
+        };
+        let res = taste.search_and_refine_with_context(u.id, "LiSA", raw_tracks, vec![], mix_ctx);
+        let mix = res.instant_mix.expect("LiSA mix should be created");
+        let mix_ids: Vec<&str> = mix.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(mix_ids.contains(&jp_gurenge.id.as_str()), "mix_ids={:?}", mix_ids);
+        assert!(mix_ids.contains(&jp_homura.id.as_str()), "mix_ids={:?}", mix_ids);
+        assert!(
+            !mix_ids.contains(&kr_money.id.as_str()),
+            "Korean LISA track leaked into Japanese LiSA mix: {:?}",
+            mix_ids
+        );
+        assert!(
+            !mix_ids.contains(&kr_lalisa.id.as_str()),
+            "Korean LISA track leaked into Japanese LiSA mix: {:?}",
+            mix_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn recently_heard_songs_get_temporary_negative_weight_in_upcoming_radio() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("radiouser", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let heard_loc = Track {
+            id: "loc:heard".into(),
+            source: "local".into(),
+            title: "Midnight City".into(),
+            artist: "M83".into(),
+            album: "Hurry Up, We're Dreaming".into(),
+            genre: "Synthpop".into(),
+            moods: "night,upbeat".into(),
+            bitrate: 900,
+            duration: 243,
+            meta: r#"{"rank":950000}"#.into(),
+            ..Default::default()
+        };
+        let heard_dup_ytm = Track {
+            id: "ytm:heard-dup".into(),
+            source: "ytm".into(),
+            title: "Midnight City (Official Video)".into(),
+            artist: "M83".into(),
+            album: "Hurry Up, We're Dreaming".into(),
+            genre: "Synthpop".into(),
+            moods: "night,upbeat".into(),
+            bitrate: 192,
+            duration: 243,
+            ..Default::default()
+        };
+        let fresh_1 = Track {
+            id: "loc:fresh1".into(),
+            source: "local".into(),
+            title: "Wait".into(),
+            artist: "M83".into(),
+            album: "Hurry Up, We're Dreaming".into(),
+            genre: "Synthpop".into(),
+            moods: "night,chill".into(),
+            bitrate: 900,
+            duration: 343,
+            ..Default::default()
+        };
+        let fresh_2 = Track {
+            id: "loc:fresh2".into(),
+            source: "local".into(),
+            title: "Running Out Of Time".into(),
+            artist: "Paramore".into(),
+            album: "This Is Why".into(),
+            genre: "Synthpop".into(),
+            moods: "upbeat".into(),
+            bitrate: 900,
+            duration: 192,
+            ..Default::default()
+        };
+        store
+            .upsert_tracks(&[
+                heard_loc.clone(),
+                heard_dup_ytm.clone(),
+                fresh_1.clone(),
+                fresh_2.clone(),
+            ])
+            .unwrap();
+
+        // User just clicked/heard `loc:heard`
+        taste.record_event(u.id, &heard_loc.id, "play", 1.0);
+
+        let sctx = taste.build_scoring_context(u.id);
+        let penalties = taste.build_recent_heard_penalties(
+            u.id,
+            &sctx,
+            &[("loc:heard".to_string(), 15)],
+        );
+        // Just-heard track and its cross-source song_key sibling both get strong temporary penalty
+        assert!(penalties.penalty_for(&heard_loc) > 10.0);
+        assert!(penalties.penalty_for(&heard_dup_ytm) > 10.0);
+        assert_eq!(penalties.penalty_for(&fresh_1), 0.0);
+
+        // Penalty expires cleanly after the temporary window (> 2 hours)
+        let expired_penalties = RecentHeardPenalties {
+            now: Utc::now().timestamp() + RECENT_HEARD_WINDOW_SECS + 60,
+            by_id: penalties.by_id.clone(),
+            by_key: penalties.by_key.clone(),
+        };
+        assert_eq!(expired_penalties.penalty_for(&heard_loc), 0.0);
+        assert_eq!(expired_penalties.penalty_for(&heard_dup_ytm), 0.0);
+
+        // Fallback radio upcoming list places fresh tracks ahead of recently heard songs
+        let upcoming = taste
+            .radio_next_tracks_with_exclusions_and_recent(
+                u.id,
+                None,
+                &HashSet::new(),
+                &[("loc:heard".to_string(), 10)],
+                2,
+            )
+            .await;
+        let upcoming_ids: Vec<&str> = upcoming.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            !upcoming_ids.contains(&"loc:heard") && !upcoming_ids.contains(&"ytm:heard-dup"),
+            "recently heard song should be deprioritized below fresh tracks in upcoming: {:?}",
+            upcoming_ids
+        );
     }
 }

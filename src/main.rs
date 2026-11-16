@@ -167,6 +167,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/mood/{slug}", get(webapp::mood_mix))
         .route("/api/web/genre/{name}", get(webapp::genre_detail))
         .route("/api/web/search", get(webapp::search))
+        .route("/api/web/instant-mix", get(webapp::instant_mix))
         .route("/api/web/album/{id}", get(webapp::album_detail))
         .route("/api/web/artist/{id}", get(webapp::artist_detail))
         .route("/api/web/library", get(webapp::library))

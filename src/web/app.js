@@ -103,6 +103,7 @@
     currentGenreShare: null,
     currentShareUrl: '',
     searchState: null,
+    activeInstantMix: null,
     settingsTab: 'general',
     settingsData: {
       sources: null,
@@ -112,7 +113,62 @@
     deferredInstallPrompt: null,
     isStandalone: false,
     hasViewNetworkError: false,
+    networkMode: 'online',
+    wasDisconnected: false,
+    backOnlineTimer: null,
+    reconnectTimer: null,
+    healthHeartbeatTimer: null,
+    healthCheckInFlight: null,
+    recentHeard: loadRecentHeard(),
   };
+
+  const RECENT_HEARD_TTL_MS = 2 * 60 * 60 * 1000;
+  const RECENT_HEARD_MAX = 50;
+
+  function loadRecentHeard() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('beatlab_recent_heard') || '[]');
+      if (!Array.isArray(parsed)) return [];
+      const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+      return parsed
+        .filter((e) => e && typeof e.id === 'string' && e.id && Number.isFinite(e.at) && e.at > cutoff)
+        .slice(0, 50);
+    } catch {
+      return [];
+    }
+  }
+
+  function pruneRecentHeard() {
+    const cutoff = Date.now() - RECENT_HEARD_TTL_MS;
+    state.recentHeard = (state.recentHeard || []).filter((e) => e && e.id && e.at > cutoff);
+    if (state.recentHeard.length > RECENT_HEARD_MAX) {
+      state.recentHeard = state.recentHeard.slice(0, RECENT_HEARD_MAX);
+    }
+  }
+
+  function recordRecentHeard(track) {
+    const id = typeof track === 'string' ? track : track && track.id;
+    if (!id) return;
+    pruneRecentHeard();
+    state.recentHeard = state.recentHeard.filter((e) => e.id !== id);
+    state.recentHeard.unshift({ id, at: Date.now() });
+    if (state.recentHeard.length > RECENT_HEARD_MAX) {
+      state.recentHeard = state.recentHeard.slice(0, RECENT_HEARD_MAX);
+    }
+    try {
+      localStorage.setItem('beatlab_recent_heard', JSON.stringify(state.recentHeard));
+    } catch {}
+  }
+
+  function buildRecentRadioParam(excludeId = '') {
+    pruneRecentHeard();
+    const now = Date.now();
+    return state.recentHeard
+      .filter((e) => e.id && e.id !== excludeId)
+      .slice(0, 40)
+      .map((e) => `${e.id}@${Math.max(0, Math.floor((now - e.at) / 1000))}`)
+      .join(',');
+  }
 
   function isStandalonePwa() {
     try {
@@ -173,11 +229,151 @@
     }
   }
 
+  function renderConnectivityBanner(mode) {
+    const pairs = [
+      [$('offline-banner'), $('offline-banner-text')],
+      [$('auth-offline-banner'), $('auth-offline-banner-text')],
+    ];
+    for (const [banner, textEl] of pairs) {
+      if (!banner) continue;
+      if (mode === 'online') {
+        banner.classList.remove('is-online');
+        banner.classList.add('hidden');
+      } else if (mode === 'back-online') {
+        if (textEl) textEl.textContent = 'Back online — connected to Beatlab server';
+        banner.classList.add('is-online');
+        banner.classList.remove('hidden');
+      } else if (mode === 'server-offline') {
+        if (textEl) textEl.textContent = 'Beatlab server is offline. Waiting to reconnect…';
+        banner.classList.remove('is-online');
+        banner.classList.remove('hidden');
+      } else {
+        if (textEl) textEl.textContent = 'You are offline. Waiting for internet connection…';
+        banner.classList.remove('is-online');
+        banner.classList.remove('hidden');
+      }
+    }
+  }
+
+  function stopReconnectPoll() {
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnectPoll() {
+    if (state.reconnectTimer || state.networkMode === 'online') return;
+    state.reconnectTimer = setTimeout(async () => {
+      state.reconnectTimer = null;
+      if (state.networkMode === 'online') return;
+      const ok = await checkServerHealth();
+      if (!ok && state.networkMode !== 'online') {
+        scheduleReconnectPoll();
+      }
+    }, 4000);
+  }
+
+  function setOfflineState(mode) {
+    const next = mode === 'device-offline' || (typeof navigator !== 'undefined' && navigator.onLine === false)
+      ? 'device-offline'
+      : 'server-offline';
+    if (state.backOnlineTimer) {
+      clearTimeout(state.backOnlineTimer);
+      state.backOnlineTimer = null;
+    }
+    state.wasDisconnected = true;
+    state.networkMode = next;
+    renderConnectivityBanner(next);
+    scheduleReconnectPoll();
+  }
+
+  async function handleConnectivityRestored() {
+    stopReconnectPoll();
+    const shouldShowBackOnline = state.wasDisconnected || state.networkMode !== 'online';
+    state.networkMode = 'online';
+    state.wasDisconnected = false;
+
+    if (shouldShowBackOnline) {
+      if (state.backOnlineTimer) {
+        clearTimeout(state.backOnlineTimer);
+      }
+      renderConnectivityBanner('back-online');
+      state.backOnlineTimer = setTimeout(() => {
+        state.backOnlineTimer = null;
+        if (state.networkMode === 'online') {
+          renderConnectivityBanner('online');
+        }
+      }, 3500);
+    } else {
+      renderConnectivityBanner('online');
+    }
+
+    if (state.token && !state.user) {
+      try {
+        const res = await api('/api/web/me');
+        if (res.user) {
+          state.user = res.user;
+          await onSignedIn();
+          return;
+        }
+      } catch {}
+    } else if (state.user && state.hasViewNetworkError) {
+      state.hasViewNetworkError = false;
+      renderCurrentHash();
+    }
+  }
+
+  function checkServerHealth() {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setOfflineState('device-offline');
+      return Promise.resolve(false);
+    }
+    if (state.healthCheckInFlight) return state.healthCheckInFlight;
+    const run = (async () => {
+      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const tid = ctrl ? setTimeout(() => ctrl.abort(), 4000) : null;
+      try {
+        const resp = await fetch('/health', {
+          method: 'GET',
+          cache: 'no-store',
+          signal: ctrl ? ctrl.signal : undefined,
+        });
+        if (resp.ok) {
+          if (state.networkMode !== 'online' || state.wasDisconnected) {
+            await handleConnectivityRestored();
+          }
+          return true;
+        }
+        setOfflineState('server-offline');
+        return false;
+      } catch {
+        setOfflineState(
+          typeof navigator !== 'undefined' && navigator.onLine === false
+            ? 'device-offline'
+            : 'server-offline'
+        );
+        return false;
+      } finally {
+        if (tid) clearTimeout(tid);
+        if (state.healthCheckInFlight === run) {
+          state.healthCheckInFlight = null;
+        }
+      }
+    })();
+    state.healthCheckInFlight = run;
+    return run;
+  }
+
   function syncOnlineStatus() {
     const online = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
-    const banner = $('offline-banner');
-    if (banner) {
-      banner.classList.toggle('hidden', online);
+    if (!online) {
+      setOfflineState('device-offline');
+    } else if (state.networkMode === 'device-offline') {
+      setOfflineState('server-offline');
+      checkServerHealth();
+    } else if (state.networkMode === 'online') {
+      renderConnectivityBanner('online');
     }
   }
 
@@ -221,28 +417,32 @@
     });
 
     window.addEventListener('offline', () => {
-      syncOnlineStatus();
-      showToast('You are offline');
+      setOfflineState('device-offline');
     });
 
-    window.addEventListener('online', async () => {
-      syncOnlineStatus();
-      if (state.token && !state.user) {
-        try {
-          const res = await api('/api/web/me');
-          if (res.user) {
-            state.user = res.user;
-            await onSignedIn();
-            showToast('Back online');
-            return;
-          }
-        } catch {}
-      } else if (state.user && state.hasViewNetworkError) {
-        state.hasViewNetworkError = false;
-        showToast('Back online');
-        renderCurrentHash();
+    window.addEventListener('online', () => {
+      checkServerHealth();
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        checkServerHealth();
       }
     });
+
+    window.addEventListener('focus', () => {
+      if (state.networkMode !== 'online') {
+        checkServerHealth();
+      }
+    });
+
+    if (!state.healthHeartbeatTimer) {
+      state.healthHeartbeatTimer = setInterval(() => {
+        if (document.visibilityState === 'visible' && state.networkMode === 'online') {
+          checkServerHealth();
+        }
+      }, 20000);
+    }
   }
 
   async function installPwa() {
@@ -309,7 +509,29 @@
     if (state.token) {
       headers['Authorization'] = `Bearer ${state.token}`;
     }
-    const resp = await fetch(path, { ...opts, headers });
+    let resp;
+    try {
+      resp = await fetch(path, { ...opts, headers });
+    } catch (err) {
+      if (!err || err.name !== 'AbortError') {
+        setOfflineState(
+          typeof navigator !== 'undefined' && navigator.onLine === false
+            ? 'device-offline'
+            : 'server-offline'
+        );
+        if (err && typeof err === 'object') err.isNetworkError = true;
+      }
+      throw err;
+    }
+    if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
+      setOfflineState('server-offline');
+      const netErr = new Error(`Beatlab server is unavailable (${resp.status})`);
+      netErr.isNetworkError = true;
+      throw netErr;
+    }
+    if (state.networkMode !== 'online' || state.wasDisconnected) {
+      handleConnectivityRestored();
+    }
     if (resp.status === 401 && path !== '/api/web/auth/signin' && path !== '/api/web/auth/signup') {
       showAuthScreen();
       throw new Error('Unauthorized');
@@ -1099,12 +1321,14 @@
           return;
         }
       } catch (err) {
-        if (err && err.message !== 'Unauthorized' && !navigator.onLine) {
-          showToast('You are offline — waiting to reconnect');
+        if (err && err.isNetworkError) {
+          showAuthScreen();
+          return;
         }
       }
     }
     showAuthScreen();
+    checkServerHealth();
   }
 
   async function onSignedIn() {
@@ -1305,6 +1529,11 @@
 
     if (hash === 'home') return renderHome();
     if (hash === 'explore') return renderExplore();
+    if (hash === 'mix' || hash.startsWith('mix?')) {
+      const qIdx = hash.indexOf('?');
+      const mixQ = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)).get('q') || '' : '';
+      return renderInstantMixPage(mixQ);
+    }
     if (isSearchHash(hash)) {
       const q = extractSearchQueryFromHash(hash);
       const searchInput = $('global-search');
@@ -1430,7 +1659,10 @@
       const d = await api('/api/web/explore', { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const charts = cacheTracks(d.charts || []);
-      let html = `<h1 class="page-greeting">Explore</h1>`;
+      let html = `<div class="section-head" style="margin-bottom:18px">
+        <h1 class="page-greeting" style="margin-bottom:0">Explore</h1>
+        <button class="btn-secondary" onclick="App.promptInstantMix()">Create Instant Mix</button>
+      </div>`;
       html += `<section class="section">
         <div class="section-head"><h2>Moods &amp; Moments</h2></div>
         <div class="mood-grid">${(d.moods || []).map(renderMoodTile).join('')}</div>
@@ -1483,17 +1715,24 @@
       const tracks = cacheTracks(d.tracks || []);
       const albums = d.albums || [];
       const artists = d.artists || [];
-      const instantMix = d.instantMix
-        ? {
-            ...d.instantMix,
-            tracks: cacheTracks(d.instantMix.tracks || []),
-          }
-        : null;
       const refinements = d.refinements || null;
 
-      if (!tracks.length && !albums.length && !artists.length && !instantMix) {
-        state.searchState = null;
-        $('main-view').innerHTML = `<p class="muted-center">No matches found for "${esc(query)}".</p>`;
+      if (!tracks.length && !albums.length && !artists.length) {
+        state.searchState = {
+          query: cleanQ,
+          tracks: [],
+          albums: [],
+          artists: [],
+          instantMix: null,
+          instantMixLoading: false,
+          instantMixError: '',
+          refinements,
+          activeFilter: 'all',
+          mixExpanded: false,
+        };
+        state.activeInstantMix = null;
+        renderSearchView();
+        $('main-view').scrollTop = 0;
         return;
       }
 
@@ -1502,11 +1741,14 @@
         tracks,
         albums,
         artists,
-        instantMix,
+        instantMix: null,
+        instantMixLoading: false,
+        instantMixError: '',
         refinements,
         activeFilter: 'all',
         mixExpanded: false,
       };
+      state.activeInstantMix = null;
       renderSearchView();
       $('main-view').scrollTop = 0;
     } catch (e) {
@@ -1572,10 +1814,124 @@
     </section>`;
   }
 
+  async function createInstantMixForSearch(customTerm) {
+    const s = state.searchState;
+    const term = String(customTerm ?? (s ? s.query : '')).trim();
+    if (!term) {
+      return promptInstantMix();
+    }
+    if (!s || (customTerm != null && term !== s.query)) {
+      return navigate(`mix?q=${encodeURIComponent(term)}`);
+    }
+    if (s.instantMixLoading) return;
+    s.instantMixLoading = true;
+    s.instantMixError = '';
+    renderSearchView();
+    try {
+      const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(term)}`);
+      if (state.searchState !== s) return;
+      s.instantMixLoading = false;
+      if (d.instantMix && Array.isArray(d.instantMix.tracks) && d.instantMix.tracks.length > 0) {
+        const mix = {
+          ...d.instantMix,
+          tracks: cacheTracks(d.instantMix.tracks || []),
+        };
+        s.instantMix = mix;
+        s.mixExpanded = false;
+        state.activeInstantMix = { mix, query: term, refinements: d.refinements || s.refinements, expanded: false };
+      } else {
+        s.instantMixError = `Couldn't generate an instant mix for "${term}". Try a different artist, song, genre, or mood.`;
+        showToast('No instant mix found for that term');
+      }
+      renderSearchView();
+    } catch (e) {
+      if (state.searchState === s) {
+        s.instantMixLoading = false;
+        s.instantMixError = e.message || 'Could not create instant mix right now.';
+        renderSearchView();
+      }
+    }
+  }
+
+  async function renderInstantMixPage(query) {
+    const cleanQ = String(query || '').trim();
+    state.searchState = null;
+    const builderHeader = (val) => `
+      <div class="section-head" style="margin-bottom:14px">
+        <h1 class="page-greeting" style="margin-bottom:0">Instant Mix</h1>
+      </div>
+      <form class="instant-mix-builder-form" onsubmit="App.submitInstantMixForm(event)">
+        <input id="instant-mix-term-input" type="text" value="${esc(val)}" placeholder="Enter an artist, song, genre, era, or mood (e.g. 80s hits, Daft Punk, chill)..." autocomplete="off" />
+        <button type="submit" class="btn-primary">Create Instant Mix</button>
+      </form>
+    `;
+    if (!cleanQ) {
+      state.activeInstantMix = null;
+      $('main-view').innerHTML = `
+        ${builderHeader('')}
+        <div class="instant-mix-suggestions">
+          ${['80s hits', '90s rock', 'Late night chill', 'Workout energy', 'Indie synthpop']
+            .map((sg) => `<button class="refine-query-pill" onclick="App.navigate('mix?q=${encodeURIComponent(sg)}')">${esc(sg)}</button>`)
+            .join('')}
+        </div>
+      `;
+      return;
+    }
+
+    const { reqToken, signal } = beginViewRequest();
+    setMainLoading(`Creating instant mix for "${cleanQ}"...`);
+    try {
+      const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
+      if (!d.instantMix || !Array.isArray(d.instantMix.tracks) || !d.instantMix.tracks.length) {
+        state.activeInstantMix = null;
+        $('main-view').innerHTML = `
+          ${builderHeader(cleanQ)}
+          <p class="muted-center">Couldn't build an instant mix for "${esc(cleanQ)}". Try another artist, song, era, or vibe.</p>
+        `;
+        return;
+      }
+      const mix = {
+        ...d.instantMix,
+        tracks: cacheTracks(d.instantMix.tracks || []),
+      };
+      state.activeInstantMix = {
+        mix,
+        query: cleanQ,
+        refinements: d.refinements || null,
+        expanded: true,
+      };
+      $('main-view').innerHTML = `
+        ${builderHeader(cleanQ)}
+        ${renderInstantMixCard(mix, d.refinements || null, cleanQ, true)}
+      `;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      handleViewFetchError(e, reqToken, signal);
+    }
+  }
+
+  function promptInstantMix(initialQuery = '') {
+    const defaultVal = String(initialQuery || (state.searchState ? state.searchState.query : '') || '').trim();
+    openModal(`
+      <div class="modal-head"><h3>Create Instant Mix</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
+      <form onsubmit="App.submitInstantMixModal(event)" style="display:flex;flex-direction:column;gap:12px">
+        <p style="font-size:13px;color:var(--text-muted)">Generate an on-demand mix from any artist, song, genre, era, or mood.</p>
+        <input id="instant-mix-modal-input" type="text" value="${esc(defaultVal)}" placeholder="e.g. 80s hits, Daft Punk, late night chill..." required autofocus />
+        <div class="instant-mix-suggestions">
+          ${['80s hits', '90s rock', 'Chill synthwave', 'Workout energy']
+            .map((sg) => `<button type="button" class="refine-query-pill" onclick="App.closeModal();App.navigate('mix?q=${encodeURIComponent(sg)}')">${esc(sg)}</button>`)
+            .join('')}
+        </div>
+        <button type="submit" class="btn-primary">Create Instant Mix</button>
+      </form>
+    `);
+  }
+
   function renderSearchView() {
     const s = state.searchState;
     if (!s) return;
-    const { query, albums, artists, instantMix, refinements, activeFilter, mixExpanded } = s;
+    const { query, albums, artists, instantMix, instantMixLoading, instantMixError, refinements, activeFilter, mixExpanded } = s;
     const tracks = applySearchFilter(s.tracks, activeFilter);
 
     let html = '';
@@ -1598,7 +1954,7 @@
       }
       if (suggestions.length > 0) {
         html += `<div class="refine-group refine-suggestions">
-          <span class="refine-label">Refine mix:</span>
+          <span class="refine-label">Related:</span>
           ${suggestions
             .map(
               (sg) =>
@@ -1610,9 +1966,29 @@
       html += `</div>`;
     }
 
-    const mixIsProminent = !!(instantMix && (instantMix.prominent || instantMix.isThemeMix));
-    if (instantMix && mixIsProminent && activeFilter === 'all') {
+    if (activeFilter === 'all' && !instantMix) {
+      html += `<div class="instant-mix-cta-row">
+        <div class="instant-mix-cta-copy">
+          <div class="instant-mix-cta-title">Want an on-demand mix for "${esc(query)}"?</div>
+          <div class="instant-mix-cta-sub">${instantMixError ? esc(instantMixError) : 'Build a fresh instant mix on demand without cluttering search results.'}</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn-secondary" ${instantMixLoading ? 'disabled' : ''} onclick="App.createInstantMixForSearch()">
+            ${instantMixLoading ? 'Creating Mix...' : 'Create Instant Mix'}
+          </button>
+          <button class="mini-btn" onclick="App.promptInstantMix()">Custom Term</button>
+        </div>
+      </div>`;
+    }
+
+    if (instantMix && activeFilter === 'all') {
       html += renderInstantMixCard(instantMix, refinements, query, mixExpanded);
+    }
+
+    if (!s.tracks.length && !albums.length && !artists.length) {
+      html += `<p class="muted-center">No matches found for "${esc(query)}".</p>`;
+      $('main-view').innerHTML = html;
+      return;
     }
 
     const topTrack = tracks[0];
@@ -1644,10 +2020,6 @@
       </section></div>`;
     } else if (activeFilter !== 'all') {
       html += `<p class="muted-center" style="margin:24px 0">No tracks matched this filter. <button class="mini-btn" onclick="App.setSearchFilter('all')">Reset filter</button></p>`;
-    }
-
-    if (instantMix && !mixIsProminent && activeFilter === 'all') {
-      html += renderInstantMixCard(instantMix, refinements, query, mixExpanded);
     }
 
     if (artists.length > 0 && activeFilter === 'all') {
@@ -3341,7 +3713,12 @@
 
   async function playQueueAt(index) {
     if (index < 0 || index >= state.queue.length) return;
+    const prevTrackObj = currentTrack();
     const track = state.queue[index];
+    if (prevTrackObj && prevTrackObj.id !== track.id) {
+      recordRecentHeard(prevTrackObj);
+    }
+    recordRecentHeard(track);
     const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
     const isBurst = state.lastPlaySwitchAt > 0 && now - state.lastPlaySwitchAt < 280;
     state.lastPlaySwitchAt = now;
@@ -3462,6 +3839,8 @@
   function playListByIds(ids, startIndex = 0) {
     const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
     if (!tracks.length) return;
+    const prev = currentTrack();
+    if (prev) recordRecentHeard(prev);
     state.radioReqToken++;
     state.radioLoading = false;
     state.queue = tracks;
@@ -3471,6 +3850,8 @@
   function playShuffledIds(ids) {
     const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
     if (!tracks.length) return;
+    const prev = currentTrack();
+    if (prev) recordRecentHeard(prev);
     for (let i = tracks.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
@@ -3484,6 +3865,9 @@
   function playSingle(id) {
     const t = state.trackMap.get(id);
     if (!t) return;
+    const prev = currentTrack();
+    if (prev) recordRecentHeard(prev);
+    recordRecentHeard(t);
     state.radioReqToken++;
     state.radioLoading = !!state.autoplay;
     state.queue = [t];
@@ -3500,6 +3884,8 @@
       if (token !== state.queueActionToken) return;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
+        const prev = currentTrack();
+        if (prev) recordRecentHeard(prev);
         state.radioReqToken++;
         state.radioLoading = false;
         state.radioInFlight = null;
@@ -3519,6 +3905,8 @@
       if (token !== state.queueActionToken) return;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
+        const prev = currentTrack();
+        if (prev) recordRecentHeard(prev);
         state.radioReqToken++;
         state.radioLoading = false;
         state.radioInFlight = null;
@@ -3536,9 +3924,27 @@
     playSingle(id);
   }
 
+  function getActiveInstantMix() {
+    if (state.searchState && state.searchState.instantMix) {
+      return {
+        mix: state.searchState.instantMix,
+        query: state.searchState.query,
+        inSearch: true,
+      };
+    }
+    if (state.activeInstantMix && state.activeInstantMix.mix) {
+      return {
+        mix: state.activeInstantMix.mix,
+        query: state.activeInstantMix.query,
+        inSearch: false,
+      };
+    }
+    return null;
+  }
+
   function playInstantMix(shuffled = false, startIndex = 0) {
-    const s = state.searchState;
-    const mix = s && s.instantMix;
+    const active = getActiveInstantMix();
+    const mix = active && active.mix;
     if (!mix || !mix.tracks || !mix.tracks.length) return;
     const ids = mix.tracks.map((t) => t.id);
     const idx = shuffled ? 0 : Math.max(0, Math.min(startIndex, ids.length - 1));
@@ -3556,8 +3962,8 @@
   }
 
   function queueInstantMix() {
-    const s = state.searchState;
-    const mix = s && s.instantMix;
+    const active = getActiveInstantMix();
+    const mix = active && active.mix;
     if (!mix || !mix.tracks || !mix.tracks.length) return;
     const tracks = mix.tracks.map((t) => state.trackMap.get(t.id) || t);
     if (!state.queue.length) {
@@ -3579,9 +3985,19 @@
   }
 
   function toggleMixExpand() {
-    if (!state.searchState) return;
-    state.searchState.mixExpanded = !state.searchState.mixExpanded;
-    renderSearchView();
+    if (state.searchState && state.searchState.instantMix) {
+      state.searchState.mixExpanded = !state.searchState.mixExpanded;
+      renderSearchView();
+      return;
+    }
+    if (state.activeInstantMix && state.activeInstantMix.mix) {
+      state.activeInstantMix.expanded = !state.activeInstantMix.expanded;
+      const { mix, query, refinements, expanded } = state.activeInstantMix;
+      const card = document.querySelector('#main-view .instant-mix-card');
+      if (card) {
+        card.outerHTML = renderInstantMixCard(mix, refinements, query, expanded);
+      }
+    }
   }
 
   function runRefinedSearch(query) {
@@ -3608,9 +4024,11 @@
           .map((t) => t.id)
           .filter(Boolean)
           .join(',');
+        const recentParam = buildRecentRadioParam(seedId);
         const params = new URLSearchParams();
         if (seedId) params.set('seed', seedId);
         if (excludeIds) params.set('exclude', excludeIds);
+        if (recentParam) params.set('recent', recentParam);
         const d = await api(`/api/web/radio?${params.toString()}`);
         if (reqToken !== state.radioReqToken) return 0;
         const recs = cacheTracks(d.tracks || []);
@@ -3646,11 +4064,17 @@
   async function startPlaylistRadio(pid) {
     const { token, signal } = beginQueueFetch();
     const reqToken = ++state.radioReqToken;
+    const prev = currentTrack();
+    if (prev) recordRecentHeard(prev);
     state.radioLoading = true;
     state.radioInFlight = null;
     showToast('Starting playlist radio...');
     try {
-      const d = await api(`/api/web/radio?playlist=${encodeURIComponent(pid || '')}`, { signal });
+      const params = new URLSearchParams();
+      params.set('playlist', pid || '');
+      const recentParam = buildRecentRadioParam();
+      if (recentParam) params.set('recent', recentParam);
+      const d = await api(`/api/web/radio?${params.toString()}`, { signal });
       if (token !== state.queueActionToken || reqToken !== state.radioReqToken) return;
       state.radioLoading = false;
       const tracks = cacheTracks(d.tracks || []);
@@ -3675,12 +4099,18 @@
     const reqToken = ++state.radioReqToken;
     const cur = currentTrack();
     const keepingCurrent = !!(cur && cur.id === seedId);
+    if (cur) recordRecentHeard(cur);
+    if (seed) recordRecentHeard(seed);
     state.radioLoading = true;
     state.radioInFlight = null;
     if (keepingCurrent) renderQueuePanel();
     showToast('Starting track radio...');
     try {
-      const d = await api(`/api/web/radio?seed=${encodeURIComponent(seedId || '')}`, { signal });
+      const params = new URLSearchParams();
+      params.set('seed', seedId || '');
+      const recentParam = buildRecentRadioParam(seedId);
+      if (recentParam) params.set('recent', recentParam);
+      const d = await api(`/api/web/radio?${params.toString()}`, { signal });
       if (token !== state.queueActionToken || reqToken !== state.radioReqToken) return;
       state.radioLoading = false;
       const recs = cacheTracks(d.tracks || []);
@@ -3820,6 +4250,7 @@
         return;
       }
       updatePlayButton(false);
+      checkServerHealth();
       showToast(`Unable to play "${cur.title}" right now`);
     });
     audio.addEventListener('ended', () => {
@@ -4400,6 +4831,15 @@
           );
         }
         renderSearchView();
+      } else if (state.activeInstantMix && state.activeInstantMix.mix) {
+        state.activeInstantMix.mix.tracks = (state.activeInstantMix.mix.tracks || []).filter(
+          (t) => t.id !== trackId
+        );
+        const { mix, query, refinements, expanded } = state.activeInstantMix;
+        const card = document.querySelector('#main-view .instant-mix-card');
+        if (card) {
+          card.outerHTML = renderInstantMixCard(mix, refinements, query, expanded);
+        }
       } else {
         document.querySelectorAll('[data-tid]').forEach((el) => {
           if (el.dataset.tid === trackId && !el.classList.contains('q-item')) {
@@ -5026,11 +5466,12 @@
       });
     },
     shareCurrentInstantMix: () => {
-      const mix = state.searchState && state.searchState.instantMix;
+      const active = getActiveInstantMix();
+      const mix = active && active.mix;
       if (!mix || !mix.tracks || !mix.tracks.length) return;
       shareEntity({
         kind: 'mix',
-        targetId: `mix:${mix.title || state.searchState.query || 'custom'}`,
+        targetId: `mix:${mix.title || active.query || 'custom'}`,
         title: mix.title,
         subtitle: mix.subtitle || 'Instant Custom Mix',
         trackIds: mix.tracks.map((t) => t.id),
@@ -5205,6 +5646,21 @@
     toggleMixExpand,
     runRefinedSearch,
     playSearchTrack,
+    createInstantMixForSearch,
+    promptInstantMix,
+    submitInstantMixModal: (e) => {
+      e.preventDefault();
+      const val = ($('instant-mix-modal-input')?.value || '').trim();
+      if (!val) return;
+      closeModal();
+      navigate(`mix?q=${encodeURIComponent(val)}`);
+    },
+    submitInstantMixForm: (e) => {
+      e.preventDefault();
+      const val = ($('instant-mix-term-input')?.value || '').trim();
+      if (!val) return;
+      navigate(`mix?q=${encodeURIComponent(val)}`);
+    },
     playInstantMix,
     playInstantMixAt,
     queueInstantMix,

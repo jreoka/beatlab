@@ -120,6 +120,7 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 artist TEXT NOT NULL,
+                artist_id TEXT NOT NULL DEFAULT '',
                 cover_url TEXT NOT NULL DEFAULT '',
                 genre TEXT NOT NULL DEFAULT '',
                 year INTEGER NOT NULL DEFAULT 0,
@@ -290,6 +291,7 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "radio_stations", "user_id", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "albums_meta", "artist_id", "TEXT NOT NULL DEFAULT ''")?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_deezer ON tracks(deezer_id)",
             [],
@@ -297,6 +299,7 @@ impl Store {
         let _ = conn.execute("DELETE FROM kv WHERE key LIKE 'nn:user:%'", []);
 
         migrate_legacy_moods(&mut conn)?;
+        migrate_artist_disambiguation(&mut conn)?;
 
         Ok(())
     }
@@ -752,6 +755,9 @@ impl Store {
                          ORDER BY f.at DESC LIMIT 12",
                     )?;
                     for raw in fstmt.query_map(params![user_id], |r| r.get::<_, String>(0))?.flatten() {
+                        if raw.starts_with("ar:dz:") || raw.starts_with("ar:ytm:") {
+                            continue;
+                        }
                         let clean = raw.trim_start_matches("ar:").replace('-', " ");
                         push_artist_pat(&clean);
                     }
@@ -894,11 +900,12 @@ impl Store {
         let conn = self.lock();
         let now = Utc::now().timestamp();
         conn.execute(
-            "INSERT INTO albums_meta(id, name, artist, cover_url, genre, year, label, deezer_id, updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO albums_meta(id, name, artist, artist_id, cover_url, genre, year, label, deezer_id, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                name = CASE WHEN excluded.name != '' THEN excluded.name ELSE albums_meta.name END,
                artist = CASE WHEN excluded.artist != '' THEN excluded.artist ELSE albums_meta.artist END,
+               artist_id = CASE WHEN excluded.artist_id != '' THEN excluded.artist_id ELSE albums_meta.artist_id END,
                cover_url = CASE WHEN excluded.cover_url != '' THEN excluded.cover_url ELSE albums_meta.cover_url END,
                genre = CASE WHEN excluded.genre != '' THEN excluded.genre ELSE albums_meta.genre END,
                year = CASE WHEN excluded.year > 0 THEN excluded.year ELSE albums_meta.year END,
@@ -909,6 +916,7 @@ impl Store {
                 meta.id,
                 meta.name,
                 meta.artist,
+                meta.artist_id,
                 meta.cover_url,
                 meta.genre,
                 meta.year,
@@ -924,21 +932,27 @@ impl Store {
         let conn = self.lock();
         let row = conn
             .query_row(
-                "SELECT id, name, artist, cover_url, genre, year, label, deezer_id FROM albums_meta WHERE id = ?1",
+                "SELECT id, name, artist, artist_id, cover_url, genre, year, label, deezer_id FROM albums_meta WHERE id = ?1",
                 params![id],
                 |r| {
                     let name: String = r.get(1)?;
                     let artist: String = r.get(2)?;
+                    let stored_artist_id: String = r.get(3)?;
+                    let artist_id = if stored_artist_id.trim().is_empty() {
+                        format!("ar:{}", slug(&primary_artist(&artist)))
+                    } else {
+                        stored_artist_id
+                    };
                     Ok(AlbumSummary {
                         id: r.get(0)?,
                         name,
-                        artist_id: format!("ar:{}", slug(&artist)),
+                        artist_id,
                         artist,
-                        cover_url: r.get(3)?,
-                        genre: r.get(4)?,
-                        year: r.get(5)?,
-                        label: r.get(6)?,
-                        deezer_id: r.get(7)?,
+                        cover_url: r.get(4)?,
+                        genre: r.get(5)?,
+                        year: r.get(6)?,
+                        label: r.get(7)?,
+                        deezer_id: r.get(8)?,
                         ..Default::default()
                     })
                 },
@@ -996,22 +1010,28 @@ impl Store {
     fn all_album_metas_map(&self) -> AppResult<HashMap<String, AlbumSummary>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, artist, cover_url, genre, year, label, deezer_id FROM albums_meta",
+            "SELECT id, name, artist, artist_id, cover_url, genre, year, label, deezer_id FROM albums_meta",
         )?;
         let mut map = HashMap::new();
         let rows = stmt.query_map([], |r| {
             let name: String = r.get(1)?;
             let artist: String = r.get(2)?;
+            let stored_artist_id: String = r.get(3)?;
+            let artist_id = if stored_artist_id.trim().is_empty() {
+                format!("ar:{}", slug(&primary_artist(&artist)))
+            } else {
+                stored_artist_id
+            };
             Ok(AlbumSummary {
                 id: r.get(0)?,
                 name,
-                artist_id: format!("ar:{}", slug(&artist)),
+                artist_id,
                 artist,
-                cover_url: r.get(3)?,
-                genre: r.get(4)?,
-                year: r.get(5)?,
-                label: r.get(6)?,
-                deezer_id: r.get(7)?,
+                cover_url: r.get(4)?,
+                genre: r.get(5)?,
+                year: r.get(6)?,
+                label: r.get(7)?,
+                deezer_id: r.get(8)?,
                 ..Default::default()
             })
         })?;
@@ -1104,11 +1124,16 @@ impl Store {
         }
 
         for (id, meta) in metas {
+            let resolved_artist_id = if meta.artist_id.trim().is_empty() {
+                format!("ar:{}", slug(&primary_artist(&meta.artist)))
+            } else {
+                meta.artist_id.clone()
+            };
             let entry = map.entry(id.clone()).or_insert_with(|| AlbumSummary {
                 id: id.clone(),
                 name: meta.name.clone(),
                 artist: meta.artist.clone(),
-                artist_id: format!("ar:{}", slug(&primary_artist(&meta.artist))),
+                artist_id: resolved_artist_id.clone(),
                 cover_id: id,
                 cover_url: meta.cover_url.clone(),
                 genre: meta.genre.clone(),
@@ -1117,6 +1142,11 @@ impl Store {
                 deezer_id: meta.deezer_id.clone(),
                 ..Default::default()
             });
+            if resolved_artist_id.starts_with("ar:dz:")
+                && !entry.artist_id.starts_with("ar:dz:")
+            {
+                entry.artist_id = resolved_artist_id;
+            }
             if !meta.cover_url.is_empty() {
                 entry.cover_url = meta.cover_url;
             }
@@ -1151,10 +1181,19 @@ impl Store {
     }
 
     pub fn album_tracks(&self, album_id: &str) -> AppResult<Vec<Track>> {
+        let dz_album_id = self
+            .get_album_meta(album_id)
+            .ok()
+            .flatten()
+            .map(|m| m.deezer_id)
+            .filter(|s| !s.is_empty());
         let mut tracks: Vec<Track> = self
             .all_tracks(8000, 0)?
             .into_iter()
-            .filter(|t| t.album_id() == album_id)
+            .filter(|t| {
+                t.album_id() == album_id
+                    || (dz_album_id.is_some() && t.deezer_album_id() == dz_album_id)
+            })
             .collect();
         tracks.sort_by(|a, b| {
             a.disc_no
@@ -1182,7 +1221,7 @@ impl Store {
         let mut map: HashMap<String, ArtistSummary> = HashMap::new();
 
         for t in tracks {
-            let arid = t.artist_id();
+            let arid = resolve_track_artist_id(&t, &metas);
             albums_per_artist
                 .entry(arid.clone())
                 .or_default()
@@ -1192,12 +1231,17 @@ impl Store {
                 name: crate::models::primary_artist(&t.artist),
                 cover_url: t.cover_url.clone(),
                 bio: String::new(),
-                deezer_id: String::new(),
+                deezer_id: t.deezer_artist_id().unwrap_or_default(),
                 album_count: 0,
                 song_count: 0,
             });
             if entry.name.is_empty() {
                 entry.name = t.artist.clone();
+            }
+            if entry.deezer_id.is_empty() {
+                if let Some(dz_id) = t.deezer_artist_id() {
+                    entry.deezer_id = dz_id;
+                }
             }
             entry.song_count += 1;
             if entry.cover_url.is_empty() && !t.cover_url.is_empty() {
@@ -1221,6 +1265,9 @@ impl Store {
                 album_count: 0,
                 song_count: 0,
             });
+            if !meta.name.is_empty() {
+                entry.name = meta.name;
+            }
             if !meta.cover_url.is_empty() {
                 entry.cover_url = meta.cover_url;
             }
@@ -1233,22 +1280,44 @@ impl Store {
         }
 
         let mut list: Vec<ArtistSummary> = map.into_values().collect();
-        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        list.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(list)
     }
 
     pub fn artist_summary_by_id(&self, artist_id: &str) -> AppResult<Option<ArtistSummary>> {
-        Ok(self
-            .build_artist_summaries()?
-            .into_iter()
-            .find(|a| a.id == artist_id || a.deezer_id == artist_id))
+        let summaries = self.build_artist_summaries()?;
+        if let Some(exact) = summaries
+            .iter()
+            .find(|a| a.id == artist_id || (!a.deezer_id.is_empty() && a.deezer_id == artist_id))
+        {
+            return Ok(Some(exact.clone()));
+        }
+        if !artist_id.starts_with("ar:dz:") && !artist_id.starts_with("ar:ytm:") {
+            let target_slug = artist_id.strip_prefix("ar:").unwrap_or(artist_id);
+            let matches: Vec<&ArtistSummary> = summaries
+                .iter()
+                .filter(|a| slug(&a.name) == target_slug)
+                .collect();
+            if matches.len() == 1 {
+                return Ok(Some(matches[0].clone()));
+            }
+        }
+        Ok(None)
     }
 
     pub fn artist_tracks(&self, artist_id: &str) -> AppResult<Vec<Track>> {
+        let metas = self.all_artist_metas_map()?;
         let mut tracks: Vec<Track> = self
             .all_tracks(8000, 0)?
             .into_iter()
-            .filter(|t| t.artist_id() == artist_id)
+            .filter(|t| {
+                t.artist_id() == artist_id || resolve_track_artist_id(t, &metas) == artist_id
+            })
             .collect();
         tracks.sort_by(|a, b| {
             b.quality_score()
@@ -2939,6 +3008,95 @@ fn migrate_legacy_moods(conn: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn resolve_track_artist_id(t: &Track, metas: &HashMap<String, ArtistSummary>) -> String {
+    let raw_id = t.artist_id();
+    if raw_id.starts_with("ar:dz:") || raw_id.starts_with("ar:ytm:") || metas.contains_key(&raw_id) {
+        return raw_id;
+    }
+    let pa = primary_artist(&t.artist);
+    if pa.is_empty() {
+        return raw_id;
+    }
+    let exact_matches: Vec<&ArtistSummary> = metas
+        .values()
+        .filter(|m| m.name == pa)
+        .collect();
+    if exact_matches.len() == 1 {
+        return exact_matches[0].id.clone();
+    }
+    let pa_slug = slug(&pa);
+    if !pa_slug.is_empty() {
+        let slug_matches: Vec<&ArtistSummary> = metas
+            .values()
+            .filter(|m| slug(&m.name) == pa_slug)
+            .collect();
+        if slug_matches.len() == 1 {
+            return slug_matches[0].id.clone();
+        }
+    }
+    raw_id
+}
+
+fn migrate_artist_disambiguation(conn: &mut Connection) -> AppResult<()> {
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'artist_disambig_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+
+    let legacy_artists: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, deezer_id FROM artists_meta
+             WHERE deezer_id != '' AND id NOT LIKE 'ar:dz:%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.flatten().collect()
+    };
+
+    let tx = conn.transaction()?;
+    for (old_id, dz_id) in legacy_artists {
+        let new_id = format!("ar:dz:{}", dz_id.trim());
+        tx.execute(
+            "UPDATE OR IGNORE artists_meta SET id = ?1 WHERE id = ?2",
+            params![new_id, old_id],
+        )?;
+        tx.execute("DELETE FROM artists_meta WHERE id = ?1", params![old_id])?;
+        tx.execute(
+            "UPDATE OR IGNORE followed_artists SET artist_id = ?1 WHERE artist_id = ?2",
+            params![new_id, old_id],
+        )?;
+        tx.execute(
+            "DELETE FROM followed_artists WHERE artist_id = ?1",
+            params![old_id],
+        )?;
+    }
+
+    // Purge unreferenced legacy Deezer catalog rows that lack `deezer_artist_id` in `meta`,
+    // so subsequent searches and artist pages re-hydrate with disambiguated artist IDs.
+    tx.execute(
+        "DELETE FROM tracks
+         WHERE source = 'deezer'
+           AND meta NOT LIKE '%deezer_artist_id%'
+           AND id NOT IN (SELECT track_id FROM playlist_tracks)
+           AND id NOT IN (SELECT track_id FROM stars)
+           AND id NOT IN (SELECT track_id FROM ratings)
+           AND id NOT IN (SELECT track_id FROM user_track_stats)",
+        [],
+    )?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO kv(key, value) VALUES ('artist_disambig_v1', '1')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn title_case(s: &str) -> String {
     s.split_whitespace()
         .map(|w| {
@@ -3307,5 +3465,106 @@ mod tests {
         store.update_playlist(&pl.id, Some("   "), None, None).unwrap();
         let after = store.get_playlist(&pl.id).unwrap().unwrap();
         assert_eq!(after.name, "Original Name");
+    }
+
+    #[test]
+    fn homonym_artists_lisa_kr_and_lisa_jp_stay_separated_in_summaries_tracks_and_albums() {
+        let store = Store::open_memory().unwrap();
+
+        let lisa_kr_meta = ArtistSummary {
+            id: "ar:dz:14559887".into(),
+            name: "LISA".into(),
+            cover_url: "https://cdn.deezer.com/lisa_kr.jpg".into(),
+            deezer_id: "14559887".into(),
+            ..Default::default()
+        };
+        let lisa_jp_meta = ArtistSummary {
+            id: "ar:dz:418196".into(),
+            name: "LiSA".into(),
+            cover_url: "https://cdn.deezer.com/lisa_jp.jpg".into(),
+            deezer_id: "418196".into(),
+            ..Default::default()
+        };
+        store.upsert_artist_meta(&lisa_kr_meta).unwrap();
+        store.upsert_artist_meta(&lisa_jp_meta).unwrap();
+
+        let alb_kr = AlbumSummary {
+            id: "al:dz-14559887-lalisa".into(),
+            name: "LALISA".into(),
+            artist: "LISA".into(),
+            artist_id: "ar:dz:14559887".into(),
+            deezer_id: "257654".into(),
+            year: 2021,
+            ..Default::default()
+        };
+        let alb_jp = AlbumSummary {
+            id: "al:dz-418196-leo-nine".into(),
+            name: "LEO-NiNE".into(),
+            artist: "LiSA".into(),
+            artist_id: "ar:dz:418196".into(),
+            deezer_id: "179000".into(),
+            year: 2020,
+            ..Default::default()
+        };
+        store.upsert_album_meta(&alb_kr).unwrap();
+        store.upsert_album_meta(&alb_jp).unwrap();
+
+        let mut money = sample_track("dz:money", "MONEY", "LISA", "LALISA");
+        money.meta = r#"{"rank":920000,"deezer_artist_id":14559887,"deezer_album_id":257654}"#.into();
+        let mut rockstar = sample_track("dz:rockstar_kr", "Rockstar", "LISA", "Alter Ego");
+        rockstar.meta = r#"{"rank":890000,"deezer_artist_id":14559887,"deezer_album_id":555111}"#.into();
+
+        let mut gurenge = sample_track("dz:gurenge", "Gurenge", "LiSA", "LEO-NiNE");
+        gurenge.meta = r#"{"rank":910000,"deezer_artist_id":418196,"deezer_album_id":179000}"#.into();
+        let mut crossing = sample_track("ytm:crossing", "Crossing Field", "LiSA", "LANDSPACE");
+        crossing.source = "ytm".into();
+        crossing.meta = r#"{"ytm_artist_id":"UC_LISA_JP"}"#.into();
+
+        let mut batch = vec![money.clone(), rockstar.clone(), gurenge.clone(), crossing.clone()];
+        crate::sources::disambiguate_batch_tracks(
+            &mut batch,
+            &[lisa_kr_meta.clone(), lisa_jp_meta.clone()],
+        );
+        store.upsert_tracks(&batch).unwrap();
+
+        let summaries = store.build_artist_summaries().unwrap();
+        let kr_summary = summaries
+            .iter()
+            .find(|a| a.id == "ar:dz:14559887")
+            .expect("Korean LISA summary should exist");
+        let jp_summary = summaries
+            .iter()
+            .find(|a| a.id == "ar:dz:418196")
+            .expect("Japanese LiSA summary should exist");
+        assert_eq!(kr_summary.name, "LISA");
+        assert_eq!(jp_summary.name, "LiSA");
+        assert_eq!(kr_summary.cover_url, "https://cdn.deezer.com/lisa_kr.jpg");
+        assert_eq!(jp_summary.cover_url, "https://cdn.deezer.com/lisa_jp.jpg");
+        assert_eq!(kr_summary.song_count, 2);
+        assert_eq!(jp_summary.song_count, 2);
+
+        let kr_tracks = store.artist_tracks("ar:dz:14559887").unwrap();
+        let kr_titles: Vec<&str> = kr_tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(kr_titles.len(), 2);
+        assert!(kr_titles.contains(&"MONEY"));
+        assert!(kr_titles.contains(&"Rockstar"));
+        assert!(!kr_titles.contains(&"Gurenge"));
+        assert!(!kr_titles.contains(&"Crossing Field"));
+
+        let jp_tracks = store.artist_tracks("ar:dz:418196").unwrap();
+        let jp_titles: Vec<&str> = jp_tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(jp_titles.len(), 2);
+        assert!(jp_titles.contains(&"Gurenge"));
+        assert!(jp_titles.contains(&"Crossing Field"));
+        assert!(!jp_titles.contains(&"MONEY"));
+        assert!(!jp_titles.contains(&"Rockstar"));
+
+        let kr_albums = store.artist_albums(0, "ar:dz:14559887").unwrap();
+        assert!(kr_albums.iter().any(|a| a.name == "LALISA"));
+        assert!(!kr_albums.iter().any(|a| a.name == "LEO-NiNE"));
+
+        let jp_albums = store.artist_albums(0, "ar:dz:418196").unwrap();
+        assert!(jp_albums.iter().any(|a| a.name == "LEO-NiNE"));
+        assert!(!jp_albums.iter().any(|a| a.name == "LALISA"));
     }
 }

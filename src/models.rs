@@ -162,23 +162,66 @@ pub struct Track {
 }
 
 impl Track {
+    pub fn deezer_artist_id(&self) -> Option<String> {
+        extract_meta_id_field(&self.meta, "deezer_artist_id")
+    }
+
+    pub fn deezer_album_id(&self) -> Option<String> {
+        extract_meta_id_field(&self.meta, "deezer_album_id")
+    }
+
+    pub fn ytm_artist_id(&self) -> Option<String> {
+        extract_meta_id_field(&self.meta, "ytm_artist_id")
+    }
+
+    pub fn set_deezer_artist_id(&mut self, dz_artist_id: &str) {
+        let clean = dz_artist_id.trim();
+        if clean.is_empty() || clean == "0" {
+            return;
+        }
+        let mut obj = parse_meta_object(&self.meta);
+        if let Ok(num) = clean.parse::<u64>() {
+            obj.insert("deezer_artist_id".to_string(), serde_json::Value::from(num));
+        } else {
+            obj.insert(
+                "deezer_artist_id".to_string(),
+                serde_json::Value::String(clean.to_string()),
+            );
+        }
+        if let Ok(s) = serde_json::to_string(&obj) {
+            self.meta = s;
+        }
+    }
+
     pub fn artist_id(&self) -> String {
+        if let Some(dz_aid) = self.deezer_artist_id() {
+            return format!("ar:dz:{}", dz_aid);
+        }
+        if let Some(ytm_aid) = self.ytm_artist_id() {
+            return format!("ar:ytm:{}", ytm_aid);
+        }
         let pa = primary_artist(&self.artist);
         let name = if pa.is_empty() { &self.artist } else { &pa };
         format!("ar:{}", slug(name))
     }
 
     pub fn album_id(&self) -> String {
+        let alb = if self.album.trim().is_empty() {
+            &self.title
+        } else {
+            &self.album
+        };
+        if let Some(dz_aid) = self.deezer_artist_id() {
+            return format!("al:dz-{}-{}", dz_aid, slug(alb));
+        }
+        if let Some(ytm_aid) = self.ytm_artist_id() {
+            return format!("al:ytm-{}-{}", slug(&ytm_aid), slug(alb));
+        }
         let pa = primary_artist(&self.artist);
         let art = if pa.is_empty() || is_generic_folder_name(&pa) {
             &self.artist
         } else {
             &pa
-        };
-        let alb = if self.album.trim().is_empty() {
-            &self.title
-        } else {
-            &self.album
         };
         format!("al:{}", slug(&format!("{}|{}", art, alb)))
     }
@@ -834,6 +877,97 @@ pub fn upgrade_cover_url(url: &str) -> String {
     trimmed.to_string()
 }
 
+pub fn extract_meta_id_field(meta: &str, field: &str) -> Option<String> {
+    let trimmed = meta.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    let field_val = val.get(field)?;
+    match field_val {
+        serde_json::Value::Number(n) => {
+            let u = n.as_u64()?;
+            (u > 0).then(|| u.to_string())
+        }
+        serde_json::Value::String(s) => {
+            let c = s.trim();
+            (!c.is_empty() && c != "0").then(|| c.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn parse_meta_object(meta: &str) -> serde_json::Map<String, serde_json::Value> {
+    let trimmed = meta.trim();
+    if trimmed.is_empty() {
+        return serde_json::Map::new();
+    }
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(trimmed) {
+            return map;
+        }
+    }
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "webpage_url".to_string(),
+        serde_json::Value::String(trimmed.to_string()),
+    );
+    map
+}
+
+/// Returns true when `a` and `b` carry explicit external artist IDs that refer to two different artists.
+pub fn tracks_conflict_artist(a: &Track, b: &Track) -> bool {
+    if let (Some(da), Some(db)) = (a.deezer_artist_id(), b.deezer_artist_id()) {
+        if da != db {
+            return true;
+        }
+    }
+    if let (Some(ya), Some(yb)) = (a.ytm_artist_id(), b.ytm_artist_id()) {
+        if ya != yb {
+            return true;
+        }
+    }
+    false
+}
+
+/// Merges two `Track.meta` strings so external IDs (`deezer_artist_id`, `deezer_album_id`,
+/// `deezer_track_id`, `ytm_artist_id`) and popularity `rank` survive cross-source quality upgrades.
+pub fn merge_meta_json(winner_meta: &str, loser_meta: &str) -> String {
+    let w = winner_meta.trim();
+    let l = loser_meta.trim();
+    if l.is_empty() {
+        return w.to_string();
+    }
+    if w.is_empty() {
+        return l.to_string();
+    }
+    if !w.starts_with('{') && !l.starts_with('{') {
+        return w.to_string();
+    }
+    let mut w_obj = parse_meta_object(w);
+    let l_obj = parse_meta_object(l);
+    for (k, lv) in l_obj {
+        if k == "rank" {
+            let wr = w_obj.get("rank").and_then(|v| v.as_u64()).unwrap_or(0);
+            let lr = lv.as_u64().unwrap_or(0);
+            if lr > wr {
+                w_obj.insert(k, lv);
+            }
+            continue;
+        }
+        let needs_fill = match w_obj.get(&k) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) == 0,
+            Some(serde_json::Value::String(s)) => s.trim().is_empty() || s.trim() == "0",
+            _ => false,
+        };
+        if needs_fill {
+            w_obj.insert(k, lv);
+        }
+    }
+    serde_json::to_string(&w_obj).unwrap_or_else(|_| w.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,5 +1048,55 @@ mod tests {
             "https://yt3.googleusercontent.com/abc=w1080-h1080-l90-rj"
         );
         assert_eq!(upgrade_cover_url("local-art:/music/a.flac"), "local-art:/music/a.flac");
+    }
+
+    #[test]
+    fn homonym_artists_produce_distinct_artist_and_album_ids_and_conflict_on_merge() {
+        let lisa_kr = Track {
+            id: "dz:1".into(),
+            source: "deezer".into(),
+            title: "MONEY".into(),
+            artist: "LISA".into(),
+            album: "LALISA".into(),
+            meta: r#"{"rank":900000,"deezer_artist_id":14559887,"deezer_album_id":257654}"#.into(),
+            ..Default::default()
+        };
+        let lisa_jp = Track {
+            id: "dz:2".into(),
+            source: "deezer".into(),
+            title: "Gurenge".into(),
+            artist: "LiSA".into(),
+            album: "LEO-NiNE".into(),
+            meta: r#"{"rank":880000,"deezer_artist_id":418196,"deezer_album_id":179000}"#.into(),
+            ..Default::default()
+        };
+
+        assert_eq!(lisa_kr.artist_id(), "ar:dz:14559887");
+        assert_eq!(lisa_jp.artist_id(), "ar:dz:418196");
+        assert_ne!(lisa_kr.artist_id(), lisa_jp.artist_id());
+
+        assert_eq!(lisa_kr.album_id(), "al:dz-14559887-lalisa");
+        assert_eq!(lisa_jp.album_id(), "al:dz-418196-leo-nine");
+        assert_ne!(lisa_kr.album_id(), lisa_jp.album_id());
+
+        assert!(tracks_conflict_artist(&lisa_kr, &lisa_jp));
+
+        // Same song across Deezer and YTM does not conflict and preserves deezer_artist_id on merge.
+        let mut ytm_money = Track {
+            id: "ytm:money".into(),
+            source: "ytm".into(),
+            title: "MONEY".into(),
+            artist: "LISA".into(),
+            meta: r#"{"ytm_artist_id":"UC6-BgjsBa5R3PZQ_kZTGGQw"}"#.into(),
+            ..Default::default()
+        };
+        assert!(!tracks_conflict_artist(&lisa_kr, &ytm_money));
+        ytm_money.meta = merge_meta_json(&ytm_money.meta, &lisa_kr.meta);
+        assert_eq!(ytm_money.deezer_artist_id().as_deref(), Some("14559887"));
+        assert_eq!(
+            ytm_money.ytm_artist_id().as_deref(),
+            Some("UC6-BgjsBa5R3PZQ_kZTGGQw")
+        );
+        assert_eq!(ytm_money.artist_id(), "ar:dz:14559887");
     }
 }
