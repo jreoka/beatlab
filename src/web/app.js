@@ -86,7 +86,135 @@
       hidden: null,
       confirmResetHidden: false,
     },
+    deferredInstallPrompt: null,
+    isStandalone: false,
+    hasViewNetworkError: false,
   };
+
+  function isStandalonePwa() {
+    try {
+      return (
+        window.matchMedia('(display-mode: standalone)').matches ||
+        window.matchMedia('(display-mode: minimal-ui)').matches ||
+        window.navigator.standalone === true
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function isIosBrowser() {
+    const ua = navigator.userAgent || '';
+    const isIos = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    return isIos && !isStandalonePwa();
+  }
+
+  function updateInstallUI() {
+    state.isStandalone = isStandalonePwa();
+    const btn = $('pwa-install-btn');
+    if (btn) {
+      btn.classList.toggle('hidden', state.isStandalone || !state.deferredInstallPrompt);
+    }
+    if ($('settings-body') && state.settingsTab === 'general') {
+      renderSettingsModalBody();
+    }
+  }
+
+  function syncOnlineStatus() {
+    const online = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+    const banner = $('offline-banner');
+    if (banner) {
+      banner.classList.toggle('hidden', online);
+    }
+  }
+
+  function registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    const doRegister = () => {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch((err) => {
+        console.warn('Service worker registration failed:', err);
+      });
+    };
+    if (document.readyState === 'complete') {
+      doRegister();
+    } else {
+      window.addEventListener('load', doRegister, { once: true });
+    }
+  }
+
+  function wirePwaLifecycle() {
+    state.isStandalone = isStandalonePwa();
+    syncOnlineStatus();
+    registerServiceWorker();
+
+    for (const mq of ['(display-mode: standalone)', '(display-mode: minimal-ui)']) {
+      try {
+        window.matchMedia(mq).addEventListener('change', updateInstallUI);
+      } catch {}
+    }
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      state.deferredInstallPrompt = e;
+      updateInstallUI();
+    });
+
+    window.addEventListener('appinstalled', () => {
+      state.deferredInstallPrompt = null;
+      state.isStandalone = true;
+      updateInstallUI();
+      showToast('Beatlab installed!');
+    });
+
+    window.addEventListener('offline', () => {
+      syncOnlineStatus();
+      showToast('You are offline');
+    });
+
+    window.addEventListener('online', async () => {
+      syncOnlineStatus();
+      if (state.token && !state.user) {
+        try {
+          const res = await api('/api/web/me');
+          if (res.user) {
+            state.user = res.user;
+            await onSignedIn();
+            showToast('Back online');
+            return;
+          }
+        } catch {}
+      } else if (state.user && state.hasViewNetworkError) {
+        state.hasViewNetworkError = false;
+        showToast('Back online');
+        renderCurrentHash();
+      }
+    });
+  }
+
+  async function installPwa() {
+    const evt = state.deferredInstallPrompt;
+    if (evt) {
+      state.deferredInstallPrompt = null;
+      updateInstallUI();
+      try {
+        await evt.prompt();
+        const choice = await evt.userChoice;
+        if (choice && choice.outcome === 'accepted') {
+          showToast('Installing Beatlab...');
+        }
+      } catch (err) {
+        console.warn('Install prompt failed:', err);
+      }
+      return;
+    }
+    if (isStandalonePwa()) {
+      showToast('Beatlab is already installed');
+    } else if (isIosBrowser()) {
+      showToast('Tap Share in Safari, then "Add to Home Screen"');
+    } else {
+      showToast('Use your browser menu to install Beatlab');
+    }
+  }
 
   const $ = (id) => document.getElementById(id);
 
@@ -517,6 +645,7 @@
     $('fs-autoplay-toggle').checked = state.autoplay;
     wirePlayerBarToggle();
     wireFsSwipeClose();
+    wirePwaLifecycle();
     syncResponsiveLayout();
     window.matchMedia('(max-width: 1060px)').addEventListener('change', syncResponsiveLayout);
     window.matchMedia('(max-width: 780px)').addEventListener('change', syncResponsiveLayout);
@@ -635,8 +764,10 @@
           await onSignedIn();
           return;
         }
-      } catch {
-        // fall through to auth screen
+      } catch (err) {
+        if (err && err.message !== 'Unauthorized' && !navigator.onLine) {
+          showToast('You are offline — waiting to reconnect');
+        }
       }
     }
     showAuthScreen();
@@ -759,6 +890,7 @@
 
   function beginViewRequest() {
     abortActiveViewRequest();
+    state.hasViewNetworkError = false;
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     state.viewAbortController = controller;
     return {
@@ -777,6 +909,7 @@
     }
     state.searchFetchingQuery = '';
     state.searchLoadingUi = false;
+    state.hasViewNetworkError = true;
     $('main-view').innerHTML = `<p class="muted-center">${esc(err.message)}</p>`;
   }
 
@@ -2577,7 +2710,28 @@
 
     if (tab === 'general') {
       const eqActive = state.eqEnabled || state.eqGains.some((v) => v !== 0);
+      const standalone = isStandalonePwa();
+      const installControl = standalone
+        ? `<span class="pwa-status-pill">Installed</span>`
+        : state.deferredInstallPrompt
+          ? `<button class="btn-primary" onclick="App.installPwa()">Install App</button>`
+          : isIosBrowser()
+            ? `<span class="settings-row-desc" style="text-align:right;max-width:220px">In Safari, tap Share then &ldquo;Add to Home Screen&rdquo;</span>`
+            : !window.isSecureContext
+              ? `<span class="settings-row-desc" style="text-align:right;max-width:220px">Requires HTTPS or localhost</span>`
+              : `<span class="settings-row-desc" style="text-align:right;max-width:220px">Available via browser menu</span>`;
       body.innerHTML = `
+        <div class="settings-section">
+          <div class="settings-section-title">App &amp; Installation</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Install Beatlab App</div>
+              <div class="settings-row-desc">${standalone ? 'Running as an installed standalone Progressive Web App' : 'Install Beatlab on your desktop or home screen for standalone playback'}</div>
+            </div>
+            ${installControl}
+          </div>
+        </div>
+
         <div class="settings-section">
           <div class="settings-section-title">Playback &amp; Audio</div>
           <div class="settings-row">
@@ -3216,6 +3370,7 @@
     },
     openEqModal,
     closeModal,
+    installPwa,
     toggleEq: (on) => {
       state.eqEnabled = on;
       applyEqGains();

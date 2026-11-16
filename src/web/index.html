@@ -4,11 +4,18 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#0c0e13" />
+  <meta name="application-name" content="Beatlab" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Beatlab" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="description" content="Self-hosted music streaming player with smart mixes, synced lyrics, and personal radio." />
   <title>Beatlab — Stream Everything</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" type="image/svg+xml" href="/web/favicon.svg" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/web/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="/web/icon-512.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/web/apple-touch-icon.png" />
   <link rel="stylesheet" href="/web/styles.css" />
 </head>
 <body>
@@ -143,6 +150,10 @@
         </div>
 
         <div class="topbar-right">
+          <button id="pwa-install-btn" class="pill-btn topbar-install-btn hidden" onclick="App.installPwa()" title="Install Beatlab app">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+            <span>Install</span>
+          </button>
           <button class="pill-btn topbar-eq-btn" onclick="App.openEqModal()" title="10-Band Audio Equalizer">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M1 14h6m2-6h6m2 8h6"/></svg>
             <span>EQ</span>
@@ -155,6 +166,10 @@
           <button class="text-btn signout-btn" onclick="App.signOut()">Sign out</button>
         </div>
       </header>
+
+      <div id="offline-banner" class="offline-banner hidden" role="status" aria-live="polite">
+        <span>You are offline. Waiting for connection to Beatlab server…</span>
+      </div>
 
       <main id="main-view" class="main-view"></main>
     </div>

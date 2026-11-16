@@ -16,6 +16,12 @@ const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLES_CSS: &str = include_str!("web/styles.css");
 const APP_JS: &str = include_str!("web/app.js");
 const FAVICON_SVG: &str = include_str!("web/favicon.svg");
+const MANIFEST_JSON: &str = include_str!("web/manifest.webmanifest");
+const SW_JS_TEMPLATE: &str = include_str!("web/sw.js");
+const ICON_192_PNG: &[u8] = include_bytes!("web/icon-192.png");
+const ICON_512_PNG: &[u8] = include_bytes!("web/icon-512.png");
+const ICON_MASKABLE_512_PNG: &[u8] = include_bytes!("web/icon-maskable-512.png");
+const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("web/apple-touch-icon.png");
 
 const CSS_LINK_TAG: &str = r#"<link rel="stylesheet" href="/web/styles.css" />"#;
 const JS_SCRIPT_TAG: &str = r#"<script src="/web/app.js"></script>"#;
@@ -23,13 +29,13 @@ const FAVICON_HREF: &str = r#"href="/web/favicon.svg""#;
 const ASSET_CACHE_CONTROL: &str = "no-cache, must-revalidate";
 
 struct CachedAsset {
-    body: &'static str,
+    body: &'static [u8],
     etag: String,
     short_hash: String,
 }
 
-fn asset_from_str(body: &'static str) -> CachedAsset {
-    let digest = hex::encode(Sha1::digest(body.as_bytes()));
+fn asset_from_bytes(body: &'static [u8]) -> CachedAsset {
+    let digest = hex::encode(Sha1::digest(body));
     let short_hash = digest[..12].to_string();
     let etag = format!("\"{short_hash}\"");
     CachedAsset {
@@ -37,6 +43,10 @@ fn asset_from_str(body: &'static str) -> CachedAsset {
         etag,
         short_hash,
     }
+}
+
+fn asset_from_str(body: &'static str) -> CachedAsset {
+    asset_from_bytes(body.as_bytes())
 }
 
 /// Escapes closing raw-text HTML tags (case-insensitively) before inlining CSS/JS.
@@ -121,12 +131,63 @@ fn favicon_asset() -> &'static CachedAsset {
     ASSET.get_or_init(|| asset_from_str(FAVICON_SVG))
 }
 
+fn manifest_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_str(MANIFEST_JSON))
+}
+
+fn icon_192_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_bytes(ICON_192_PNG))
+}
+
+fn icon_512_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_bytes(ICON_512_PNG))
+}
+
+fn icon_maskable_512_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_bytes(ICON_MASKABLE_512_PNG))
+}
+
+fn apple_touch_icon_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_bytes(APPLE_TOUCH_ICON_PNG))
+}
+
 fn index_asset() -> &'static CachedAsset {
     static ASSET: OnceLock<CachedAsset> = OnceLock::new();
     ASSET.get_or_init(|| {
         let html: &'static str =
             Box::leak(build_bundled_index(&favicon_asset().short_hash).into_boxed_str());
         asset_from_str(html)
+    })
+}
+
+fn build_service_worker() -> String {
+    let mut hasher = Sha1::new();
+    for part in [
+        index_asset().short_hash.as_bytes(),
+        manifest_asset().short_hash.as_bytes(),
+        favicon_asset().short_hash.as_bytes(),
+        icon_192_asset().short_hash.as_bytes(),
+        icon_512_asset().short_hash.as_bytes(),
+        icon_maskable_512_asset().short_hash.as_bytes(),
+        apple_touch_icon_asset().short_hash.as_bytes(),
+        SW_JS_TEMPLATE.as_bytes(),
+    ] {
+        hasher.update(part);
+    }
+    let version = format!("beatlab-pwa-{}", &hex::encode(hasher.finalize())[..12]);
+    SW_JS_TEMPLATE.replace("__BEATLAB_SW_VERSION__", &version)
+}
+
+fn sw_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| {
+        let body: &'static str = Box::leak(build_service_worker().into_boxed_str());
+        asset_from_str(body)
     })
 }
 
@@ -185,6 +246,39 @@ pub async fn serve_js(headers: HeaderMap) -> Response {
 
 pub async fn serve_favicon(headers: HeaderMap) -> Response {
     serve_asset(&headers, "image/svg+xml; charset=utf-8", favicon_asset())
+}
+
+pub async fn serve_manifest(headers: HeaderMap) -> Response {
+    serve_asset(
+        &headers,
+        "application/manifest+json; charset=utf-8",
+        manifest_asset(),
+    )
+}
+
+pub async fn serve_sw(headers: HeaderMap) -> Response {
+    let mut res = serve_asset(&headers, "application/javascript; charset=utf-8", sw_asset());
+    res.headers_mut().insert(
+        header::HeaderName::from_static("service-worker-allowed"),
+        header::HeaderValue::from_static("/"),
+    );
+    res
+}
+
+pub async fn serve_icon_192(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "image/png", icon_192_asset())
+}
+
+pub async fn serve_icon_512(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "image/png", icon_512_asset())
+}
+
+pub async fn serve_icon_maskable_512(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "image/png", icon_maskable_512_asset())
+}
+
+pub async fn serve_apple_touch_icon(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "image/png", apple_touch_icon_asset())
 }
 
 #[derive(Serialize)]
@@ -2190,6 +2284,10 @@ mod tests {
             r#"href="/web/favicon.svg?v={}""#,
             favicon_asset().short_hash
         )));
+        assert!(html.contains(r#"<link rel="manifest" href="/manifest.webmanifest" />"#));
+        assert!(html.contains(r#"href="/web/apple-touch-icon.png""#));
+        assert!(html.contains(r#"href="/web/icon-192.png""#));
+        assert!(html.contains(r#"href="/web/icon-512.png""#));
 
         // Exact ETag and weak Cloudflare ETag both return 304 Not Modified
         let mut req_headers = HeaderMap::new();
@@ -2215,6 +2313,12 @@ mod tests {
             ("css", serve_css(HeaderMap::new()).await),
             ("js", serve_js(HeaderMap::new()).await),
             ("favicon", serve_favicon(HeaderMap::new()).await),
+            ("manifest", serve_manifest(HeaderMap::new()).await),
+            ("sw", serve_sw(HeaderMap::new()).await),
+            ("icon-192", serve_icon_192(HeaderMap::new()).await),
+            ("icon-512", serve_icon_512(HeaderMap::new()).await),
+            ("icon-maskable-512", serve_icon_maskable_512(HeaderMap::new()).await),
+            ("apple-touch-icon", serve_apple_touch_icon(HeaderMap::new()).await),
         ] {
             assert_eq!(res.status(), StatusCode::OK, "{handler_name} status");
             assert_eq!(
@@ -2232,5 +2336,55 @@ mod tests {
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::IF_NONE_MATCH, css_etag.parse().unwrap());
         assert_eq!(serve_css(hdrs).await.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn pwa_manifest_service_worker_and_icons_are_valid() {
+        use axum::body::to_bytes;
+
+        let manifest_res = serve_manifest(HeaderMap::new()).await;
+        assert_eq!(
+            manifest_res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/manifest+json; charset=utf-8"
+        );
+        let manifest_bytes = to_bytes(manifest_res.into_body(), 1024 * 64).await.unwrap();
+        let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest["name"], "Beatlab");
+        assert_eq!(manifest["start_url"], "/");
+        assert_eq!(manifest["scope"], "/");
+        assert_eq!(manifest["display"], "standalone");
+        let icons = manifest["icons"].as_array().unwrap();
+        assert!(icons.iter().any(|i| i["sizes"] == "192x192" && i["type"] == "image/png" && i["purpose"] == "any"));
+        assert!(icons.iter().any(|i| i["sizes"] == "512x512" && i["type"] == "image/png" && i["purpose"] == "any"));
+        assert!(icons.iter().any(|i| i["sizes"] == "512x512" && i["type"] == "image/png" && i["purpose"] == "maskable"));
+
+        let sw_res = serve_sw(HeaderMap::new()).await;
+        assert_eq!(
+            sw_res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(sw_res.headers().get("service-worker-allowed").unwrap(), "/");
+        let sw_etag = sw_res.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string();
+        let sw_bytes = to_bytes(sw_res.into_body(), 1024 * 64).await.unwrap();
+        let sw_src = std::str::from_utf8(&sw_bytes).unwrap();
+        assert!(!sw_src.contains("__BEATLAB_SW_VERSION__"));
+        assert!(sw_src.contains("beatlab-pwa-"));
+
+        let mut sw_hdrs = HeaderMap::new();
+        sw_hdrs.insert(header::IF_NONE_MATCH, sw_etag.parse().unwrap());
+        let sw_304 = serve_sw(sw_hdrs).await;
+        assert_eq!(sw_304.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(sw_304.headers().get("service-worker-allowed").unwrap(), "/");
+
+        for icon_res in [
+            serve_icon_192(HeaderMap::new()).await,
+            serve_icon_512(HeaderMap::new()).await,
+            serve_icon_maskable_512(HeaderMap::new()).await,
+            serve_apple_touch_icon(HeaderMap::new()).await,
+        ] {
+            assert_eq!(icon_res.headers().get(header::CONTENT_TYPE).unwrap(), "image/png");
+            let bytes = to_bytes(icon_res.into_body(), 1024 * 128).await.unwrap();
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
     }
 }

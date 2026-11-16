@@ -32,6 +32,24 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+fn web_ui_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route("/", get(webapp::serve_index))
+        .route("/web", get(webapp::serve_index))
+        .route("/web/styles.css", get(webapp::serve_css))
+        .route("/web/app.js", get(webapp::serve_js))
+        .route("/web/favicon.svg", get(webapp::serve_favicon))
+        .route("/favicon.svg", get(webapp::serve_favicon))
+        .route("/manifest.webmanifest", get(webapp::serve_manifest))
+        .route("/web/manifest.webmanifest", get(webapp::serve_manifest))
+        .route("/sw.js", get(webapp::serve_sw))
+        .route("/web/icon-192.png", get(webapp::serve_icon_192))
+        .route("/web/icon-512.png", get(webapp::serve_icon_512))
+        .route("/web/icon-maskable-512.png", get(webapp::serve_icon_maskable_512))
+        .route("/web/apple-touch-icon.png", get(webapp::serve_apple_touch_icon))
+        .route("/apple-touch-icon.png", get(webapp::serve_apple_touch_icon))
+}
+
 #[tokio::main]
 async fn main() -> models::AppResult<()> {
     tracing_subscriber::fmt()
@@ -136,12 +154,7 @@ async fn main() -> models::AppResult<()> {
 
     let app = Router::new()
         // Embedded Web Player SPA
-        .route("/", get(webapp::serve_index))
-        .route("/web", get(webapp::serve_index))
-        .route("/web/styles.css", get(webapp::serve_css))
-        .route("/web/app.js", get(webapp::serve_js))
-        .route("/web/favicon.svg", get(webapp::serve_favicon))
-        .route("/favicon.svg", get(webapp::serve_favicon))
+        .merge(web_ui_routes())
         // Web Player API (/api/web/*) — open account creation & full player features
         .route("/api/web/me", get(webapp::me))
         .route("/api/web/auth/signin", post(webapp::signin))
@@ -535,6 +548,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok_resp.status(), reqwest::StatusCode::OK);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn web_ui_routes_serve_pwa_assets() {
+        let app: Router<()> = web_ui_routes();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        for (path, expected_ct) in [
+            ("/", "text/html"),
+            ("/manifest.webmanifest", "application/manifest+json"),
+            ("/web/manifest.webmanifest", "application/manifest+json"),
+            ("/sw.js", "application/javascript"),
+            ("/web/icon-192.png", "image/png"),
+            ("/web/icon-512.png", "image/png"),
+            ("/web/icon-maskable-512.png", "image/png"),
+            ("/web/apple-touch-icon.png", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
+        ] {
+            let resp = client.get(format!("http://{addr}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path}");
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(ct.starts_with(expected_ct), "{path} content-type: {ct}");
+        }
 
         server.abort();
     }
