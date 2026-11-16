@@ -626,6 +626,49 @@ a {
   color: #fda4af;
   background: rgba(253, 164, 175, 0.12);
 }
+.pl-pin-btn {
+  opacity: 0;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  transition: opacity 0.14s, color 0.14s, background 0.14s;
+}
+.pl-pin-btn svg {
+  width: 13px;
+  height: 13px;
+}
+.pl-link-row:hover .pl-pin-btn,
+.pl-pin-btn:focus-visible {
+  opacity: 1;
+}
+.pl-pin-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+.sidebar-pin-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.sidebar-pin-link {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: none;
+  padding: 0;
+}
+.sidebar-pin-link:hover {
+  text-decoration: underline;
+}
 .pl-link-name {
   white-space: nowrap;
   overflow: hidden;
@@ -1093,6 +1136,41 @@ a {
 .card-del-btn:hover {
   color: #fda4af;
   background: rgba(10, 12, 16, 0.92);
+}
+.card-pin-btn {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  background: rgba(10, 12, 16, 0.78);
+  color: #e4e7ec;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.14s, color 0.14s, background 0.14s;
+}
+.card-pin-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.media-card:hover .card-pin-btn,
+.card-pin-btn:focus-visible,
+.card-pin-btn.pinned {
+  opacity: 1;
+}
+.card-pin-btn.pinned {
+  color: #08120c;
+  background: var(--accent);
+}
+.card-pin-btn:hover {
+  background: rgba(10, 12, 16, 0.92);
+}
+.card-pin-btn.pinned:hover {
+  background: #2ce46e;
 }
 
 .card-title {

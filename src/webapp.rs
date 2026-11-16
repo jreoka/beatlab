@@ -1002,10 +1002,11 @@ pub async fn explore_mix(
     let Some(spec) = crate::taste::find_explore_mix_spec(&key) else {
         return err_res(StatusCode::NOT_FOUND, "Explore mix not found");
     };
-    let tracks = state
+    let raw_tracks = state
         .taste
         .get_curated_explore_mix_tracks(user.id, spec, 35)
         .await;
+    let tracks = filter_visible_tracks(&state, user.id, raw_tracks);
     let total_duration: i32 = tracks.iter().map(|t| t.duration.max(0)).sum();
     json_res(json!({
         "mix": {

@@ -34,7 +34,55 @@
     repeatAll: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/>',
     repeatOne: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/><path d="M11 10.2 12.4 9.2V15"/>',
     trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
+    pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>',
   };
+
+  function pinnedPlaylistsStorageKey() {
+    return `beatlab_pinned_playlists_${state.user?.id || 'anon'}`;
+  }
+
+  function getPinnedPlaylistIds() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(pinnedPlaylistsStorageKey()) || '[]');
+      return Array.isArray(raw) ? raw.filter((id) => typeof id === 'string' && id) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function savePinnedPlaylistIds(ids) {
+    try {
+      localStorage.setItem(pinnedPlaylistsStorageKey(), JSON.stringify([...new Set(ids)]));
+    } catch {}
+  }
+
+  function isPlaylistPinned(pid) {
+    return getPinnedPlaylistIds().includes(pid);
+  }
+
+  function renderSidebarPlaylistsDom() {
+    const box = $('sidebar-playlists');
+    if (!box) return;
+    const pinnedSet = new Set(getPinnedPlaylistIds());
+    const pinned = (state.playlists || []).filter((p) => pinnedSet.has(p.id));
+    if (!pinned.length) {
+      box.innerHTML = `<div class="sidebar-pin-empty">No pinned playlists yet.<br><button type="button" class="sidebar-pin-link" onclick="App.navigate('playlists')">Browse Playlists</button></div>`;
+      return;
+    }
+    box.innerHTML = pinned
+      .map(
+        (p) => `
+          <div class="pl-link-row">
+            <button class="pl-link" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(`${p.trackCount} tracks · ${p.ownerName}`)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
+              <span class="pl-link-name">${esc(p.name)}</span>
+              ${p.isAuto ? '<span class="pl-auto-pill">Mix</span>' : ''}
+            </button>
+            <button class="pl-pin-btn" title="Unpin from sidebar" aria-label="Unpin ${esc(p.name)}" onclick="event.stopPropagation();App.togglePinPlaylist(${esc(JSON.stringify(p.id))})">${ICONS.pin}</button>
+            ${!p.isAuto ? `<button class="pl-del-btn" title="Delete playlist" aria-label="Delete ${esc(p.name)}" onclick="event.stopPropagation();App.deletePlaylist(${esc(JSON.stringify(p.id))})">${ICONS.trash}</button>` : ''}
+          </div>`
+      )
+      .join('');
+  }
 
   function loadEqGains() {
     const flat = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -1372,19 +1420,7 @@
     try {
       const lib = await api('/api/web/library');
       state.playlists = lib.playlists || [];
-      const box = $('sidebar-playlists');
-      box.innerHTML = state.playlists
-        .map(
-          (p) => `
-          <div class="pl-link-row">
-            <button class="pl-link" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(`${p.trackCount} tracks · ${p.ownerName}`)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
-              <span class="pl-link-name">${esc(p.name)}</span>
-              ${p.isAuto ? '<span class="pl-auto-pill">Mix</span>' : ''}
-            </button>
-            ${!p.isAuto ? `<button class="pl-del-btn" title="Delete playlist" aria-label="Delete ${esc(p.name)}" onclick="event.stopPropagation();App.deletePlaylist(${esc(JSON.stringify(p.id))})">${ICONS.trash}</button>` : ''}
-          </div>`
-        )
-        .join('');
+      renderSidebarPlaylistsDom();
     } catch {
       // ignore background error
     }
@@ -1554,6 +1590,7 @@
         hash === r ||
         hash.startsWith(`${r}?`) ||
         hash.startsWith(`${r}/`) ||
+        (r === 'playlists' && hash.startsWith('playlist/')) ||
         (r === 'library' && (hash === 'liked' || hash === 'history'));
       el.classList.toggle('active', match);
     });
@@ -1594,6 +1631,7 @@
     if (hash.startsWith('playlist/')) return renderPlaylist(safeDecodeUri(hash.slice(9)));
     if (hash.startsWith('mood/')) return renderMood(safeDecodeUri(hash.slice(5)));
     if (hash.startsWith('genre/')) return renderGenre(safeDecodeUri(hash.slice(6)));
+    if (hash === 'playlists') return renderPlaylistsView();
     if (hash === 'library') return renderLibrary(state.libTab);
     if (hash === 'liked') return renderLibrary('liked');
     if (hash === 'history') return renderLibrary('history');
@@ -2376,6 +2414,7 @@
             ${tracks.length ? `<button class="btn-secondary" onclick="App.startPlaylistRadio(${esc(JSON.stringify(pl.id))})">Start Radio</button>` : ''}
             ${tracks.length ? `<button class="btn-secondary" onclick="App.sharePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))}, ${esc(JSON.stringify(pl.ownerName))}, ${esc(JSON.stringify(pl.coverUrl))})">${ICONS.share} Share</button>` : ''}
             ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" onclick="App.promptRenamePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))})">Rename</button>` : ''}
+            <button class="btn-secondary" id="pl-hero-pin-btn" onclick="App.togglePinPlaylist(${esc(JSON.stringify(pl.id))})">${ICONS.pin} ${isPlaylistPinned(pl.id) ? 'Pinned' : 'Pin to Sidebar'}</button>
             ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" style="color:#fda4af" onclick="App.deletePlaylist(${esc(JSON.stringify(pl.id))})">Delete</button>` : ''}
           </div>
         </div>
@@ -2543,6 +2582,44 @@
         <div class="track-table">${renderTrackRows(tracks)}</div>
       </section>`;
       $('main-view').innerHTML = html;
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      handleViewFetchError(e, reqToken, signal);
+    }
+  }
+
+  async function renderPlaylistsView() {
+    const { reqToken, signal } = beginViewRequest();
+    setMainLoading('Loading playlists...');
+    try {
+      const lib = await api('/api/web/library', { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
+      state.playlists = lib.playlists || [];
+      renderSidebarPlaylistsDom();
+      const pinnedSet = new Set(getPinnedPlaylistIds());
+      const pinned = state.playlists.filter((p) => pinnedSet.has(p.id));
+      const allHtml = state.playlists.length
+        ? `<div class="card-grid">${state.playlists.map(renderPlaylistCard).join('')}</div>`
+        : `<p class="muted-center">No playlists yet. Create one or save an Instant Mix!</p>`;
+      const pinnedHtml = pinned.length
+        ? `<section class="section"><div class="section-head"><h2>Pinned to Sidebar (${pinned.length})</h2></div><div class="card-grid">${pinned.map(renderPlaylistCard).join('')}</div></section>`
+        : '';
+      $('main-view').innerHTML = `
+        <div class="section-head">
+          <div>
+            <h1>Playlists</h1>
+            <p style="font-size:13px;color:var(--text-muted);margin-top:4px">Pin your favorites to keep them handy in the sidebar</p>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn-secondary" onclick="App.promptInstantMix()">Instant Mix</button>
+            <button class="btn-primary" onclick="App.promptCreatePlaylist()">+ New Playlist</button>
+          </div>
+        </div>
+        ${pinnedHtml}
+        <section class="section">
+          <div class="section-head"><h2>All Playlists (${state.playlists.length})</h2></div>
+          ${allHtml}
+        </section>`;
       $('main-view').scrollTop = 0;
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
@@ -3743,9 +3820,11 @@
 
   function renderPlaylistCard(p) {
     const sub = `${p.trackCount} tracks · ${p.ownerName}`;
+    const pinned = isPlaylistPinned(p.id);
     return `<div class="media-card" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(p.coverUrl)}" loading="lazy" alt="" />
+        <button class="card-pin-btn ${pinned ? 'pinned' : ''}" title="${pinned ? 'Unpin from sidebar' : 'Pin to sidebar'}" aria-label="${pinned ? 'Unpin' : 'Pin'} ${esc(p.name)}" onclick="event.stopPropagation();App.togglePinPlaylist(${esc(JSON.stringify(p.id))})">${ICONS.pin}</button>
         ${!p.isAuto ? `<button class="card-del-btn" title="Delete playlist" aria-label="Delete ${esc(p.name)}" onclick="event.stopPropagation();App.deletePlaylist(${esc(JSON.stringify(p.id))})">${ICONS.trash}</button>` : ''}
         <button class="card-play-fab" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(p.id))})">${ICONS.play}</button>
       </div>
@@ -5250,7 +5329,7 @@
           );
         }
         renderSearchView();
-      } else if (state.activeInstantMix && state.activeInstantMix.mix) {
+      } else if (state.activeInstantMix && state.activeInstantMix.mix && document.querySelector('#main-view .instant-mix-card')) {
         state.activeInstantMix.mix.tracks = (state.activeInstantMix.mix.tracks || []).filter(
           (t) => t.id !== trackId
         );
@@ -5259,13 +5338,12 @@
         if (card) {
           card.outerHTML = renderInstantMixCard(mix, refinements, query, expanded);
         }
-      } else {
-        document.querySelectorAll('[data-tid]').forEach((el) => {
-          if (el.dataset.tid === trackId && !el.classList.contains('q-item')) {
-            el.remove();
-          }
-        });
       }
+      document.querySelectorAll('#main-view [data-tid]').forEach((el) => {
+        if (el.dataset.tid === trackId && !el.classList.contains('q-item')) {
+          el.remove();
+        }
+      });
 
       const cur = currentTrack();
       const wasCur = !!(cur && cur.id === trackId);
@@ -6240,10 +6318,41 @@
         showToast(err.message);
       }
     },
+    togglePinPlaylist: (pid) => {
+      const ids = getPinnedPlaylistIds();
+      const idx = ids.indexOf(pid);
+      let pinnedNow = false;
+      if (idx >= 0) {
+        ids.splice(idx, 1);
+      } else {
+        ids.push(pid);
+        pinnedNow = true;
+      }
+      savePinnedPlaylistIds(ids);
+      renderSidebarPlaylistsDom();
+      const heroBtn = $('pl-hero-pin-btn');
+      if (heroBtn) {
+        heroBtn.innerHTML = `${ICONS.pin} ${pinnedNow ? 'Pinned' : 'Pin to Sidebar'}`;
+      }
+      const curHash = location.hash.replace(/^#/, '');
+      if (curHash === 'playlists') {
+        renderPlaylistsView();
+      } else if (curHash === 'library' && state.libTab === 'playlists') {
+        renderLibrary('playlists');
+      }
+      showToast(pinnedNow ? 'Pinned to sidebar' : 'Unpinned from sidebar');
+    },
     deletePlaylist: async (pid) => {
+      const pl = state.playlists?.find((p) => p.id === pid);
+      const msg = pl?.name
+        ? `Are you sure you want to delete "${pl.name}"?`
+        : 'Are you sure you want to delete this playlist?';
+      if (!window.confirm(msg)) return;
       try {
         await api(`/api/web/playlists/${encodeURIComponent(pid)}`, { method: 'DELETE' });
         haptic('warning');
+        const pinnedIds = getPinnedPlaylistIds().filter((id) => id !== pid);
+        savePinnedPlaylistIds(pinnedIds);
         if (state.activeInstantMix?.mix?.savedPlaylistId === pid) {
           delete state.activeInstantMix.mix.savedPlaylistId;
         }
@@ -6255,7 +6364,9 @@
         showToast('Playlist deleted');
         const curHash = location.hash.replace(/^#/, '');
         if (curHash === `playlist/${encodeURIComponent(pid)}` || curHash === `playlist/${pid}`) {
-          navigate('library');
+          navigate('playlists');
+        } else if (curHash === 'playlists') {
+          renderPlaylistsView();
         } else if (curHash === 'library' || curHash === '') {
           renderLibrary(state.libTab);
         }

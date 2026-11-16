@@ -88,6 +88,10 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5V4.5m5 15V4.5m5 15L20 6"/></svg>
             <span>Your Library</span>
           </button>
+          <button class="nav-item" data-route="playlists" onclick="App.navigate('playlists')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            <span>Playlists</span>
+          </button>
           <button class="nav-item" data-route="stats" onclick="App.navigate('stats')">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16"/><rect x="5.5" y="12" width="3" height="5.5" rx="0.8" fill="currentColor" stroke="none"/><rect x="10.5" y="7" width="3" height="10.5" rx="0.8" fill="currentColor" stroke="none"/><rect x="15.5" y="4" width="3" height="13.5" rx="0.8" fill="currentColor" stroke="none"/></svg>
             <span>Stats</span>
@@ -97,7 +101,7 @@
 
       <div class="sidebar-library">
         <div class="sidebar-section-head">
-          <span>PLAYLISTS &amp; MIXES</span>
+          <span>PINNED PLAYLISTS</span>
           <button class="icon-btn" title="Create playlist" onclick="App.promptCreatePlaylist()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M12 4.5v15M4.5 12h15"/></svg>
           </button>

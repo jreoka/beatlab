@@ -2044,10 +2044,39 @@ impl TasteEngine {
         let now = Utc::now().timestamp();
         self.store.kv_set("curator:last_tick_at", &now.to_string());
     }
+}
 
+fn moment_mood(key: &str) -> Option<Mood> {
+    match key {
+        "morning_coffee" => Some(Mood::Acoustic),
+        "deep_work" => Some(Mood::Focus),
+        "late_night_drive" => Some(Mood::LateNight),
+        "workout_pump" => Some(Mood::Energy),
+        "rainy_day" => Some(Mood::Melancholy),
+        "road_trip" => Some(Mood::Upbeat),
+        _ => None,
+    }
+}
+
+fn moment_playlist_queries(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "morning_coffee" => Some(&["acoustic chill", "morning coffee acoustic", "coffeehouse acoustic"]),
+        "deep_work" => Some(&["deep focus", "ambient instrumental", "lofi study beats"]),
+        "late_night_drive" => Some(&["late night vibes", "late night drive", "after hours"]),
+        "workout_pump" => Some(&["workout hits", "workout motivation", "gym pump"]),
+        "rainy_day" => Some(&["melancholy indie", "rainy day indie", "sad indie acoustic"]),
+        "road_trip" => Some(&["road trip hits", "road trip classics", "feel good hits"]),
+        _ => None,
+    }
+}
+
+impl TasteEngine {
     pub async fn curate_explore_mix(&self, spec: &ExploreMixSpec) -> Vec<Track> {
         let intent = parse_search_intent(spec.query);
-        let mut pl_queries = if intent.is_theme_mix {
+        let mapped_mood = moment_mood(spec.key);
+        let mut pl_queries: Vec<String> = if let Some(mqs) = moment_playlist_queries(spec.key) {
+            mqs.iter().map(|s| (*s).to_string()).collect()
+        } else if intent.is_theme_mix {
             let mut q = intent.playlist_search_queries();
             if q.is_empty() {
                 q.push(spec.query.to_string());
@@ -2056,7 +2085,8 @@ impl TasteEngine {
         } else {
             vec![spec.query.to_string()]
         };
-        if intent.genres.is_empty()
+        if mapped_mood.is_none()
+            && intent.genres.is_empty()
             && intent.decade_label.is_none()
             && intent.themes.is_empty()
             && intent.moods.len() == 1
@@ -2071,46 +2101,59 @@ impl TasteEngine {
 
         let mut curated_batches = Vec::new();
         for pq in &pl_queries {
-            let batches = self.sources.deezer.fetch_curated_mix_tracks(pq, 2, 25).await;
-            curated_batches.extend(batches);
+            let batches = self.sources.deezer.fetch_curated_mix_tracks(pq, 3, 25).await;
+            for (pl_title, batch) in batches {
+                if let Some(m) = mapped_mood {
+                    if !is_curated_playlist_for_mood(&pl_title, m) {
+                        continue;
+                    }
+                }
+                if !batch.is_empty() {
+                    curated_batches.push((pl_title, batch));
+                }
+            }
         }
 
         let mut raw_tracks = Vec::new();
         if curated_batches.is_empty() {
-            // Avoid `deezer.search_tracks` for mood-only queries like "late night vibes",
-            // since Deezer track search mainly returns literal title-collision tracks.
-            let is_mood_only = !intent.moods.is_empty()
-                && intent.genres.is_empty()
-                && intent.decade_label.is_none()
-                && intent.themes.is_empty();
-            if is_mood_only {
-                let hints = intent.deezer_genre_hints();
-                if !hints.is_empty() {
-                    let dz_genres = self.sources.deezer.fetch_genres().await;
-                    let matched: Vec<_> = dz_genres
-                        .into_iter()
-                        .filter(|g| {
-                            let gl = g.name.to_lowercase();
-                            hints.iter().any(|want| contains_term(&gl, want))
-                        })
-                        .take(2)
-                        .collect();
-                    for g in matched {
-                        let chart = self
-                            .sources
-                            .deezer
-                            .fetch_genre_chart_tracks(g.id, &g.name, 20)
-                            .await;
-                        raw_tracks.extend(chart);
-                    }
-                }
+            if let Some(m) = mapped_mood {
+                raw_tracks = self.curate_mood_pool(m).await;
             } else {
-                raw_tracks = self.sources.deezer.search_tracks(spec.query, 20).await;
-            }
-            if raw_tracks.len() < 8 {
-                use crate::sources::MusicSource;
-                let ytm_tracks = self.sources.ytm.search(spec.query, 15).await;
-                raw_tracks.extend(ytm_tracks);
+                // Avoid `deezer.search_tracks` for mood-only queries like "late night vibes",
+                // since Deezer track search mainly returns literal title-collision tracks.
+                let is_mood_only = !intent.moods.is_empty()
+                    && intent.genres.is_empty()
+                    && intent.decade_label.is_none()
+                    && intent.themes.is_empty();
+                if is_mood_only {
+                    let hints = intent.deezer_genre_hints();
+                    if !hints.is_empty() {
+                        let dz_genres = self.sources.deezer.fetch_genres().await;
+                        let matched: Vec<_> = dz_genres
+                            .into_iter()
+                            .filter(|g| {
+                                let gl = g.name.to_lowercase();
+                                hints.iter().any(|want| contains_term(&gl, want))
+                            })
+                            .take(2)
+                            .collect();
+                        for g in matched {
+                            let chart = self
+                                .sources
+                                .deezer
+                                .fetch_genre_chart_tracks(g.id, &g.name, 20)
+                                .await;
+                            raw_tracks.extend(chart);
+                        }
+                    }
+                } else {
+                    raw_tracks = self.sources.deezer.search_tracks(spec.query, 20).await;
+                }
+                if raw_tracks.len() < 8 {
+                    use crate::sources::MusicSource;
+                    let ytm_tracks = self.sources.ytm.search(spec.query, 15).await;
+                    raw_tracks.extend(ytm_tracks);
+                }
             }
         }
 
@@ -2122,7 +2165,7 @@ impl TasteEngine {
             let _ = self.store.upsert_tracks(&to_upsert);
         }
 
-        let has_curated = !curated_batches.is_empty();
+        let has_curated = !curated_batches.is_empty() || mapped_mood.is_some();
         let res = self.search_and_refine_with_context(
             0,
             spec.query,
@@ -2134,7 +2177,23 @@ impl TasteEngine {
             .instant_mix
             .map(|m| m.tracks)
             .unwrap_or_else(|| res.tracks);
-        tracks.retain(|t| !is_mood_clutter_track(t));
+        tracks.retain(|t| {
+            !is_mood_clutter_track(t)
+                && mapped_mood.map_or(true, |m| is_track_compatible_with_mood(t, "", m))
+        });
+        if let Some(m) = mapped_mood {
+            if tracks.len() < 12 {
+                let mut seen: HashSet<String> = tracks.iter().map(|t| t.id.clone()).collect();
+                for t in self.curate_mood_pool(m).await {
+                    if !is_mood_clutter_track(&t)
+                        && is_track_compatible_with_mood(&t, "", m)
+                        && seen.insert(t.id.clone())
+                    {
+                        tracks.push(t);
+                    }
+                }
+            }
+        }
         if has_curated && tracks.len() >= 8 {
             let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
             self.save_curated_pool(&explore_cache_key(spec.key), &ids);
@@ -2157,6 +2216,22 @@ impl TasteEngine {
         };
         if curated_tracks.len() < 8 {
             curated_tracks = self.curate_explore_mix(spec).await;
+        }
+        if curated_tracks.len() < 12 {
+            if let Some(m) = moment_mood(spec.key) {
+                let mood_ids = self.load_curated_pool_ids(&mood_cache_key(m), 24 * 3600);
+                let mood_tracks = if mood_ids.len() >= 8 {
+                    self.store.get_tracks_by_ids(&mood_ids).unwrap_or_default()
+                } else {
+                    self.curate_mood_pool(m).await
+                };
+                let mut seen: HashSet<String> = curated_tracks.iter().map(|t| t.id.clone()).collect();
+                for t in mood_tracks {
+                    if seen.insert(t.id.clone()) {
+                        curated_tracks.push(t);
+                    }
+                }
+            }
         }
 
         let intent = parse_search_intent(spec.query);
@@ -3493,6 +3568,239 @@ impl TasteEngine {
         let ordered: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
         dedup_and_interleave(ordered, limit, 3)
     }
+}
+
+fn strict_topic_keywords(topic: &str) -> &'static [&'static str] {
+    match topic {
+        "christmas" => &[
+            "christmas",
+            "xmas",
+            "holiday",
+            "holidays",
+            "santa",
+            "noel",
+            "yuletide",
+            "jingle",
+            "silent night",
+            "white christmas",
+            "last christmas",
+            "let it snow",
+            "winter wonderland",
+            "rudolph",
+            "frosty",
+            "feliz navidad",
+            "mistletoe",
+            "sleigh",
+            "holly jolly",
+            "carol",
+            "all i want for christmas",
+            "rockin' around",
+            "it's beginning to look",
+            "wonderful christmastime",
+            "happy xmas",
+            "o holy night",
+            "silver bells",
+            "little drummer boy",
+            "deck the halls",
+            "joy to the world",
+            "blue christmas",
+            "christmastime",
+            "hanukkah",
+            "kwanzaa",
+        ],
+        "halloween" => &[
+            "halloween",
+            "spooky",
+            "monster mash",
+            "ghostbusters",
+            "witch",
+            "zombie",
+            "nightmare before",
+        ],
+        _ => &[],
+    }
+}
+
+fn strict_topic_for_text(text: &str) -> Option<&'static str> {
+    let low = text.to_lowercase();
+    for topic in ["christmas", "halloween"] {
+        if strict_topic_keywords(topic)
+            .iter()
+            .any(|kw| contains_term(&low, kw))
+        {
+            return Some(topic);
+        }
+    }
+    None
+}
+
+fn track_matches_topic(t: &Track, topic: &str) -> bool {
+    let hay = format!("{} {} {} {}", t.title, t.album, t.genre, t.moods).to_lowercase();
+    strict_topic_keywords(topic)
+        .iter()
+        .any(|kw| contains_term(&hay, kw))
+}
+
+#[derive(Debug, Clone, Default)]
+struct RadioScope {
+    topic_key: Option<&'static str>,
+    genres: Vec<String>,
+    artists: HashSet<String>,
+}
+
+impl RadioScope {
+    fn from_seed(seed: &Track, sims: &[Track]) -> Self {
+        let mut scope = Self::default();
+        let pa = slug(&primary_artist(&seed.artist));
+        if !pa.is_empty() {
+            scope.artists.insert(pa);
+        }
+
+        let seed_text = format!("{} {} {} {}", seed.title, seed.album, seed.genre, seed.moods);
+        scope.topic_key = strict_topic_for_text(&seed_text).or_else(|| {
+            ["christmas", "halloween"].into_iter().find(|topic| {
+                let hits = sims.iter().filter(|t| track_matches_topic(t, topic)).count();
+                hits >= 3 && hits * 2 >= sims.len().max(1)
+            })
+        });
+
+        let mut genres = split_genres(&seed.genre);
+        if genres.is_empty() {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for t in sims {
+                for g in split_genres(&t.genre) {
+                    *counts.entry(g).or_insert(0) += 1;
+                }
+            }
+            let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            genres = ranked
+                .into_iter()
+                .filter(|(_, c)| *c >= 2)
+                .take(2)
+                .map(|(g, _)| g)
+                .collect();
+        }
+        scope.genres = genres;
+        scope
+    }
+
+    fn from_playlist(pl_name: &str, pl_comment: &str, pl_tracks: &[Track]) -> Self {
+        let mut scope = Self::default();
+        for t in pl_tracks {
+            let pa = slug(&primary_artist(&t.artist));
+            if !pa.is_empty() {
+                scope.artists.insert(pa);
+            }
+        }
+
+        let hint_text = format!("{} {}", pl_name, pl_comment);
+        scope.topic_key = strict_topic_for_text(&hint_text).or_else(|| {
+            if pl_tracks.is_empty() {
+                return None;
+            }
+            ["christmas", "halloween"].into_iter().find(|topic| {
+                let hits = pl_tracks
+                    .iter()
+                    .filter(|t| track_matches_topic(t, topic))
+                    .count();
+                hits > 0 && hits * 3 >= pl_tracks.len()
+            })
+        });
+
+        let mut g_counts: HashMap<String, usize> = HashMap::new();
+        for t in pl_tracks {
+            for g in split_genres(&t.genre) {
+                *g_counts.entry(g).or_insert(0) += 1;
+            }
+        }
+        let mut genres: Vec<String> = if !g_counts.is_empty() {
+            let threshold = (pl_tracks.len() / 5).max(1);
+            let mut ranked: Vec<(String, usize)> = g_counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            ranked
+                .into_iter()
+                .filter(|(_, c)| *c >= threshold)
+                .take(4)
+                .map(|(g, _)| g)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let intent = parse_search_intent(&hint_text);
+        for g in intent.genres {
+            let gl = g.to_lowercase();
+            if !genres.contains(&gl) {
+                genres.push(gl);
+            }
+        }
+        scope.genres = genres;
+        scope
+    }
+
+    fn is_off_topic_or_clashing(&self, t: &Track) -> bool {
+        if let Some(topic) = self.topic_key {
+            return !track_matches_topic(t, topic);
+        }
+        !self.genres.is_empty() && has_genre_clash(t, "", &self.genres)
+    }
+
+    fn matches_external_candidate(&self, t: &Track) -> bool {
+        if let Some(topic) = self.topic_key {
+            return track_matches_topic(t, topic);
+        }
+        let pa = slug(&primary_artist(&t.artist));
+        if !self.genres.is_empty() {
+            if has_genre_clash(t, "", &self.genres) {
+                return false;
+            }
+            return !split_genres(&t.genre).is_empty() || (!pa.is_empty() && self.artists.contains(&pa));
+        }
+        !pa.is_empty() && self.artists.contains(&pa)
+    }
+}
+
+impl TasteEngine {
+    fn scoped_external_candidates(
+        &self,
+        user_id: i64,
+        sctx: &ScoringContext,
+        scope: &RadioScope,
+        exclude_ids: &HashSet<String>,
+        want_familiar: bool,
+        count: usize,
+    ) -> Vec<Track> {
+        let primary = if want_familiar {
+            self.for_you_tracks(user_id, (count * 5).max(80))
+        } else {
+            self.discover_weekly(user_id, (count * 5).max(80))
+        };
+        let catalog = self
+            .store
+            .candidate_tracks_for_user(user_id, 600)
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for t in primary.into_iter().chain(catalog) {
+            if exclude_ids.contains(&t.id) || !seen.insert(t.id.clone()) {
+                continue;
+            }
+            if is_strongly_disliked(&t, &sctx.prof, &sctx.stats) {
+                continue;
+            }
+            if is_familiar_track(&t, &sctx.prof, &sctx.stats) != want_familiar {
+                continue;
+            }
+            if !scope.matches_external_candidate(&t) {
+                continue;
+            }
+            out.push(t);
+            if out.len() >= count * 3 {
+                break;
+            }
+        }
+        out
+    }
 
     pub async fn recommend_for_playlist(
         &self,
@@ -3506,6 +3814,7 @@ impl TasteEngine {
         let pl_tracks = self.store.playlist_tracks(playlist_id).unwrap_or_default();
         let query_hint = playlist_query_hint(&pl.name, &pl.comment);
         let centroid = build_playlist_centroid(&pl_tracks, &query_hint);
+        let scope = RadioScope::from_playlist(&pl.name, &pl.comment, &pl_tracks);
         let sctx = self.build_scoring_context(user_id);
 
         // Sample up to 3 diverse artists from the playlist to pull fresh related candidates.
@@ -3550,6 +3859,16 @@ impl TasteEngine {
                 && !is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
             {
                 dedup_candidates.push(t);
+            }
+        }
+        if scope.topic_key.is_some() || !scope.genres.is_empty() {
+            let on_scope: Vec<Track> = dedup_candidates
+                .iter()
+                .filter(|t| !scope.is_off_topic_or_clashing(t))
+                .cloned()
+                .collect();
+            if !on_scope.is_empty() {
+                dedup_candidates = on_scope;
             }
         }
 
@@ -3600,7 +3919,13 @@ impl TasteEngine {
         let recs = self
             .recommend_for_playlist(user_id, playlist_id, count * 2)
             .await;
+        let pl = self.store.get_playlist(playlist_id).ok().flatten();
         let pl_tracks = self.store.playlist_tracks(playlist_id).unwrap_or_default();
+        let (pl_name, pl_comment) = pl
+            .as_ref()
+            .map(|p| (p.name.as_str(), p.comment.as_str()))
+            .unwrap_or(("", ""));
+        let scope = RadioScope::from_playlist(pl_name, pl_comment, &pl_tracks);
         let sctx = self.build_scoring_context(user_id);
         let recent_penalties = self.build_recent_heard_penalties(user_id, &sctx, client_recent);
 
@@ -3642,11 +3967,15 @@ impl TasteEngine {
                 combined.extend(familiar);
                 if combined.len() < count {
                     let mut seen: HashSet<String> = combined.iter().map(|t| t.id.clone()).collect();
-                    for t in self.for_you_tracks(user_id, count * 3) {
-                        if !exclude_ids.contains(&t.id)
-                            && is_familiar_track(&t, &sctx.prof, &sctx.stats)
-                            && seen.insert(t.id.clone())
-                        {
+                    for t in self.scoped_external_candidates(
+                        user_id,
+                        &sctx,
+                        &scope,
+                        exclude_ids,
+                        true,
+                        count,
+                    ) {
+                        if seen.insert(t.id.clone()) {
                             combined.push(t);
                         }
                     }
@@ -3654,7 +3983,31 @@ impl TasteEngine {
                 combined.extend(fresh);
             }
             RadioMode::Discover => {
-                combined.extend(fresh);
+                let unheard_fresh: Vec<Track> = fresh
+                    .iter()
+                    .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .cloned()
+                    .collect();
+                if !unheard_fresh.is_empty() {
+                    combined.extend(unheard_fresh);
+                } else {
+                    combined.extend(fresh);
+                }
+                if combined.len() < count {
+                    let mut seen: HashSet<String> = combined.iter().map(|t| t.id.clone()).collect();
+                    for t in self.scoped_external_candidates(
+                        user_id,
+                        &sctx,
+                        &scope,
+                        exclude_ids,
+                        false,
+                        count,
+                    ) {
+                        if seen.insert(t.id.clone()) {
+                            combined.push(t);
+                        }
+                    }
+                }
                 if combined.len() < count {
                     combined.extend(familiar);
                 }
@@ -3683,17 +4036,32 @@ impl TasteEngine {
         }
         if combined.is_empty() {
             let fallback: Vec<Track> = match mode {
-                RadioMode::Discover => self.discover_weekly(user_id, count * 2),
-                RadioMode::Familiar => self
-                    .for_you_tracks(user_id, count * 3)
+                RadioMode::Discover => self.scoped_external_candidates(
+                    user_id,
+                    &sctx,
+                    &scope,
+                    exclude_ids,
+                    false,
+                    count,
+                ),
+                RadioMode::Familiar => self.scoped_external_candidates(
+                    user_id,
+                    &sctx,
+                    &scope,
+                    exclude_ids,
+                    true,
+                    count,
+                ),
+                RadioMode::Default => self
+                    .for_you_tracks(user_id, (count * 5).max(80))
                     .into_iter()
-                    .filter(|t| is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .filter(|t| {
+                        !exclude_ids.contains(&t.id)
+                            && ((scope.topic_key.is_none() && scope.genres.is_empty())
+                                || scope.matches_external_candidate(t))
+                    })
                     .collect(),
-                RadioMode::Default => self.for_you_tracks(user_id, count * 2),
-            }
-            .into_iter()
-            .filter(|t| !exclude_ids.contains(&t.id))
-            .collect();
+            };
             return self.rank_fallback_with_recent(fallback, &recent_penalties, count);
         }
         dedup_and_interleave(combined, count, 2)
@@ -3733,6 +4101,7 @@ impl TasteEngine {
 
         if let Some(s) = seed {
             let sims = self.similar_songs_async(s, (count * 2).max(20)).await;
+            let scope = RadioScope::from_seed(s, &sims);
             let mut filtered: Vec<Track> = Vec::new();
             let mut seen_ids: HashSet<String> = exclude_ids.clone();
             seen_ids.insert(s.id.clone());
@@ -3742,22 +4111,39 @@ impl TasteEngine {
                 }
             }
 
+            if scope.topic_key.is_some() || !scope.genres.is_empty() {
+                let on_scope: Vec<Track> = filtered
+                    .iter()
+                    .filter(|t| !scope.is_off_topic_or_clashing(t))
+                    .cloned()
+                    .collect();
+                if scope.topic_key.is_some() || !on_scope.is_empty() {
+                    filtered = on_scope;
+                }
+            }
+
             // If exclusions consumed most of the seed artist's direct radio, chain 1 hop
             // via a related artist track so autoplay stays on-vibe instead of jumping genres.
             if filtered.len() < count {
                 let seed_artist = slug(&primary_artist(&s.artist));
                 let hop_seed = filtered
                     .iter()
-                    .find(|t| slug(&primary_artist(&t.artist)) != seed_artist)
+                    .find(|t| {
+                        slug(&primary_artist(&t.artist)) != seed_artist
+                            && !scope.is_off_topic_or_clashing(t)
+                    })
                     .or_else(|| {
-                        sims.iter()
-                            .find(|t| t.id != s.id && slug(&primary_artist(&t.artist)) != seed_artist)
+                        sims.iter().find(|t| {
+                            t.id != s.id
+                                && slug(&primary_artist(&t.artist)) != seed_artist
+                                && !scope.is_off_topic_or_clashing(t)
+                        })
                     })
                     .cloned();
                 if let Some(next_seed) = hop_seed {
                     let hop_sims = self.similar_songs_async(&next_seed, (count * 2).max(20)).await;
                     for t in hop_sims {
-                        if seen_ids.insert(t.id.clone()) {
+                        if !scope.is_off_topic_or_clashing(&t) && seen_ids.insert(t.id.clone()) {
                             filtered.push(t);
                         }
                     }
@@ -3765,9 +4151,15 @@ impl TasteEngine {
             }
 
             if mode == RadioMode::Familiar {
-                for t in self.for_you_tracks(user_id, count * 3) {
-                    if is_familiar_track(&t, &sctx.prof, &sctx.stats) && seen_ids.insert(t.id.clone())
-                    {
+                for t in self.scoped_external_candidates(
+                    user_id,
+                    &sctx,
+                    &scope,
+                    &seen_ids,
+                    true,
+                    count,
+                ) {
+                    if seen_ids.insert(t.id.clone()) {
                         filtered.push(t);
                     }
                 }
@@ -3782,12 +4174,26 @@ impl TasteEngine {
                     .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
                     .collect();
                 if mode == RadioMode::Discover {
-                    let unheard: Vec<Track> = eligible
+                    let mut unheard: Vec<Track> = eligible
                         .iter()
                         .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
                         .cloned()
                         .collect();
-                    if unheard.len() >= count.min(4) {
+                    if unheard.len() < count.min(4) {
+                        for t in self.scoped_external_candidates(
+                            user_id,
+                            &sctx,
+                            &scope,
+                            &seen_ids,
+                            false,
+                            count,
+                        ) {
+                            if seen_ids.insert(t.id.clone()) {
+                                unheard.push(t);
+                            }
+                        }
+                    }
+                    if unheard.len() >= count.min(4) || !unheard.is_empty() {
                         eligible = unheard;
                     }
                 }
@@ -3818,7 +4224,7 @@ impl TasteEngine {
                                 let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
                                 let mut b = 0.0;
                                 if is_familiar_track(&t, &sctx.prof, &sctx.stats) {
-                                    b += 5.5;
+                                    b += 12.0;
                                 }
                                 if st.play_count > 0 {
                                     b += (st.play_count as f64).min(5.0) * 0.4;
@@ -3843,6 +4249,34 @@ impl TasteEngine {
                     let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
                     return dedup_and_interleave(ranked, count, 2);
                 }
+            }
+            let scoped_fallback: Vec<Track> = match mode {
+                RadioMode::Discover => self.scoped_external_candidates(
+                    user_id,
+                    &sctx,
+                    &scope,
+                    exclude_ids,
+                    false,
+                    count,
+                ),
+                RadioMode::Familiar => self.scoped_external_candidates(
+                    user_id,
+                    &sctx,
+                    &scope,
+                    exclude_ids,
+                    true,
+                    count,
+                ),
+                RadioMode::Default => self
+                    .for_you_tracks(user_id, (count * 5).max(80))
+                    .into_iter()
+                    .filter(|t| {
+                        !exclude_ids.contains(&t.id) && scope.matches_external_candidate(t)
+                    })
+                    .collect(),
+            };
+            if !scoped_fallback.is_empty() || scope.topic_key.is_some() || !scope.genres.is_empty() {
+                return self.rank_fallback_with_recent(scoped_fallback, &recent_penalties, count);
             }
         }
         let picks: Vec<Track> = match mode {
@@ -6176,6 +6610,19 @@ fn curated_playlist_title_score(pl_title: &str, intent: &SearchIntent) -> Option
 }
 
 fn genre_family(g_low: &str) -> Option<u8> {
+    if [
+        "christmas",
+        "xmas",
+        "holiday",
+        "holidays",
+        "festive",
+        "yuletide",
+    ]
+    .iter()
+    .any(|k| contains_term(g_low, k))
+    {
+        return Some(14);
+    }
     if ["k-pop", "kpop", "korean pop"]
         .iter()
         .any(|k| contains_term(g_low, k))
@@ -9360,6 +9807,348 @@ mod tests {
             !rec_artist_names.contains(&"Ryokuoushoku Shakai"),
             "already followed artist leaked: {:?}",
             rec_artist_names
+        );
+    }
+
+    #[tokio::test]
+    async fn familiar_and_discover_radio_stay_on_topic_and_genre() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("xmas_jpop_user", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mut tracks = Vec::new();
+        // Heavy J-Pop user history so global for_you_tracks / discover_weekly are dominated by J-Pop.
+        for i in 0..8 {
+            tracks.push(Track {
+                id: format!("loc:jpop-fam-{}", i),
+                source: "local".into(),
+                title: format!("Tokyo Neon {}", i),
+                artist: format!("J-Pop Star {}", i),
+                album: "Shibuya Nights".into(),
+                genre: "J-Pop".into(),
+                moods: "upbeat,energetic".into(),
+                bitrate: 900,
+                duration: 220,
+                ..Default::default()
+            });
+            tracks.push(Track {
+                id: format!("loc:jpop-new-{}", i),
+                source: "local".into(),
+                title: format!("Osaka Sunrise {}", i),
+                artist: format!("J-Pop Newcomer {}", i),
+                album: "City Lights".into(),
+                genre: "J-Pop".into(),
+                moods: "upbeat,energetic".into(),
+                bitrate: 900,
+                duration: 215,
+                ..Default::default()
+            });
+        }
+
+        // Christmas tracks: 1 seed, 2 familiar, 3 unheard discoveries.
+        let xmas_seed = Track {
+            id: "loc:xmas-seed".into(),
+            source: "local".into(),
+            title: "All I Want for Christmas Is You".into(),
+            artist: "Mariah Carey".into(),
+            album: "Merry Christmas".into(),
+            genre: "Pop".into(),
+            moods: "upbeat,happy".into(),
+            bitrate: 900,
+            duration: 241,
+            ..Default::default()
+        };
+        let xmas_fam_1 = Track {
+            id: "loc:xmas-fam-1".into(),
+            source: "local".into(),
+            title: "Last Christmas".into(),
+            artist: "Wham!".into(),
+            album: "Music from the Edge of Heaven".into(),
+            genre: "Pop".into(),
+            moods: "upbeat,chill".into(),
+            bitrate: 900,
+            duration: 262,
+            ..Default::default()
+        };
+        let xmas_fam_2 = Track {
+            id: "loc:xmas-fam-2".into(),
+            source: "local".into(),
+            title: "White Christmas".into(),
+            artist: "Bing Crosby".into(),
+            album: "Holiday Inn".into(),
+            genre: "Holiday".into(),
+            moods: "chill".into(),
+            bitrate: 900,
+            duration: 185,
+            ..Default::default()
+        };
+        let xmas_new_1 = Track {
+            id: "loc:xmas-new-1".into(),
+            source: "local".into(),
+            title: "Jingle Bell Rock".into(),
+            artist: "Bobby Helms".into(),
+            album: "Christmas Classics".into(),
+            genre: "Holiday".into(),
+            moods: "upbeat".into(),
+            bitrate: 900,
+            duration: 131,
+            ..Default::default()
+        };
+        let xmas_new_2 = Track {
+            id: "loc:xmas-new-2".into(),
+            source: "local".into(),
+            title: "Let It Snow! Let It Snow!".into(),
+            artist: "Dean Martin".into(),
+            album: "A Winter Romance".into(),
+            genre: "Jazz".into(),
+            moods: "chill".into(),
+            bitrate: 900,
+            duration: 117,
+            ..Default::default()
+        };
+        let xmas_new_3 = Track {
+            id: "loc:xmas-new-3".into(),
+            source: "local".into(),
+            title: "Feliz Navidad".into(),
+            artist: "Jose Feliciano".into(),
+            album: "Feliz Navidad".into(),
+            genre: "Pop".into(),
+            moods: "upbeat".into(),
+            bitrate: 900,
+            duration: 182,
+            ..Default::default()
+        };
+
+        // Jazz tracks to verify non-seasonal genre scoping too.
+        let jazz_seed = Track {
+            id: "loc:jazz-seed".into(),
+            source: "local".into(),
+            title: "So What".into(),
+            artist: "Miles Davis".into(),
+            album: "Kind of Blue".into(),
+            genre: "Jazz".into(),
+            moods: "chill,night".into(),
+            bitrate: 900,
+            duration: 545,
+            ..Default::default()
+        };
+        let jazz_fam = Track {
+            id: "loc:jazz-fam".into(),
+            source: "local".into(),
+            title: "Take Five".into(),
+            artist: "Dave Brubeck".into(),
+            album: "Time Out".into(),
+            genre: "Jazz".into(),
+            moods: "chill".into(),
+            bitrate: 900,
+            duration: 324,
+            ..Default::default()
+        };
+        let jazz_new = Track {
+            id: "loc:jazz-new".into(),
+            source: "local".into(),
+            title: "Blue Train".into(),
+            artist: "John Coltrane".into(),
+            album: "Blue Train".into(),
+            genre: "Jazz".into(),
+            moods: "night".into(),
+            bitrate: 900,
+            duration: 643,
+            ..Default::default()
+        };
+
+        tracks.extend([
+            xmas_seed.clone(),
+            xmas_fam_1.clone(),
+            xmas_fam_2.clone(),
+            xmas_new_1.clone(),
+            xmas_new_2.clone(),
+            xmas_new_3.clone(),
+            jazz_seed.clone(),
+            jazz_fam.clone(),
+            jazz_new.clone(),
+        ]);
+        store.upsert_tracks(&tracks).unwrap();
+
+        // Build strong J-Pop preference, plus familiarity with two Christmas tracks and one Jazz track.
+        for i in 0..8 {
+            let tid = format!("loc:jpop-fam-{}", i);
+            for _ in 0..4 {
+                taste.record_event(u.id, &tid, "play", 1.0);
+                taste.record_event(u.id, &tid, "complete", 1.0);
+            }
+            store.star_track(u.id, &tid).unwrap();
+            taste.record_event(u.id, &tid, "star", 1.0);
+        }
+        store.star_track(u.id, &xmas_fam_1.id).unwrap();
+        store.star_track(u.id, &xmas_fam_2.id).unwrap();
+        taste.record_event(u.id, &xmas_fam_1.id, "star", 1.0);
+        taste.record_event(u.id, &xmas_fam_2.id, "star", 1.0);
+        store.star_track(u.id, &jazz_fam.id).unwrap();
+        taste.record_event(u.id, &jazz_fam.id, "star", 1.0);
+        taste.mark_taste_dirty(u.id);
+
+        // 1. Track-seeded Christmas radio in Familiar mode: must NOT play J-Pop.
+        let xmas_familiar = taste
+            .radio_next_tracks_with_mode(
+                u.id,
+                Some(&xmas_seed),
+                &HashSet::new(),
+                &[],
+                6,
+                RadioMode::Familiar,
+            )
+            .await;
+        let xmas_fam_ids: Vec<&str> = xmas_familiar.iter().map(|t| t.id.as_str()).collect();
+        assert!(!xmas_fam_ids.is_empty());
+        assert!(
+            !xmas_fam_ids.iter().any(|id| id.contains("jpop")),
+            "Familiar Christmas radio leaked J-Pop: {:?}",
+            xmas_fam_ids
+        );
+        assert!(
+            xmas_fam_ids.contains(&xmas_fam_1.id.as_str())
+                && xmas_fam_ids.contains(&xmas_fam_2.id.as_str()),
+            "Familiar Christmas radio should include familiar Christmas tracks: {:?}",
+            xmas_fam_ids
+        );
+
+        // 2. Track-seeded Christmas radio in Discover mode: must return unheard Christmas tracks, no J-Pop.
+        let xmas_discover = taste
+            .radio_next_tracks_with_mode(
+                u.id,
+                Some(&xmas_seed),
+                &HashSet::new(),
+                &[],
+                6,
+                RadioMode::Discover,
+            )
+            .await;
+        let xmas_disc_ids: Vec<&str> = xmas_discover.iter().map(|t| t.id.as_str()).collect();
+        assert!(!xmas_disc_ids.is_empty());
+        assert!(
+            !xmas_disc_ids.iter().any(|id| id.contains("jpop")),
+            "Discover Christmas radio leaked J-Pop: {:?}",
+            xmas_disc_ids
+        );
+        assert!(
+            !xmas_disc_ids.contains(&xmas_fam_1.id.as_str())
+                && !xmas_disc_ids.contains(&xmas_fam_2.id.as_str()),
+            "Discover Christmas radio should exclude familiar Christmas tracks: {:?}",
+            xmas_disc_ids
+        );
+        assert!(
+            xmas_discover.iter().all(|t| track_matches_topic(t, "christmas")),
+            "Discover Christmas radio should stay on-topic: {:?}",
+            xmas_discover
+                .iter()
+                .map(|t| format!("{}: {}", t.id, t.title))
+                .collect::<Vec<_>>()
+        );
+
+        // 3. Track-seeded Jazz radio in Familiar & Discover modes: must NOT play J-Pop.
+        let jazz_familiar = taste
+            .radio_next_tracks_with_mode(
+                u.id,
+                Some(&jazz_seed),
+                &HashSet::new(),
+                &[],
+                4,
+                RadioMode::Familiar,
+            )
+            .await;
+        let jazz_fam_ids: Vec<&str> = jazz_familiar.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            !jazz_fam_ids.iter().any(|id| id.contains("jpop")),
+            "Familiar Jazz radio leaked J-Pop: {:?}",
+            jazz_fam_ids
+        );
+        assert!(jazz_fam_ids.contains(&jazz_fam.id.as_str()), "jazz_fam={:?}", jazz_fam_ids);
+
+        let jazz_discover = taste
+            .radio_next_tracks_with_mode(
+                u.id,
+                Some(&jazz_seed),
+                &HashSet::new(),
+                &[],
+                4,
+                RadioMode::Discover,
+            )
+            .await;
+        let jazz_disc_ids: Vec<&str> = jazz_discover.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            !jazz_disc_ids.iter().any(|id| id.contains("jpop")),
+            "Discover Jazz radio leaked J-Pop: {:?}",
+            jazz_disc_ids
+        );
+        assert!(!jazz_disc_ids.is_empty());
+        assert!(!jazz_disc_ids.contains(&jazz_fam.id.as_str()), "jazz_disc={:?}", jazz_disc_ids);
+        assert!(
+            jazz_discover
+                .iter()
+                .all(|t| !has_genre_clash(t, "", &["jazz".to_string()])),
+            "Discover Jazz radio should stay on Jazz: {:?}",
+            jazz_disc_ids
+        );
+
+        // 4. Playlist-seeded Christmas radio in Familiar & Discover modes: must NOT play J-Pop.
+        let pl = store
+            .create_playlist(
+                u.id,
+                "Christmas Classics",
+                "Holiday favorites",
+                false,
+                &[xmas_seed.id.clone()],
+            )
+            .unwrap();
+
+        let pl_familiar = taste
+            .playlist_radio_tracks_with_mode(
+                u.id,
+                &pl.id,
+                &HashSet::from([xmas_seed.id.clone()]),
+                &[],
+                6,
+                RadioMode::Familiar,
+            )
+            .await;
+        let pl_fam_ids: Vec<&str> = pl_familiar.iter().map(|t| t.id.as_str()).collect();
+        assert!(!pl_fam_ids.is_empty());
+        assert!(
+            !pl_fam_ids.iter().any(|id| id.contains("jpop")),
+            "Playlist Familiar Christmas radio leaked J-Pop: {:?}",
+            pl_fam_ids
+        );
+        assert!(
+            pl_fam_ids.contains(&xmas_fam_1.id.as_str())
+                && pl_fam_ids.contains(&xmas_fam_2.id.as_str()),
+            "Playlist Familiar should surface familiar Christmas tracks: {:?}",
+            pl_fam_ids
+        );
+
+        let pl_discover = taste
+            .playlist_radio_tracks_with_mode(
+                u.id,
+                &pl.id,
+                &HashSet::from([xmas_seed.id.clone()]),
+                &[],
+                6,
+                RadioMode::Discover,
+            )
+            .await;
+        let pl_disc_ids: Vec<&str> = pl_discover.iter().map(|t| t.id.as_str()).collect();
+        assert!(!pl_disc_ids.is_empty());
+        assert!(
+            !pl_disc_ids.iter().any(|id| id.contains("jpop")),
+            "Playlist Discover Christmas radio leaked J-Pop: {:?}",
+            pl_disc_ids
         );
     }
 }
