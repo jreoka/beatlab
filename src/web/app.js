@@ -1609,9 +1609,11 @@
       const quickPicks = cacheTracks(d.quickPicks || []).slice(0, 6);
       const trending = cacheTracks(d.trending || []);
       const recent = cacheTracks(d.recent || []);
+      const relatedTracks = cacheTracks(d.relatedTracks || []);
       const mixes = d.madeForYou || [];
       const albums = d.albums || [];
       const artists = d.artists || [];
+      const recommendedArtists = d.recommendedArtists || [];
       const moods = d.moods || [];
 
       let html = `<h1 class="page-greeting">${greetingText()}, ${esc(state.user.username)}</h1>`;
@@ -1634,6 +1636,20 @@
         html += `<section class="section">
           <div class="section-head"><h2>Recently Played</h2></div>
           <div class="card-grid">${recent.slice(0, 8).map(renderTrackCard).join('')}</div>
+        </section>`;
+      }
+
+      if (relatedTracks.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Related Tracks For You</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="track-table">${renderTrackRows(relatedTracks.slice(0, 10), relatedTracks)}</div>
+        </section>`;
+      }
+
+      if (recommendedArtists.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Artists You Might Like</h2></div>
+          <div class="card-grid">${recommendedArtists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
 
@@ -1699,9 +1715,11 @@
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const charts = cacheTracks(d.charts || []);
       const discoveryPicks = cacheTracks(d.discoveryPicks || []);
+      const relatedTracks = cacheTracks(d.relatedTracks || []);
       const moments = d.moments || [];
       const decades = d.decades || [];
       const artists = d.artists || [];
+      const recommendedArtists = d.recommendedArtists || [];
       const curator = d.curator || null;
       const curatorBadge = curator
         ? `<span class="curator-pill" title="Server continuously curates moods, moments, and discovery pools in the background"><span class="curator-dot"></span>Live Curator · ${Number(curator.catalogTracks || 0).toLocaleString()} tracks · ${curator.readyMoods || 0}/${curator.totalMoods || 10} moods ready</span>`
@@ -1738,6 +1756,20 @@
         html += `<section class="section">
           <div class="section-head"><h2>Fresh Discovery Picks</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(discoveryPicks.map((t) => t.id)))}, 0)">Play All</button></div>
           <div class="track-table">${renderTrackRows(discoveryPicks)}</div>
+        </section>`;
+      }
+
+      if (relatedTracks.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Related Tracks</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="track-table">${renderTrackRows(relatedTracks)}</div>
+        </section>`;
+      }
+
+      if (recommendedArtists.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Artists You Might Like</h2></div>
+          <div class="card-grid">${recommendedArtists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
 
@@ -2232,7 +2264,9 @@
       const top = cacheTracks(d.topTracks || []);
       const albums = d.albums || [];
       const related = d.related || [];
+      const relatedTracks = cacheTracks(d.relatedTracks || []);
       const idsJson = esc(JSON.stringify(top.map((t) => t.id)));
+      state.artistView = { top, expanded: false };
 
       let html = `<div class="hero-header">
         <img class="hero-art round" src="${esc(art.coverUrl)}" alt="${esc(art.name)}" />
@@ -2250,15 +2284,24 @@
       </div>`;
 
       if (top.length > 0) {
+        const showMore = top.length > 15
+          ? `<button id="artist-tracks-toggle" class="mini-btn" onclick="App.toggleArtistTracks()">Show all (${top.length})</button>`
+          : '';
         html += `<section class="section">
-          <div class="section-head"><h2>Popular</h2></div>
-          <div class="track-table">${renderTrackRows(top.slice(0, 10), top)}</div>
+          <div class="section-head"><h2>Popular</h2>${showMore}</div>
+          <div id="artist-popular-table" class="track-table">${renderTrackRows(top.slice(0, 15), top)}</div>
         </section>`;
       }
       if (albums.length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Discography</h2></div>
           <div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>
+        </section>`;
+      }
+      if (relatedTracks.length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>Related Tracks</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="track-table">${renderTrackRows(relatedTracks)}</div>
         </section>`;
       }
       if (related.length > 0) {
@@ -5791,6 +5834,19 @@
     startPlaylistRadio,
     setSearchFilter,
     toggleMixExpand,
+    toggleArtistTracks: () => {
+      if (!state.artistView || !Array.isArray(state.artistView.top)) return;
+      state.artistView.expanded = !state.artistView.expanded;
+      const { top, expanded } = state.artistView;
+      const tbl = $('artist-popular-table');
+      if (tbl) {
+        tbl.innerHTML = renderTrackRows(expanded ? top : top.slice(0, 15), top);
+      }
+      const btn = $('artist-tracks-toggle');
+      if (btn) {
+        btn.textContent = expanded ? 'Show fewer' : `Show all (${top.length})`;
+      }
+    },
     runRefinedSearch,
     playSearchTrack,
     createInstantMixForSearch,

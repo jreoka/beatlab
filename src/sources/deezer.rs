@@ -59,9 +59,11 @@ impl DeezerSource {
                 Ok(r) => r,
                 Err(e) => {
                     drop(permit);
-                    if attempt == 0 {
-                        warn!(error = %e, url, "deezer request failed");
+                    if attempt < 1 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
                     }
+                    warn!(error = %e, url, "deezer request failed");
                     return None;
                 }
             };
@@ -318,8 +320,8 @@ impl DeezerSource {
     ) -> Option<(ArtistSummary, Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
         let eid = urlencoding::encode(deezer_artist_id);
         let u_info = format!("https://api.deezer.com/artist/{}", eid);
-        let u_top = format!("https://api.deezer.com/artist/{}/top?limit=20", eid);
-        let u_albums = format!("https://api.deezer.com/artist/{}/albums?limit=30", eid);
+        let u_top = format!("https://api.deezer.com/artist/{}/top?limit=50", eid);
+        let u_albums = format!("https://api.deezer.com/artist/{}/albums?limit=50", eid);
         let u_related = format!("https://api.deezer.com/artist/{}/related?limit=12", eid);
 
         let (r_info, r_top, r_albums, r_related) = tokio::join!(
@@ -610,25 +612,24 @@ fn playlist_title_relevance_score(title: &str, query_low: &str) -> Option<i32> {
         return Some(1);
     }
 
+    let intent = crate::taste::parse_search_intent(query_low);
+    if !intent.genres.is_empty() {
+        if !intent
+            .genres
+            .iter()
+            .any(|g| crate::taste::genre_matches_text(&title_norm, g))
+        {
+            return None;
+        }
+        if crate::taste::has_conflicting_scene_genre(&title_norm, &intent.genres, &q_norm) {
+            return None;
+        }
+    }
+
     let mut score = 0i32;
     let mut matched = 0usize;
     for tok in &content_tokens {
-        let synonym_hit = match *tok {
-            "christmas" | "xmas" => ["christmas", "xmas", "holiday", "noel"]
-                .iter()
-                .any(|s| crate::taste::contains_term(&title_norm, s)),
-            "lofi" | "lo-fi" => ["lofi", "lo-fi", "chillhop", "chill"]
-                .iter()
-                .any(|s| crate::taste::contains_term(&title_norm, s)),
-            "hip-hop" | "hiphop" => ["hip-hop", "hip hop", "hiphop", "rap"]
-                .iter()
-                .any(|s| crate::taste::contains_term(&title_norm, s)),
-            "r&b" | "rnb" => ["r&b", "rnb", "soul"]
-                .iter()
-                .any(|s| crate::taste::contains_term(&title_norm, s)),
-            _ => crate::taste::contains_term(&title_norm, tok),
-        };
-        if synonym_hit {
+        if crate::taste::playlist_token_matches(&title_norm, tok) {
             matched += 1;
             score += 20;
         }
@@ -996,5 +997,17 @@ mod tests {
             "ambient instrumental"
         ));
         assert!(is_usable_mix_playlist(&mk("Melancholy Indie Folk", 45), "melancholy indie"));
+    }
+
+    #[test]
+    fn playlist_relevance_matches_hyphenated_genres_and_rejects_scene_clashes() {
+        assert!(playlist_title_relevance_score("Top J-Pop", "jpop").is_some());
+        assert!(playlist_title_relevance_score("J-Pop Essentials", "jpop").is_some());
+        assert!(playlist_title_relevance_score("KPOP x JPOP mix", "jpop").is_none());
+        assert!(playlist_title_relevance_score("MIX J-POP / K-POP", "j-pop").is_none());
+        assert!(playlist_title_relevance_score("Top K-Pop", "kpop").is_some());
+        assert!(playlist_title_relevance_score("Top J-Rock", "jrock").is_some());
+        assert!(playlist_title_relevance_score("Pop Hits", "city pop").is_none());
+        assert!(playlist_title_relevance_score("80s Japanese City Pop", "city pop").is_some());
     }
 }

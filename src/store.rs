@@ -1289,6 +1289,43 @@ impl Store {
         Ok(list)
     }
 
+    pub fn featured_artist_summaries(&self, limit: usize) -> AppResult<Vec<ArtistSummary>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let mut ranked: Vec<(f64, ArtistSummary)> = self
+            .build_artist_summaries()?
+            .into_iter()
+            .filter(|a| !is_junk_featured_artist_name(&a.name))
+            .map(|a| {
+                let mut score = 0.0f64;
+                if !a.cover_url.trim().is_empty() {
+                    score += 100.0;
+                }
+                if !a.deezer_id.trim().is_empty() {
+                    score += 40.0;
+                }
+                if let Some(fans_str) = a.bio.split_whitespace().next() {
+                    if let Ok(fans) = fans_str.parse::<u64>() {
+                        if fans > 0 {
+                            score += (fans as f64).log10() * 12.0;
+                        }
+                    }
+                }
+                score += (a.song_count.min(25) as f64) * 2.0;
+                score += (a.album_count.min(10) as f64) * 3.0;
+                (score, a)
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.song_count.cmp(&a.1.song_count))
+                .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+        });
+        Ok(ranked.into_iter().take(limit).map(|(_, a)| a).collect())
+    }
+
     pub fn artist_summary_by_id(&self, artist_id: &str) -> AppResult<Option<ArtistSummary>> {
         let summaries = self.build_artist_summaries()?;
         if let Some(exact) = summaries
@@ -2949,10 +2986,51 @@ fn artist_genre_index_locked(
         .collect())
 }
 
+pub(crate) fn is_junk_featured_artist_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let low = trimmed.to_lowercase();
+    if matches!(
+        low.as_str(),
+        "unknown" | "unknown artist" | "various" | "various artists" | "va" | "artist" | "none" | "null" | "untitled"
+    ) {
+        return true;
+    }
+    let stripped_bang = low.trim_start_matches('!').trim();
+    if stripped_bang.is_empty() || stripped_bang == "artist" {
+        return true;
+    }
+    if !trimmed.chars().any(|c| c.is_alphabetic()) {
+        return true;
+    }
+    for bad in [
+        "to sort",
+        "unsorted",
+        "new folder",
+        "greatest hits",
+        "super hits",
+        "pop hits",
+        "karaoke",
+        "tribute",
+        "cover band",
+        "covers",
+    ] {
+        if low.contains(bad) {
+            return true;
+        }
+    }
+    if low.ends_with(" hits") {
+        return true;
+    }
+    false
+}
+
 fn migrate_legacy_moods(conn: &mut Connection) -> AppResult<()> {
     let done: Option<String> = conn
         .query_row(
-            "SELECT value FROM kv WHERE key = 'moods_classifier_v2'",
+            "SELECT value FROM kv WHERE key = 'moods_classifier_v3'",
             [],
             |r| r.get(0),
         )
@@ -3001,8 +3079,9 @@ fn migrate_legacy_moods(conn: &mut Connection) -> AppResult<()> {
         }
     }
 
+    conn.execute("DELETE FROM kv WHERE key LIKE 'curated:%'", [])?;
     conn.execute(
-        "INSERT OR REPLACE INTO kv(key, value) VALUES ('moods_classifier_v2', '1')",
+        "INSERT OR REPLACE INTO kv(key, value) VALUES ('moods_classifier_v3', '1')",
         [],
     )?;
     Ok(())
@@ -3328,9 +3407,9 @@ mod tests {
                 .upsert_tracks(&[waltz, untagged, cover, eno_known, eno_ytm])
                 .unwrap();
 
-            // Simulate upgrading a legacy pre-v2 database where kv flag does not yet exist.
+            // Simulate upgrading a legacy pre-v3 database where kv flag does not yet exist.
             let conn = store.lock();
-            conn.execute("DELETE FROM kv WHERE key = 'moods_classifier_v2'", [])
+            conn.execute("DELETE FROM kv WHERE key = 'moods_classifier_v3'", [])
                 .unwrap();
         }
 
@@ -3566,5 +3645,39 @@ mod tests {
         let jp_albums = store.artist_albums(0, "ar:dz:418196").unwrap();
         assert!(jp_albums.iter().any(|a| a.name == "LEO-NiNE"));
         assert!(!jp_albums.iter().any(|a| a.name == "LALISA"));
+    }
+
+    #[test]
+    fn featured_artist_summaries_filters_junk_and_ranks_by_quality_not_alphabet() {
+        let store = Store::open_memory().unwrap();
+        let tracks = vec![
+            sample_track("t1", "Song", "!ARTIST", "Alb"),
+            sample_track("t2", "Song", "03 2025", "Alb"),
+            sample_track("t3", "Song", "07", "Alb"),
+            sample_track("t4", "Song", "08 To Sort", "Alb"),
+            sample_track("t5", "Song", "'80s Pop Hits", "Alb"),
+            sample_track("t6", "Song", "Unknown Artist", "Alb"),
+            sample_track("t7", "Song", "! 멜 벅", "Alb"),
+            sample_track("t8", "Idol", "YOASOBI", "THE BOOK"),
+            sample_track("t9", "Tracing A Dream", "YOASOBI", "THE BOOK"),
+        ];
+        store.upsert_tracks(&tracks).unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:999".into(),
+                name: "YOASOBI".into(),
+                cover_url: "https://cdn.deezer.com/yoasobi.jpg".into(),
+                bio: "500000 fans on Deezer".into(),
+                deezer_id: "999".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let featured = store.featured_artist_summaries(5).unwrap();
+        let names: Vec<&str> = featured.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names.first().copied(), Some("YOASOBI"), "featured={:?}", names);
+        for junk in ["!ARTIST", "03 2025", "07", "08 To Sort", "'80s Pop Hits", "Unknown Artist"] {
+            assert!(!names.contains(&junk), "junk leaked into featured: {:?}", names);
+        }
     }
 }

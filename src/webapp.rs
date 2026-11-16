@@ -782,17 +782,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
             .take(12)
             .collect()
     };
-    let artists = if !chart_artists.is_empty() {
-        chart_artists
-    } else {
-        state
-            .store
-            .build_artist_summaries()
-            .unwrap_or_default()
-            .into_iter()
-            .take(12)
-            .collect()
-    };
+    let artists = resolve_featured_artists(&state, chart_artists, 12);
 
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
@@ -811,10 +801,15 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
         })
         .collect();
 
+    let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
+    let recommended_artists = state.taste.recommended_artists_for_user(uid, 12);
+
     json_res(json!({
         "quickPicks": to_web_tracks(&state, uid, &quick_picks),
         "recent": to_web_tracks(&state, uid, &recent),
         "madeForYou": auto_mixes,
+        "relatedTracks": to_web_tracks(&state, uid, &related_tracks),
+        "recommendedArtists": recommended_artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "trending": to_web_tracks(&state, uid, &trending_tracks),
         "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
@@ -921,17 +916,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
             .take(18)
             .collect()
     };
-    let artists = if !chart_artists.is_empty() {
-        chart_artists
-    } else {
-        state
-            .store
-            .build_artist_summaries()
-            .unwrap_or_default()
-            .into_iter()
-            .take(14)
-            .collect()
-    };
+    let artists = resolve_featured_artists(&state, chart_artists, 14);
 
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
@@ -945,17 +930,61 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         },
     );
 
+    let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
+    let recommended_artists = state.taste.recommended_artists_for_user(uid, 14);
+
     json_res(json!({
         "moods": moods,
         "moments": moments,
         "decades": decades,
         "discoveryPicks": to_web_tracks(&state, uid, &discovery_picks),
+        "relatedTracks": to_web_tracks(&state, uid, &related_tracks),
+        "recommendedArtists": recommended_artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "genres": genres,
         "charts": to_web_tracks(&state, uid, &visible_charts),
         "newAlbums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "curator": state.taste.curator_status_snapshot(),
     }))
+}
+
+fn resolve_featured_artists(
+    state: &AppState,
+    chart_artists: Vec<ArtistSummary>,
+    limit: usize,
+) -> Vec<ArtistSummary> {
+    const CHART_ARTISTS_KV_KEY: &str = "explore:chart_artists_v1";
+    const CHART_ARTISTS_TTL_SECS: i64 = 24 * 3600;
+    let now = chrono::Utc::now().timestamp();
+
+    if !chart_artists.is_empty() {
+        let payload = serde_json::json!({
+            "ts": now,
+            "artists": chart_artists,
+        });
+        state.store.kv_set(CHART_ARTISTS_KV_KEY, &payload.to_string());
+        return chart_artists.into_iter().take(limit).collect();
+    }
+
+    if let Some(raw) = state.store.kv_get(CHART_ARTISTS_KV_KEY) {
+        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+            let ts = val.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+            if now - ts <= CHART_ARTISTS_TTL_SECS {
+                if let Some(arr) = val.get("artists").cloned() {
+                    if let Ok(cached) = serde_json::from_value::<Vec<ArtistSummary>>(arr) {
+                        if !cached.is_empty() {
+                            return cached.into_iter().take(limit).collect();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    state
+        .store
+        .featured_artist_summaries(limit)
+        .unwrap_or_default()
 }
 
 pub async fn explore_mix(
@@ -1308,6 +1337,9 @@ pub async fn instant_mix(
                     return true;
                 }
             }
+            if !intent.genres.is_empty() && crate::taste::has_genre_clash(t, "", &intent.genres) {
+                return true;
+            }
             false
         };
 
@@ -1330,6 +1362,34 @@ pub async fn instant_mix(
             if let Some((min_y, max_y)) = intent.year_range {
                 if t.year >= min_y && t.year <= max_y {
                     prio += 200;
+                }
+            }
+            if !intent.genres.is_empty() {
+                let g_low = t.genre.to_lowercase();
+                let tl = t.title.to_lowercase();
+                if intent
+                    .genres
+                    .iter()
+                    .any(|g| crate::taste::genre_matches_text(&g_low, g))
+                {
+                    prio += 200;
+                } else {
+                    if t.source == "ytm" {
+                        prio += 40;
+                    }
+                    // Title-word collisions (e.g. "K-POP" by The Weeknd or "meowsynth jpop")
+                    // make poor YTM radio seeds when the track has no matching genre tag.
+                    if crate::taste::has_conflicting_scene_genre(
+                        &tl,
+                        &intent.genres,
+                        &intent.normalized,
+                    ) || intent
+                        .genres
+                        .iter()
+                        .any(|g| crate::taste::genre_matches_text(&tl, g))
+                    {
+                        prio -= 150;
+                    }
                 }
             }
             ranked_seed_cands.push((prio, vid));
@@ -1756,6 +1816,14 @@ pub async fn artist_detail(
     else {
         return err_res(StatusCode::NOT_FOUND, "Artist not found");
     };
+    let related_tracks = filter_visible_tracks(
+        &state,
+        user.id,
+        state
+            .taste
+            .artist_related_tracks(&artist, &related, &top_tracks, 12)
+            .await,
+    );
     let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
     let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
     json_res(json!({
@@ -1763,6 +1831,7 @@ pub async fn artist_detail(
         "topTracks": to_web_tracks(&state, user.id, &top_tracks),
         "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "related": related.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
+        "relatedTracks": to_web_tracks(&state, user.id, &related_tracks),
     }))
 }
 

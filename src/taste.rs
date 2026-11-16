@@ -294,13 +294,13 @@ const MOOD_TITLE_RULES: &[(Mood, &[&str])] = &[
     ),
     (
         Mood::Energy,
-        &["workout", "phonk", "hardstyle", "dubstep", "metalcore", "drum and bass", "thrash"],
+        &["phonk", "hardstyle", "dubstep", "metalcore", "drum and bass", "thrash"],
     ),
     (
         Mood::LateNight,
-        &["synthwave", "darkwave", "dark ambient", "vaporwave", "after hours", "late night", "nightcall"],
+        &["synthwave", "darkwave", "dark ambient", "vaporwave"],
     ),
-    (Mood::Upbeat, &["synthpop", "electropop", "dance pop", "feel good"]),
+    (Mood::Upbeat, &["synthpop", "electropop", "dance pop"]),
     (Mood::Melancholy, &["melancholy", "slowcore", "sadcore", "heartbreak ballad"]),
     (
         Mood::Party,
@@ -737,7 +737,16 @@ impl SearchIntent {
             }
         } else if self.is_theme_mix {
             out.push(self.normalized.clone());
-            if !self.normalized.contains("hits") && !self.normalized.contains("mix") {
+            if self.genres.len() == 1 {
+                let canonical = self.genres[0].to_lowercase();
+                if canonical != self.normalized {
+                    out.push(canonical);
+                }
+            }
+            if out.len() < 2
+                && !self.normalized.contains("hits")
+                && !self.normalized.contains("mix")
+            {
                 out.push(format!("{} mix", self.normalized));
             }
         }
@@ -771,7 +780,8 @@ impl SearchIntent {
         let mut hints: Vec<&'static str> = Vec::new();
         for g in &self.genres {
             let mapped: &[&str] = match g.as_str() {
-                "Pop" | "Synthpop" | "Dream Pop" => &["pop"],
+                "Pop" => &["pop"],
+                "Synthpop" | "Dream Pop" => &[],
                 "Rock" | "Grunge" | "Punk" | "Post-Punk" | "Pop Punk" => &["rock", "alternative"],
                 "Indie" | "Alternative" | "Shoegaze" | "Emo" => &["alternative", "indie", "rock"],
                 "Hip-Hop" | "Rap" | "Trap" => &["rap", "hip hop"],
@@ -789,7 +799,7 @@ impl SearchIntent {
                 "Reggae" => &["reggae"],
                 "Latin" | "Reggaeton" => &["latin"],
                 "Afrobeats" => &["african", "afro"],
-                "J-Pop" | "J-Rock" | "City Pop" | "K-Pop" => &["asian", "pop"],
+                "J-Pop" | "J-Rock" | "City Pop" | "K-Pop" | "C-Pop" => &[],
                 _ => &[],
             };
             for &h in mapped {
@@ -1328,6 +1338,165 @@ impl TasteEngine {
         dedup_and_interleave(ranked, limit, 1)
     }
 
+    /// Returns personalized related tracks drawn from the user's related-artist and radio graph.
+    pub fn related_tracks_for_user(&self, user_id: i64, limit: usize) -> Vec<Track> {
+        if limit == 0 {
+            return vec![];
+        }
+        let candidates = self
+            .store
+            .candidate_tracks_for_user(user_id, 900)
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            return vec![];
+        }
+        let sctx = self.build_scoring_context(user_id);
+        let heard_keys: HashSet<String> = candidates
+            .iter()
+            .filter(|t| {
+                let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
+                st.play_count > 0 || st.skip_count > 0
+            })
+            .map(Track::song_key)
+            .collect();
+
+        let has_rel_graph = !sctx.prof.related_track_affinity.is_empty()
+            || !sctx.prof.related_artist_affinity.is_empty();
+
+        let mut scored: Vec<(f64, Track)> = candidates
+            .into_iter()
+            .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
+            .filter_map(|t| {
+                let key = t.song_key();
+                let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
+                let heard = st.play_count > 0 || st.skip_count > 0 || heard_keys.contains(&key);
+                let known_fav = sctx.prof.starred.contains(&t.id)
+                    || sctx.prof.manual_playlist_ids.contains(&t.id)
+                    || sctx.prof.manual_playlist_song_keys.contains(&key);
+                if heard || known_fav {
+                    return None;
+                }
+                let fctx = build_track_affinities(&t, &sctx.prof);
+                let align = compute_taste_alignment(&t, &sctx.prof, &fctx);
+                let rel_bonus = align.rel_t * 3.0 + align.rel_a * 2.2;
+                if has_rel_graph && rel_bonus <= 0.0 && fctx.genre_affinity <= 0.0 {
+                    return None;
+                }
+                let core = score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Discover);
+                Some((core + rel_bonus, t))
+            })
+            .collect();
+
+        if scored.is_empty() {
+            return self.discover_weekly(user_id, limit);
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        dedup_and_interleave(ranked, limit, 2)
+    }
+
+    /// Returns personalized "Artists You Might Like" based on related artists, genres, and taste profile.
+    pub fn recommended_artists_for_user(&self, user_id: i64, limit: usize) -> Vec<ArtistSummary> {
+        if limit == 0 {
+            return vec![];
+        }
+        let sctx = self.build_scoring_context(user_id);
+        let followed = self.store.followed_artist_ids(user_id).unwrap_or_default();
+        let summaries = self.store.build_artist_summaries().unwrap_or_default();
+        if summaries.is_empty() {
+            return vec![];
+        }
+        let artist_names: Vec<String> = summaries.iter().map(|a| a.name.clone()).collect();
+        let artist_genres = self
+            .store
+            .known_artist_genres_for(&artist_names)
+            .unwrap_or_default();
+
+        let has_taste = profile_has_taste(&sctx.prof)
+            || !sctx.prof.related_artist_affinity.is_empty()
+            || !sctx.prof.genre_affinity.is_empty();
+
+        let mut scored: Vec<(f64, ArtistSummary)> = summaries
+            .into_iter()
+            .filter(|a| {
+                !followed.contains(&a.id)
+                    && !crate::store::is_junk_featured_artist_name(&a.name)
+            })
+            .filter_map(|a| {
+                let ak = slug(&primary_artist(&a.name));
+                if ak.is_empty() {
+                    return None;
+                }
+                let direct_aff = sctx
+                    .prof
+                    .artist_affinity
+                    .get(&a.id)
+                    .or_else(|| sctx.prof.artist_affinity.get(&ak))
+                    .copied()
+                    .unwrap_or(0.0);
+                // Prefer artists the user hasn't already overplayed so recommendations feel fresh.
+                if has_taste && direct_aff > 8.0 {
+                    return None;
+                }
+                let rel_aff = sctx
+                    .prof
+                    .related_artist_affinity
+                    .get(&ak)
+                    .copied()
+                    .unwrap_or(0.0);
+                let ag = artist_genres
+                    .get(&primary_artist(&a.name).to_lowercase())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let mut genre_aff = 0.0f64;
+                for g in split_genres(ag) {
+                    if let Some(&gw) = sctx.prof.genre_affinity.get(&g) {
+                        genre_aff += gw;
+                    }
+                    if let Some(&pgw) = sctx.prof.playlist_genre_affinity.get(&g) {
+                        genre_aff += pgw * 0.7;
+                    }
+                }
+                let taste_rel = rel_aff * 6.5 + genre_aff.min(6.0) * 2.2 - direct_aff * 0.4;
+                if has_taste && rel_aff <= 0.0 && genre_aff <= 0.0 {
+                    return None;
+                }
+
+                let mut pop_score = 0.0f64;
+                if !a.cover_url.trim().is_empty() {
+                    pop_score += 2.5;
+                }
+                if !a.deezer_id.trim().is_empty() {
+                    pop_score += 1.5;
+                }
+                if let Some(fans) = parse_deezer_fans(&a.bio) {
+                    if fans > 0 {
+                        pop_score += (fans as f64).log10() * 0.8;
+                    }
+                }
+                pop_score += (a.song_count.min(15) as f64) * 0.15;
+
+                Some((taste_rel + pop_score, a))
+            })
+            .collect();
+
+        if scored.is_empty() {
+            return self
+                .store
+                .featured_artist_summaries(limit)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| !followed.contains(&a.id))
+                .collect();
+        }
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+        });
+        scored.into_iter().take(limit).map(|(_, a)| a).collect()
+    }
+
     /// Synthesizes a mix built from the musical DNA across all of a user's curated playlists.
     pub fn playlist_dna_mix(&self, user_id: i64, limit: usize) -> Vec<Track> {
         if user_id <= 0 {
@@ -1738,7 +1907,7 @@ impl TasteEngine {
 
     pub async fn curate_explore_mix(&self, spec: &ExploreMixSpec) -> Vec<Track> {
         let intent = parse_search_intent(spec.query);
-        let pl_queries = if intent.is_theme_mix {
+        let mut pl_queries = if intent.is_theme_mix {
             let mut q = intent.playlist_search_queries();
             if q.is_empty() {
                 q.push(spec.query.to_string());
@@ -1747,6 +1916,18 @@ impl TasteEngine {
         } else {
             vec![spec.query.to_string()]
         };
+        if intent.genres.is_empty()
+            && intent.decade_label.is_none()
+            && intent.themes.is_empty()
+            && intent.moods.len() == 1
+        {
+            for mq in mood_playlist_queries(intent.moods[0]) {
+                if !pl_queries.iter().any(|existing| existing.eq_ignore_ascii_case(mq)) {
+                    pl_queries.push((*mq).to_string());
+                }
+            }
+            pl_queries.truncate(3);
+        }
 
         let mut curated_batches = Vec::new();
         for pq in &pl_queries {
@@ -1756,7 +1937,36 @@ impl TasteEngine {
 
         let mut raw_tracks = Vec::new();
         if curated_batches.is_empty() {
-            raw_tracks = self.sources.deezer.search_tracks(spec.query, 20).await;
+            // Avoid `deezer.search_tracks` for mood-only queries like "late night vibes",
+            // since Deezer track search mainly returns literal title-collision tracks.
+            let is_mood_only = !intent.moods.is_empty()
+                && intent.genres.is_empty()
+                && intent.decade_label.is_none()
+                && intent.themes.is_empty();
+            if is_mood_only {
+                let hints = intent.deezer_genre_hints();
+                if !hints.is_empty() {
+                    let dz_genres = self.sources.deezer.fetch_genres().await;
+                    let matched: Vec<_> = dz_genres
+                        .into_iter()
+                        .filter(|g| {
+                            let gl = g.name.to_lowercase();
+                            hints.iter().any(|want| contains_term(&gl, want))
+                        })
+                        .take(2)
+                        .collect();
+                    for g in matched {
+                        let chart = self
+                            .sources
+                            .deezer
+                            .fetch_genre_chart_tracks(g.id, &g.name, 20)
+                            .await;
+                        raw_tracks.extend(chart);
+                    }
+                }
+            } else {
+                raw_tracks = self.sources.deezer.search_tracks(spec.query, 20).await;
+            }
             if raw_tracks.len() < 8 {
                 use crate::sources::MusicSource;
                 let ytm_tracks = self.sources.ytm.search(spec.query, 15).await;
@@ -1772,6 +1982,7 @@ impl TasteEngine {
             let _ = self.store.upsert_tracks(&to_upsert);
         }
 
+        let has_curated = !curated_batches.is_empty();
         let res = self.search_and_refine_with_context(
             0,
             spec.query,
@@ -1784,7 +1995,7 @@ impl TasteEngine {
             .map(|m| m.tracks)
             .unwrap_or_else(|| res.tracks);
         tracks.retain(|t| !is_mood_clutter_track(t));
-        if tracks.len() >= 5 {
+        if has_curated && tracks.len() >= 8 {
             let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
             self.save_curated_pool(&explore_cache_key(spec.key), &ids);
             self.save_curated_pool(&query_cache_key(&intent.normalized), &ids);
@@ -2348,7 +2559,7 @@ impl TasteEngine {
         merge_tracks_dedup(tracks, matched)
     }
 
-    /// Loads full artist profile + top tracks + albums + related artists, hydrating live from Deezer when available.
+    /// Loads full artist profile + top tracks + albums + related artists, hydrating live from Deezer & YTM when available.
     pub async fn get_or_hydrate_artist(
         &self,
         artist_id: &str,
@@ -2356,7 +2567,25 @@ impl TasteEngine {
     ) -> Option<(ArtistSummary, Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
         let local_summary = self.store.artist_summary_by_id(artist_id).ok().flatten();
         let stored_for_id = self.store.artist_tracks(artist_id).unwrap_or_default();
-        let dz_artist_id = artist_id
+        let search_name = local_summary
+            .as_ref()
+            .map(|a| a.name.clone())
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| {
+                stored_for_id
+                    .first()
+                    .map(|t| primary_artist(&t.artist))
+                    .filter(|n| !n.trim().is_empty())
+            })
+            .unwrap_or_else(|| {
+                if artist_id.starts_with("ar:dz:") || artist_id.starts_with("ar:ytm:") {
+                    String::new()
+                } else {
+                    artist_id.trim_start_matches("ar:").replace('-', " ")
+                }
+            });
+
+        let mut dz_artist_id = artist_id
             .strip_prefix("ar:dz:")
             .or_else(|| artist_id.strip_prefix("dz:"))
             .map(|s| s.trim().to_string())
@@ -2369,59 +2598,224 @@ impl TasteEngine {
             })
             .or_else(|| stored_for_id.iter().find_map(Track::deezer_artist_id));
 
-        let resolved_dz_id = match dz_artist_id {
-            Some(id) => Some(id),
-            None => {
-                let name = local_summary
-                    .as_ref()
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| {
-                        artist_id
-                            .trim_start_matches("ar:")
-                            .replace('-', " ")
-                    });
-                let candidates = self.sources.deezer.search_artists(&name, 6).await;
-                let exact_id = candidates.iter().find(|a| a.id == artist_id);
-                let exact_case = candidates.iter().find(|a| a.name == name);
-                let slug_match = candidates.iter().find(|a| slug(&a.name) == slug(&name));
-                exact_id
-                    .or(exact_case)
-                    .or(slug_match)
-                    .map(|a| a.deezer_id.clone())
-                    .filter(|id| !id.is_empty())
-            }
+        let pick_best_dz_candidate = |candidates: Vec<ArtistSummary>, want_name: &str| -> Option<String> {
+            let want_slug = slug(want_name);
+            let mut matching: Vec<(bool, u64, usize, bool, ArtistSummary)> = candidates
+                .into_iter()
+                .filter(|a| {
+                    !a.deezer_id.is_empty()
+                        && (a.id == artist_id
+                            || a.name == want_name
+                            || (!want_slug.is_empty() && slug(&a.name) == want_slug))
+                })
+                .map(|a| {
+                    let exact = a.name == want_name;
+                    let fans = parse_deezer_fans(&a.bio).unwrap_or(0);
+                    let albs = a.album_count;
+                    let has_art = !a.cover_url.trim().is_empty();
+                    (exact, fans, albs, has_art, a)
+                })
+                .collect();
+            matching.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| b.3.cmp(&a.3))
+            });
+            matching.into_iter().next().map(|(_, _, _, _, a)| a.deezer_id)
         };
 
-        if let Some(dz_id) = resolved_dz_id {
-            if let Some((meta, top_tracks, dz_albums, related)) =
-                self.sources.deezer.fetch_artist(&dz_id).await
-            {
-                let _ = self.store.upsert_artist_meta(&meta);
-                let _ = self.store.upsert_tracks(&top_tracks);
-                for a in &dz_albums {
-                    let _ = self.store.upsert_album_meta(a);
+        let mut searched_by_name = false;
+        if dz_artist_id.is_none() && !search_name.is_empty() {
+            searched_by_name = true;
+            let candidates = self.sources.deezer.search_artists(&search_name, 8).await;
+            dz_artist_id = pick_best_dz_candidate(candidates, &search_name);
+        }
+
+        let mut hydrated = if let Some(ref dz_id) = dz_artist_id {
+            self.sources.deezer.fetch_artist(dz_id).await
+        } else {
+            None
+        };
+
+        // Recover if an explicit/cached Deezer ID pointed at an empty stub profile (0 fans / 0 tracks / 0 albums).
+        let is_empty_dz_stub = hydrated
+            .as_ref()
+            .map_or(true, |(_, tops, albs, _)| tops.is_empty() && albs.is_empty());
+        if is_empty_dz_stub && !searched_by_name && !search_name.is_empty() {
+            let candidates = self.sources.deezer.search_artists(&search_name, 8).await;
+            if let Some(better_id) = pick_best_dz_candidate(candidates, &search_name) {
+                if dz_artist_id.as_deref() != Some(better_id.as_str()) {
+                    if let Some(better_res) = self.sources.deezer.fetch_artist(&better_id).await {
+                        if !better_res.1.is_empty() || !better_res.2.is_empty() {
+                            hydrated = Some(better_res);
+                        }
+                    }
                 }
-                for r in &related {
-                    let _ = self.store.upsert_artist_meta(r);
-                }
-                let merged_tracks = merge_tracks_dedup(
-                    top_tracks,
-                    self.store.artist_tracks(&meta.id).unwrap_or_default(),
-                );
-                let upgraded_tracks = self.upgrade_artist_from_soulseek(&meta, merged_tracks).await;
-                let merged_albums = merge_albums_dedup(
-                    dz_albums,
-                    self.store.artist_albums(user_id, &meta.id).unwrap_or_default(),
-                );
-                return Some((meta, upgraded_tracks, merged_albums, related));
             }
         }
 
-        let summary = local_summary?;
-        let tracks = self.store.artist_tracks(&summary.id).unwrap_or_default();
-        let upgraded = self.upgrade_artist_from_soulseek(&summary, tracks).await;
-        let albums = self.store.artist_albums(user_id, &summary.id).unwrap_or_default();
-        Some((summary, upgraded, albums, vec![]))
+        let mut meta = if let Some((ref m, _, _, _)) = hydrated {
+            m.clone()
+        } else if let Some(s) = local_summary.clone() {
+            s
+        } else {
+            return None;
+        };
+
+        let mut dz_top_tracks = Vec::new();
+        let mut dz_albums = Vec::new();
+        let mut related = Vec::new();
+        if let Some((_, top_tracks, albs, rel)) = hydrated {
+            dz_top_tracks = top_tracks;
+            dz_albums = albs;
+            related = rel;
+            let _ = self.store.upsert_artist_meta(&meta);
+            if !dz_top_tracks.is_empty() {
+                let _ = self.store.upsert_tracks(&dz_top_tracks);
+            }
+            for a in &dz_albums {
+                let _ = self.store.upsert_album_meta(a);
+            }
+            for r in &related {
+                let _ = self.store.upsert_artist_meta(r);
+            }
+        }
+
+        let mut combined_local = self.store.artist_tracks(&meta.id).unwrap_or_default();
+        if !stored_for_id.is_empty() {
+            combined_local.extend(stored_for_id);
+        }
+        let mut merged_tracks = merge_tracks_dedup(dz_top_tracks, combined_local);
+
+        // When Deezer returned few/no tracks (or was offline/rate-limited), supplement from YTM & Deezer track search.
+        let artist_name_for_search = if !meta.name.trim().is_empty() {
+            meta.name.clone()
+        } else {
+            search_name
+        };
+        if merged_tracks.len() < 15 && !artist_name_for_search.trim().is_empty() {
+            use crate::sources::MusicSource;
+            let want_dz = (!meta.deezer_id.is_empty()).then(|| meta.deezer_id.as_str());
+            let (ytm_hits, dz_hits) = tokio::join!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(3500),
+                    self.sources.ytm.search(&artist_name_for_search, 25),
+                ),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(3500),
+                    self.sources.deezer.search_tracks(&artist_name_for_search, 25),
+                ),
+            );
+            let mut extra = Vec::new();
+            for t in dz_hits
+                .unwrap_or_default()
+                .into_iter()
+                .chain(ytm_hits.unwrap_or_default())
+            {
+                if !is_same_or_featured_artist(&t.artist, &artist_name_for_search) {
+                    continue;
+                }
+                if let (Some(want), Some(got)) = (want_dz, t.deezer_artist_id().as_deref()) {
+                    if want != got {
+                        continue;
+                    }
+                }
+                extra.push(t);
+            }
+            if !extra.is_empty() {
+                let _ = self.store.upsert_tracks(&extra);
+                merged_tracks = merge_tracks_dedup(merged_tracks, extra);
+            }
+        }
+
+        let upgraded_tracks = self
+            .upgrade_artist_from_soulseek(&meta, merged_tracks)
+            .await;
+        let final_tracks = merge_tracks_dedup(upgraded_tracks, vec![]);
+        let merged_albums = merge_albums_dedup(
+            dz_albums,
+            self.store.artist_albums(user_id, &meta.id).unwrap_or_default(),
+        );
+        if meta.song_count < final_tracks.len() {
+            meta.song_count = final_tracks.len();
+        }
+        if meta.album_count < merged_albums.len() {
+            meta.album_count = merged_albums.len();
+        }
+        Some((meta, final_tracks, merged_albums, related))
+    }
+
+    /// Collects related tracks for an artist page from related artists' catalogs and track radio.
+    pub async fn artist_related_tracks(
+        &self,
+        anchor: &ArtistSummary,
+        related_artists: &[ArtistSummary],
+        anchor_tracks: &[Track],
+        limit: usize,
+    ) -> Vec<Track> {
+        if limit == 0 {
+            return vec![];
+        }
+        let anchor_slug = slug(&primary_artist(&anchor.name));
+        let mut pool: Vec<Track> = Vec::new();
+
+        for rel in related_artists.iter().take(6) {
+            let local_rel = self.store.artist_tracks(&rel.id).unwrap_or_default();
+            pool.extend(local_rel.into_iter().take(4));
+        }
+
+        if pool.len() < limit && !related_artists.is_empty() {
+            let fetch_targets: Vec<String> = related_artists
+                .iter()
+                .filter(|r| !r.deezer_id.is_empty())
+                .take(4)
+                .map(|r| r.deezer_id.clone())
+                .collect();
+            let futs = fetch_targets.into_iter().map(|dz_id| {
+                let dz = self.sources.deezer.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(2500),
+                        dz.fetch_artist_top_tracks(&dz_id, 6),
+                    )
+                    .await
+                    .unwrap_or_default()
+                }
+            });
+            let batches: Vec<Vec<Track>> = futures::future::join_all(futs).await;
+            let fetched: Vec<Track> = batches.into_iter().flatten().collect();
+            if !fetched.is_empty() {
+                let _ = self.store.upsert_tracks(&fetched);
+                pool.extend(fetched);
+            }
+        }
+
+        if pool.len() < 4 && !anchor.deezer_id.is_empty() {
+            if let Ok(radio) = tokio::time::timeout(
+                std::time::Duration::from_millis(2500),
+                self.sources.deezer.fetch_artist_radio(&anchor.deezer_id),
+            )
+            .await
+            {
+                if !radio.is_empty() {
+                    let _ = self.store.upsert_tracks(&radio);
+                    pool.extend(radio);
+                }
+            }
+        }
+
+        let filtered: Vec<Track> = pool
+            .into_iter()
+            .filter(|t| {
+                let ts = slug(&primary_artist(&t.artist));
+                !ts.is_empty()
+                    && ts != anchor_slug
+                    && !is_same_or_featured_artist(&t.artist, &anchor.name)
+                    && !anchor_tracks.iter().any(|at| at.song_key() == t.song_key())
+            })
+            .collect();
+        dedup_and_interleave(filtered, limit, 2)
     }
 
     pub async fn similar_songs_async(&self, seed: &Track, count: usize) -> Vec<Track> {
@@ -2764,6 +3158,9 @@ impl TasteEngine {
                 let has_known_genre = !t.genre.trim().is_empty() || !ag.trim().is_empty();
                 let clean_match = clean_moods.contains(&mood) && (has_known_genre || t.source == "local");
                 if !is_curated && !meta_match && !clean_match {
+                    return None;
+                }
+                if !is_curated && !meta_match && is_mood_title_trap(&t, mood) {
                     return None;
                 }
 
@@ -3586,10 +3983,18 @@ impl TasteEngine {
                         if !is_fallback_compatible(&e.track, ag, e.era_match, e.theme_match) {
                             continue;
                         }
-                        // For era-only queries without curated playlists, avoid generic tracks
-                        // unless we got them from the query search itself or they match era/theme.
+                        // For genre/era queries without curated playlists, avoid letting
+                        // user taste or general popularity lift unverified tracks over relevant hits.
                         if seen_fallback_keys.insert(e.track.song_key()) {
-                            let s = e.mix_score + (e.lex / 220.0).min(2.0);
+                            let s = if e.curated_prior > 0.0
+                                || e.theme_match > 0.0
+                                || e.era_match > 0.0
+                            {
+                                e.mix_score + (e.lex / 220.0).min(2.0)
+                            } else {
+                                (if e.track.source == "ytm" { 1.0 } else { 0.0 })
+                                    + (e.lex / 220.0).min(0.5)
+                            };
                             mix_pool.push((s, e.track.clone()));
                         }
                     }
@@ -4447,18 +4852,28 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         ("rnb", "R&B"),
         ("neo soul", "Neo-Soul"),
         ("neo-soul", "Neo-Soul"),
+        ("neosoul", "Neo-Soul"),
         ("new wave", "New Wave"),
         ("synthpop", "Synthpop"),
+        ("synth-pop", "Synthpop"),
         ("synth pop", "Synthpop"),
         ("synthwave", "Synthwave"),
         ("dream pop", "Dream Pop"),
+        ("dream-pop", "Dream Pop"),
+        ("dreampop", "Dream Pop"),
         ("city pop", "City Pop"),
+        ("city-pop", "City Pop"),
+        ("citypop", "City Pop"),
         ("j-pop", "J-Pop"),
         ("jpop", "J-Pop"),
         ("j-rock", "J-Rock"),
         ("jrock", "J-Rock"),
         ("k-pop", "K-Pop"),
         ("kpop", "K-Pop"),
+        ("c-pop", "C-Pop"),
+        ("cpop", "C-Pop"),
+        ("mandopop", "C-Pop"),
+        ("cantopop", "C-Pop"),
         ("lo-fi", "Lo-Fi"),
         ("lofi", "Lo-Fi"),
         ("drum and bass", "Drum & Bass"),
@@ -4471,7 +4886,9 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         ("shoegaze", "Shoegaze"),
         ("post-punk", "Post-Punk"),
         ("post punk", "Post-Punk"),
+        ("postpunk", "Post-Punk"),
         ("pop punk", "Pop Punk"),
+        ("pop-punk", "Pop Punk"),
         ("alt rock", "Alternative"),
         ("alt-rock", "Alternative"),
         ("alternative", "Alternative"),
@@ -4554,6 +4971,23 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
             themes.push(theme_catalog[6].1.clone());
         }
 
+        // Check multi-word genre phrases first so e.g. "city pop" or "pop punk"
+        // does not also register generic "Pop" / "Punk".
+        let mut phrase_genre_tokens = vec![false; tokens.len()];
+        for &(phrase, g_lbl) in genre_map {
+            if phrase.contains(' ') && contains_term(&clean_norm, phrase) {
+                if !genres.iter().any(|g| g == g_lbl) {
+                    genres.push(g_lbl.to_string());
+                }
+                for (idx, tok) in tokens.iter().enumerate() {
+                    if phrase.split_whitespace().any(|p| p == tok) {
+                        matched_token_flags[idx] = true;
+                        phrase_genre_tokens[idx] = true;
+                    }
+                }
+            }
+        }
+
         for (idx, tok) in tokens.iter().enumerate() {
             if let Some((lbl, min_y, max_y)) = parse_decade_token(tok) {
                 decade_label = Some(lbl);
@@ -4602,24 +5036,12 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
                     matched_token_flags[idx] = true;
                 }
             }
-            for &(g_tok, g_lbl) in genre_map {
-                if tok == g_tok {
-                    if !genres.iter().any(|g| g == g_lbl) {
-                        genres.push(g_lbl.to_string());
-                    }
-                    matched_token_flags[idx] = true;
-                }
-            }
-        }
-
-        // Check two-word phrases like "hip hop", "new wave", "synth pop", "late night"
-        for &(phrase, g_lbl) in genre_map {
-            if phrase.contains(' ') && clean_norm.contains(phrase) {
-                if !genres.iter().any(|g| g == g_lbl) {
-                    genres.push(g_lbl.to_string());
-                }
-                for (idx, tok) in tokens.iter().enumerate() {
-                    if phrase.split_whitespace().any(|p| p == tok) {
+            if !phrase_genre_tokens[idx] {
+                for &(g_tok, g_lbl) in genre_map {
+                    if !g_tok.contains(' ') && tok == g_tok {
+                        if !genres.iter().any(|g| g == g_lbl) {
+                            genres.push(g_lbl.to_string());
+                        }
                         matched_token_flags[idx] = true;
                     }
                 }
@@ -4839,7 +5261,7 @@ fn compute_query_theme_match_with_artist(
         let g_hits = intent
             .genres
             .iter()
-            .filter(|g| contains_term(&genre_hay, &g.to_lowercase()))
+            .filter(|g| genre_matches_text(&genre_hay, g))
             .count();
         if g_hits > 0 {
             score += (0.45 * g_hits as f64).min(0.75);
@@ -4852,8 +5274,11 @@ fn compute_query_theme_match_with_artist(
             .moods
             .iter()
             .filter(|m| {
+                let genre_matched = has_mood_meta_match(&genre_hay, **m);
                 is_track_compatible_with_mood(t, artist_genres, **m)
-                    && (tm.contains(m) || has_mood_meta_match(&meta_hay, **m))
+                    && (genre_matched
+                        || (!is_mood_title_trap(t, **m)
+                            && (tm.contains(m) || has_mood_meta_match(&meta_hay, **m))))
             })
             .count();
         if m_hits > 0 {
@@ -4939,6 +5364,142 @@ fn is_mix_clutter_track(t: &Track, query_low: &str) -> bool {
     false
 }
 
+fn genre_variants(term_low: &str) -> &'static [&'static str] {
+    match term_low {
+        "j-pop" | "jpop" | "j pop" | "japanese pop" => {
+            &["jpop", "j-pop", "j pop", "japanese pop"]
+        }
+        "j-rock" | "jrock" | "j rock" | "japanese rock" => {
+            &["jrock", "j-rock", "j rock", "japanese rock"]
+        }
+        "k-pop" | "kpop" | "k pop" | "korean pop" => {
+            &["kpop", "k-pop", "k pop", "korean pop"]
+        }
+        "c-pop" | "cpop" | "c pop" | "mandopop" | "cantopop" => {
+            &["cpop", "c-pop", "c pop", "mandopop", "cantopop"]
+        }
+        "city pop" | "city-pop" | "citypop" => &["citypop", "city-pop", "city pop"],
+        "synthpop" | "synth-pop" | "synth pop" => &["synthpop", "synth-pop", "synth pop"],
+        "dream pop" | "dream-pop" | "dreampop" => &["dreampop", "dream-pop", "dream pop"],
+        "neo-soul" | "neo soul" | "neosoul" => &["neosoul", "neo-soul", "neo soul"],
+        "post-punk" | "post punk" | "postpunk" => &["postpunk", "post-punk", "post punk"],
+        "pop punk" | "pop-punk" => &["pop-punk", "pop punk"],
+        "lo-fi" | "lofi" => &["lofi", "lo-fi"],
+        "hip-hop" | "hiphop" | "hip hop" => &["hip-hop", "hip hop", "hiphop"],
+        "r&b" | "rnb" => &["r&b", "rnb"],
+        "drum & bass" | "drum and bass" | "dnb" => {
+            &["dnb", "drum and bass", "drum & bass", "drum n bass"]
+        }
+        "alternative" | "alt-rock" | "alt rock" | "altrock" => {
+            &["alternative", "alt-rock", "alt rock", "alternative rock"]
+        }
+        _ => &[],
+    }
+}
+
+pub(crate) fn playlist_token_matches(pl_norm: &str, tok: &str) -> bool {
+    match tok {
+        "christmas" | "xmas" => ["christmas", "xmas", "holiday", "noel"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "classic" => ["classic", "classics", "oldies", "greatest", "throwback", "retro"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "chill" => ["chill", "chillout", "lofi", "lo-fi", "downtempo", "relax"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "workout" => ["workout", "gym", "fitness", "cardio", "running"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "focus" | "study" => ["focus", "study", "ambient", "instrumental", "classical", "piano"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "sleep" => ["sleep", "ambient", "calm", "relax", "rain"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "lofi" | "lo-fi" => ["lofi", "lo-fi", "chillhop", "chill"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "hip-hop" | "hiphop" => ["hip-hop", "hip hop", "hiphop", "rap"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        "r&b" | "rnb" => ["r&b", "rnb", "soul"]
+            .iter()
+            .any(|s| contains_term(pl_norm, s)),
+        _ => {
+            let variants = genre_variants(tok);
+            if !variants.is_empty() {
+                variants.iter().any(|s| contains_term(pl_norm, s))
+            } else {
+                contains_term(pl_norm, tok)
+            }
+        }
+    }
+}
+
+pub(crate) fn genre_matches_text(hay_low: &str, genre_label: &str) -> bool {
+    let g_low = genre_label.to_lowercase();
+    let variants = genre_variants(&g_low);
+    if !variants.is_empty() {
+        variants.iter().any(|v| contains_term(hay_low, v))
+    } else {
+        contains_term(hay_low, &g_low)
+    }
+}
+
+pub(crate) fn has_conflicting_scene_genre(
+    hay_low: &str,
+    wanted_genres: &[String],
+    query_low: &str,
+) -> bool {
+    if wanted_genres.is_empty() {
+        return false;
+    }
+    const SCENE_GROUPS: &[(&[&str], &[&str])] = &[
+        (
+            &["J-Pop", "J-Rock", "City Pop"],
+            &[
+                "jpop",
+                "j-pop",
+                "j pop",
+                "jrock",
+                "j-rock",
+                "j rock",
+                "city pop",
+                "city-pop",
+                "citypop",
+                "japanese pop",
+                "japanese rock",
+            ],
+        ),
+        (&["K-Pop"], &["kpop", "k-pop", "k pop", "korean pop"]),
+        (
+            &["C-Pop"],
+            &["cpop", "c-pop", "c pop", "mandopop", "cantopop"],
+        ),
+    ];
+
+    let wants_any_scene = wanted_genres.iter().any(|g| {
+        SCENE_GROUPS
+            .iter()
+            .any(|(labels, _)| labels.iter().any(|l| l.eq_ignore_ascii_case(g)))
+    });
+    if !wants_any_scene {
+        return false;
+    }
+
+    for (labels, terms) in SCENE_GROUPS {
+        let group_wanted = wanted_genres
+            .iter()
+            .any(|g| labels.iter().any(|l| l.eq_ignore_ascii_case(g)))
+            || terms.iter().any(|t| contains_term(query_low, t));
+        if !group_wanted && terms.iter().any(|t| contains_term(hay_low, t)) {
+            return true;
+        }
+    }
+    false
+}
+
 fn curated_playlist_title_score(pl_title: &str, intent: &SearchIntent) -> Option<f64> {
     if !intent.is_theme_mix {
         return None;
@@ -4986,46 +5547,24 @@ fn curated_playlist_title_score(pl_title: &str, intent: &SearchIntent) -> Option
         }
     }
 
+    if !intent.genres.is_empty() {
+        if !intent.genres.iter().any(|g| genre_matches_text(&pl_norm, g)) {
+            return None;
+        }
+        if has_conflicting_scene_genre(&pl_norm, &intent.genres, &intent.normalized) {
+            return None;
+        }
+    }
+
     if intent.content_tokens.is_empty() {
         return Some(1.6);
     }
 
-    let mut matches = 0usize;
-    for tok in &intent.content_tokens {
-        let hit = match tok.as_str() {
-            "christmas" | "xmas" => ["christmas", "xmas", "holiday", "noel"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "classic" => ["classic", "classics", "oldies", "greatest", "throwback", "retro"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "chill" => ["chill", "chillout", "lofi", "lo-fi", "downtempo", "relax"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "workout" => ["workout", "gym", "fitness", "cardio", "running"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "focus" | "study" => ["focus", "study", "ambient", "instrumental", "classical", "piano"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "sleep" => ["sleep", "ambient", "calm", "relax", "rain"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "lofi" | "lo-fi" => ["lofi", "lo-fi", "chillhop", "chill"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "hip-hop" | "hiphop" => ["hip-hop", "hip hop", "hiphop", "rap"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            "r&b" | "rnb" => ["r&b", "rnb", "soul"]
-                .iter()
-                .any(|s| contains_term(&pl_norm, s)),
-            _ => contains_term(&pl_norm, tok),
-        };
-        if hit {
-            matches += 1;
-        }
-    }
+    let matches = intent
+        .content_tokens
+        .iter()
+        .filter(|tok| playlist_token_matches(&pl_norm, tok))
+        .count();
 
     if matches == 0 {
         return None;
@@ -5034,13 +5573,47 @@ fn curated_playlist_title_score(pl_title: &str, intent: &SearchIntent) -> Option
 }
 
 fn genre_family(g_low: &str) -> Option<u8> {
+    if ["k-pop", "kpop", "korean pop"]
+        .iter()
+        .any(|k| contains_term(g_low, k))
+    {
+        return Some(9);
+    }
+    if [
+        "j-pop",
+        "jpop",
+        "japanese pop",
+        "city pop",
+        "city-pop",
+        "citypop",
+    ]
+    .iter()
+    .any(|k| contains_term(g_low, k))
+    {
+        return Some(10);
+    }
+    if ["j-rock", "jrock", "japanese rock"]
+        .iter()
+        .any(|k| contains_term(g_low, k))
+    {
+        return Some(11);
+    }
+    if ["c-pop", "cpop", "mandopop", "cantopop"]
+        .iter()
+        .any(|k| contains_term(g_low, k))
+    {
+        return Some(12);
+    }
+    if g_low.contains("asian") {
+        return Some(13);
+    }
     if ["rock", "alt", "indie", "punk", "metal", "grunge", "emo", "shoegaze"]
         .iter()
         .any(|k| g_low.contains(k))
     {
         return Some(1);
     }
-    if ["pop", "synthpop", "disco", "dance pop", "k-pop", "j-pop", "city pop"]
+    if ["pop", "synthpop", "disco", "dance pop"]
         .iter()
         .any(|k| g_low.contains(k))
     {
@@ -5085,7 +5658,7 @@ fn genre_family(g_low: &str) -> Option<u8> {
     None
 }
 
-fn has_genre_clash(t: &Track, artist_genres: &str, wanted_genres: &[String]) -> bool {
+pub(crate) fn has_genre_clash(t: &Track, artist_genres: &str, wanted_genres: &[String]) -> bool {
     if wanted_genres.is_empty() {
         return false;
     }
@@ -5093,10 +5666,7 @@ fn has_genre_clash(t: &Track, artist_genres: &str, wanted_genres: &[String]) -> 
     if meta.trim().is_empty() {
         return false;
     }
-    if wanted_genres
-        .iter()
-        .any(|g| contains_term(&meta, &g.to_lowercase()))
-    {
+    if wanted_genres.iter().any(|g| genre_matches_text(&meta, g)) {
         return false;
     }
     let wanted_families: HashSet<u8> = wanted_genres
@@ -5479,6 +6049,23 @@ pub fn is_track_compatible_with_mood(t: &Track, artist_genres: &str, mood: Mood)
         Mood::RockIndie => &["classical", "kids", "meditation", "new age", "eurodance", "reggaeton"],
     };
     !clashes.iter().any(|c| contains_term(&g_low, c))
+}
+
+fn is_mood_title_trap(t: &Track, mood: Mood) -> bool {
+    let tl = crate::models::core_song_title(&t.title).to_lowercase();
+    let traps: &[&str] = match mood {
+        Mood::Chill => &["chill vibes", "lofi chill", "chill music"],
+        Mood::Focus => &["deep focus", "focus music", "study beats", "study music"],
+        Mood::Energy => &["workout", "workout hits", "high energy", "gym motivation"],
+        Mood::LateNight => &["late night", "late night vibes", "late-night vibes", "after hours"],
+        Mood::Upbeat => &["feel good", "upbeat hits", "happy hits"],
+        Mood::Melancholy => &["sad songs", "melancholy"],
+        Mood::Party => &["dance party", "club hits", "party hits"],
+        Mood::Acoustic => &["acoustic chill", "folk acoustic"],
+        Mood::Groove => &["soul groove", "neo soul"],
+        Mood::RockIndie => &["indie rock", "alternative rock"],
+    };
+    traps.iter().any(|p| tl == *p || contains_term(&tl, p))
 }
 
 pub fn append_mood_slug(existing: &str, mood: Mood) -> String {
@@ -6026,11 +6613,12 @@ fn dedup_and_interleave_with_anchor(
     }
 
     let mut seen_keys = HashSet::new();
-    let mut pool: Vec<(String, Track)> = Vec::with_capacity(tracks.len());
+    let mut pool: Vec<(String, String, Track)> = Vec::with_capacity(tracks.len());
     for t in tracks {
         if seen_keys.insert(t.song_key()) {
             let ak = slug(&primary_artist(&t.artist));
-            pool.push((ak, t));
+            let tk = slug(&crate::models::core_song_title(&t.title));
+            pool.push((ak, tk, t));
         }
     }
 
@@ -6045,6 +6633,7 @@ fn dedup_and_interleave_with_anchor(
 
     let cooldown = if limit <= 10 { 2 } else { 3 };
     let mut artist_counts: HashMap<String, usize> = HashMap::new();
+    let mut title_counts: HashMap<String, usize> = HashMap::new();
     let mut recent_artists: Vec<String> = Vec::with_capacity(limit);
     let mut out = Vec::with_capacity(limit.min(pool.len()));
 
@@ -6052,22 +6641,33 @@ fn dedup_and_interleave_with_anchor(
         let window_start = recent_artists.len().saturating_sub(cooldown);
         let window = &recent_artists[window_start..];
 
-        // Prefer top-ranked track respecting both per-artist cap and cooldown spacing.
-        let best_spaced = pool.iter().position(|(ak, _)| {
-            artist_counts.get(ak).copied().unwrap_or(0) < cap_for(ak) && !window.contains(ak)
+        let title_ok = |tk: &str, counts: &HashMap<String, usize>| -> bool {
+            tk.is_empty() || counts.get(tk).copied().unwrap_or(0) == 0
+        };
+
+        // Prefer top-ranked track respecting per-artist cap, unique core title, and cooldown spacing.
+        let best_spaced = pool.iter().position(|(ak, tk, _)| {
+            artist_counts.get(ak).copied().unwrap_or(0) < cap_for(ak)
+                && title_ok(tk, &title_counts)
+                && !window.contains(ak)
         });
 
         let chosen_idx = best_spaced.or_else(|| {
-            pool.iter()
-                .position(|(ak, _)| artist_counts.get(ak).copied().unwrap_or(0) < cap_for(ak))
+            pool.iter().position(|(ak, tk, _)| {
+                artist_counts.get(ak).copied().unwrap_or(0) < cap_for(ak)
+                    && title_ok(tk, &title_counts)
+            })
         });
 
         let Some(idx) = chosen_idx else {
             break;
         };
 
-        let (ak, track) = pool.remove(idx);
+        let (ak, tk, track) = pool.remove(idx);
         *artist_counts.entry(ak.clone()).or_insert(0) += 1;
+        if !tk.is_empty() {
+            *title_counts.entry(tk).or_insert(0) += 1;
+        }
         recent_artists.push(ak);
         out.push(track);
     }
@@ -6129,6 +6729,11 @@ fn merge_tracks_dedup(primary: Vec<Track>, secondary: Vec<Track>) -> Vec<Track> 
         }
     }
     out
+}
+
+fn parse_deezer_fans(bio: &str) -> Option<u64> {
+    let first = bio.split_whitespace().next()?;
+    first.parse::<u64>().ok()
 }
 
 fn parse_rank_bonus(meta: &str) -> f64 {
@@ -7702,5 +8307,321 @@ mod tests {
         assert_eq!(snap["active"], true);
         assert_eq!(snap["readyMoods"], 1);
         assert_eq!(snap["totalMoods"], 10);
+    }
+
+    #[test]
+    fn jpop_instant_mix_accepts_hyphenated_playlists_and_rejects_pop_and_kpop_drift() {
+        let intent = parse_search_intent("jpop");
+        assert!(intent.is_theme_mix);
+        assert_eq!(intent.genres, vec!["J-Pop".to_string()]);
+        assert!(intent.deezer_genre_hints().is_empty());
+        let pl_q = intent.playlist_search_queries();
+        assert!(pl_q.contains(&"jpop".to_string()), "pl_q={:?}", pl_q);
+        assert!(pl_q.contains(&"j-pop".to_string()), "pl_q={:?}", pl_q);
+
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("rnb_kpop_user", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str, artist: &str, genre: &str, rank: u64| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: title.into(),
+            genre: genre.into(),
+            duration: 210,
+            bitrate: 256,
+            meta: format!(r#"{{"rank":{}}}"#, rank),
+            ..Default::default()
+        };
+
+        let snoh = mk("dz:snoh", "Warmest Shade Of Blue", "Snoh Aalegra", "R&B", 950000);
+        let wiz = mk("dz:wiz", "Highs and Lows", "Wiz Khalifa", "Hip-Hop", 940000);
+        let taeyeon = mk("dz:taeyeon", "Panorama", "TAEYEON", "K-Pop", 930000);
+        let iu = mk("dz:iu", "Dear my crazy soulmate", "IU", "K-Pop", 920000);
+        let weeknd_kpop = mk("dz:weeknd", "K-POP", "The Weeknd", "", 980000);
+
+        let yoasobi = mk("dz:yoasobi", "New me", "YOASOBI", "", 880000);
+        let fujii = mk("dz:fujii", "Hachiko", "Fujii Kaze", "", 870000);
+        let yonezu = mk("dz:yonezu", "Azalea", "Kenshi Yonezu", "", 860000);
+        let anri = mk("dz:anri", "SHYNESS BOY", "Anri", "City Pop", 800000);
+
+        store
+            .upsert_tracks(&[
+                snoh.clone(),
+                wiz.clone(),
+                taeyeon.clone(),
+                iu.clone(),
+                weeknd_kpop.clone(),
+                yoasobi.clone(),
+                fujii.clone(),
+                yonezu.clone(),
+                anri.clone(),
+            ])
+            .unwrap();
+        // Give user strong personal affinity to Snoh Aalegra & TAEYEON so taste_aff can't leak them.
+        store.star_track(u.id, &snoh.id).unwrap();
+        store.star_track(u.id, &taeyeon.id).unwrap();
+        taste.record_event(u.id, &snoh.id, "complete", 1.0);
+        taste.record_event(u.id, &taeyeon.id, "complete", 1.0);
+
+        let res = taste.search_and_refine_with_context(
+            u.id,
+            "jpop",
+            vec![snoh.clone(), wiz.clone(), weeknd_kpop.clone()],
+            vec![
+                ("Top J-Pop".into(), vec![yoasobi.clone(), fujii.clone()]),
+                ("J-Pop Essentials".into(), vec![yonezu.clone()]),
+                ("KPOP x JPOP mix".into(), vec![taeyeon.clone(), iu.clone()]),
+            ],
+            SearchMixContext::default(),
+        );
+        let mix = res.instant_mix.expect("J-Pop mix should be created");
+        assert_eq!(mix.title, "J-Pop Mix");
+        let ids: Vec<&str> = mix.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&yoasobi.id.as_str()), "ids={:?}", ids);
+        assert!(ids.contains(&fujii.id.as_str()), "ids={:?}", ids);
+        assert!(ids.contains(&yonezu.id.as_str()), "ids={:?}", ids);
+        assert!(!ids.contains(&snoh.id.as_str()), "R&B leaked: {:?}", ids);
+        assert!(!ids.contains(&wiz.id.as_str()), "Hip-Hop leaked: {:?}", ids);
+        assert!(!ids.contains(&taeyeon.id.as_str()), "K-Pop leaked: {:?}", ids);
+        assert!(!ids.contains(&iu.id.as_str()), "K-Pop leaked: {:?}", ids);
+        assert!(!ids.contains(&weeknd_kpop.id.as_str()), "Title trap leaked: {:?}", ids);
+
+        // Even in offline/fallback mode without curated playlists, K-Pop and Pop must clash with J-Pop.
+        assert!(has_genre_clash(&taeyeon, "", &["J-Pop".into()]));
+        assert!(has_genre_clash(
+            &mk("dz:pop", "Pop Hit", "Western Pop", "Pop", 900000),
+            "",
+            &["J-Pop".into()]
+        ));
+        assert!(!has_genre_clash(&anri, "", &["J-Pop".into()]));
+    }
+
+    #[test]
+    fn late_night_mood_and_explore_reject_title_traps_and_duplicate_titles() {
+        assert!(classify_moods("Late Night Vibes", "Cozy Deluxe, Vol. 15", "", "").is_empty());
+        assert!(classify_moods("After Hours", "Album", "", "").is_empty());
+        assert!(classify_moods("Nightcall", "Outrun", "Synthwave", "").contains(&Mood::LateNight));
+
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("nightowl", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str, artist: &str, genre: &str, moods: &str| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: title.into(),
+            genre: genre.into(),
+            moods: moods.into(),
+            duration: 210,
+            bitrate: 256,
+            ..Default::default()
+        };
+
+        let trap_1 = mk("dz:trap1", "Late Night Vibes", "Vincent Price", "", "late_night");
+        let trap_2 = mk("dz:trap2", "Late Night Vibes", "Darius Silk", "Pop", "late_night");
+        let trap_3 = mk("dz:trap3", "Late Night", "Flow Sound", "", "late_night");
+        let real_synth = mk("dz:real1", "Sunset", "The Midnight", "Synthwave", "late_night");
+        let real_curated = mk("dz:real2", "the day she left", "inertia.", "", "");
+
+        store
+            .upsert_tracks(&[
+                trap_1.clone(),
+                trap_2.clone(),
+                trap_3.clone(),
+                real_synth.clone(),
+                real_curated.clone(),
+            ])
+            .unwrap();
+
+        let curated_ids = HashSet::from([real_curated.id.clone()]);
+        let ranked = taste.rank_mood_mix(
+            u.id,
+            Mood::LateNight,
+            vec![trap_1.clone(), trap_2.clone(), trap_3.clone(), real_synth.clone(), real_curated.clone()],
+            &curated_ids,
+            20,
+        );
+        let ids: Vec<&str> = ranked.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&real_synth.id.as_str()), "ids={:?}", ids);
+        assert!(ids.contains(&real_curated.id.as_str()), "ids={:?}", ids);
+        assert!(!ids.contains(&trap_1.id.as_str()), "title trap leaked: {:?}", ids);
+        assert!(!ids.contains(&trap_2.id.as_str()), "title trap leaked: {:?}", ids);
+        assert!(!ids.contains(&trap_3.id.as_str()), "title trap leaked: {:?}", ids);
+
+        // dedup_and_interleave caps duplicate identical core song titles to 1.
+        let dup_titles = vec![
+            mk("dz:d1", "Late Night Vibes", "Artist A", "Synthwave", ""),
+            mk("dz:d2", "Late Night Vibes", "Artist B", "Synthwave", ""),
+            mk("dz:d3", "Midnight City", "M83", "Synthwave", ""),
+        ];
+        let interleaved = dedup_and_interleave(dup_titles, 10, 2);
+        assert_eq!(interleaved.len(), 2, "interleaved={:?}", interleaved.iter().map(|t| &t.id).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn artist_recommendations_and_related_tracks_work_and_dedup_songs() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jpop_fan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let hires_dup = Track {
+            id: "slsk:beaflower".into(),
+            source: "soulseek".into(),
+            title: "Be a flower".into(),
+            artist: "Ryokuoushoku Shakai".into(),
+            album: "Be a flower".into(),
+            format: "flac".into(),
+            bitrate: 1411,
+            bit_depth: 24,
+            sample_rate: 48000,
+            duration: 199,
+            ..Default::default()
+        };
+        let aac_dup = Track {
+            id: "ytm:beaflower".into(),
+            source: "ytm".into(),
+            title: "Be a flower".into(),
+            artist: "Ryokuoushoku Shakai".into(),
+            album: "Be a flower".into(),
+            format: "m4a".into(),
+            bitrate: 128,
+            duration: 200,
+            ..Default::default()
+        };
+        let other_song = Track {
+            id: "ytm:toumei".into(),
+            source: "ytm".into(),
+            title: "Toumeidatta Sekai".into(),
+            artist: "Ryokuoushoku Shakai".into(),
+            album: "Toumeidatta Sekai".into(),
+            format: "m4a".into(),
+            bitrate: 128,
+            duration: 213,
+            ..Default::default()
+        };
+        let rel_yorushika = Track {
+            id: "dz:yorushika1".into(),
+            source: "deezer".into(),
+            title: "Sunny".into(),
+            artist: "Yorushika".into(),
+            album: "Sunny".into(),
+            genre: "J-Pop".into(),
+            duration: 240,
+            bitrate: 256,
+            ..Default::default()
+        };
+        let rel_kinggnu = Track {
+            id: "dz:kinggnu1".into(),
+            source: "deezer".into(),
+            title: "Hakujitsu".into(),
+            artist: "King Gnu".into(),
+            album: "CEREMONY".into(),
+            genre: "J-Rock".into(),
+            duration: 276,
+            bitrate: 256,
+            ..Default::default()
+        };
+        store
+            .upsert_tracks(&[
+                hires_dup.clone(),
+                aac_dup.clone(),
+                other_song.clone(),
+                rel_yorushika.clone(),
+                rel_kinggnu.clone(),
+            ])
+            .unwrap();
+
+        let anchor_meta = ArtistSummary {
+            id: "ar:ryokuoushoku-shakai".into(),
+            name: "Ryokuoushoku Shakai".into(),
+            ..Default::default()
+        };
+        let yorushika_meta = ArtistSummary {
+            id: "ar:dz:67898492".into(),
+            name: "Yorushika".into(),
+            cover_url: "https://cdn.deezer.com/yorushika.jpg".into(),
+            bio: "80000 fans on Deezer".into(),
+            deezer_id: "67898492".into(),
+            ..Default::default()
+        };
+        let kinggnu_meta = ArtistSummary {
+            id: "ar:dz:12944623".into(),
+            name: "King Gnu".into(),
+            cover_url: "https://cdn.deezer.com/kinggnu.jpg".into(),
+            bio: "95000 fans on Deezer".into(),
+            deezer_id: "12944623".into(),
+            ..Default::default()
+        };
+        store.upsert_artist_meta(&anchor_meta).unwrap();
+        store.upsert_artist_meta(&yorushika_meta).unwrap();
+        store.upsert_artist_meta(&kinggnu_meta).unwrap();
+
+        // Duplicate versions of "Be a flower" merge into the single lossless HI-RES track.
+        let deduped = merge_tracks_dedup(vec![hires_dup.clone(), aac_dup.clone(), other_song.clone()], vec![]);
+        assert_eq!(deduped.len(), 2, "deduped={:?}", deduped.iter().map(|t| &t.id).collect::<Vec<_>>());
+        assert_eq!(deduped[0].id, "slsk:beaflower");
+
+        // Artist related tracks surface Yorushika / King Gnu tracks while excluding anchor tracks.
+        let art_rel = taste
+            .artist_related_tracks(&anchor_meta, &[yorushika_meta.clone(), kinggnu_meta.clone()], &deduped, 10)
+            .await;
+        let art_rel_ids: Vec<&str> = art_rel.iter().map(|t| t.id.as_str()).collect();
+        assert!(art_rel_ids.contains(&"dz:yorushika1"), "art_rel={:?}", art_rel_ids);
+        assert!(art_rel_ids.contains(&"dz:kinggnu1"), "art_rel={:?}", art_rel_ids);
+        assert!(!art_rel_ids.contains(&"slsk:beaflower"), "anchor leaked: {:?}", art_rel_ids);
+
+        // User taste links surface both "Related Tracks" and "Artists You Might Like" on Home/Explore.
+        store.follow_artist(u.id, &anchor_meta.id).unwrap();
+        store
+            .upsert_taste_links(
+                u.id,
+                &[
+                    ("related_track", rel_yorushika.id.as_str(), 2.2),
+                    ("related_artist", "yorushika", 2.0),
+                    ("related_artist", "king-gnu", 1.8),
+                ],
+            )
+            .unwrap();
+        taste.mark_taste_dirty(u.id);
+
+        let rec_tracks = taste.related_tracks_for_user(u.id, 10);
+        let rec_track_ids: Vec<&str> = rec_tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(rec_track_ids.contains(&"dz:yorushika1"), "rec_tracks={:?}", rec_track_ids);
+
+        let rec_artists = taste.recommended_artists_for_user(u.id, 10);
+        let rec_artist_names: Vec<&str> = rec_artists.iter().map(|a| a.name.as_str()).collect();
+        assert!(rec_artist_names.contains(&"Yorushika"), "rec_artists={:?}", rec_artist_names);
+        assert!(rec_artist_names.contains(&"King Gnu"), "rec_artists={:?}", rec_artist_names);
+        assert!(
+            !rec_artist_names.contains(&"Ryokuoushoku Shakai"),
+            "already followed artist leaked: {:?}",
+            rec_artist_names
+        );
     }
 }
