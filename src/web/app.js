@@ -55,9 +55,10 @@
     playlists: [],
     trackMap: new Map(), // id -> track object for instant access
     queue: [],
+    unshuffledQueue: null,
     queueIndex: -1,
     pendingSeekSec: 0,
-    shuffle: false,
+    shuffle: localStorage.getItem('beatlab_shuffle') === 'true',
     repeat: 'off', // off | all | one
     autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
     hapticsEnabled: localStorage.getItem('beatlab_haptics') !== 'false',
@@ -776,6 +777,7 @@
     state.playlists = [];
     state.trackMap.clear();
     state.queue = [];
+    state.unshuffledQueue = null;
     state.queueIndex = -1;
     state.radioReqToken++;
     state.radioLoading = false;
@@ -1209,6 +1211,7 @@
     applyOutputVolume();
     $('pb-volume').value = String(state.volume);
     updateVolumeIcon();
+    syncShuffleUI();
     localStorage.removeItem('beatlab_quality');
     wirePlayerBarToggle();
     wireFsSwipeClose();
@@ -3889,14 +3892,98 @@
     sendTrackEvent(track.id, 'play', 1);
 
     // Pre-warm next track
-    const next = state.queue[state.queueIndex + 1];
-    if (next) {
-      state.queueWarmTimer = setTimeout(() => {
-        state.queueWarmTimer = null;
-        if (loadToken !== state.activeAudioToken) return;
-        api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
-      }, 450);
+    scheduleWarmNextTrack(loadToken);
+  }
+
+  function syncShuffleUI() {
+    $('btn-shuffle').classList.toggle('active', state.shuffle);
+    if ($('fs-shuffle')) $('fs-shuffle').classList.toggle('active', state.shuffle);
+  }
+
+  function shuffleArray(items) {
+    const copy = items.slice();
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
     }
+    return copy;
+  }
+
+  function scheduleWarmNextTrack(loadToken = state.activeAudioToken) {
+    if (state.queueWarmTimer) {
+      clearTimeout(state.queueWarmTimer);
+      state.queueWarmTimer = null;
+    }
+    const next = state.queue[state.queueIndex + 1];
+    if (!next) return;
+    state.queueWarmTimer = setTimeout(() => {
+      state.queueWarmTimer = null;
+      if (loadToken !== state.activeAudioToken) return;
+      api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
+    }, 450);
+  }
+
+  function restoreUpcomingOrder(upcoming, original, cur) {
+    const len = original.length;
+    if (!len || upcoming.length <= 1) return upcoming.slice();
+
+    const curOrigIdx = cur ? original.findIndex((t) => t.id === cur.id) : -1;
+    const posQueues = new Map();
+    original.forEach((t, idx) => {
+      if (!posQueues.has(t.id)) posQueues.set(t.id, []);
+      posQueues.get(t.id).push(idx);
+    });
+
+    if (curOrigIdx >= 0 && cur) {
+      const q = posQueues.get(cur.id);
+      if (q) {
+        const hit = q.indexOf(curOrigIdx);
+        if (hit >= 0) q.splice(hit, 1);
+      }
+    }
+
+    const known = [];
+    const extras = [];
+    for (const t of upcoming) {
+      const q = posQueues.get(t.id);
+      const origIdx = q && q.length ? q.shift() : -1;
+      if (origIdx >= 0) {
+        const sortKey = curOrigIdx >= 0 ? (origIdx - curOrigIdx - 1 + len) % len : origIdx;
+        known.push({ track: t, sortKey });
+      } else {
+        extras.push(t);
+      }
+    }
+    known.sort((a, b) => a.sortKey - b.sortKey);
+    return known.map((x) => x.track).concat(extras);
+  }
+
+  function setQueueWithShuffle(tracks, startIndex = 0, forceShuffle = false) {
+    const ordered = tracks.slice();
+    if (!ordered.length) {
+      state.unshuffledQueue = null;
+      state.queue = [];
+      return -1;
+    }
+    if (forceShuffle) {
+      state.shuffle = true;
+      localStorage.setItem('beatlab_shuffle', 'true');
+      syncShuffleUI();
+      state.unshuffledQueue = ordered;
+      state.queue = shuffleArray(ordered);
+      return 0;
+    }
+    if (state.shuffle && ordered.length > 1) {
+      const idx = Math.max(0, Math.min(startIndex, ordered.length - 1));
+      state.unshuffledQueue = ordered;
+      const pinned = ordered[idx];
+      const rest = ordered.filter((_, i) => i !== idx);
+      state.queue = [pinned, ...shuffleArray(rest)];
+      return 0;
+    }
+    state.unshuffledQueue = null;
+    state.queue = ordered;
+    return Math.max(0, Math.min(startIndex, ordered.length - 1));
   }
 
   async function playQueueAt(index) {
@@ -4031,8 +4118,8 @@
     if (prev) recordRecentHeard(prev);
     state.radioReqToken++;
     state.radioLoading = false;
-    state.queue = tracks;
-    playQueueAt(Math.max(0, Math.min(startIndex, tracks.length - 1)));
+    const idx = setQueueWithShuffle(tracks, startIndex, false);
+    playQueueAt(idx);
   }
 
   function playShuffledIds(ids) {
@@ -4040,14 +4127,10 @@
     if (!tracks.length) return;
     const prev = currentTrack();
     if (prev) recordRecentHeard(prev);
-    for (let i = tracks.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
-    }
     state.radioReqToken++;
     state.radioLoading = false;
-    state.queue = tracks;
-    playQueueAt(0);
+    const idx = setQueueWithShuffle(tracks, 0, true);
+    playQueueAt(idx);
   }
 
   function playSingle(id) {
@@ -4058,6 +4141,7 @@
     recordRecentHeard(t);
     state.radioReqToken++;
     state.radioLoading = !!state.autoplay;
+    state.unshuffledQueue = null;
     state.queue = [t];
     playQueueAt(0);
     if (state.autoplay) {
@@ -4077,8 +4161,8 @@
         state.radioReqToken++;
         state.radioLoading = false;
         state.radioInFlight = null;
-        state.queue = tracks;
-        playQueueAt(0);
+        const idx = setQueueWithShuffle(tracks, 0, false);
+        playQueueAt(idx);
       }
     } catch (e) {
       if (e && e.name === 'AbortError') return;
@@ -4098,8 +4182,8 @@
         state.radioReqToken++;
         state.radioLoading = false;
         state.radioInFlight = null;
-        state.queue = tracks;
-        playQueueAt(0);
+        const idx = setQueueWithShuffle(tracks, 0, false);
+        playQueueAt(idx);
       }
     } catch (e) {
       if (e && e.name === 'AbortError') return;
@@ -4155,10 +4239,14 @@
     if (!mix || !mix.tracks || !mix.tracks.length) return;
     const tracks = mix.tracks.map((t) => state.trackMap.get(t.id) || t);
     if (!state.queue.length) {
-      state.queue = tracks;
-      playQueueAt(0);
+      const idx = setQueueWithShuffle(tracks, 0, false);
+      playQueueAt(idx);
     } else {
-      state.queue.push(...tracks);
+      const toAdd = state.shuffle ? shuffleArray(tracks) : tracks;
+      state.queue.push(...toAdd);
+      if (Array.isArray(state.unshuffledQueue)) {
+        state.unshuffledQueue.push(...tracks);
+      }
       renderQueuePanel();
       saveServerQueue();
     }
@@ -4225,6 +4313,9 @@
         for (const r of recs) {
           if (!existing.has(r.id)) {
             state.queue.push(r);
+            if (Array.isArray(state.unshuffledQueue)) {
+              state.unshuffledQueue.push(r);
+            }
             existing.add(r.id);
             added++;
           }
@@ -4267,8 +4358,8 @@
       state.radioLoading = false;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
-        state.queue = tracks;
-        playQueueAt(0);
+        const idx = setQueueWithShuffle(tracks, 0, false);
+        playQueueAt(idx);
       } else {
         showToast('No radio tracks found for this playlist yet');
       }
@@ -4304,19 +4395,20 @@
       const recs = cacheTracks(d.tracks || []);
       const filtered = recs.filter((r) => r.id !== seedId);
       if (keepingCurrent && currentTrack()?.id === seedId) {
-        state.queue = [cur, ...filtered];
+        const unshuffled = [cur, ...filtered];
+        const upcoming = state.shuffle ? shuffleArray(filtered) : filtered;
+        state.unshuffledQueue = state.shuffle ? unshuffled : null;
+        state.queue = [cur, ...upcoming];
         state.queueIndex = 0;
         renderQueuePanel();
         saveServerQueue();
-        if (filtered[0]) {
-          api(`/api/web/warm/${encodeURIComponent(filtered[0].id)}`, { method: 'POST' }).catch(() => {});
-        }
+        scheduleWarmNextTrack();
         return;
       }
       const queue = seed ? [seed, ...filtered] : filtered;
       if (queue.length) {
-        state.queue = queue;
-        playQueueAt(0);
+        const idx = setQueueWithShuffle(queue, 0, false);
+        playQueueAt(idx);
       } else {
         renderQueuePanel();
       }
@@ -4374,11 +4466,6 @@
     }
     if (!state.queue.length) return;
 
-    if (state.shuffle && state.queue.length > 1) {
-      let nextIdx = Math.floor(Math.random() * (state.queue.length - 1));
-      if (nextIdx >= state.queueIndex) nextIdx += 1;
-      return playQueueAt(nextIdx);
-    }
     if (state.queueIndex + 1 < state.queue.length) {
       const next = state.queueIndex + 1;
       if (state.autoplay && !state.radioLoading && state.queue.length - next <= 2 && cur) {
@@ -4387,6 +4474,14 @@
       return playQueueAt(next);
     }
     if (state.repeat === 'all') {
+      if (state.shuffle && state.queue.length > 1) {
+        const reshuffled = shuffleArray(state.queue);
+        if (cur && reshuffled[0].id === cur.id) {
+          const swapIdx = 1 + Math.floor(Math.random() * (reshuffled.length - 1));
+          [reshuffled[0], reshuffled[swapIdx]] = [reshuffled[swapIdx], reshuffled[0]];
+        }
+        state.queue = reshuffled;
+      }
       return playQueueAt(0);
     }
     if (state.autoplay && cur) {
@@ -5040,6 +5135,9 @@
 
       const cur = currentTrack();
       const wasCur = !!(cur && cur.id === trackId);
+      if (Array.isArray(state.unshuffledQueue)) {
+        state.unshuffledQueue = state.unshuffledQueue.filter((item) => item.id !== trackId);
+      }
       const oldIdx = state.queueIndex;
       const newQueue = [];
       let newIdx = -1;
@@ -5529,6 +5627,7 @@
         state.queue.splice(idx, 1);
         renderQueuePanel();
         saveServerQueue();
+        if (idx === state.queueIndex + 1) scheduleWarmNextTrack();
       }
     },
     startRadioForId,
@@ -5544,8 +5643,14 @@
       haptic('success');
       if (state.queue.length === 0) return playSingle(tid);
       state.queue.splice(state.queueIndex + 1, 0, t);
+      if (Array.isArray(state.unshuffledQueue)) {
+        const cur = currentTrack();
+        const curPos = cur ? state.unshuffledQueue.findIndex((item) => item.id === cur.id) : -1;
+        state.unshuffledQueue.splice(curPos >= 0 ? curPos + 1 : 0, 0, t);
+      }
       renderQueuePanel();
       saveServerQueue();
+      scheduleWarmNextTrack();
       showToast('Will play next');
     },
     addToQueue: (tid) => {
@@ -5554,8 +5659,12 @@
       haptic('success');
       if (state.queue.length === 0) return playSingle(tid);
       state.queue.push(t);
+      if (Array.isArray(state.unshuffledQueue)) {
+        state.unshuffledQueue.push(t);
+      }
       renderQueuePanel();
       saveServerQueue();
+      scheduleWarmNextTrack();
       showToast('Added to queue');
     },
     togglePlay,
@@ -5564,8 +5673,29 @@
     toggleShuffle: () => {
       haptic('select');
       state.shuffle = !state.shuffle;
-      $('btn-shuffle').classList.toggle('active', state.shuffle);
-      if ($('fs-shuffle')) $('fs-shuffle').classList.toggle('active', state.shuffle);
+      localStorage.setItem('beatlab_shuffle', state.shuffle ? 'true' : 'false');
+      syncShuffleUI();
+      if (state.queue.length > 0) {
+        const splitIdx = state.queueIndex >= 0 ? state.queueIndex + 1 : 0;
+        const played = state.queue.slice(0, splitIdx);
+        const upcoming = state.queue.slice(splitIdx);
+        if (state.shuffle) {
+          state.unshuffledQueue = state.queue.slice();
+          if (upcoming.length > 1) {
+            state.queue = played.concat(shuffleArray(upcoming));
+          }
+        } else {
+          if (Array.isArray(state.unshuffledQueue) && state.unshuffledQueue.length > 0 && upcoming.length > 1) {
+            state.queue = played.concat(restoreUpcomingOrder(upcoming, state.unshuffledQueue, currentTrack()));
+          }
+          state.unshuffledQueue = null;
+        }
+        renderQueuePanel();
+        saveServerQueue();
+        scheduleWarmNextTrack();
+      } else {
+        state.unshuffledQueue = null;
+      }
     },
     cycleRepeat: () => {
       haptic('select');

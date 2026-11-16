@@ -21,6 +21,18 @@ fn prefixed_track_cols(alias: &str) -> String {
         .join(", ")
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct NeuralTrainingCorpus {
+    pub user_ids: Vec<i64>,
+    pub user_events: HashMap<i64, Vec<(String, String, f64, i64)>>,
+    pub user_stars: HashMap<i64, Vec<String>>,
+    pub user_ratings: HashMap<i64, Vec<(String, i32)>>,
+    pub user_disliked: HashMap<i64, Vec<String>>,
+    pub playlists: Vec<(i64, String, Vec<String>)>,
+    pub catalog_ids: Vec<String>,
+    pub tracks: HashMap<String, Track>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -673,7 +685,7 @@ impl Store {
                 let rel_sql = format!(
                     "SELECT {} FROM user_taste_links l
                      JOIN tracks t ON t.id = l.key
-                     WHERE l.user_id = ?1 AND l.kind = 'related_track'
+                     WHERE l.user_id = ?1 AND l.kind IN ('related_track', 'neural_track')
                      ORDER BY l.updated DESC, l.weight DESC
                      LIMIT ?2",
                     tcols
@@ -2075,10 +2087,250 @@ impl Store {
                 "related_track" => {
                     rel_tracks.insert(key, decayed);
                 }
+                "neural_artist" => {
+                    rel_artists
+                        .entry(key)
+                        .and_modify(|w| *w = (*w).max(decayed * 0.7))
+                        .or_insert(decayed * 0.7);
+                }
+                "neural_track" => {
+                    rel_tracks
+                        .entry(key)
+                        .and_modify(|w| *w = (*w).max(decayed * 0.7))
+                        .or_insert(decayed * 0.7);
+                }
                 _ => {}
             }
         }
         Ok((rel_artists, rel_tracks))
+    }
+
+    /// Replaces the Transformer-distilled `neural_track` and `neural_artist` links for `user_id`
+    /// without disturbing external `related_track`/`related_artist` graph links.
+    pub fn replace_neural_taste_links(
+        &self,
+        user_id: i64,
+        track_links: &[(String, f64)],
+        artist_links: &[(String, f64)],
+    ) -> AppResult<()> {
+        if user_id <= 0 {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            tx.execute(
+                "DELETE FROM user_taste_links WHERE user_id = ?1 AND kind IN ('neural_track', 'neural_artist')",
+                params![user_id],
+            )?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO user_taste_links(user_id, kind, key, weight, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(user_id, kind, key) DO UPDATE SET
+                   weight = excluded.weight,
+                   updated = excluded.updated",
+            )?;
+            for (key, weight) in track_links {
+                let k = key.trim();
+                if !k.is_empty() && weight.is_finite() && *weight > 0.0 {
+                    stmt.execute(params![user_id, "neural_track", k, *weight, now])?;
+                }
+            }
+            for (key, weight) in artist_links {
+                let k = key.trim();
+                if !k.is_empty() && weight.is_finite() && *weight > 0.0 {
+                    stmt.execute(params![user_id, "neural_artist", k, *weight, now])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads a compact chronological interaction sequence (track + event kind) for one user.
+    pub fn load_user_neural_history(
+        &self,
+        user_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<(Track, String, i64)>> {
+        if user_id <= 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, e.kind, e.at
+             FROM events e
+             JOIN tracks t ON t.id = e.track_id
+             WHERE e.user_id = ?1
+             ORDER BY e.at DESC, e.id DESC
+             LIMIT ?2",
+            prefixed_track_cols("t")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt
+            .query_map(params![user_id, limit as i64], |r| {
+                let t = row_to_track(r)?;
+                let kind: String = r.get(21)?;
+                let at: i64 = r.get(22)?;
+                Ok((t, kind, at))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// Loads multi-user training sequences, manual playlists, positive/negative signals,
+    /// and a catalog track pool for the background Transformer trainer & distiller.
+    pub fn load_transformer_corpus(
+        &self,
+        max_events_per_user: usize,
+        catalog_limit: usize,
+    ) -> AppResult<NeuralTrainingCorpus> {
+        let conn = self.lock();
+        let mut corpus = NeuralTrainingCorpus::default();
+
+        let mut ustmt = conn.prepare("SELECT id FROM users ORDER BY id ASC")?;
+        corpus.user_ids = ustmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut needed_ids: HashSet<String> = HashSet::new();
+
+        for &uid in &corpus.user_ids {
+            let mut estmt = conn.prepare(
+                "SELECT track_id, kind, value, at FROM events
+                 WHERE user_id = ?1
+                 ORDER BY at DESC, id DESC
+                 LIMIT ?2",
+            )?;
+            let mut evs: Vec<(String, String, f64, i64)> = estmt
+                .query_map(params![uid, max_events_per_user as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .flatten()
+                .collect();
+            evs.reverse();
+            for (tid, _, _, _) in &evs {
+                needed_ids.insert(tid.clone());
+            }
+            if !evs.is_empty() {
+                corpus.user_events.insert(uid, evs);
+            }
+
+            let mut sstmt = conn.prepare("SELECT track_id FROM stars WHERE user_id = ?1")?;
+            let stars: Vec<String> = sstmt
+                .query_map(params![uid], |r| r.get::<_, String>(0))?
+                .flatten()
+                .collect();
+            for tid in &stars {
+                needed_ids.insert(tid.clone());
+            }
+            if !stars.is_empty() {
+                corpus.user_stars.insert(uid, stars);
+            }
+
+            let mut rstmt = conn.prepare("SELECT track_id, rating FROM ratings WHERE user_id = ?1")?;
+            let ratings: Vec<(String, i32)> = rstmt
+                .query_map(params![uid], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .flatten()
+                .collect();
+            for (tid, _) in &ratings {
+                needed_ids.insert(tid.clone());
+            }
+            if !ratings.is_empty() {
+                corpus.user_ratings.insert(uid, ratings);
+            }
+
+            let mut dstmt = conn.prepare(
+                "SELECT track_id FROM hidden_tracks WHERE user_id = ?1
+                 UNION
+                 SELECT track_id FROM ratings WHERE user_id = ?1 AND rating <= 2
+                 UNION
+                 SELECT track_id FROM user_track_stats WHERE user_id = ?1 AND skip_count >= play_count + 2",
+            )?;
+            let dislikes: Vec<String> = dstmt
+                .query_map(params![uid], |r| r.get::<_, String>(0))?
+                .flatten()
+                .collect();
+            for tid in &dislikes {
+                needed_ids.insert(tid.clone());
+            }
+            if !dislikes.is_empty() {
+                corpus.user_disliked.insert(uid, dislikes);
+            }
+        }
+
+        // Load all users' manual playlists for cross-user collaborative sequence/set learning.
+        let mut pstmt = conn.prepare(
+            "SELECT p.id, p.user_id, p.name, pt.track_id
+             FROM playlists p
+             JOIN playlist_tracks pt ON pt.playlist_id = p.id
+             WHERE p.is_auto = 0
+             ORDER BY p.id, pt.pos ASC",
+        )?;
+        let mut pl_map: HashMap<String, (i64, String, Vec<String>)> = HashMap::new();
+        for row in pstmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .flatten()
+        {
+            let (pid, uid, name, tid) = row;
+            needed_ids.insert(tid.clone());
+            let entry = pl_map
+                .entry(pid)
+                .or_insert_with(|| (uid, name, Vec::new()));
+            entry.2.push(tid);
+        }
+        corpus.playlists = pl_map
+            .into_values()
+            .filter(|(_, _, tids)| tids.len() >= 2)
+            .collect();
+
+        // Load recent catalog tracks for negative sampling and background user distillation.
+        let cat_sql = format!(
+            "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
+            TRACK_COLS
+        );
+        let mut cstmt = conn.prepare(&cat_sql)?;
+        for t in cstmt
+            .query_map(params![catalog_limit as i64], row_to_track)?
+            .flatten()
+        {
+            corpus.catalog_ids.push(t.id.clone());
+            corpus.tracks.insert(t.id.clone(), t);
+        }
+
+        let missing: Vec<String> = needed_ids
+            .into_iter()
+            .filter(|id| !corpus.tracks.contains_key(id))
+            .collect();
+        for chunk in missing.chunks(250) {
+            let placeholders: String = (1..=chunk.len())
+                .map(|i| format!("?{}", i))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT {} FROM tracks WHERE id IN ({})",
+                TRACK_COLS, placeholders
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn ToSql> = chunk.iter().map(|s| s as &dyn ToSql).collect();
+            for t in stmt
+                .query_map(params_from_iter(params_refs), row_to_track)?
+                .flatten()
+            {
+                corpus.tracks.insert(t.id.clone(), t);
+            }
+        }
+
+        Ok(corpus)
     }
 
     // -------------------------------------------------------------------------

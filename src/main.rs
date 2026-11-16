@@ -7,6 +7,7 @@ mod stats;
 mod store;
 mod subsonic;
 mod taste;
+mod transformer;
 mod webapp;
 
 use axum::extract::{Request, State};
@@ -128,11 +129,11 @@ async fn main() -> models::AppResult<()> {
         now_playing: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    // Fast startup catalog warming + continuous background curation even when idle
+    // Fast startup catalog warming + continuous RoPE-QKVO/XSA/GEGLU Transformer training & curation
     let warm_taste = taste.clone();
     tokio::spawn(async move {
         warm_taste.warm_catalog().await;
-        let mut interval = tokio::time::interval(Duration::from_secs(120));
+        let mut interval = tokio::time::interval(Duration::from_secs(90));
         interval.tick().await;
         let mut tick: usize = 0;
         loop {

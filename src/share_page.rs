@@ -933,6 +933,8 @@ pub fn render_share_html(
 
     const state = {{
       idx: 0,
+      order: tracks.map((_, i) => i),
+      orderPos: 0,
       shuffle: false,
       repeat: 'off',
       seeking: false,
@@ -1126,6 +1128,64 @@ pub fn render_share_html(
       renderTracklist();
     }}
 
+    function shuffleIndices(indices) {{
+      const copy = indices.slice();
+      for (let i = copy.length - 1; i > 0; i--) {{
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+      }}
+      return copy;
+    }}
+
+    function rebuildPlayOrder(pinnedIdx) {{
+      if (!tracks.length) {{
+        state.order = [];
+        state.orderPos = 0;
+        return;
+      }}
+      if (state.shuffle && tracks.length > 1) {{
+        if (typeof pinnedIdx === 'number' && pinnedIdx >= 0 && pinnedIdx < tracks.length) {{
+          const rest = tracks.map((_, i) => i).filter((i) => i !== pinnedIdx);
+          state.order = [pinnedIdx, ...shuffleIndices(rest)];
+          state.orderPos = 0;
+        }} else {{
+          state.order = shuffleIndices(tracks.map((_, i) => i));
+          state.orderPos = 0;
+        }}
+      }} else {{
+        state.order = tracks.map((_, i) => i);
+        state.orderPos = typeof pinnedIdx === 'number' && pinnedIdx >= 0 ? pinnedIdx : state.idx;
+      }}
+    }}
+
+    function advanceShareTrack(step) {{
+      if (tracks.length <= 1) return;
+      if (state.order.length !== tracks.length) rebuildPlayOrder(state.idx);
+      const nextPos = state.orderPos + step;
+      if (nextPos >= 0 && nextPos < state.order.length) {{
+        state.orderPos = nextPos;
+        loadTrack(state.order[nextPos], true);
+        return;
+      }}
+      if (state.repeat === 'all') {{
+        if (step > 0) {{
+          if (state.shuffle) {{
+            const reshuffled = shuffleIndices(tracks.map((_, i) => i));
+            if (reshuffled[0] === state.idx && reshuffled.length > 1) {{
+              const swap = 1 + Math.floor(Math.random() * (reshuffled.length - 1));
+              [reshuffled[0], reshuffled[swap]] = [reshuffled[swap], reshuffled[0]];
+            }}
+            state.order = reshuffled;
+          }}
+          state.orderPos = 0;
+          loadTrack(state.order[0], true);
+        }} else {{
+          state.orderPos = state.order.length - 1;
+          loadTrack(state.order[state.orderPos], true);
+        }}
+      }}
+    }}
+
     function commitShareTrack(token, t, autoplay) {{
       if (token !== state.activeAudioToken || tracks[state.idx]?.id !== t.id) return;
       try {{
@@ -1269,13 +1329,7 @@ pub fn render_share_html(
         return;
       }}
       if (tracks.length > 1) {{
-        if (state.shuffle) {{
-          ShareApp.playIndex(Math.floor(Math.random() * tracks.length));
-        }} else if (state.idx + 1 < tracks.length) {{
-          ShareApp.playIndex(state.idx + 1);
-        }} else if (state.repeat === 'all') {{
-          ShareApp.playIndex(0);
-        }}
+        advanceShareTrack(1);
       }}
     }});
     audio.addEventListener('error', () => {{
@@ -1328,27 +1382,28 @@ pub fn render_share_html(
         else if (audio.paused) audio.play().catch(() => {{}});
         else audio.pause();
       }},
-      playIndex: (i) => loadTrack(i, true),
+      playIndex: (i) => {{
+        rebuildPlayOrder(i);
+        loadTrack(i, true);
+      }},
       playShuffled: () => {{
         if (!tracks.length) return;
         state.shuffle = true;
         $('btn-shuffle').classList.add('active');
-        loadTrack(Math.floor(Math.random() * tracks.length), true);
+        rebuildPlayOrder(null);
+        loadTrack(state.order[0], true);
       }},
       prev: () => {{
         if (audio.currentTime > 4) {{ audio.currentTime = 0; return; }}
-        loadTrack(state.idx - 1, true);
+        advanceShareTrack(-1);
       }},
       next: () => {{
-        if (state.shuffle && tracks.length > 1) {{
-          loadTrack(Math.floor(Math.random() * tracks.length), true);
-        }} else {{
-          loadTrack(state.idx + 1, true);
-        }}
+        advanceShareTrack(1);
       }},
       toggleShuffle: () => {{
         state.shuffle = !state.shuffle;
         $('btn-shuffle').classList.toggle('active', state.shuffle);
+        rebuildPlayOrder(state.idx);
       }},
       cycleRepeat: () => {{
         const modes = ['off', 'all', 'one'];
