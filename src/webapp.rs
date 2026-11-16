@@ -561,6 +561,7 @@ pub struct PasswordChangeReq {
 #[derive(Deserialize)]
 pub struct SearchQuery {
     pub q: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1163,6 +1164,11 @@ pub async fn instant_mix(
         Err(r) => return r,
     };
     let query = q.q.unwrap_or_default().trim().to_string();
+    let mode_override = match q.mode.as_deref().map(str::trim).map(str::to_lowercase).as_deref() {
+        Some("topic") | Some("genre") | Some("vibe") => Some("topic".to_string()),
+        Some("entity") | Some("artist") | Some("song") => Some("entity".to_string()),
+        _ => None,
+    };
     if query.is_empty() {
         return json_res(json!({
             "query": "",
@@ -1177,12 +1183,29 @@ pub async fn instant_mix(
         .as_deref()
         .unwrap_or(&query)
         .to_string();
+    let force_topic = mode_override.as_deref() == Some("topic");
+    let force_entity = mode_override.as_deref() == Some("entity");
 
     let mix_future = async {
-        if !intent.is_theme_mix {
+        if force_entity {
             return (Vec::new(), Vec::new());
         }
-        let pl_queries = intent.playlist_search_queries();
+        if !intent.is_theme_mix && !force_topic {
+            // Fetch curated playlists in parallel for evidence-based topic vs entity routing.
+            let dz = state.sources.deezer.clone();
+            let q_owned = base_query.clone();
+            let curated = tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                dz.fetch_curated_mix_tracks(&q_owned, 2, 24),
+            )
+            .await
+            .unwrap_or_default();
+            return (curated, Vec::new());
+        }
+        let mut pl_queries = intent.playlist_search_queries();
+        if pl_queries.is_empty() {
+            pl_queries.push(base_query.clone());
+        }
         let tr_queries = intent.expanded_track_queries();
         let genre_hints = intent.deezer_genre_hints();
 
@@ -1312,26 +1335,34 @@ pub async fn instant_mix(
         }
     }
 
-    let mix_ctx = if !intent.is_theme_mix {
+    let base_slug = crate::models::slug(&base_query);
+    let has_exact_artist = !base_slug.is_empty()
+        && (dz_artists
+            .iter()
+            .any(|a| crate::models::slug(&a.name) == base_slug)
+            || combined.iter().any(|t| {
+                crate::models::slug(&crate::models::primary_artist(&t.artist)) == base_slug
+            }));
+    let has_topic_evidence = !curated_batches.is_empty()
+        || state.store.has_catalog_genre(&intent.normalized);
+    let use_topic_path = force_topic
+        || (!force_entity && (intent.is_theme_mix || (!has_exact_artist && has_topic_evidence)));
+
+    let mut mix_ctx = if !use_topic_path {
         let ctx =
             expand_entity_mix_context(&state, user.id, &query, &combined, &dz_artists, &ytm_hints)
                 .await;
         if ctx.anchor_artist.is_none() && curated_batches.is_empty() {
-            let dz_curated = tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                state.sources.deezer.fetch_curated_mix_tracks(&query, 3, 24),
+            use crate::sources::MusicSource;
+            let ytm_topic = tokio::time::timeout(
+                std::time::Duration::from_millis(2500),
+                state.sources.ytm.search(&format!("{} music", query), 15),
             )
             .await
             .unwrap_or_default();
-            if !dz_curated.is_empty() {
-                let mut extra_upsert = Vec::new();
-                for (_, batch) in &dz_curated {
-                    extra_upsert.extend(batch.iter().cloned());
-                }
-                if !extra_upsert.is_empty() {
-                    let _ = state.store.upsert_tracks(&extra_upsert);
-                }
-                curated_batches.extend(dz_curated);
+            if !ytm_topic.is_empty() {
+                let _ = state.store.upsert_tracks(&ytm_topic);
+                combined.extend(ytm_topic);
             }
         }
         ctx
@@ -1457,6 +1488,7 @@ pub async fn instant_mix(
     } else {
         crate::taste::SearchMixContext::default()
     };
+    mix_ctx.mode_override = mode_override;
 
     build_instant_mix_response(state, user.id, query, combined, curated_batches, mix_ctx).await
 }
@@ -1634,6 +1666,7 @@ async fn expand_entity_mix_context(
         anchor_track_key: seed_track.as_ref().map(Track::song_key),
         anchor_genres,
         is_artist_query: plan.is_artist_query,
+        mode_override: None,
         ytm_radio,
         dz_artist_top,
         dz_artist_radio,

@@ -2650,7 +2650,19 @@ a {
   gap: 10px;
   align-items: center;
   flex-wrap: wrap;
-  margin-bottom: 20px;
+  margin-bottom: 12px;
+}
+.instant-mix-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.instant-mix-mode-row .refine-query-pill.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b0d12;
+  font-weight: 600;
 }
 .instant-mix-builder-form input[type="text"] {
   flex: 1;

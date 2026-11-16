@@ -1554,8 +1554,10 @@
     if (hash.startsWith('explore-mix/')) return renderExploreMix(safeDecodeUri(hash.slice(12)));
     if (hash === 'mix' || hash.startsWith('mix?')) {
       const qIdx = hash.indexOf('?');
-      const mixQ = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)).get('q') || '' : '';
-      return renderInstantMixPage(mixQ);
+      const params = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)) : null;
+      const mixQ = params ? params.get('q') || '' : '';
+      const mixMode = params ? params.get('mode') || 'auto' : 'auto';
+      return renderInstantMixPage(mixQ, mixMode);
     }
     if (isSearchHash(hash)) {
       const q = extractSearchQueryFromHash(hash);
@@ -2016,9 +2018,16 @@
     }
   }
 
-  async function renderInstantMixPage(query) {
+  async function renderInstantMixPage(query, mode = 'auto') {
     const cleanQ = String(query || '').trim();
+    const cleanMode = ['topic', 'entity'].includes(mode) ? mode : 'auto';
+    state.instantMixMode = cleanMode;
     state.searchState = null;
+    const modeOptions = [
+      ['auto', 'Auto'],
+      ['topic', 'Genre & Vibe'],
+      ['entity', 'Artist or Song'],
+    ];
     const builderHeader = (val) => `
       <div class="section-head" style="margin-bottom:14px">
         <h1 class="page-greeting" style="margin-bottom:0">Instant Mix</h1>
@@ -2027,6 +2036,14 @@
         <input id="instant-mix-term-input" type="text" value="${esc(val)}" placeholder="Enter an artist, song, genre, era, or mood (e.g. 80s hits, Daft Punk, chill)..." autocomplete="off" />
         <button type="submit" class="btn-primary">Create Instant Mix</button>
       </form>
+      <div class="instant-mix-mode-row" role="group" aria-label="Mix mode">
+        ${modeOptions
+          .map(
+            ([key, label]) =>
+              `<button type="button" class="refine-query-pill${cleanMode === key ? ' active' : ''}" onclick="App.setInstantMixMode('${key}')">${esc(label)}</button>`
+          )
+          .join('')}
+      </div>
     `;
     if (!cleanQ) {
       state.activeInstantMix = null;
@@ -2044,7 +2061,8 @@
     const { reqToken, signal } = beginViewRequest();
     setMainLoading(`Creating instant mix for "${cleanQ}"...`);
     try {
-      const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}`, { signal });
+      const modeParam = cleanMode !== 'auto' ? `&mode=${encodeURIComponent(cleanMode)}` : '';
+      const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}${modeParam}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       if (!d.instantMix || !Array.isArray(d.instantMix.tracks) || !d.instantMix.tracks.length) {
         state.activeInstantMix = null;
@@ -5992,7 +6010,22 @@
       e.preventDefault();
       const val = ($('instant-mix-term-input')?.value || '').trim();
       if (!val) return;
-      navigate(`mix?q=${encodeURIComponent(val)}`);
+      const mode = state.instantMixMode && state.instantMixMode !== 'auto' ? `&mode=${encodeURIComponent(state.instantMixMode)}` : '';
+      navigate(`mix?q=${encodeURIComponent(val)}${mode}`);
+    },
+    setInstantMixMode: (mode) => {
+      const cleanMode = ['topic', 'entity'].includes(mode) ? mode : 'auto';
+      state.instantMixMode = cleanMode;
+      const val = ($('instant-mix-term-input')?.value || '').trim();
+      if (val) {
+        const modeParam = cleanMode !== 'auto' ? `&mode=${encodeURIComponent(cleanMode)}` : '';
+        navigate(`mix?q=${encodeURIComponent(val)}${modeParam}`);
+      } else {
+        document.querySelectorAll('.instant-mix-mode-row .refine-query-pill').forEach((btn, idx) => {
+          const keys = ['auto', 'topic', 'entity'];
+          btn.classList.toggle('active', keys[idx] === cleanMode);
+        });
+      }
     },
     playInstantMix,
     playInstantMixAt,
