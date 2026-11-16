@@ -1,4 +1,6 @@
-use crate::models::{AlbumSummary, ArtistSummary, Mood, PlayQueueState, Playlist, Track, User};
+use crate::models::{
+    AlbumSummary, ArtistSummary, Mood, PlayQueueState, Playlist, Track, User, UserTrackStats,
+};
 use crate::subsonic::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -9,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const INDEX_HTML: &str = include_str!("web/index.html");
@@ -326,6 +328,40 @@ fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> 
         .collect()
 }
 
+fn to_web_track_with_maps(
+    t: &Track,
+    starred: &HashSet<String>,
+    stats: &HashMap<String, UserTrackStats>,
+    ratings: &HashMap<String, i32>,
+    is_taste_match: bool,
+) -> WebTrack {
+    WebTrack {
+        id: t.id.clone(),
+        source: t.source.clone(),
+        title: t.title.clone(),
+        artist: t.artist.clone(),
+        artist_id: t.artist_id(),
+        album: t.album.clone(),
+        album_id: t.album_id(),
+        genre: t.genre.clone(),
+        moods: t.moods.clone(),
+        year: t.year,
+        track_no: t.track_no,
+        disc_no: t.disc_no,
+        duration: t.duration,
+        format: t.format.clone(),
+        bitrate: t.bitrate,
+        is_lossless: t.is_lossless(),
+        is_popular: track_is_popular(&t.meta),
+        is_taste_match,
+        quality_badge: t.quality_badge(),
+        cover_url: cover_api_url(&t.id),
+        is_starred: starred.contains(&t.id),
+        play_count: stats.get(&t.id).map(|s| s.play_count).unwrap_or(0),
+        rating: ratings.get(&t.id).copied().unwrap_or(0),
+    }
+}
+
 fn to_web_tracks(state: &AppState, user_id: i64, tracks: &[Track]) -> Vec<WebTrack> {
     to_web_tracks_with_taste(state, user_id, tracks, &HashSet::new())
 }
@@ -354,30 +390,14 @@ fn to_web_tracks_with_taste(
 
     tracks
         .iter()
-        .map(|t| WebTrack {
-            id: t.id.clone(),
-            source: t.source.clone(),
-            title: t.title.clone(),
-            artist: t.artist.clone(),
-            artist_id: t.artist_id(),
-            album: t.album.clone(),
-            album_id: t.album_id(),
-            genre: t.genre.clone(),
-            moods: t.moods.clone(),
-            year: t.year,
-            track_no: t.track_no,
-            disc_no: t.disc_no,
-            duration: t.duration,
-            format: t.format.clone(),
-            bitrate: t.bitrate,
-            is_lossless: t.is_lossless(),
-            is_popular: track_is_popular(&t.meta),
-            is_taste_match: taste_match_ids.contains(&t.id),
-            quality_badge: t.quality_badge(),
-            cover_url: cover_api_url(&t.id),
-            is_starred: starred.contains(&t.id),
-            play_count: stats.get(&t.id).map(|s| s.play_count).unwrap_or(0),
-            rating: ratings.get(&t.id).copied().unwrap_or(0),
+        .map(|t| {
+            to_web_track_with_maps(
+                t,
+                &starred,
+                &stats,
+                &ratings,
+                taste_match_ids.contains(&t.id),
+            )
         })
         .collect()
 }
@@ -541,6 +561,25 @@ pub struct PasswordChangeReq {
 #[derive(Deserialize)]
 pub struct SearchQuery {
     pub q: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct StatsQuery {
+    pub range: Option<String>,
+    pub tz: Option<i32>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateShareReq {
+    pub kind: String,
+    #[serde(default, rename = "targetId")]
+    pub target_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: String,
+    #[serde(default, rename = "trackIds")]
+    pub track_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1375,6 +1414,168 @@ pub async fn library(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }))
 }
 
+pub async fn stats(
+    State(state): State<AppState>,
+    Query(q): Query<StatsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let uid = user.id;
+    let range = crate::stats::StatsRange::from_str(q.range.as_deref());
+    let tz = q.tz.unwrap_or(0);
+    let store = state.store.clone();
+    let user_clone = user.clone();
+
+    let Ok((computed, starred, track_stats, ratings)) =
+        tokio::task::spawn_blocking(move || {
+            let now_ts = Utc::now().timestamp();
+            let c = crate::stats::build_user_stats(&store, &user_clone, range, tz, now_ts);
+            let st = store.starred_ids(uid).unwrap_or_default();
+            let ts = store.track_stats_map(uid).unwrap_or_default();
+            let rt = store.user_ratings(uid).unwrap_or_default();
+            (c, st, ts, rt)
+        })
+        .await
+    else {
+        return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute stats");
+    };
+
+    let wrap_track = |t: &Track| to_web_track_with_maps(t, &starred, &track_stats, &ratings, false);
+
+    let top_tracks: Vec<Value> = computed
+        .top_tracks
+        .iter()
+        .map(|item| {
+            json!({
+                "track": wrap_track(&item.track),
+                "streams": item.streams,
+                "completed": item.completed,
+                "skips": item.skips,
+                "listenedSecs": item.listened_secs,
+                "lastPlayed": item.last_played,
+            })
+        })
+        .collect();
+
+    let top_artists: Vec<Value> = computed
+        .top_artists
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "name": a.name,
+                "coverUrl": cover_api_url(&a.id),
+                "streams": a.streams,
+                "listenedSecs": a.listened_secs,
+                "uniqueTracks": a.unique_tracks,
+                "pct": a.pct,
+                "isFollowed": a.is_followed,
+            })
+        })
+        .collect();
+
+    let top_albums: Vec<Value> = computed
+        .top_albums
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "name": a.name,
+                "artist": a.artist,
+                "artistId": a.artist_id,
+                "coverUrl": cover_api_url(&a.id),
+                "year": a.year,
+                "streams": a.streams,
+                "listenedSecs": a.listened_secs,
+                "uniqueTracks": a.unique_tracks,
+                "isSaved": a.is_saved,
+            })
+        })
+        .collect();
+
+    let most_skipped: Vec<Value> = computed
+        .most_skipped
+        .iter()
+        .map(|s| {
+            json!({
+                "track": wrap_track(&s.track),
+                "skips": s.skips,
+                "streams": s.streams,
+            })
+        })
+        .collect();
+
+    let highlights = json!({
+        "longestTrack": computed.highlights.longest_track.as_ref().map(|t| json!({
+            "track": wrap_track(t),
+            "duration": t.duration,
+        })),
+        "shortestTrack": computed.highlights.shortest_track.as_ref().map(|t| json!({
+            "track": wrap_track(t),
+            "duration": t.duration,
+        })),
+        "firstTrackEver": computed.highlights.first_track_ever.as_ref().map(|(t, at)| json!({
+            "track": wrap_track(t),
+            "at": at,
+        })),
+        "mostCompletedTrack": computed.highlights.most_completed_track.as_ref().map(|(t, completed)| json!({
+            "track": wrap_track(t),
+            "completed": completed,
+        })),
+    });
+
+    let recent_events: Vec<Value> = computed
+        .recent_events
+        .iter()
+        .map(|ev| {
+            json!({
+                "kind": ev.kind,
+                "label": ev.label,
+                "at": ev.at,
+                "value": ev.value,
+                "track": wrap_track(&ev.track),
+            })
+        })
+        .collect();
+
+    json_res(json!({
+        "range": computed.range.key(),
+        "rangeLabel": computed.range.label(),
+        "tzOffsetMin": computed.tz_offset_min,
+        "generatedAt": computed.generated_at,
+        "memberSince": computed.member_since,
+        "firstListenAt": computed.first_listen_at,
+        "lastListenAt": computed.last_listen_at,
+        "summary": computed.summary,
+        "streaks": computed.streaks,
+        "library": computed.library,
+        "persona": computed.persona,
+        "timeline": computed.timeline,
+        "heatmap": computed.heatmap,
+        "hourly": computed.hourly,
+        "peakHour": computed.peak_hour,
+        "weekdays": computed.weekdays,
+        "peakWeekday": computed.peak_weekday,
+        "moods": computed.moods,
+        "genres": computed.genres,
+        "qualityTiers": computed.quality_tiers,
+        "formats": computed.formats,
+        "sources": computed.sources,
+        "decades": computed.decades,
+        "oldestTrack": computed.oldest_track,
+        "newestTrack": computed.newest_track,
+        "topTracks": top_tracks,
+        "topArtists": top_artists,
+        "topAlbums": top_albums,
+        "mostSkipped": most_skipped,
+        "highlights": highlights,
+        "recentEvents": recent_events,
+    }))
+}
+
 pub async fn get_playlist(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1878,10 +2079,7 @@ pub async fn warm_track(
         return r;
     }
     if let Some(t) = state.store.get_track(&id).ok().flatten() {
-        let engine = state.engine.clone();
-        tokio::spawn(async move {
-            let _ = engine.warm_track(&t).await;
-        });
+        state.engine.spawn_warm_track(t);
     }
     json_res(json!({ "ok": true }))
 }
@@ -1921,6 +2119,517 @@ pub async fn sources_info(State(state): State<AppState>, headers: HeaderMap) -> 
         "cacheMb": (cache_mb * 10.0).round() / 10.0,
         "ffmpeg": state.engine.ffmpeg_available,
     }))
+}
+
+fn request_origin(headers: &HeaderMap) -> String {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let proto = headers
+        .get("x-forwarded-proto")
+        .or_else(|| headers.get("x-forwarded-scheme"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.split(',').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| s == "http" || s == "https");
+
+    if let Some(h) = host {
+        let scheme = proto.unwrap_or_else(|| {
+            if h.starts_with("localhost") || h.starts_with("127.0.0.1") || h.starts_with("[::1]") {
+                "http".to_string()
+            } else {
+                "https".to_string()
+            }
+        });
+        return format!("{}://{}", scheme, h);
+    }
+
+    if let Ok(env_url) = std::env::var("URL") {
+        let trimmed = env_url.trim().trim_end_matches('/');
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return trimmed.to_string();
+        }
+        if !trimmed.is_empty() {
+            return format!("https://{}", trimmed);
+        }
+    }
+
+    "http://localhost:4533".to_string()
+}
+
+fn is_link_preview_bot(headers: &HeaderMap) -> bool {
+    let Some(ua) = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let low = ua.to_ascii_lowercase();
+    [
+        "discordbot",
+        "twitterbot",
+        "slackbot",
+        "telegrambot",
+        "whatsapp",
+        "facebookexternalhit",
+        "linkedinbot",
+        "bluesky",
+        "embedly",
+    ]
+    .iter()
+    .any(|b| low.contains(b))
+}
+
+fn resolve_share_tracks_live(state: &AppState, share: &crate::models::ShareRecord) -> Vec<Track> {
+    if share.kind == "playlist" {
+        if let Ok(Some(pl)) = state.store.get_playlist(&share.target_id) {
+            let raw = state.store.playlist_tracks(&pl.id).unwrap_or_default();
+            let list = if pl.is_auto {
+                filter_visible_tracks(state, pl.user_id, raw)
+            } else {
+                raw
+            };
+            if !list.is_empty() {
+                return list;
+            }
+        }
+    }
+    let mut tracks = state.store.get_tracks_by_ids(&share.track_ids).unwrap_or_default();
+    if tracks.is_empty() && share.kind == "track" && !share.target_id.is_empty() {
+        if let Ok(Some(t)) = state.store.get_track(&share.target_id) {
+            tracks.push(t);
+        }
+    }
+    tracks
+}
+
+pub async fn create_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateShareReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+
+    let kind = req.kind.trim().to_ascii_lowercase();
+    let target_id = req.target_id.trim().to_string();
+
+    let (resolved_target, title, subtitle, track_ids, lead_track) = match kind.as_str() {
+        "track" => {
+            if target_id.is_empty() {
+                return err_res(StatusCode::BAD_REQUEST, "Missing track ID");
+            }
+            let Some(t) = state.store.get_track(&target_id).ok().flatten() else {
+                return err_res(StatusCode::NOT_FOUND, "Track not found");
+            };
+            let sub = if t.album.trim().is_empty() {
+                t.artist.clone()
+            } else {
+                format!("{} · {}", t.artist, t.album)
+            };
+            (
+                t.id.clone(),
+                t.title.clone(),
+                sub,
+                vec![t.id.clone()],
+                Some(t),
+            )
+        }
+        "playlist" => {
+            if target_id.is_empty() {
+                return err_res(StatusCode::BAD_REQUEST, "Missing playlist ID");
+            }
+            let Some(pl) = state.store.get_playlist(&target_id).ok().flatten() else {
+                return err_res(StatusCode::NOT_FOUND, "Playlist not found");
+            };
+            if !pl.public && pl.user_id != user.id {
+                return err_res(StatusCode::FORBIDDEN, "Permission denied");
+            }
+            let raw = state.store.playlist_tracks(&pl.id).unwrap_or_default();
+            let list = if pl.is_auto {
+                filter_visible_tracks(&state, user.id, raw)
+            } else {
+                raw
+            };
+            let ids: Vec<String> = list.iter().take(100).map(|t| t.id.clone()).collect();
+            let sub = if pl.comment.trim().is_empty() {
+                format!("Playlist by {}", pl.owner_name)
+            } else {
+                pl.comment.clone()
+            };
+            (pl.id, pl.name, sub, ids, list.into_iter().next())
+        }
+        "album" => {
+            if target_id.is_empty() {
+                return err_res(StatusCode::BAD_REQUEST, "Missing album ID");
+            }
+            let Some((alb, tracks)) = state.taste.get_or_hydrate_album(&target_id).await else {
+                return err_res(StatusCode::NOT_FOUND, "Album not found");
+            };
+            let ids: Vec<String> = tracks.iter().take(100).map(|t| t.id.clone()).collect();
+            let sub = if alb.year > 0 {
+                format!("{} · {}", alb.artist, alb.year)
+            } else {
+                alb.artist.clone()
+            };
+            (alb.id, alb.name, sub, ids, tracks.into_iter().next())
+        }
+        "artist" => {
+            if target_id.is_empty() {
+                return err_res(StatusCode::BAD_REQUEST, "Missing artist ID");
+            }
+            let Some((art, top_tracks, _, _)) =
+                state.taste.get_or_hydrate_artist(&target_id, user.id).await
+            else {
+                return err_res(StatusCode::NOT_FOUND, "Artist not found");
+            };
+            let ids: Vec<String> = top_tracks.iter().take(40).map(|t| t.id.clone()).collect();
+            (
+                art.id,
+                art.name,
+                "Top Tracks".to_string(),
+                ids,
+                top_tracks.into_iter().next(),
+            )
+        }
+        "mix" => {
+            let trimmed_ids: Vec<String> = req
+                .track_ids
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .take(100)
+                .collect();
+            let valid = state.store.get_tracks_by_ids(&trimmed_ids).unwrap_or_default();
+            if valid.is_empty() {
+                return err_res(StatusCode::BAD_REQUEST, "Mix contains no playable tracks");
+            }
+            let ids: Vec<String> = valid.iter().map(|t| t.id.clone()).collect();
+            let clean_title = if req.title.trim().is_empty() {
+                "Instant Mix".to_string()
+            } else {
+                req.title.trim().to_string()
+            };
+            let clean_target = if target_id.is_empty() {
+                format!("mix:{}", crate::models::slug(&clean_title))
+            } else {
+                target_id
+            };
+            (
+                clean_target,
+                clean_title,
+                req.subtitle.trim().to_string(),
+                ids,
+                valid.into_iter().next(),
+            )
+        }
+        _ => return err_res(StatusCode::BAD_REQUEST, "Unsupported share kind"),
+    };
+
+    match state.store.create_or_get_share(
+        user.id,
+        &kind,
+        &resolved_target,
+        &title,
+        &subtitle,
+        &track_ids,
+    ) {
+        Ok(share) => {
+            if share.kind == "track" && state.engine.ffmpeg_available {
+                if let Some(lead) = lead_track {
+                    let eng = state.engine.clone();
+                    tokio::spawn(async move {
+                        let _ = eng.ensure_share_embed_mp4(&lead, ICON_512_PNG).await;
+                    });
+                }
+            }
+            let origin = request_origin(&headers);
+            let path = format!("/s/{}", share.id);
+            let url = format!("{}{}", origin, path);
+            json_res(json!({
+                "id": share.id,
+                "path": path,
+                "url": url,
+                "kind": share.kind,
+                "title": share.title,
+                "subtitle": share.subtitle,
+                "trackCount": share.track_ids.len(),
+            }))
+        }
+        Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+pub async fn public_share_page(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return (
+            StatusCode::NOT_FOUND,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            crate::share_page::render_share_not_found_html(),
+        )
+            .into_response();
+    };
+
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let mut has_embed_video = false;
+    if share.kind == "track" {
+        if let Some(lead) = tracks.first() {
+            if state.engine.has_cached_embed_mp4(&lead.id) {
+                has_embed_video = true;
+            } else if state.engine.ffmpeg_available {
+                if is_link_preview_bot(&headers) {
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_millis(3800),
+                        state.engine.ensure_share_embed_mp4(lead, ICON_512_PNG),
+                    )
+                    .await;
+                    has_embed_video = matches!(res, Ok(Some(_)));
+                } else {
+                    let eng = state.engine.clone();
+                    let t_clone = lead.clone();
+                    tokio::spawn(async move {
+                        let _ = eng.ensure_share_embed_mp4(&t_clone, ICON_512_PNG).await;
+                    });
+                }
+            }
+        }
+    }
+
+    let primary_mime = tracks
+        .first()
+        .map(|t| {
+            let ext = if t.format.trim().is_empty() {
+                "mp3"
+            } else {
+                t.format.as_str()
+            };
+            crate::engine::mime_for_audio_ext(ext)
+        })
+        .unwrap_or("audio/mpeg");
+
+    let origin = request_origin(&headers);
+    let html = crate::share_page::render_share_html(
+        &origin,
+        &share,
+        &tracks,
+        has_embed_video,
+        primary_mime,
+    );
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+pub async fn public_share_embed_page(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            crate::share_page::render_share_not_found_html(),
+        )
+            .into_response();
+    };
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let origin = request_origin(&headers);
+    let html = crate::share_page::render_embed_html(&origin, &share, &tracks);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+pub async fn public_share_cover(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "Share not found").into_response();
+    };
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let primary_target = if share.kind == "mix" {
+        tracks
+            .first()
+            .map(|t| t.id.clone())
+            .unwrap_or_else(|| share.target_id.clone())
+    } else {
+        share.target_id.clone()
+    };
+
+    if let Some((bytes, mime)) = state.engine.cover_raster_bytes(&primary_target).await {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
+    if let Some(first) = tracks.first() {
+        if first.id != primary_target {
+            if let Some((bytes, mime)) = state.engine.cover_raster_bytes(&first.id).await {
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, mime),
+                        (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+                    ],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        ICON_512_PNG,
+    )
+        .into_response()
+}
+
+pub async fn public_share_stream_primary(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Share not found");
+    };
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let Some(track) = tracks.into_iter().next() else {
+        return err_res(StatusCode::NOT_FOUND, "No playable track in share");
+    };
+    let offset = q.offset.unwrap_or(0.0);
+    let force_compat = matches!(q.compat.as_deref(), Some("1" | "true"));
+    state
+        .engine
+        .serve_web_stream(&track, &headers, offset, force_compat)
+        .await
+}
+
+pub async fn public_share_stream_track(
+    State(state): State<AppState>,
+    Path((id, track_id)): Path<(String, String)>,
+    Query(q): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Share not found");
+    };
+    let decoded = urlencoding::decode(&track_id)
+        .map(|s| s.into_owned())
+        .unwrap_or(track_id);
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let Some(track) = tracks.into_iter().find(|t| t.id == decoded) else {
+        return err_res(StatusCode::NOT_FOUND, "Track not part of this share");
+    };
+    let offset = q.offset.unwrap_or(0.0);
+    let force_compat = matches!(q.compat.as_deref(), Some("1" | "true"));
+    state
+        .engine
+        .serve_web_stream(&track, &headers, offset, force_compat)
+        .await
+}
+
+pub async fn public_share_embed_mp4(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "Share not found").into_response();
+    };
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let Some(lead) = tracks.first() else {
+        return (StatusCode::NOT_FOUND, "Track not found").into_response();
+    };
+    state
+        .engine
+        .serve_share_embed_mp4(lead, &headers, ICON_512_PNG)
+        .await
+}
+
+pub async fn public_share_oembed(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Share not found");
+    };
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let (title, _) = crate::share_page::build_share_meta(&share, &tracks);
+    let origin = request_origin(&headers);
+    let embed_url = format!("{}/s/{}/embed", origin, share.id);
+    let cover_url = format!("{}/s/{}/cover", origin, share.id);
+    let iframe_html = format!(
+        r#"<iframe src="{}" width="480" height="152" frameborder="0" allow="autoplay; encrypted-media"></iframe>"#,
+        crate::share_page::html_escape(&embed_url)
+    );
+    json_res(json!({
+        "version": "1.0",
+        "type": "rich",
+        "provider_name": "Beatlab",
+        "provider_url": origin,
+        "title": title,
+        "author_name": share.creator_name,
+        "thumbnail_url": cover_url,
+        "thumbnail_width": 600,
+        "thumbnail_height": 600,
+        "width": 480,
+        "height": 152,
+        "html": iframe_html,
+    }))
+}
+
+pub async fn public_share_lyrics(
+    State(state): State<AppState>,
+    Path((id, track_id)): Path<(String, String)>,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Share not found");
+    };
+    let decoded = urlencoding::decode(&track_id)
+        .map(|s| s.into_owned())
+        .unwrap_or(track_id);
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let Some(track) = tracks.into_iter().find(|t| t.id == decoded) else {
+        return err_res(StatusCode::NOT_FOUND, "Track not part of this share");
+    };
+    let lyrics = state.engine.fetch_lyrics(&track).await;
+    json_res(serde_json::to_value(lyrics).unwrap_or_else(|_| json!({ "synced": false, "plain": "", "lines": [] })))
 }
 
 fn album_json(a: &AlbumSummary, is_saved: bool) -> Value {
@@ -2278,8 +2987,13 @@ mod tests {
         assert!(html.contains("<style>\n"));
         assert!(html.contains(".settings-btn {"));
         assert!(html.contains(".mobile-brand {"));
+        assert!(html.contains(".stats-page {"));
+        assert!(html.contains(".loading-spinner {"));
         assert!(html.contains("<script>\n"));
         assert!(html.contains("openSettingsModal"));
+        assert!(html.contains("renderStatsView"));
+        assert!(html.contains("shareEntity"));
+        assert!(html.contains("data-route=\"stats\""));
         assert!(html.contains(&format!(
             r#"href="/web/favicon.svg?v={}""#,
             favicon_asset().short_hash
@@ -2386,5 +3100,408 @@ mod tests {
             let bytes = to_bytes(icon_res.into_body(), 1024 * 128).await.unwrap();
             assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         }
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_returns_isolated_detailed_user_stats() {
+        use crate::engine::StreamEngine;
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use crate::store::Store;
+        use crate::taste::TasteEngine;
+        use axum::body::to_bytes;
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-web-stats-{}", uuid::Uuid::new_v4()));
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+
+        let t1 = Track {
+            id: "loc:st1".into(),
+            source: "local".into(),
+            title: "Time".into(),
+            artist: "Pink Floyd".into(),
+            album: "The Dark Side of the Moon".into(),
+            genre: "Progressive Rock, Classic Rock".into(),
+            moods: "late_night,rock_indie".into(),
+            year: 1973,
+            duration: 413,
+            bitrate: 1050,
+            format: "flac".into(),
+            ..Default::default()
+        };
+        let t2 = Track {
+            id: "dz:st2".into(),
+            source: "deezer".into(),
+            title: "Around the World".into(),
+            artist: "Daft Punk".into(),
+            album: "Homework".into(),
+            genre: "Electronic, House".into(),
+            year: 1997,
+            duration: 429,
+            bitrate: 256,
+            format: "m4a".into(),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[t1.clone(), t2.clone()]).unwrap();
+
+        let (u1, _) = store.authenticate_or_create_user("stat_alice", "pw123").unwrap();
+        let (u2, _) = store.authenticate_or_create_user("stat_bob", "pw123").unwrap();
+        let tok1 = store.create_session(u1.id, "web", 3600).unwrap();
+        let tok2 = store.create_session(u2.id, "web", 3600).unwrap();
+
+        store.record_event(u1.id, &t1.id, "play", 1.0).unwrap();
+        store.record_event(u1.id, &t1.id, "complete", 1.0).unwrap();
+        store.record_event(u1.id, &t2.id, "play", 1.0).unwrap();
+        store.record_event(u1.id, &t2.id, "skip", 1.0).unwrap();
+        store.star_track(u1.id, &t1.id).unwrap();
+        store.set_rating(u1.id, &t1.id, 5).unwrap();
+        store.record_event(u2.id, &t2.id, "complete", 1.0).unwrap();
+
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+        };
+
+        // Unauthenticated fails
+        let unauth = stats(
+            State(state.clone()),
+            Query(StatsQuery { range: None, tz: None }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // Alice sees her 2 streams (1 completed, 1 skipped), not Bob's
+        let mut h1 = HeaderMap::new();
+        h1.insert(header::AUTHORIZATION, format!("Bearer {}", tok1).parse().unwrap());
+        let res1 = stats(
+            State(state.clone()),
+            Query(StatsQuery {
+                range: Some("30d".into()),
+                tz: Some(-300),
+            }),
+            h1,
+        )
+        .await;
+        assert_eq!(res1.status(), StatusCode::OK);
+        let b1: Value = serde_json::from_slice(&to_bytes(res1.into_body(), 1024 * 256).await.unwrap()).unwrap();
+        assert_eq!(b1["range"], "30d");
+        assert_eq!(b1["tzOffsetMin"], -300);
+        assert_eq!(b1["summary"]["totalStreams"], 2);
+        assert_eq!(b1["summary"]["completedStreams"], 1);
+        assert_eq!(b1["summary"]["skippedStreams"], 1);
+        assert_eq!(b1["summary"]["uniqueArtists"], 2);
+        assert_eq!(b1["library"]["likedTracks"], 1);
+        assert_eq!(b1["library"]["ratedTracks"], 1);
+        assert_eq!(b1["topTracks"][0]["track"]["id"], "loc:st1");
+        assert!(b1["hourly"].as_array().unwrap().len() == 24);
+        assert!(b1["weekdays"].as_array().unwrap().len() == 7);
+        assert!(b1["moods"].as_array().unwrap().len() == 10);
+        assert!(b1["timeline"]["points"].as_array().unwrap().len() == 30);
+
+        // Bob sees only his 1 completed stream
+        let mut h2 = HeaderMap::new();
+        h2.insert(header::AUTHORIZATION, format!("Bearer {}", tok2).parse().unwrap());
+        let res2 = stats(
+            State(state),
+            Query(StatsQuery { range: Some("all".into()), tz: Some(0) }),
+            h2,
+        )
+        .await;
+        let b2: Value = serde_json::from_slice(&to_bytes(res2.into_body(), 1024 * 256).await.unwrap()).unwrap();
+        assert_eq!(b2["summary"]["totalStreams"], 1);
+        assert_eq!(b2["summary"]["completedStreams"], 1);
+        assert_eq!(b2["library"]["likedTracks"], 0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn share_links_work_for_public_listeners_and_discord_embeds() {
+        use crate::engine::StreamEngine;
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use crate::store::Store;
+        use crate::taste::TasteEngine;
+        use axum::body::to_bytes;
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-web-share-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+
+        let audio_file = tmp.join("shared.mp3");
+        std::fs::write(&audio_file, b"ID3\x03\x00\x00\x00\x00\x00\x00FAKE_MP3_PAYLOAD").unwrap();
+
+        let t1 = Track {
+            id: "loc:sh1".into(),
+            source: "local".into(),
+            title: "Resonance </script><script>alert(1)</script>".into(),
+            artist: "HOME".into(),
+            album: "Odyssey".into(),
+            genre: "Synthwave".into(),
+            year: 2014,
+            duration: 212,
+            format: "mp3".into(),
+            bitrate: 320,
+            stream_url: format!("file:{}", audio_file.display()),
+            ..Default::default()
+        };
+        let t2 = Track {
+            id: "loc:sh2".into(),
+            source: "local".into(),
+            title: "Secret Unshared".into(),
+            artist: "Hidden".into(),
+            format: "mp3".into(),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[t1.clone(), t2.clone()]).unwrap();
+
+        let (u1, _) = store.authenticate_or_create_user("sharer", "pw123").unwrap();
+        let (u2, _) = store.authenticate_or_create_user("other", "pw123").unwrap();
+        let tok1 = store.create_session(u1.id, "web", 3600).unwrap();
+        let tok2 = store.create_session(u2.id, "web", 3600).unwrap();
+
+        let pl = store
+            .create_playlist(u1.id, "Private Chill", "Late night synth", false, &[t1.id.clone()])
+            .unwrap();
+
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+        };
+
+        let mut h1 = HeaderMap::new();
+        h1.insert(header::AUTHORIZATION, format!("Bearer {}", tok1).parse().unwrap());
+        h1.insert(header::HOST, "music.example.com".parse().unwrap());
+        h1.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        // 1. Track share creation & deduplication
+        let sr1 = create_share(
+            State(state.clone()),
+            h1.clone(),
+            Json(CreateShareReq {
+                kind: "track".into(),
+                target_id: t1.id.clone(),
+                title: String::new(),
+                subtitle: String::new(),
+                track_ids: vec![],
+            }),
+        )
+        .await;
+        assert_eq!(sr1.status(), StatusCode::OK);
+        let b1: Value = serde_json::from_slice(&to_bytes(sr1.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        let share_id = b1["id"].as_str().unwrap().to_string();
+        assert_eq!(b1["url"], format!("https://music.example.com/s/{}", share_id));
+
+        // 2. Public share page loads without auth and escapes XSS while providing Discord OG tags + signup CTA
+        let mut bot_hdrs = HeaderMap::new();
+        bot_hdrs.insert(header::HOST, "music.example.com".parse().unwrap());
+        bot_hdrs.insert("x-forwarded-proto", "https".parse().unwrap());
+        let page_res = public_share_page(State(state.clone()), Path(share_id.clone()), bot_hdrs.clone()).await;
+        assert_eq!(page_res.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(page_res.into_body(), 1024 * 256).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("og:title"));
+        assert!(html.contains("og:audio"));
+        assert!(html.contains("Sign Up Free"));
+        assert!(html.contains("Sign In"));
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("&lt;/script&gt;"));
+
+        // 3. Cover endpoint always returns raster image (PNG/JPEG), never SVG
+        let cov_res = public_share_cover(State(state.clone()), Path(share_id.clone())).await;
+        assert_eq!(cov_res.status(), StatusCode::OK);
+        let cov_ct = cov_res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        assert!(!cov_ct.contains("svg"));
+
+        // 4. Shared track streams publicly, while unshared track is rejected
+        let ok_stream = public_share_stream_track(
+            State(state.clone()),
+            Path((share_id.clone(), t1.id.clone())),
+            Query(StreamQuery { token: None, offset: None, compat: None }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(ok_stream.status(), StatusCode::OK);
+
+        let denied_stream = public_share_stream_track(
+            State(state.clone()),
+            Path((share_id.clone(), t2.id.clone())),
+            Query(StreamQuery { token: None, offset: None, compat: None }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(denied_stream.status(), StatusCode::NOT_FOUND);
+
+        // 5. Private playlist cannot be shared by another user, but can be shared by owner
+        let mut h2 = HeaderMap::new();
+        h2.insert(header::AUTHORIZATION, format!("Bearer {}", tok2).parse().unwrap());
+        let forbidden = create_share(
+            State(state.clone()),
+            h2,
+            Json(CreateShareReq {
+                kind: "playlist".into(),
+                target_id: pl.id.clone(),
+                title: String::new(),
+                subtitle: String::new(),
+                track_ids: vec![],
+            }),
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let pl_share = create_share(
+            State(state.clone()),
+            h1.clone(),
+            Json(CreateShareReq {
+                kind: "playlist".into(),
+                target_id: pl.id.clone(),
+                title: String::new(),
+                subtitle: String::new(),
+                track_ids: vec![],
+            }),
+        )
+        .await;
+        assert_eq!(pl_share.status(), StatusCode::OK);
+
+        // 6. Ephemeral Instant Mix share succeeds without persisting to playlists table
+        let mix_share = create_share(
+            State(state.clone()),
+            h1,
+            Json(CreateShareReq {
+                kind: "mix".into(),
+                target_id: "mix:synthwave".into(),
+                title: "Synthwave Instant Mix".into(),
+                subtitle: "Curated vibes".into(),
+                track_ids: vec![t1.id.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(mix_share.status(), StatusCode::OK);
+        assert_eq!(store.list_playlists(u1.id, false).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn rapid_warm_event_and_queue_bursts_succeed_without_errors() {
+        let store = crate::Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("burst_u", "pw").unwrap();
+        let tok = store.create_session(u.id, "web", 3600).unwrap();
+
+        let tmp = std::env::temp_dir().join(format!("beatlab_webapp_burst_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let audio_file = tmp.join("burst.mp3");
+        std::fs::write(&audio_file, vec![0u8; 8192]).unwrap();
+
+        let mut tracks = Vec::new();
+        for i in 0..12 {
+            tracks.push(Track {
+                id: format!("local:burst-track-{}", i),
+                source: "local".into(),
+                title: format!("Track {}", i),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                duration: 180,
+                format: "mp3".into(),
+                bitrate: 320,
+                stream_url: format!("file:{}", audio_file.display()),
+                ..Default::default()
+            });
+        }
+        store.upsert_tracks(&tracks).unwrap();
+
+        let sources = crate::sources::SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            std::sync::Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let state = AppState {
+            store: store.clone(),
+            sources: sources.clone(),
+            engine: std::sync::Arc::new(crate::engine::StreamEngine::new(
+                store.clone(),
+                sources.clone(),
+                &tmp,
+                1.0,
+            )),
+            taste: std::sync::Arc::new(crate::taste::TasteEngine::new(store, sources)),
+            now_playing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+
+        let mut hdr = HeaderMap::new();
+        hdr.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
+
+        let mut handles = Vec::new();
+        for i in 0..30 {
+            let st = state.clone();
+            let h = hdr.clone();
+            let tid = format!("local:burst-track-{}", i % 12);
+            handles.push(tokio::spawn(async move {
+                let r1 = warm_track(State(st.clone()), Path(tid.clone()), h.clone()).await;
+                let r2 = record_event(
+                    State(st.clone()),
+                    h.clone(),
+                    Json(EventReq {
+                        track_id: tid.clone(),
+                        kind: "skip".into(),
+                        value: 1.0,
+                    }),
+                )
+                .await;
+                let r3 = save_queue(
+                    State(st),
+                    h,
+                    Json(WebQueueSaveReq {
+                        current_id: tid.clone(),
+                        current_index: i % 12,
+                        position_ms: 0,
+                        track_ids: vec![tid],
+                    }),
+                )
+                .await;
+                assert_eq!(r1.status(), StatusCode::OK);
+                assert_eq!(r2.status(), StatusCode::OK);
+                assert_eq!(r3.status(), StatusCode::OK);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -347,6 +347,28 @@ pub struct Event {
     pub at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct UserEventRow {
+    pub track_id: String,
+    pub kind: String,
+    pub value: f64,
+    pub at: i64,
+    pub track: Option<Track>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareRecord {
+    pub id: String,
+    pub user_id: i64,
+    pub creator_name: String,
+    pub kind: String,
+    pub target_id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub track_ids: Vec<String>,
+    pub created: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RadioStation {
     pub id: String,

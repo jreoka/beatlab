@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 const INNERTUBE_SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
@@ -35,6 +37,7 @@ pub struct YtmCandidate {
 pub struct YtmSource {
     http: reqwest::Client,
     ytdlp_bin: String,
+    ytdlp_sem: Arc<Semaphore>,
 }
 
 impl YtmSource {
@@ -47,7 +50,11 @@ impl YtmSource {
         let ytdlp_bin = ytdlp_override
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(detect_ytdlp_bin);
-        Self { http, ytdlp_bin }
+        Self {
+            http,
+            ytdlp_bin,
+            ytdlp_sem: Arc::new(Semaphore::new(4)),
+        }
     }
 
     pub fn ytdlp_bin(&self) -> &str {
@@ -170,6 +177,10 @@ impl YtmSource {
         title: &str,
         target_duration: i32,
     ) -> Option<String> {
+        let _permit = tokio::time::timeout(Duration::from_secs(10), self.ytdlp_sem.acquire())
+            .await
+            .ok()?
+            .ok()?;
         let search_arg = format!("ytsearch4:{} audio", query);
         let mut cmd = Command::new(&self.ytdlp_bin);
         cmd.kill_on_drop(true);
@@ -257,6 +268,10 @@ impl YtmSource {
         extractor_args: &str,
         format_sel: &str,
     ) -> AppResult<ResolvedStream> {
+        let _permit = tokio::time::timeout(Duration::from_secs(12), self.ytdlp_sem.acquire())
+            .await
+            .map_err(|_| err_msg("Timed out waiting for yt-dlp concurrency slot"))?
+            .map_err(|_| err_msg("yt-dlp semaphore closed"))?;
         let mut cmd = Command::new(&self.ytdlp_bin);
         cmd.kill_on_drop(true);
         cmd.arg("-j").arg("--no-playlist").arg("--no-warnings");

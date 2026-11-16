@@ -1,7 +1,7 @@
 use crate::models::{
     constant_time_eq, err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
-    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, RadioStation, Track, User,
-    UserTrackStats,
+    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, RadioStation, ShareRecord,
+    Track, User, UserEventRow, UserTrackStats,
 };
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, ToSql};
@@ -258,6 +258,20 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_hidden_tracks_user
                 ON hidden_tracks(user_id, at DESC);
+
+            CREATE TABLE IF NOT EXISTS shares (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                subtitle TEXT NOT NULL DEFAULT '',
+                track_ids TEXT NOT NULL DEFAULT '[]',
+                created INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_shares_user_kind_target
+                ON shares(user_id, kind, target_id);
             ",
         )?;
 
@@ -1579,6 +1593,40 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn user_events_with_tracks(&self, user_id: i64) -> AppResult<Vec<UserEventRow>> {
+        if user_id <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, e.track_id, e.kind, e.value, e.at
+             FROM events e
+             LEFT JOIN tracks t ON t.id = e.track_id
+             WHERE e.user_id = ?1
+             ORDER BY e.at ASC, e.id ASC",
+            prefixed_track_cols("t")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                let has_track: Option<String> = r.get(0)?;
+                let track = if has_track.is_some() {
+                    Some(row_to_track(r)?)
+                } else {
+                    None
+                };
+                Ok(UserEventRow {
+                    track_id: r.get(21)?,
+                    kind: r.get(22)?,
+                    value: r.get(23)?,
+                    at: r.get(24)?,
+                    track,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn star_track(&self, user_id: i64, track_id: &str) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();
@@ -2525,6 +2573,120 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Public Share Links
+    // -------------------------------------------------------------------------
+
+    pub fn create_or_get_share(
+        &self,
+        user_id: i64,
+        kind: &str,
+        target_id: &str,
+        title: &str,
+        subtitle: &str,
+        track_ids: &[String],
+    ) -> AppResult<ShareRecord> {
+        let ids_json = serde_json::to_string(track_ids).unwrap_or_else(|_| "[]".to_string());
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+
+        let existing_id: Option<String> = if kind == "mix" {
+            conn.query_row(
+                "SELECT id FROM shares
+                 WHERE user_id = ?1 AND kind = 'mix' AND title = ?2 AND track_ids = ?3
+                 LIMIT 1",
+                params![user_id, title, ids_json],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            conn.query_row(
+                "SELECT id FROM shares
+                 WHERE user_id = ?1 AND kind = ?2 AND target_id = ?3
+                 LIMIT 1",
+                params![user_id, kind, target_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+
+        let share_id = if let Some(id) = existing_id {
+            conn.execute(
+                "UPDATE shares SET title = ?1, subtitle = ?2, track_ids = ?3 WHERE id = ?4",
+                params![title, subtitle, ids_json, id],
+            )?;
+            id
+        } else {
+            let mut id = Uuid::new_v4().simple().to_string()[..10].to_string();
+            while conn
+                .query_row("SELECT 1 FROM shares WHERE id = ?1", params![id], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .optional()?
+                .is_some()
+            {
+                id = Uuid::new_v4().simple().to_string()[..10].to_string();
+            }
+            conn.execute(
+                "INSERT INTO shares(id, user_id, kind, target_id, title, subtitle, track_ids, created)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, user_id, kind, target_id, title, subtitle, ids_json, now],
+            )?;
+            id
+        };
+
+        let creator_name: String = conn
+            .query_row(
+                "SELECT username FROM users WHERE id = ?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "Beatlab User".to_string());
+
+        Ok(ShareRecord {
+            id: share_id,
+            user_id,
+            creator_name,
+            kind: kind.to_string(),
+            target_id: target_id.to_string(),
+            title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            track_ids: track_ids.to_vec(),
+            created: now,
+        })
+    }
+
+    pub fn get_share(&self, id: &str) -> AppResult<Option<ShareRecord>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT s.id, s.user_id, COALESCE(u.username, 'Beatlab User'), s.kind, s.target_id, s.title, s.subtitle, s.track_ids, s.created
+                 FROM shares s
+                 LEFT JOIN users u ON u.id = s.user_id
+                 WHERE s.id = ?1",
+                params![id.trim()],
+                |r| {
+                    let ids_json: String = r.get(7)?;
+                    let track_ids: Vec<String> =
+                        serde_json::from_str(&ids_json).unwrap_or_default();
+                    Ok(ShareRecord {
+                        id: r.get(0)?,
+                        user_id: r.get(1)?,
+                        creator_name: r.get(2)?,
+                        kind: r.get(3)?,
+                        target_id: r.get(4)?,
+                        title: r.get(5)?,
+                        subtitle: r.get(6)?,
+                        track_ids,
+                        created: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 }
 

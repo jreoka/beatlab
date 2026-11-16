@@ -26,6 +26,7 @@
     arrowUp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
     eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
+    share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>',
     nowPlaying: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="10" width="3" height="10" rx="1"/><rect x="10.5" y="4" width="3" height="16" rx="1"/><rect x="17" y="7" width="3" height="13" rx="1"/></svg>',
     volOn: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>',
     volMuted: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/>',
@@ -60,11 +61,26 @@
     autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
     radioReqToken: 0,
     radioLoading: false,
+    radioInFlight: null,
     compatAttemptedId: '',
     volume: parseFloat(localStorage.getItem('beatlab_vol') || '0.9'),
     muted: false,
     seeking: false,
     lastScrobbleCompleteId: '',
+    playCommitTimer: null,
+    lastPlaySwitchAt: 0,
+    lastCommittedTrackId: '',
+    activeAudioToken: 0,
+    lyricsAbortController: null,
+    lyricsReqToken: 0,
+    queueActionToken: 0,
+    queueAbortController: null,
+    queueSaveTimer: null,
+    queueSaveDirty: false,
+    queueWarmTimer: null,
+    likeInFlight: new Set(),
+    lastSkipKeyAt: 0,
+    shareInFlight: false,
     fsTab: 'queue',
     fsMobileView: 'player',
     lyrics: { synced: false, plain: '', lines: [] },
@@ -79,6 +95,12 @@
     viewReqToken: 0,
     viewAbortController: null,
     libTab: 'playlists',
+    statsRange: 'all',
+    statsMetric: 'streams',
+    statsData: null,
+    currentMoodShare: null,
+    currentGenreShare: null,
+    currentShareUrl: '',
     searchState: null,
     settingsTab: 'general',
     settingsData: {
@@ -481,6 +503,10 @@
     state.lyrics = { synced: false, plain: '', lines: [] };
     state.activeLyricIdx = -1;
     state.searchState = null;
+    state.statsData = null;
+    state.currentMoodShare = null;
+    state.currentGenreShare = null;
+    state.currentShareUrl = '';
     state.settingsData = { sources: null, hidden: null, confirmResetHidden: false };
     clearTimeout(state.searchTimer);
     state.searchTimer = null;
@@ -652,6 +678,11 @@
         resetAuthForm();
       }
     });
+    const flushOnExit = () => {
+      if (state.queueSaveDirty) flushServerQueue(true);
+    };
+    window.addEventListener('pagehide', flushOnExit);
+    window.addEventListener('beforeunload', flushOnExit);
 
     $('auth-form').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -696,7 +727,7 @@
           if (state.searchState) {
             renderSearchView();
           } else {
-            setMainLoading('Search songs, artists, or albums...');
+            renderExplore();
           }
         }
         return;
@@ -705,9 +736,10 @@
       if (state.searchFetchingQuery && state.searchFetchingQuery !== trimmed) {
         abortActiveViewRequest();
         state.searchLoadingUi = true;
-        setMainLoading(`Searching for "${trimmed}" across all sources...`);
-      } else if (state.searchLoadingUi) {
-        setMainLoading(`Searching for "${trimmed}" across all sources...`);
+        setMainLoading(`Searching "${trimmed}"...`);
+      } else if (!state.searchComposing) {
+        state.searchLoadingUi = true;
+        setMainLoading(`Searching "${trimmed}"...`);
       }
 
       state.searchTimer = setTimeout(() => {
@@ -752,6 +784,7 @@
     wireAudioEvents();
     wireKeyboardShortcuts();
     wireTrackGestures();
+    wireStatsTooltips();
     window.addEventListener('hashchange', () => renderCurrentHash());
 
     if (state.token) {
@@ -788,7 +821,7 @@
       box.innerHTML = state.playlists
         .map(
           (p) => `
-          <button class="pl-link" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
+          <button class="pl-link" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(`${p.trackCount} tracks · ${p.ownerName}`)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
             <span class="pl-link-name">${esc(p.name)}</span>
             ${p.isAuto ? '<span class="pl-auto-pill">Mix</span>' : ''}
           </button>`
@@ -838,11 +871,17 @@
     }
   }
 
-  function saveServerQueue() {
+  function flushServerQueue(keepalive = false) {
+    if (state.queueSaveTimer) {
+      clearTimeout(state.queueSaveTimer);
+      state.queueSaveTimer = null;
+    }
+    state.queueSaveDirty = false;
     if (!state.token) return;
     const cur = currentTrack();
     api('/api/web/queue', {
       method: 'PUT',
+      keepalive: !!keepalive,
       body: JSON.stringify({
         currentId: cur ? cur.id : '',
         currentIndex: Math.max(0, state.queueIndex),
@@ -850,6 +889,22 @@
         trackIds: state.queue.map((t) => t.id),
       }),
     }).catch(() => {});
+  }
+
+  function saveServerQueue(immediate = false) {
+    if (!state.token) return;
+    state.queueSaveDirty = true;
+    if (state.queueSaveTimer) {
+      clearTimeout(state.queueSaveTimer);
+      state.queueSaveTimer = null;
+    }
+    if (immediate) {
+      flushServerQueue(false);
+      return;
+    }
+    state.queueSaveTimer = setTimeout(() => {
+      flushServerQueue(false);
+    }, 650);
   }
 
   // ---------------------------------------------------------------------------
@@ -914,6 +969,7 @@
   function navigate(route) {
     setExpandedPlayer(false);
     closeTrackMenu();
+    hideStatsTooltip();
     const clean = route.replace(/^#/, '');
     if (!isSearchHash(clean)) {
       clearTimeout(state.searchTimer);
@@ -974,11 +1030,21 @@
     if (hash === 'library') return renderLibrary(state.libTab);
     if (hash === 'liked') return renderLibrary('liked');
     if (hash === 'history') return renderLibrary('history');
+    if (hash === 'stats' || hash.startsWith('stats?')) {
+      const qIdx = hash.indexOf('?');
+      const rangeParam = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)).get('range') : '';
+      return renderStats(rangeParam || state.statsRange || 'all');
+    }
     return renderHome();
   }
 
-  function setMainLoading(label = 'Loading...') {
-    $('main-view').innerHTML = `<p class="muted-center">${esc(label)}</p>`;
+  function setMainLoading(label = 'Loading...', showSpinner = true) {
+    $('main-view').innerHTML = `
+      <div class="main-loading-state" role="status" aria-live="polite">
+        ${showSpinner ? '<div class="loading-spinner" aria-hidden="true"></div>' : ''}
+        <p class="loading-label">${esc(label || 'Loading...')}</p>
+      </div>
+    `;
   }
 
   async function renderHome() {
@@ -1096,15 +1162,16 @@
   }
 
   async function renderSearch(query) {
-    if (!query) {
+    const cleanQ = String(query || '').trim();
+    if (!cleanQ) {
       return renderExplore();
     }
     const { reqToken, signal } = beginViewRequest();
-    state.searchFetchingQuery = query;
+    state.searchFetchingQuery = cleanQ;
     state.searchLoadingUi = true;
-    setMainLoading(`Searching for "${query}" across all sources...`);
+    setMainLoading(`Searching "${cleanQ}"...`);
     try {
-      const d = await api(`/api/web/search?q=${encodeURIComponent(query)}`, { signal });
+      const d = await api(`/api/web/search?q=${encodeURIComponent(cleanQ)}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       state.searchFetchingQuery = '';
       state.searchLoadingUi = false;
@@ -1171,7 +1238,7 @@
     const intentTag = refinements?.detectedIntent ? ` · ${esc(refinements.detectedIntent)}` : '';
 
     const isProminent = !!(mix.prominent || mix.isThemeMix);
-    return `<section class="instant-mix-card ${isProminent ? 'prominent' : ''}">
+    return `<section class="instant-mix-card ${isProminent ? 'prominent' : ''}" data-share-kind="mix" data-share-id="${esc(`mix:${mix.title || query}`)}" data-share-title="${esc(mix.title)}" data-share-sub="${esc(mix.subtitle || '')}" data-share-cover="${esc(covers[0] || '')}">
       <div class="instant-mix-head">
         ${artHtml}
         <div class="instant-mix-info">
@@ -1182,6 +1249,7 @@
             <button class="btn-primary" onclick="App.playInstantMix(false, 0)">${ICONS.play} Play Mix</button>
             <button class="btn-secondary" onclick="App.playInstantMix(true, 0)">Shuffle</button>
             <button class="btn-secondary" onclick="App.queueInstantMix()">Add to Queue</button>
+            <button class="btn-secondary" onclick="App.shareCurrentInstantMix()">${ICONS.share} Share Mix</button>
           </div>
         </div>
       </div>
@@ -1326,6 +1394,7 @@
             <button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>
             <button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>
             <button id="save-alb-btn" class="btn-secondary ${alb.isSaved ? 'active' : ''}" onclick="App.toggleSaveAlbum(${esc(JSON.stringify(alb.id))}, ${!alb.isSaved})">${ICONS.heart} ${alb.isSaved ? 'Saved' : 'Save Album'}</button>
+            <button class="btn-secondary" onclick="App.shareAlbum(${esc(JSON.stringify(alb.id))}, ${esc(JSON.stringify(alb.name))}, ${esc(JSON.stringify(alb.artist))}, ${esc(JSON.stringify(alb.coverUrl))})">${ICONS.share} Share</button>
           </div>
         </div>
       </div>`;
@@ -1371,6 +1440,7 @@
             ${top.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Top Tracks</button>` : ''}
             ${top[0] ? `<button class="btn-secondary" onclick="App.startRadioForId(${esc(JSON.stringify(top[0].id))})">Artist Radio</button>` : ''}
             <button class="btn-secondary ${art.isFollowed ? 'active' : ''}" onclick="App.toggleFollowArtist(${esc(JSON.stringify(art.id))}, ${!art.isFollowed})">${art.isFollowed ? '✓ Following' : '+ Follow'}</button>
+            <button class="btn-secondary" onclick="App.shareArtist(${esc(JSON.stringify(art.id))}, ${esc(JSON.stringify(art.name))}, ${esc(JSON.stringify(art.coverUrl))})">${ICONS.share} Share</button>
           </div>
         </div>
       </div>`;
@@ -1421,6 +1491,7 @@
             ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>` : ''}
             ${tracks.length > 1 ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
             ${tracks.length ? `<button class="btn-secondary" onclick="App.startPlaylistRadio(${esc(JSON.stringify(pl.id))})">Start Radio</button>` : ''}
+            ${tracks.length ? `<button class="btn-secondary" onclick="App.sharePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))}, ${esc(JSON.stringify(pl.ownerName))}, ${esc(JSON.stringify(pl.coverUrl))})">${ICONS.share} Share</button>` : ''}
             ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" onclick="App.promptRenamePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))})">Rename</button>` : ''}
             ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" style="color:#fda4af" onclick="App.deletePlaylist(${esc(JSON.stringify(pl.id))})">Delete</button>` : ''}
           </div>
@@ -1514,6 +1585,14 @@
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const m = d.mood;
       const tracks = cacheTracks(d.tracks || []);
+      state.currentMoodShare = {
+        kind: 'mix',
+        targetId: `mood:${m.slug}`,
+        title: `${m.label} Mix`,
+        subtitle: m.subtitle || 'Mood Mix',
+        trackIds: tracks.map((t) => t.id),
+        coverUrl: tracks[0]?.coverUrl || '/api/web/cover/default',
+      };
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
       let html = `<div class="hero-header" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)};">
         <div class="hero-info">
@@ -1523,6 +1602,7 @@
           <div class="hero-actions">
             <button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Mix</button>
             <button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>
+            ${tracks.length ? `<button class="btn-secondary" onclick="App.shareCurrentMoodMix()">${ICONS.share} Share Mix</button>` : ''}
           </div>
         </div>
       </div>
@@ -1542,6 +1622,14 @@
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const tracks = cacheTracks(d.tracks || []);
       const artists = d.artists || [];
+      state.currentGenreShare = {
+        kind: 'mix',
+        targetId: `genre:${d.genre}`,
+        title: `${d.genre} Mix`,
+        subtitle: `Genre Mix · ${tracks.length} tracks`,
+        trackIds: tracks.map((t) => t.id),
+        coverUrl: tracks[0]?.coverUrl || '/api/web/cover/default',
+      };
       const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
       let html = `<div class="hero-header">
         <div class="hero-info">
@@ -1550,6 +1638,7 @@
           <div class="hero-sub">${tracks.length} tracks ready to stream</div>
           <div class="hero-actions">
             ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play ${esc(d.genre)}</button>` : ''}
+            ${tracks.length ? `<button class="btn-secondary" onclick="App.shareCurrentGenreMix()">${ICONS.share} Share Mix</button>` : ''}
           </div>
         </div>
       </div>`;
@@ -1593,7 +1682,7 @@
         ['frequent', `Most Played`],
       ];
 
-      let html = `<div class="section-head"><h1>Your Library</h1><button class="btn-primary" onclick="App.promptCreatePlaylist()">+ New Playlist</button></div>`;
+      let html = `<div class="section-head"><h1>Your Library</h1><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn-secondary" onclick="App.navigate('stats')">Listening Stats</button><button class="btn-primary" onclick="App.promptCreatePlaylist()">+ New Playlist</button></div></div>`;
       html += `<div class="tabs-bar">${tabs
         .map(
           ([k, lbl]) =>
@@ -1632,6 +1721,1211 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Detailed Listening Stats & Graphs
+  // ---------------------------------------------------------------------------
+  function fmtStatsDuration(sec) {
+    if (!Number.isFinite(sec) || sec <= 0) return '0m';
+    const s = Math.floor(sec);
+    if (s < 60) return `${s}s`;
+    const mins = Math.floor(s / 60);
+    const hrs = Math.floor(mins / 60);
+    const remM = mins % 60;
+    if (hrs >= 100) {
+      const days = Math.floor(hrs / 24);
+      const remH = hrs % 24;
+      return `${days}d ${remH}h`;
+    }
+    return hrs > 0 ? `${hrs}h ${remM}m` : `${mins}m`;
+  }
+
+  function fmtDateLabel(ts) {
+    if (!ts) return '—';
+    try {
+      return new Date(ts * 1000).toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+    } catch {
+      return '—';
+    }
+  }
+
+  function fmtShortDayIso(iso) {
+    if (!iso) return '';
+    try {
+      const [y, m, d] = iso.split('-').map(Number);
+      const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1));
+      return dt.toLocaleDateString(undefined, {
+        timeZone: 'UTC',
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+    } catch {
+      return iso;
+    }
+  }
+
+  function fmtRelativeTime(ts) {
+    if (!ts) return '';
+    const diff = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 7 * 86400) return `${Math.floor(diff / 86400)}d ago`;
+    return fmtDateLabel(ts);
+  }
+
+  function fmtHourLongJs(h) {
+    if (h === 0) return '12 AM';
+    if (h < 12) return `${h} AM`;
+    if (h === 12) return '12 PM';
+    return `${h - 12} PM`;
+  }
+
+  function hideStatsTooltip() {
+    const tip = $('stats-tooltip');
+    if (tip) tip.classList.add('hidden');
+  }
+
+  function showStatsTooltip(target, clientX, clientY) {
+    const tip = $('stats-tooltip');
+    if (!tip || !target) return;
+    const title = target.getAttribute('data-tip-title') || '';
+    const body = target.getAttribute('data-tip-body') || '';
+    if (!title && !body) {
+      hideStatsTooltip();
+      return;
+    }
+    tip.innerHTML = `${title ? `<div class="stats-tip-title">${esc(title)}</div>` : ''}${body ? `<div class="stats-tip-body">${esc(body)}</div>` : ''}`;
+    tip.classList.remove('hidden');
+
+    const rect = tip.getBoundingClientRect();
+    let x = clientX;
+    let y = clientY;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || (x === 0 && y === 0)) {
+      const tr = target.getBoundingClientRect();
+      x = tr.left + tr.width / 2;
+      y = tr.top;
+    }
+    const pad = 10;
+    const left = Math.max(pad, Math.min(window.innerWidth - rect.width - pad, x - rect.width / 2));
+    let top = y - rect.height - 14;
+    if (top < pad) top = y + 18;
+    top = Math.max(pad, Math.min(window.innerHeight - rect.height - pad, top));
+    tip.style.left = `${Math.round(left)}px`;
+    tip.style.top = `${Math.round(top)}px`;
+  }
+
+  function wireStatsTooltips() {
+    const mv = $('main-view');
+    if (!mv) return;
+    mv.addEventListener('pointermove', (e) => {
+      const t = e.target && e.target.closest ? e.target.closest('.stats-tip-target') : null;
+      if (t) {
+        showStatsTooltip(t, e.clientX, e.clientY);
+      } else {
+        hideStatsTooltip();
+      }
+    });
+    mv.addEventListener('pointerleave', hideStatsTooltip);
+    mv.addEventListener('scroll', hideStatsTooltip, { passive: true });
+    mv.addEventListener('click', (e) => {
+      const t = e.target && e.target.closest ? e.target.closest('.stats-tip-target') : null;
+      if (t && window.matchMedia && window.matchMedia('(pointer: coarse)').matches) {
+        showStatsTooltip(t, e.clientX, e.clientY);
+      }
+    });
+  }
+
+  function svgDonutSlicePath(cx, cy, rOuter, rInner, startDeg, endDeg) {
+    const rad = Math.PI / 180;
+    const s = startDeg * rad;
+    const e = endDeg * rad;
+    const large = endDeg - startDeg > 180 ? 1 : 0;
+    const x1 = cx + rOuter * Math.cos(s);
+    const y1 = cy + rOuter * Math.sin(s);
+    const x2 = cx + rOuter * Math.cos(e);
+    const y2 = cy + rOuter * Math.sin(e);
+    const x3 = cx + rInner * Math.cos(e);
+    const y3 = cy + rInner * Math.sin(e);
+    const x4 = cx + rInner * Math.cos(s);
+    const y4 = cy + rInner * Math.sin(s);
+    return `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${rOuter} ${rOuter} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} L ${x3.toFixed(2)} ${y3.toFixed(2)} A ${rInner} ${rInner} 0 ${large} 0 ${x4.toFixed(2)} ${y4.toFixed(2)} Z`;
+  }
+
+  function renderStatsTimelineSvg(timeline, metric) {
+    const points = (timeline && timeline.points) || [];
+    if (!points.length) {
+      return '<p class="muted-center">No timeline points yet.</p>';
+    }
+    const vals = points.map((p) => (metric === 'mins' ? Math.round((p.secs || 0) / 60) : (p.streams || 0)));
+    const maxVal = Math.max(1, ...vals);
+    const W = 760;
+    const H = 228;
+    const padL = 42;
+    const padR = 14;
+    const padT = 18;
+    const padB = 30;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+    const baseY = padT + plotH;
+    const n = points.length;
+    const slotW = plotW / n;
+    const barW = Math.max(3, Math.min(28, slotW * 0.54));
+
+    const coords = points.map((p, i) => {
+      const x = padL + (i + 0.5) * slotW;
+      const y = baseY - (vals[i] / maxVal) * plotH;
+      return { x, y, v: vals[i], p };
+    });
+
+    // Horizontal grid lines & Y axis labels
+    const ticks = [0, 0.5, 1];
+    const gridSvg = ticks
+      .map((t) => {
+        const y = baseY - t * plotH;
+        const val = Math.round(t * maxVal);
+        return `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="#232834" stroke-dasharray="${t === 0 ? '0' : '3 4'}" stroke-width="1" />
+          <text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="#6b7485" font-size="10.5">${val}${metric === 'mins' ? 'm' : ''}</text>`;
+      })
+      .join('');
+
+    // Smooth curve & gradient area
+    let linePath = '';
+    let areaPath = '';
+    if (coords.length === 1) {
+      linePath = `M ${coords[0].x.toFixed(1)} ${coords[0].y.toFixed(1)}`;
+    } else {
+      linePath = coords
+        .map((c, i) => {
+          if (i === 0) return `M ${c.x.toFixed(1)} ${c.y.toFixed(1)}`;
+          const prev = coords[i - 1];
+          const midX = ((prev.x + c.x) / 2).toFixed(1);
+          return `C ${midX} ${prev.y.toFixed(1)}, ${midX} ${c.y.toFixed(1)}, ${c.x.toFixed(1)} ${c.y.toFixed(1)}`;
+        })
+        .join(' ');
+      areaPath = `${linePath} L ${coords[coords.length - 1].x.toFixed(1)} ${baseY} L ${coords[0].x.toFixed(1)} ${baseY} Z`;
+    }
+
+    const peakVal = Math.max(...vals);
+    const labelStep = Math.max(1, Math.ceil(n / 8));
+
+    const barsAndHits = coords
+      .map((c, i) => {
+        const barH = Math.max(c.v > 0 ? 3 : 0, baseY - c.y);
+        const bx = c.x - barW / 2;
+        const isPeak = peakVal > 0 && c.v === peakVal;
+        const tipTitle = c.p.label || c.p.key;
+        const tipBody = `${c.p.streams} stream${c.p.streams === 1 ? '' : 's'} · ${fmtStatsDuration(c.p.secs)} (${c.p.completed} completed, ${c.p.skipped} skipped)`;
+        const xLabel =
+          i % labelStep === 0 || i === n - 1
+            ? `<text x="${c.x.toFixed(1)}" y="${H - 8}" text-anchor="middle" fill="#6b7485" font-size="10.5">${esc(c.p.shortLabel)}</text>`
+            : '';
+        const peakDot = isPeak
+          ? `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="4.2" fill="#1ed760" stroke="#0c0e13" stroke-width="2" />`
+          : '';
+        return `
+          <rect x="${bx.toFixed(1)}" y="${c.y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" rx="2" fill="${isPeak ? '#1ed760' : 'rgba(56, 189, 248, 0.38)'}" />
+          ${peakDot}
+          ${xLabel}
+          <rect class="stats-hit-col stats-tip-target" x="${(padL + i * slotW).toFixed(1)}" y="${padT}" width="${slotW.toFixed(1)}" height="${plotH}" fill="transparent" data-tip-title="${esc(tipTitle)}" data-tip-body="${esc(tipBody)}" />
+        `;
+      })
+      .join('');
+
+    return `<svg class="stats-svg-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <linearGradient id="statsTimelineGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#1ed760" stop-opacity="0.28" />
+          <stop offset="100%" stop-color="#1ed760" stop-opacity="0.01" />
+        </linearGradient>
+      </defs>
+      ${gridSvg}
+      ${areaPath ? `<path d="${areaPath}" fill="url(#statsTimelineGrad)" />` : ''}
+      ${linePath ? `<path d="${linePath}" fill="none" stroke="#1ed760" stroke-width="2.2" stroke-linecap="round" />` : ''}
+      ${barsAndHits}
+    </svg>`;
+  }
+
+  function renderStatsClockSvg(hourly, metric, peakHour) {
+    const hrs = hourly || [];
+    const vals = hrs.map((h) => (metric === 'mins' ? Math.round((h.secs || 0) / 60) : (h.streams || 0)));
+    const maxVal = Math.max(1, ...vals);
+    const W = 280;
+    const H = 280;
+    const cx = 140;
+    const cy = 140;
+    const rInner = 46;
+    const rMax = 112;
+
+    const wedges = hrs
+      .map((h, i) => {
+        const startDeg = i * 15 - 90 + 1.1;
+        const endDeg = (i + 1) * 15 - 90 - 1.1;
+        const v = vals[i] || 0;
+        const ratio = v / maxVal;
+        const rOuter = v > 0 ? rInner + 10 + ratio * (rMax - rInner - 10) : rInner + 4;
+        let fill = '#232834';
+        let opacity = 0.85;
+        if (v > 0) {
+          if (i === peakHour) {
+            fill = '#1ed760';
+            opacity = 1;
+          } else if (i >= 22 || i <= 4) {
+            fill = '#38bdf8';
+            opacity = 0.35 + 0.65 * ratio;
+          } else if (i >= 17 && i <= 21) {
+            fill = '#a855f7';
+            opacity = 0.35 + 0.65 * ratio;
+          } else {
+            fill = '#1ed760';
+            opacity = 0.3 + 0.6 * ratio;
+          }
+        }
+        const tipTitle = `${fmtHourLongJs(i)} – ${fmtHourLongJs((i + 1) % 24)}`;
+        const tipBody = `${h.streams} stream${h.streams === 1 ? '' : 's'} (${h.pct}%) · ${fmtStatsDuration(h.secs)}`;
+        return `
+          <path d="${svgDonutSlicePath(cx, cy, rOuter, rInner, startDeg, endDeg)}" fill="${fill}" fill-opacity="${opacity.toFixed(2)}" />
+          <path class="stats-clock-hit stats-tip-target" d="${svgDonutSlicePath(cx, cy, rMax + 4, rInner, startDeg, endDeg)}" fill="transparent" data-tip-title="${esc(tipTitle)}" data-tip-body="${esc(tipBody)}" />
+        `;
+      })
+      .join('');
+
+    const peakLabel = peakHour != null ? fmtHourLongJs(peakHour) : '—';
+    const peakPct = peakHour != null && hrs[peakHour] ? `${hrs[peakHour].pct}% of plays` : 'No streams';
+
+    return `<svg class="stats-clock-svg" viewBox="0 0 ${W} ${H}">
+      <circle cx="${cx}" cy="${cy}" r="${rMax}" fill="none" stroke="#232834" stroke-dasharray="3 4" />
+      <circle cx="${cx}" cy="${cy}" r="${((rInner + rMax) / 2).toFixed(1)}" fill="none" stroke="#1e2330" stroke-dasharray="2 4" />
+      <text x="${cx}" y="16" text-anchor="middle" fill="#98a2b3" font-size="11" font-weight="700">12 AM</text>
+      <text x="${W - 8}" y="${cy + 4}" text-anchor="end" fill="#98a2b3" font-size="11" font-weight="700">6 AM</text>
+      <text x="${cx}" y="${H - 8}" text-anchor="middle" fill="#98a2b3" font-size="11" font-weight="700">12 PM</text>
+      <text x="8" y="${cy + 4}" text-anchor="start" fill="#98a2b3" font-size="11" font-weight="700">6 PM</text>
+      ${wedges}
+      <circle cx="${cx}" cy="${cy}" r="${rInner - 4}" fill="#12151c" stroke="#232834" />
+      <text x="${cx}" y="${cy - 3}" text-anchor="middle" fill="#f3f5f8" font-size="15" font-weight="800">${esc(peakLabel)}</text>
+      <text x="${cx}" y="${cy + 14}" text-anchor="middle" fill="#98a2b3" font-size="10">${esc(peakPct)}</text>
+    </svg>`;
+  }
+
+  function renderStatsHeatmap(heatmap) {
+    if (!heatmap || !heatmap.startDate || !heatmap.endDate) return '';
+    const dayMap = new Map();
+    for (const d of heatmap.days || []) {
+      dayMap.set(d.date, d);
+    }
+    const maxStreams = Math.max(1, heatmap.maxStreams || 0);
+    const [sy, sm, sd] = heatmap.startDate.split('-').map(Number);
+    const [ey, em, ed] = heatmap.endDate.split('-').map(Number);
+    const startUtc = new Date(Date.UTC(sy, sm - 1, sd));
+    const endUtc = new Date(Date.UTC(ey, em - 1, ed));
+
+    // Align grid start back to Monday (0=Mon..6=Sun)
+    const startDow = (startUtc.getUTCDay() + 6) % 7;
+    const gridStart = new Date(startUtc.getTime() - startDow * 86400000);
+
+    const weeks = [];
+    let cur = new Date(gridStart.getTime());
+    while (cur <= endUtc) {
+      const col = [];
+      for (let r = 0; r < 7; r++) {
+        const d = new Date(cur.getTime() + r * 86400000);
+        const iso = d.toISOString().slice(0, 10);
+        const inRange = d >= startUtc && d <= endUtc;
+        const info = inRange ? dayMap.get(iso) : null;
+        col.push({ iso, date: d, inRange, streams: info ? info.streams : 0, secs: info ? info.secs : 0 });
+      }
+      weeks.push(col);
+      cur = new Date(cur.getTime() + 7 * 86400000);
+    }
+
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    let lastMonth = -1;
+    const monthLabels = weeks
+      .map((col) => {
+        const firstDay = col.find((c) => c.inRange && c.date.getUTCDate() <= 7) || col.find((c) => c.inRange);
+        let label = '';
+        if (firstDay) {
+          const m = firstDay.date.getUTCMonth();
+          if (m !== lastMonth && (firstDay.date.getUTCDate() <= 7 || lastMonth === -1)) {
+            label = months[m];
+            lastMonth = m;
+          }
+        }
+        return `<div class="stats-hm-month">${label}</div>`;
+      })
+      .join('');
+
+    const colsHtml = weeks
+      .map((col) => {
+        const cells = col
+          .map((c) => {
+            if (!c.inRange) {
+              return '<div class="stats-hm-cell empty"></div>';
+            }
+            let lvl = 0;
+            if (c.streams > 0) {
+              const ratio = c.streams / maxStreams;
+              lvl = ratio <= 0.25 ? 1 : ratio <= 0.5 ? 2 : ratio <= 0.75 ? 3 : 4;
+            }
+            const tipTitle = fmtShortDayIso(c.iso);
+            const tipBody = c.streams > 0
+              ? `${c.streams} stream${c.streams === 1 ? '' : 's'} · ${fmtStatsDuration(c.secs)}`
+              : 'No streams logged';
+            return `<div class="stats-hm-cell lv-${lvl} stats-tip-target" data-tip-title="${esc(tipTitle)}" data-tip-body="${esc(tipBody)}"></div>`;
+          })
+          .join('');
+        return `<div class="stats-hm-col">${cells}</div>`;
+      })
+      .join('');
+
+    return `
+      <div class="stats-hm-scroll" id="stats-hm-scroll">
+        <div class="stats-hm-inner">
+          <div class="stats-hm-months-row">
+            <div class="stats-hm-wd-spacer"></div>
+            <div class="stats-hm-months">${monthLabels}</div>
+          </div>
+          <div class="stats-hm-body">
+            <div class="stats-hm-weekdays">
+              <span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span><span></span>
+            </div>
+            <div class="stats-hm-grid">${colsHtml}</div>
+          </div>
+        </div>
+      </div>
+      <div class="stats-hm-legend">
+        <span>Less</span>
+        <span class="stats-hm-cell lv-0"></span>
+        <span class="stats-hm-cell lv-1"></span>
+        <span class="stats-hm-cell lv-2"></span>
+        <span class="stats-hm-cell lv-3"></span>
+        <span class="stats-hm-cell lv-4"></span>
+        <span>More</span>
+      </div>
+    `;
+  }
+
+  function renderStatsMoodRadarSvg(moods) {
+    const list = moods || [];
+    if (!list.length) return '';
+    const W = 340;
+    const H = 286;
+    const cx = 170;
+    const cy = 143;
+    const rMax = 88;
+    const n = list.length;
+    const maxStreams = Math.max(1, ...list.map((m) => m.streams || 0));
+    const hasAny = list.some((m) => m.streams > 0);
+
+    const pointAt = (idx, radius) => {
+      const ang = -Math.PI / 2 + (idx * 2 * Math.PI) / n;
+      return [cx + radius * Math.cos(ang), cy + radius * Math.sin(ang), ang];
+    };
+
+    const rings = [0.25, 0.5, 0.75, 1]
+      .map((frac) => {
+        const pts = list.map((_, i) => pointAt(i, rMax * frac).slice(0, 2).map((v) => v.toFixed(1)).join(',')).join(' ');
+        return `<polygon points="${pts}" fill="none" stroke="#232834" stroke-width="1" />`;
+      })
+      .join('');
+
+    const spokes = list
+      .map((_, i) => {
+        const [x, y] = pointAt(i, rMax);
+        return `<line x1="${cx}" y1="${cy}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}" stroke="#1e2330" stroke-width="1" />`;
+      })
+      .join('');
+
+    const dataPts = list.map((m, i) => {
+      const ratio = hasAny && m.streams > 0 ? Math.max(0.14, m.streams / maxStreams) : 0.05;
+      return pointAt(i, rMax * ratio);
+    });
+    const polyStr = dataPts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+
+    const labelsAndDots = list
+      .map((m, i) => {
+        const [dx, dy] = dataPts[i];
+        const [lx, ly, ang] = pointAt(i, rMax + 18);
+        const cos = Math.cos(ang);
+        const anchor = Math.abs(cos) < 0.25 ? 'middle' : cos > 0 ? 'start' : 'end';
+        const shortLbl = m.label.replace(' & Lo-Fi', '').replace(' & Dance', '').replace(' & Indie', '');
+        const tipBody = `${m.streams} stream${m.streams === 1 ? '' : 's'} (${m.pct}%) · ${fmtStatsDuration(m.secs)}`;
+        return `
+          <circle class="stats-tip-target" cx="${dx.toFixed(1)}" cy="${dy.toFixed(1)}" r="${m.streams > 0 ? 4.2 : 2.5}" fill="${m.streams > 0 ? esc(m.c1) : '#475569'}" stroke="#0c0e13" stroke-width="1.5" data-tip-title="${esc(m.label)}" data-tip-body="${esc(tipBody)}" />
+          <text class="stats-radar-lbl" x="${lx.toFixed(1)}" y="${(ly + 3.5).toFixed(1)}" text-anchor="${anchor}" fill="${m.streams > 0 ? '#f3f5f8' : '#6b7485'}" font-size="10.5" font-weight="600" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">${esc(shortLbl)}</text>
+        `;
+      })
+      .join('');
+
+    return `<svg class="stats-radar-svg" viewBox="0 0 ${W} ${H}">
+      ${rings}
+      ${spokes}
+      ${hasAny ? `<polygon points="${polyStr}" fill="rgba(30, 215, 96, 0.22)" stroke="#1ed760" stroke-width="2.1" stroke-linejoin="round" />` : ''}
+      ${labelsAndDots}
+    </svg>`;
+  }
+
+  function renderStatsDonutSvg(segments, centerTop, centerBottom) {
+    const W = 176;
+    const H = 176;
+    const cx = 88;
+    const cy = 88;
+    const rOuter = 74;
+    const rInner = 48;
+    const total = segments.reduce((acc, s) => acc + (s.value || 0), 0);
+
+    let ringSvg = '';
+    if (total <= 0) {
+      ringSvg = `<circle cx="${cx}" cy="${cy}" r="${(rOuter + rInner) / 2}" fill="none" stroke="#232834" stroke-width="${rOuter - rInner}" />`;
+    } else if (segments.filter((s) => s.value > 0).length === 1) {
+      const only = segments.find((s) => s.value > 0);
+      ringSvg = `<circle class="stats-tip-target" cx="${cx}" cy="${cy}" r="${(rOuter + rInner) / 2}" fill="none" stroke="${esc(only.color)}" stroke-width="${rOuter - rInner}" data-tip-title="${esc(only.label)}" data-tip-body="${esc(only.tipBody || '')}" />`;
+    } else {
+      let angle = -90;
+      const active = segments.filter((s) => s.value > 0);
+      const gap = active.length > 1 ? 1.6 : 0;
+      ringSvg = active
+        .map((seg) => {
+          const sweep = (seg.value / total) * 360;
+          const start = angle + gap / 2;
+          const end = angle + sweep - gap / 2;
+          angle += sweep;
+          if (end <= start) return '';
+          return `<path class="stats-tip-target" d="${svgDonutSlicePath(cx, cy, rOuter, rInner, start, end)}" fill="${esc(seg.color)}" data-tip-title="${esc(seg.label)}" data-tip-body="${esc(seg.tipBody || '')}" />`;
+        })
+        .join('');
+    }
+
+    return `<svg class="stats-donut-svg" viewBox="0 0 ${W} ${H}">
+      ${ringSvg}
+      <text x="${cx}" y="${cy - 2}" text-anchor="middle" fill="#f3f5f8" font-size="20" font-weight="800">${esc(centerTop)}</text>
+      <text x="${cx}" y="${cy + 15}" text-anchor="middle" fill="#98a2b3" font-size="10.5" font-weight="600">${esc(centerBottom)}</text>
+    </svg>`;
+  }
+
+  async function renderStats(range = 'all') {
+    const { reqToken, signal } = beginViewRequest();
+    const cleanRange = ['7d', '30d', '90d', '365d', 'all'].includes(range) ? range : 'all';
+    state.statsRange = cleanRange;
+    hideStatsTooltip();
+    setMainLoading('Crunching your listening stats...');
+    try {
+      const tzOffsetMin = -new Date().getTimezoneOffset();
+      const d = await api(`/api/web/stats?range=${encodeURIComponent(cleanRange)}&tz=${encodeURIComponent(tzOffsetMin)}`, { signal });
+      if (!isViewRequestCurrent(reqToken, signal)) return;
+      state.statsData = d;
+      cacheTracks((d.topTracks || []).map((x) => x.track));
+      cacheTracks((d.mostSkipped || []).map((x) => x.track));
+      cacheTracks((d.recentEvents || []).map((x) => x.track));
+      if (d.highlights) {
+        for (const k of ['longestTrack', 'shortestTrack', 'firstTrackEver', 'mostCompletedTrack']) {
+          if (d.highlights[k]?.track) cacheTracks([d.highlights[k].track]);
+        }
+      }
+      renderStatsView();
+      $('main-view').scrollTop = 0;
+    } catch (e) {
+      handleViewFetchError(e, reqToken, signal);
+    }
+  }
+
+  function renderStatsView() {
+    const d = state.statsData;
+    if (!d) return;
+    hideStatsTooltip();
+
+    const s = d.summary || {};
+    const streaks = d.streaks || {};
+    const lib = d.library || {};
+    const persona = d.persona || {};
+    const metric = state.statsMetric === 'mins' ? 'mins' : 'streams';
+    const ranges = [
+      ['7d', '7 Days'],
+      ['30d', '30 Days'],
+      ['90d', '90 Days'],
+      ['365d', '1 Year'],
+      ['all', 'All Time'],
+    ];
+    const initial = ((state.user?.username || 'B')[0] || 'B').toUpperCase();
+
+    let html = `<div class="stats-page">`;
+
+    // Hero Banner with Listener Persona + Controls
+    html += `
+      <section class="stats-hero">
+        <div class="stats-hero-left">
+          <div class="stats-hero-identity">
+            <span class="avatar-dot large">${esc(initial)}</span>
+            <div>
+              <div class="hero-kicker">LISTENING ANALYTICS · ${esc(d.rangeLabel || 'All Time')}</div>
+              <h1 class="stats-hero-title">${esc(state.user?.username || 'Your')}’s Listening Stats</h1>
+              <div class="stats-hero-dates">
+                Member since ${esc(fmtDateLabel(d.memberSince))}
+                ${d.firstListenAt ? ` · First stream ${esc(fmtDateLabel(d.firstListenAt))}` : ''}
+              </div>
+            </div>
+          </div>
+          <div class="stats-persona-box">
+            <div class="stats-persona-row">
+              <span class="stats-persona-pill">${esc(persona.title || 'Music Listener')}</span>
+              ${(persona.badges || []).map((b) => `<span class="stats-vibe-chip">${esc(b)}</span>`).join('')}
+            </div>
+            <p class="stats-persona-headline">${esc(persona.headline || '')}</p>
+          </div>
+        </div>
+        <div class="stats-hero-controls">
+          <div class="stats-range-pills" role="group" aria-label="Timeframe">
+            ${ranges
+              .map(
+                ([k, lbl]) =>
+                  `<button class="tab-chip ${d.range === k ? 'active' : ''}" onclick="App.setStatsRange('${k}')">${esc(lbl)}</button>`
+              )
+              .join('')}
+          </div>
+          <div class="stats-ctrl-row">
+            <div class="stats-seg-toggle" role="group" aria-label="Chart Metric">
+              <button class="stats-seg-btn ${metric === 'streams' ? 'active' : ''}" onclick="App.setStatsMetric('streams')">Streams</button>
+              <button class="stats-seg-btn ${metric === 'mins' ? 'active' : ''}" onclick="App.setStatsMetric('mins')">Minutes</button>
+            </div>
+            <button class="btn-secondary" onclick="App.refreshStats()" title="Refresh stats">Refresh</button>
+          </div>
+        </div>
+      </section>
+    `;
+
+    // 8-Card KPI Grid (renders cleanly even at 0 streams)
+    const activeTodayDot = streaks.streakActiveToday
+      ? '<span class="stats-live-dot" title="Active today"></span>'
+      : '';
+    html += `
+      <section class="stats-kpi-grid">
+        <div class="stats-kpi-card accent-green">
+          <div class="stats-kpi-label">Listening Time</div>
+          <div class="stats-kpi-val">${esc(fmtStatsDuration(s.totalListeningSecs || 0))}</div>
+          <div class="stats-kpi-sub">${s.activeDays ? `${fmtStatsDuration(s.avgDailySecs)}/active day · ${fmtTime(s.avgTrackDurationSecs)} avg track` : 'Start spinning tracks'}</div>
+        </div>
+        <div class="stats-kpi-card">
+          <div class="stats-kpi-label">Total Streams</div>
+          <div class="stats-kpi-val">${s.totalStreams || 0}</div>
+          <div class="stats-kpi-sub">${s.completedStreams || 0} completed (${s.completionRate || 0}%)</div>
+          <div class="stats-kpi-bar"><span style="width:${Math.min(100, s.completionRate || 0)}%"></span></div>
+        </div>
+        <div class="stats-kpi-card accent-blue">
+          <div class="stats-kpi-label">Unique Songs</div>
+          <div class="stats-kpi-val">${s.uniqueTracks || 0}</div>
+          <div class="stats-kpi-sub">${s.repeatRatio || 0}× avg replay · ${s.newTracksDiscovered || 0} new (${s.discoveryRatePct || 0}%)</div>
+        </div>
+        <div class="stats-kpi-card">
+          <div class="stats-kpi-label">Artists &amp; Albums</div>
+          <div class="stats-kpi-val">${s.uniqueArtists || 0} <span class="stats-kpi-unit">artists</span></div>
+          <div class="stats-kpi-sub">${s.uniqueAlbums || 0} albums · ${s.newArtistsDiscovered || 0} newly discovered</div>
+        </div>
+        <div class="stats-kpi-card accent-amber">
+          <div class="stats-kpi-label">Daily Streak ${activeTodayDot}</div>
+          <div class="stats-kpi-val">${streaks.currentDays || 0}d</div>
+          <div class="stats-kpi-sub">Best streak: ${streaks.longestDays || 0}d · ${streaks.activeDaysAllTime || 0} days all-time</div>
+        </div>
+        <div class="stats-kpi-card">
+          <div class="stats-kpi-label">Completion vs Skips</div>
+          <div class="stats-kpi-val">${s.skipRate || 0}% <span class="stats-kpi-unit">skip</span></div>
+          <div class="stats-kpi-sub">${s.skippedStreams || 0} skipped · ${s.partialStreams || 0} partial plays</div>
+        </div>
+        <div class="stats-kpi-card accent-purple">
+          <div class="stats-kpi-label">Audio Fidelity</div>
+          <div class="stats-kpi-val">${s.losslessPct || 0}% <span class="stats-kpi-unit">lossless</span></div>
+          <div class="stats-kpi-sub">${s.avgBitrate ? `${s.avgBitrate} kbps avg · ` : ''}${esc(s.favoriteSourceLabel || '—')}</div>
+        </div>
+        <div class="stats-kpi-card">
+          <div class="stats-kpi-label">Library &amp; Taste</div>
+          <div class="stats-kpi-val">${lib.likedTracks || 0} <span class="stats-kpi-unit">likes</span></div>
+          <div class="stats-kpi-sub">${lib.manualPlaylists || 0} playlists · ${lib.followedArtists || 0} followed${lib.ratedTracks ? ` · ${lib.avgRating}★` : ''}</div>
+        </div>
+      </section>
+    `;
+
+    if (!s.totalStreams) {
+      html += `
+        <section class="stats-card stats-empty-card">
+          <h2>No Streams Recorded in ${esc(d.rangeLabel || 'This Period')}</h2>
+          <p>Play songs from Home, Explore, or Search (or scrobble via Subsonic/Navidrome clients) to unlock your timeline graphs, 24-hour listening clock, mood radar, and top charts.</p>
+          <div class="hero-actions" style="justify-content:center;margin-top:14px">
+            <button class="btn-primary" onclick="App.navigate('explore')">Explore Music</button>
+            <button class="btn-secondary" onclick="App.navigate('home')">Go Home</button>
+            ${d.range !== 'all' ? `<button class="btn-secondary" onclick="App.setStatsRange('all')">View All Time</button>` : ''}
+          </div>
+        </section>
+      `;
+      if ((d.recentEvents || []).length > 0) {
+        html += renderStatsActivityCard(d.recentEvents);
+      }
+      html += `</div>`;
+      $('main-view').innerHTML = html;
+      return;
+    }
+
+    // Row 1: Listening Timeline + 24-Hour Listening Clock
+    const granLabel =
+      d.timeline?.granularity === 'month'
+        ? 'Monthly'
+        : d.timeline?.granularity === 'week'
+          ? 'Weekly'
+          : 'Daily';
+    html += `
+      <section class="stats-grid-hero-charts">
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Listening Activity</h2>
+              <p class="stats-card-sub">${granLabel} ${metric === 'mins' ? 'minutes listened' : 'streams'} · ${s.activeDays} active day${s.activeDays === 1 ? '' : 's'} (${s.avgStreamsPerActiveDay}/day avg)</p>
+            </div>
+            <span class="stats-badge">${esc(granLabel)}</span>
+          </div>
+          <div class="stats-chart-wrap">
+            ${renderStatsTimelineSvg(d.timeline, metric)}
+          </div>
+        </div>
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>24-Hour Clock</h2>
+              <p class="stats-card-sub">${esc(persona.chronotypeDesc || 'Hourly distribution')}</p>
+            </div>
+            <span class="stats-badge green">${esc(persona.chronotype || '')}</span>
+          </div>
+          <div class="stats-clock-wrap">
+            ${renderStatsClockSvg(d.hourly, metric, d.peakHour)}
+          </div>
+        </div>
+      </section>
+    `;
+
+    // 365-Day Activity Heatmap
+    const bestDayText = streaks.bestDay
+      ? `Best day: ${fmtShortDayIso(streaks.bestDay.date)} · ${streaks.bestDay.streams} streams (${fmtStatsDuration(streaks.bestDay.secs)})`
+      : 'Consistency calendar';
+    html += `
+      <section class="stats-card stats-section-gap">
+        <div class="stats-card-head">
+          <div>
+            <h2>Listening Consistency (Past 365 Days)</h2>
+            <p class="stats-card-sub">${esc(bestDayText)}</p>
+          </div>
+          <div class="stats-inline-chips">
+            <span class="stats-badge">Current: ${streaks.currentDays || 0}d</span>
+            <span class="stats-badge">Best: ${streaks.longestDays || 0}d</span>
+          </div>
+        </div>
+        ${renderStatsHeatmap(d.heatmap)}
+      </section>
+    `;
+
+    // Row 2: Mood DNA Radar + Weekday & Decade Charts
+    const activeMoods = [...(d.moods || [])].filter((m) => m.streams > 0).sort((a, b) => b.streams - a.streams);
+    const weekdays = d.weekdays || [];
+    const maxWdVal = Math.max(1, ...weekdays.map((w) => (metric === 'mins' ? Math.round((w.secs || 0) / 60) : (w.streams || 0))));
+    const decades = d.decades || [];
+    const maxDecVal = Math.max(1, ...decades.map((x) => (metric === 'mins' ? Math.round((x.secs || 0) / 60) : (x.streams || 0))));
+
+    html += `
+      <section class="stats-grid-2">
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Mood &amp; Vibe DNA</h2>
+              <p class="stats-card-sub">Your emotional listening fingerprint across Beatlab’s 10 vibes</p>
+            </div>
+          </div>
+          <div class="stats-mood-split">
+            <div class="stats-radar-wrap">${renderStatsMoodRadarSvg(d.moods)}</div>
+            <div class="stats-mood-bars">
+              ${
+                activeMoods.length
+                  ? activeMoods
+                      .slice(0, 6)
+                      .map(
+                        (m) => `
+                    <div class="stats-hbar-row clickable" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">
+                      <div class="stats-hbar-top">
+                        <span class="stats-hbar-name">${esc(m.label)}</span>
+                        <span class="stats-hbar-val">${m.streams} · ${m.pct}%</span>
+                      </div>
+                      <div class="stats-hbar-track">
+                        <div class="stats-hbar-fill" style="width:${Math.max(4, m.pct)}%;background:${esc(m.c1)}"></div>
+                      </div>
+                    </div>`
+                      )
+                      .join('')
+                  : '<p class="muted-center">Mood breakdown appears as tracks are analyzed.</p>'
+              }
+            </div>
+          </div>
+        </div>
+
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Weekly Rhythm &amp; Eras</h2>
+              <p class="stats-card-sub">${d.peakWeekday ? `Peak day: ${esc(d.peakWeekday)}` : 'Day-of-week & release decades'}</p>
+            </div>
+          </div>
+          <div class="stats-subblock">
+            <div class="stats-subblock-title">Day of Week (${metric === 'mins' ? 'Minutes' : 'Streams'})</div>
+            <div class="stats-vbar-chart">
+              ${weekdays
+                .map((w) => {
+                  const v = metric === 'mins' ? Math.round((w.secs || 0) / 60) : w.streams;
+                  const hPct = v > 0 ? Math.max(8, (v / maxWdVal) * 100) : 3;
+                  const isPeak = d.peakWeekday && w.fullDay === d.peakWeekday && w.streams > 0;
+                  const tipBody = `${w.streams} streams (${w.pct}%) · ${fmtStatsDuration(w.secs)}`;
+                  return `
+                    <div class="stats-vbar-col stats-tip-target" data-tip-title="${esc(w.fullDay)}" data-tip-body="${esc(tipBody)}">
+                      <div class="stats-vbar-num">${v > 0 ? v : ''}</div>
+                      <div class="stats-vbar-track">
+                        <div class="stats-vbar-fill ${isPeak ? 'peak' : ''}" style="height:${hPct.toFixed(1)}%"></div>
+                      </div>
+                      <div class="stats-vbar-lbl">${esc(w.day)}</div>
+                    </div>`;
+                })
+                .join('')}
+            </div>
+          </div>
+
+          ${
+            decades.length > 0
+              ? `<div class="stats-subblock" style="margin-top:16px">
+                  <div class="stats-subblock-title">Music Eras &amp; Release Decades</div>
+                  <div class="stats-vbar-chart compact">
+                    ${decades
+                      .map((dec) => {
+                        const v = metric === 'mins' ? Math.round((dec.secs || 0) / 60) : dec.streams;
+                        const hPct = v > 0 ? Math.max(10, (v / maxDecVal) * 100) : 4;
+                        const tipBody = `${dec.streams} streams (${dec.pct}%) · ${fmtStatsDuration(dec.secs)}`;
+                        return `
+                          <div class="stats-vbar-col stats-tip-target" data-tip-title="${esc(dec.label)}" data-tip-body="${esc(tipBody)}">
+                            <div class="stats-vbar-num">${dec.pct}%</div>
+                            <div class="stats-vbar-track">
+                              <div class="stats-vbar-fill blue" style="height:${hPct.toFixed(1)}%"></div>
+                            </div>
+                            <div class="stats-vbar-lbl">${esc(dec.label)}</div>
+                          </div>`;
+                      })
+                      .join('')}
+                  </div>
+                  ${
+                    d.oldestTrack || d.newestTrack
+                      ? `<div class="stats-era-footnotes">
+                          ${d.oldestTrack ? `<span>Oldest: <strong>${d.oldestTrack.year}</strong> (${esc(d.oldestTrack.title)})</span>` : ''}
+                          ${d.newestTrack ? `<span>Newest: <strong>${d.newestTrack.year}</strong> (${esc(d.newestTrack.title)})</span>` : ''}
+                        </div>`
+                      : ''
+                  }
+                </div>`
+              : ''
+          }
+        </div>
+      </section>
+    `;
+
+    // Row 3: Genres + Audio Quality & Sources/Formats
+    const genres = d.genres || [];
+    const maxGenreStreams = Math.max(1, ...genres.map((g) => g.streams || 0));
+    const qualityTiers = d.qualityTiers || [];
+    const qualitySegments = qualityTiers.map((q) => ({
+      label: q.label,
+      value: q.streams,
+      color: q.color,
+      tipBody: `${q.streams} streams (${q.pct}%) · ${fmtStatsDuration(q.secs)}`,
+    }));
+    const srcColors = ['#1ed760', '#38bdf8', '#a855f7', '#fbbf24', '#ec4899', '#14b8a6'];
+    const sources = d.sources || [];
+    const sourceSegments = sources.map((src, idx) => ({
+      label: src.label,
+      value: src.streams,
+      color: srcColors[idx % srcColors.length],
+      tipBody: `${src.streams} streams (${src.pct}%) · ${fmtStatsDuration(src.secs)}`,
+    }));
+
+    html += `
+      <section class="stats-grid-3">
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Top Genres</h2>
+              <p class="stats-card-sub">${genres.length ? 'Click any genre to explore & play' : 'Genre tags from streamed tracks'}</p>
+            </div>
+          </div>
+          ${
+            genres.length
+              ? `<div class="stats-genre-list">
+                  ${genres
+                    .slice(0, 10)
+                    .map((g, idx) => {
+                      const wPct = Math.max(6, (g.streams / maxGenreStreams) * 100);
+                      return `
+                        <div class="stats-hbar-row clickable" onclick="App.navigate('genre/${encodeURIComponent(g.name)}')">
+                          <div class="stats-hbar-top">
+                            <span class="stats-hbar-name"><span class="stats-rank-num">#${idx + 1}</span> ${esc(g.name)}</span>
+                            <span class="stats-hbar-val">${g.streams} · ${fmtStatsDuration(g.secs)} (${g.pct}%)</span>
+                          </div>
+                          <div class="stats-hbar-track">
+                            <div class="stats-hbar-fill" style="width:${wPct.toFixed(1)}%;background:${idx === 0 ? '#1ed760' : idx < 3 ? '#38bdf8' : '#a855f7'}"></div>
+                          </div>
+                        </div>`;
+                    })
+                    .join('')}
+                </div>`
+              : '<p class="muted-center">No genre tags logged yet.</p>'
+          }
+        </div>
+
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Audio Quality &amp; Codecs</h2>
+              <p class="stats-card-sub">${s.avgBitrate ? `Average bitrate ${s.avgBitrate} kbps` : 'Stream quality tiers'}</p>
+            </div>
+          </div>
+          <div class="stats-donut-layout">
+            ${renderStatsDonutSvg(qualitySegments, `${s.losslessPct || 0}%`, 'Lossless')}
+            <div class="stats-donut-legend">
+              ${qualityTiers
+                .map(
+                  (q) => `
+                <div class="stats-legend-row">
+                  <span class="stats-dot" style="background:${esc(q.color)}"></span>
+                  <span class="stats-legend-name">${esc(q.label)}</span>
+                  <span class="stats-legend-val">${q.streams} (${q.pct}%)</span>
+                </div>`
+                )
+                .join('')}
+            </div>
+          </div>
+          ${
+            (d.formats || []).length
+              ? `<div class="stats-chip-row">
+                  ${d.formats
+                    .map(
+                      (f) =>
+                        `<span class="stats-codec-pill stats-tip-target" data-tip-title="${esc(f.label)}" data-tip-body="${f.streams} streams (${f.pct}%) · ${fmtStatsDuration(f.secs)}">${esc(f.label)} · ${f.pct}%</span>`
+                    )
+                    .join('')}
+                </div>`
+              : ''
+          }
+        </div>
+
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Sources &amp; Signals</h2>
+              <p class="stats-card-sub">Where your streams come from &amp; taste actions</p>
+            </div>
+          </div>
+          <div class="stats-donut-layout">
+            ${renderStatsDonutSvg(sourceSegments, `${sources.length}`, sources.length === 1 ? 'Source' : 'Sources')}
+            <div class="stats-donut-legend">
+              ${sources
+                .map(
+                  (src, idx) => `
+                <div class="stats-legend-row">
+                  <span class="stats-dot" style="background:${srcColors[idx % srcColors.length]}"></span>
+                  <span class="stats-legend-name">${esc(src.label)}</span>
+                  <span class="stats-legend-val">${src.streams} (${src.pct}%)</span>
+                </div>`
+                )
+                .join('')}
+            </div>
+          </div>
+          <div class="stats-signal-grid">
+            <div class="stats-sig-box"><strong>${lib.signalsInRange?.stars || 0}</strong><span>Likes</span></div>
+            <div class="stats-sig-box"><strong>${lib.signalsInRange?.playlistAdds || 0}</strong><span>Playlisted</span></div>
+            <div class="stats-sig-box"><strong>${lib.signalsInRange?.searchPicks || 0}</strong><span>Search Picks</span></div>
+            <div class="stats-sig-box"><strong>${lib.signalsInRange?.mixPlays || 0}</strong><span>Mix Plays</span></div>
+          </div>
+        </div>
+      </section>
+    `;
+
+    // Row 4: Top Artists & Top Albums Leaderboards
+    const topArtists = d.topArtists || [];
+    const maxArtistStreams = Math.max(1, ...topArtists.map((a) => a.streams || 0));
+    const topAlbums = d.topAlbums || [];
+    const maxAlbumStreams = Math.max(1, ...topAlbums.map((a) => a.streams || 0));
+
+    html += `
+      <section class="stats-grid-2">
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Top Artists</h2>
+              <p class="stats-card-sub">Ranked by stream count in ${esc(d.rangeLabel || 'All Time')}</p>
+            </div>
+          </div>
+          ${
+            topArtists.length
+              ? `<div class="stats-lb-list">
+                  ${topArtists
+                    .slice(0, 10)
+                    .map(
+                      (a, idx) => `
+                    <div class="stats-lb-row" onclick="App.navigate('artist/${encodeURIComponent(a.id)}')">
+                      <span class="stats-lb-rank ${idx < 3 ? 'top' : ''}">${idx + 1}</span>
+                      <img class="stats-lb-img round" src="${esc(a.coverUrl)}" loading="lazy" alt="" />
+                      <div class="stats-lb-info">
+                        <div class="stats-lb-title">${esc(a.name)} ${a.isFollowed ? '<span class="stats-mini-tag">Following</span>' : ''}</div>
+                        <div class="stats-lb-sub">${a.uniqueTracks} track${a.uniqueTracks === 1 ? '' : 's'} · ${fmtStatsDuration(a.listenedSecs)}</div>
+                        <div class="stats-lb-meter"><span style="width:${Math.max(4, (a.streams / maxArtistStreams) * 100).toFixed(1)}%"></span></div>
+                      </div>
+                      <div class="stats-lb-count"><strong>${a.streams}</strong><span>plays</span></div>
+                    </div>`
+                    )
+                    .join('')}
+                </div>`
+              : '<p class="muted-center">No artist plays yet.</p>'
+          }
+        </div>
+
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Top Albums</h2>
+              <p class="stats-card-sub">Most spun records in ${esc(d.rangeLabel || 'All Time')}</p>
+            </div>
+          </div>
+          ${
+            topAlbums.length
+              ? `<div class="stats-lb-list">
+                  ${topAlbums
+                    .slice(0, 10)
+                    .map(
+                      (al, idx) => `
+                    <div class="stats-lb-row" onclick="App.navigate('album/${encodeURIComponent(al.id)}')">
+                      <span class="stats-lb-rank ${idx < 3 ? 'top' : ''}">${idx + 1}</span>
+                      <img class="stats-lb-img" src="${esc(al.coverUrl)}" loading="lazy" alt="" />
+                      <div class="stats-lb-info">
+                        <div class="stats-lb-title">${esc(al.name)} ${al.isSaved ? '<span class="stats-mini-tag">Saved</span>' : ''}</div>
+                        <div class="stats-lb-sub">${esc(al.artist)}${al.year ? ` · ${al.year}` : ''} · ${fmtStatsDuration(al.listenedSecs)}</div>
+                        <div class="stats-lb-meter"><span style="width:${Math.max(4, (al.streams / maxAlbumStreams) * 100).toFixed(1)}%;background:var(--accent-blue)"></span></div>
+                      </div>
+                      <div class="stats-lb-count"><strong>${al.streams}</strong><span>plays</span></div>
+                    </div>`
+                    )
+                    .join('')}
+                </div>`
+              : '<p class="muted-center">No album plays yet.</p>'
+          }
+        </div>
+      </section>
+    `;
+
+    // Top Tracks Playable Leaderboard
+    const topTracks = d.topTracks || [];
+    if (topTracks.length > 0) {
+      const topTrackObjs = topTracks.map((x) => x.track);
+      const topIdsJson = esc(JSON.stringify(topTrackObjs.map((t) => t.id)));
+      html += `
+        <section class="stats-card stats-section-gap">
+          <div class="stats-card-head">
+            <div>
+              <h2>Most Played Tracks</h2>
+              <p class="stats-card-sub">Your top ${topTracks.length} heavy rotation songs</p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-primary" onclick="App.playListByIds(${topIdsJson}, 0)">${ICONS.play} Play Top Tracks</button>
+              <button class="btn-secondary" onclick="App.playShuffledIds(${topIdsJson})">Shuffle</button>
+            </div>
+          </div>
+          <div class="track-table">
+            ${topTracks
+              .map((item, idx) => {
+                const t = item.track;
+                const cur = currentTrack();
+                const isCur = cur && cur.id === t.id;
+                return `
+                  <div class="track-row stats-top-track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
+                    <div class="tr-idx" onclick="App.playListByIds(${topIdsJson}, ${idx})">
+                      <span class="tr-num ${idx < 3 ? 'stats-medal' : ''}">${isCur ? ICONS.nowPlaying : idx + 1}</span>
+                      <span class="tr-play-icon">${ICONS.play}</span>
+                    </div>
+                    <div class="tr-main" onclick="App.playListByIds(${topIdsJson}, ${idx})">
+                      <img class="tr-thumb" src="${esc(t.coverUrl)}" loading="lazy" alt="" />
+                      <div class="tr-text">
+                        <div class="tr-title-row">
+                          <div class="tr-title">${esc(t.title)}</div>
+                        </div>
+                        <div class="tr-sub">
+                          <span class="clickable" onclick="event.stopPropagation();App.navigate('artist/${encodeURIComponent(t.artistId)}')">${esc(t.artist)}</span>
+                          ${t.album ? ` · <span class="clickable" onclick="event.stopPropagation();App.navigate('album/${encodeURIComponent(t.albumId)}')">${esc(t.album)}</span>` : ''}
+                        </div>
+                      </div>
+                    </div>
+                    <span class="stats-play-pill">${item.streams} play${item.streams === 1 ? '' : 's'} · ${fmtStatsDuration(item.listenedSecs)}</span>
+                    <span class="quality-badge ${t.isLossless ? 'lossless' : ''}">${esc(t.qualityBadge)}</span>
+                    <div class="tr-dur">${fmtTime(t.duration)}</div>
+                    <div class="tr-actions">
+                      <button class="icon-btn tr-like-btn ${t.isStarred ? 'active' : ''}" title="Like" onclick="App.toggleTrackLike(${esc(JSON.stringify(t.id))}, this)">${ICONS.heart}</button>
+                      <button class="icon-btn" title="More options" onclick="App.openTrackMenu(event, ${esc(JSON.stringify(t.id))})">${ICONS.more}</button>
+                    </div>
+                  </div>`;
+              })
+              .join('')}
+          </div>
+        </section>
+      `;
+    }
+
+    // Bottom Row: Milestones, Ratings & Most Skipped + Recent Activity Feed
+    const hl = d.highlights || {};
+    const mostSkipped = d.mostSkipped || [];
+    const ratingsDist = lib.ratingsDist || [0, 0, 0, 0, 0];
+    const maxRatingCnt = Math.max(1, ...ratingsDist);
+
+    html += `
+      <section class="stats-grid-2">
+        <div class="stats-card">
+          <div class="stats-card-head">
+            <div>
+              <h2>Milestones &amp; Quirks</h2>
+              <p class="stats-card-sub">Standout moments from your listening history</p>
+            </div>
+          </div>
+          <div class="stats-milestones-grid">
+            ${
+              hl.mostCompletedTrack
+                ? `<div class="stats-ms-tile clickable" onclick="App.playSingle(${esc(JSON.stringify(hl.mostCompletedTrack.track.id))})">
+                    <div class="stats-ms-kicker">MOST COMPLETED</div>
+                    <div class="stats-ms-title">${esc(hl.mostCompletedTrack.track.title)}</div>
+                    <div class="stats-ms-sub">${esc(hl.mostCompletedTrack.track.artist)} · ${hl.mostCompletedTrack.completed} full listens</div>
+                  </div>`
+                : ''
+            }
+            ${
+              hl.longestTrack
+                ? `<div class="stats-ms-tile clickable" onclick="App.playSingle(${esc(JSON.stringify(hl.longestTrack.track.id))})">
+                    <div class="stats-ms-kicker">LONGEST TRACK</div>
+                    <div class="stats-ms-title">${esc(hl.longestTrack.track.title)}</div>
+                    <div class="stats-ms-sub">${esc(hl.longestTrack.track.artist)} · ${fmtTime(hl.longestTrack.duration)}</div>
+                  </div>`
+                : ''
+            }
+            ${
+              hl.shortestTrack
+                ? `<div class="stats-ms-tile clickable" onclick="App.playSingle(${esc(JSON.stringify(hl.shortestTrack.track.id))})">
+                    <div class="stats-ms-kicker">SHORTEST TRACK</div>
+                    <div class="stats-ms-title">${esc(hl.shortestTrack.track.title)}</div>
+                    <div class="stats-ms-sub">${esc(hl.shortestTrack.track.artist)} · ${fmtTime(hl.shortestTrack.duration)}</div>
+                  </div>`
+                : ''
+            }
+            ${
+              hl.firstTrackEver
+                ? `<div class="stats-ms-tile clickable" onclick="App.playSingle(${esc(JSON.stringify(hl.firstTrackEver.track.id))})">
+                    <div class="stats-ms-kicker">FIRST TRACK LOGGED</div>
+                    <div class="stats-ms-title">${esc(hl.firstTrackEver.track.title)}</div>
+                    <div class="stats-ms-sub">${esc(hl.firstTrackEver.track.artist)} · ${esc(fmtDateLabel(hl.firstTrackEver.at))}</div>
+                  </div>`
+                : ''
+            }
+          </div>
+
+          ${
+            lib.ratedTracks > 0
+              ? `<div class="stats-subblock" style="margin-top:16px">
+                  <div class="stats-subblock-title">Star Ratings Distribution (${lib.ratedTracks} rated · ${lib.avgRating}★ avg)</div>
+                  <div class="stats-ratings-bars">
+                    ${[5, 4, 3, 2, 1]
+                      .map((star) => {
+                        const cnt = ratingsDist[star - 1] || 0;
+                        const w = cnt > 0 ? Math.max(4, (cnt / maxRatingCnt) * 100) : 0;
+                        return `
+                          <div class="stats-rating-row">
+                            <span>${star}★</span>
+                            <div class="stats-hbar-track"><div class="stats-hbar-fill" style="width:${w.toFixed(1)}%;background:#fbbf24"></div></div>
+                            <span>${cnt}</span>
+                          </div>`;
+                      })
+                      .join('')}
+                  </div>
+                </div>`
+              : ''
+          }
+
+          ${
+            mostSkipped.length > 0
+              ? `<div class="stats-subblock" style="margin-top:16px">
+                  <div class="stats-subblock-title">Most Skipped Tracks</div>
+                  <div class="stats-mini-list">
+                    ${mostSkipped
+                      .slice(0, 5)
+                      .map(
+                        (ms) => `
+                      <div class="stats-mini-row" data-tid="${esc(ms.track.id)}" onclick="App.playSingle(${esc(JSON.stringify(ms.track.id))})">
+                        <img src="${esc(ms.track.coverUrl)}" loading="lazy" alt="" />
+                        <div class="stats-mini-meta">
+                          <div class="stats-mini-title">${esc(ms.track.title)}</div>
+                          <div class="stats-mini-sub">${esc(ms.track.artist)}</div>
+                        </div>
+                        <span class="stats-skip-pill">${ms.skips} skip${ms.skips === 1 ? '' : 's'}</span>
+                      </div>`
+                      )
+                      .join('')}
+                  </div>
+                </div>`
+              : ''
+          }
+        </div>
+
+        ${renderStatsActivityCard(d.recentEvents || [])}
+      </section>
+    `;
+
+    html += `</div>`;
+    $('main-view').innerHTML = html;
+
+    // Auto-scroll 365-day heatmap to the latest week on narrow viewports
+    const hmScroll = $('stats-hm-scroll');
+    if (hmScroll) {
+      hmScroll.scrollLeft = hmScroll.scrollWidth;
+    }
+  }
+
+  function renderStatsActivityCard(recentEvents) {
+    return `
+      <div class="stats-card">
+        <div class="stats-card-head">
+          <div>
+            <h2>Recent Activity Log</h2>
+            <p class="stats-card-sub">Latest playback &amp; taste events across web &amp; Subsonic</p>
+          </div>
+        </div>
+        ${
+          recentEvents.length
+            ? `<div class="stats-activity-list">
+                ${recentEvents
+                  .map(
+                    (ev) => `
+                  <div class="stats-act-row" data-tid="${esc(ev.track.id)}" onclick="App.playSingle(${esc(JSON.stringify(ev.track.id))})">
+                    <img src="${esc(ev.track.coverUrl)}" loading="lazy" alt="" />
+                    <div class="stats-act-meta">
+                      <div class="stats-act-title">${esc(ev.track.title)}</div>
+                      <div class="stats-act-sub">${esc(ev.track.artist)}</div>
+                    </div>
+                    <span class="stats-act-kind kind-${esc(ev.kind)}">${esc(ev.label)}</span>
+                    <span class="stats-act-time">${esc(fmtRelativeTime(ev.at))}</span>
+                  </div>`
+                  )
+                  .join('')}
+              </div>`
+            : '<p class="muted-center">No recent events recorded yet.</p>'
+        }
+      </div>
+    `;
+  }
+
+  // ---------------------------------------------------------------------------
   // Reusable UI Renderers
   // ---------------------------------------------------------------------------
   function renderQuickTile(t) {
@@ -1657,18 +2951,19 @@
   }
 
   function renderAlbumCard(a) {
-    return `<div class="media-card" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
+    const sub = `${a.artist}${a.year ? ` · ${a.year}` : ''}`;
+    return `<div class="media-card" data-share-kind="album" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
         <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(a.name)}</div>
-      <div class="card-sub">${esc(a.artist)}${a.year ? ` · ${a.year}` : ''}</div>
+      <div class="card-sub">${esc(sub)}</div>
     </div>`;
   }
 
   function renderArtistCard(a) {
-    return `<div class="media-card" onclick="App.navigate('artist/${encodeURIComponent(a.id)}')">
+    return `<div class="media-card" data-share-kind="artist" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="Artist" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('artist/${encodeURIComponent(a.id)}')">
       <div class="card-art-wrap round">
         <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
       </div>
@@ -1678,13 +2973,14 @@
   }
 
   function renderPlaylistCard(p) {
-    return `<div class="media-card" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
+    const sub = `${p.trackCount} tracks · ${p.ownerName}`;
+    return `<div class="media-card" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(p.coverUrl)}" loading="lazy" alt="" />
         <button class="card-play-fab" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(p.id))})">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(p.name)}</div>
-      <div class="card-sub">${p.trackCount} tracks · ${esc(p.ownerName)}</div>
+      <div class="card-sub">${esc(sub)}</div>
     </div>`;
   }
 
@@ -1796,70 +3092,117 @@
     return url;
   }
 
-  async function playQueueAt(index) {
-    if (index < 0 || index >= state.queue.length) return;
-    state.queueIndex = index;
-    state.pendingSeekSec = 0;
-    const track = state.queue[index];
-    state.lastScrobbleCompleteId = '';
-    state.compatAttemptedId = '';
+  function cancelPendingPlaybackWork() {
+    if (state.playCommitTimer) {
+      clearTimeout(state.playCommitTimer);
+      state.playCommitTimer = null;
+    }
+    if (state.queueWarmTimer) {
+      clearTimeout(state.queueWarmTimer);
+      state.queueWarmTimer = null;
+    }
+    if (state.lyricsAbortController) {
+      try {
+        state.lyricsAbortController.abort();
+      } catch {}
+      state.lyricsAbortController = null;
+    }
+    state.lyricsReqToken++;
+  }
 
-    ensureAudioGraph();
+  function beginQueueFetch() {
+    if (state.queueAbortController) {
+      try {
+        state.queueAbortController.abort();
+      } catch {}
+    }
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.queueAbortController = ctrl;
+    return {
+      token: ++state.queueActionToken,
+      signal: ctrl ? ctrl.signal : undefined,
+    };
+  }
+
+  function commitTrackLoad(loadToken, track) {
+    if (loadToken !== state.activeAudioToken) return;
+    const cur = currentTrack();
+    if (!cur || cur.id !== track.id) return;
+
+    applyCommittedMediaUI(track);
+    try {
+      if (!audio.paused) audio.pause();
+    } catch {}
     audio.src = buildStreamUrl(track);
     audio.play().catch((e) => {
+      if (loadToken !== state.activeAudioToken) return;
+      if (e && e.name === 'AbortError') return;
       updatePlayButton(false);
       console.warn('Playback prevented or error:', e);
     });
 
-    updateNowPlayingUI(track, true);
-    renderQueuePanel();
-    saveServerQueue();
     loadLyricsForTrack(track.id);
-
+    state.lastCommittedTrackId = track.id;
     sendTrackEvent(track.id, 'play', 1);
 
-    // Pre-warm next track so transitions feel instant!
-    const next = state.queue[index + 1];
+    // Pre-warm next track only once the user settles on the current track!
+    const next = state.queue[state.queueIndex + 1];
     if (next) {
-      api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
+      state.queueWarmTimer = setTimeout(() => {
+        state.queueWarmTimer = null;
+        if (loadToken !== state.activeAudioToken) return;
+        api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
+      }, 450);
     }
+  }
+
+  async function playQueueAt(index) {
+    if (index < 0 || index >= state.queue.length) return;
+    const track = state.queue[index];
+    const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    const isBurst = state.lastPlaySwitchAt > 0 && now - state.lastPlaySwitchAt < 280;
+    state.lastPlaySwitchAt = now;
+
+    cancelPendingPlaybackWork();
+    const loadToken = ++state.activeAudioToken;
+    state.queueIndex = index;
+    state.pendingSeekSec = 0;
+    state.lastScrobbleCompleteId = '';
+    state.compatAttemptedId = '';
+
+    ensureAudioGraph();
+    updateNowPlayingUI(track, true, isBurst);
+    renderQueuePanel();
+    saveServerQueue();
 
     // Highlight playing track in current view if visible
     document.querySelectorAll('.track-row').forEach((row) => {
       row.classList.toggle('playing', row.dataset.tid === track.id);
     });
+
+    if (!isBurst) {
+      commitTrackLoad(loadToken, track);
+      return;
+    }
+
+    // During rapid skip bursts, pause current stream immediately and coalesce the actual
+    // audio/network/lyrics/warm commitment until the user stops skipping for 220ms.
+    try {
+      if (!audio.paused) audio.pause();
+    } catch {}
+    state.playCommitTimer = setTimeout(() => {
+      state.playCommitTimer = null;
+      if (loadToken === state.activeAudioToken) {
+        commitTrackLoad(loadToken, track);
+      }
+    }, 220);
   }
 
-  function updateNowPlayingUI(track, active) {
+  function applyCommittedMediaUI(track) {
     if (!track) return;
     $('pb-cover').src = track.coverUrl;
-    $('pb-title').textContent = track.title;
-    $('pb-artist').textContent = track.artist;
-    $('pb-like').classList.toggle('active', !!track.isStarred);
-    $('pb-quality').textContent = track.qualityBadge;
-    $('pb-quality').classList.remove('hidden');
-    $('pb-quality').classList.toggle('lossless', !!track.isLossless);
-    $('pb-duration').textContent = fmtTime(track.duration);
-    $('pb-elapsed').textContent = '0:00';
-    $('pb-seek').value = '0';
-    if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = '0%';
-
     $('fs-cover').src = track.coverUrl;
-    $('fs-title').textContent = track.title;
-    $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(track.artist)}</span>${track.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(track.album)}</span>` : ''}`;
     $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
-    if ($('fs-like')) $('fs-like').classList.toggle('active', !!track.isStarred);
-    if ($('fs-quality')) {
-      $('fs-quality').textContent = track.qualityBadge;
-      $('fs-quality').classList.remove('hidden');
-      $('fs-quality').classList.toggle('lossless', !!track.isLossless);
-    }
-    if ($('fs-duration')) $('fs-duration').textContent = fmtTime(track.duration);
-    if ($('fs-elapsed')) $('fs-elapsed').textContent = '0:00';
-    if ($('fs-seek')) $('fs-seek').value = '0';
-
-    document.title = `${track.title} · ${track.artist} — Beatlab`;
-    updatePlayButton(active);
 
     if ('mediaSession' in navigator) {
       try {
@@ -1882,6 +3225,40 @@
         // unsupported in some browsers
       }
     }
+  }
+
+  function updateNowPlayingUI(track, active, skipHeavy = false) {
+    if (!track) return;
+    if (!skipHeavy) {
+      $('pb-cover').src = track.coverUrl;
+      $('fs-cover').src = track.coverUrl;
+      $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
+    }
+    $('pb-title').textContent = track.title;
+    $('pb-artist').textContent = track.artist;
+    $('pb-like').classList.toggle('active', !!track.isStarred);
+    $('pb-quality').textContent = track.qualityBadge;
+    $('pb-quality').classList.remove('hidden');
+    $('pb-quality').classList.toggle('lossless', !!track.isLossless);
+    $('pb-duration').textContent = fmtTime(track.duration);
+    $('pb-elapsed').textContent = '0:00';
+    $('pb-seek').value = '0';
+    if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = '0%';
+
+    $('fs-title').textContent = track.title;
+    $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(track.artist)}</span>${track.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(track.album)}</span>` : ''}`;
+    if ($('fs-like')) $('fs-like').classList.toggle('active', !!track.isStarred);
+    if ($('fs-quality')) {
+      $('fs-quality').textContent = track.qualityBadge;
+      $('fs-quality').classList.remove('hidden');
+      $('fs-quality').classList.toggle('lossless', !!track.isLossless);
+    }
+    if ($('fs-duration')) $('fs-duration').textContent = fmtTime(track.duration);
+    if ($('fs-elapsed')) $('fs-elapsed').textContent = '0:00';
+    if ($('fs-seek')) $('fs-seek').value = '0';
+
+    document.title = `${track.title} · ${track.artist} — Beatlab`;
+    updatePlayButton(active);
   }
 
   function updatePlayButton(playing) {
@@ -1934,31 +3311,39 @@
   }
 
   async function playAlbumNow(id) {
+    const { token, signal } = beginQueueFetch();
     try {
-      const d = await api(`/api/web/album/${encodeURIComponent(id)}`);
+      const d = await api(`/api/web/album/${encodeURIComponent(id)}`, { signal });
+      if (token !== state.queueActionToken) return;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
         state.radioReqToken++;
         state.radioLoading = false;
+        state.radioInFlight = null;
         state.queue = tracks;
         playQueueAt(0);
       }
     } catch (e) {
+      if (e && e.name === 'AbortError') return;
       showToast(e.message);
     }
   }
 
   async function playPlaylistNow(id) {
+    const { token, signal } = beginQueueFetch();
     try {
-      const d = await api(`/api/web/playlist/${encodeURIComponent(id)}`);
+      const d = await api(`/api/web/playlist/${encodeURIComponent(id)}`, { signal });
+      if (token !== state.queueActionToken) return;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
         state.radioReqToken++;
         state.radioLoading = false;
+        state.radioInFlight = null;
         state.queue = tracks;
         playQueueAt(0);
       }
     } catch (e) {
+      if (e && e.name === 'AbortError') return;
       showToast(e.message);
     }
   }
@@ -2028,53 +3413,62 @@
     navigate(`search?q=${encodeURIComponent(q)}`);
   }
 
-  async function appendRadioTracks(seedId) {
+  function appendRadioTracks(seedId) {
+    if (state.radioInFlight) return state.radioInFlight;
     const reqToken = ++state.radioReqToken;
     state.radioLoading = true;
     renderQueuePanel();
-    try {
-      const excludeIds = state.queue
-        .slice(-80)
-        .map((t) => t.id)
-        .filter(Boolean)
-        .join(',');
-      const params = new URLSearchParams();
-      if (seedId) params.set('seed', seedId);
-      if (excludeIds) params.set('exclude', excludeIds);
-      const d = await api(`/api/web/radio?${params.toString()}`);
-      if (reqToken !== state.radioReqToken) return 0;
-      const recs = cacheTracks(d.tracks || []);
-      const existing = new Set(state.queue.map((t) => t.id));
-      let added = 0;
-      for (const r of recs) {
-        if (!existing.has(r.id)) {
-          state.queue.push(r);
-          existing.add(r.id);
-          added++;
+    const run = (async () => {
+      try {
+        const excludeIds = state.queue
+          .slice(-80)
+          .map((t) => t.id)
+          .filter(Boolean)
+          .join(',');
+        const params = new URLSearchParams();
+        if (seedId) params.set('seed', seedId);
+        if (excludeIds) params.set('exclude', excludeIds);
+        const d = await api(`/api/web/radio?${params.toString()}`);
+        if (reqToken !== state.radioReqToken) return 0;
+        const recs = cacheTracks(d.tracks || []);
+        const existing = new Set(state.queue.map((t) => t.id));
+        let added = 0;
+        for (const r of recs) {
+          if (!existing.has(r.id)) {
+            state.queue.push(r);
+            existing.add(r.id);
+            added++;
+          }
+        }
+        if (added > 0) {
+          saveServerQueue();
+        }
+        return added;
+      } catch {
+        return 0;
+      } finally {
+        if (state.radioInFlight === run) {
+          state.radioInFlight = null;
+        }
+        if (reqToken === state.radioReqToken) {
+          state.radioLoading = false;
+          renderQueuePanel();
         }
       }
-      state.radioLoading = false;
-      renderQueuePanel();
-      if (added > 0) {
-        saveServerQueue();
-      }
-      return added;
-    } catch {
-      if (reqToken === state.radioReqToken) {
-        state.radioLoading = false;
-        renderQueuePanel();
-      }
-      return 0;
-    }
+    })();
+    state.radioInFlight = run;
+    return run;
   }
 
   async function startPlaylistRadio(pid) {
+    const { token, signal } = beginQueueFetch();
     const reqToken = ++state.radioReqToken;
     state.radioLoading = true;
+    state.radioInFlight = null;
     showToast('Starting playlist radio...');
     try {
-      const d = await api(`/api/web/radio?playlist=${encodeURIComponent(pid || '')}`);
-      if (reqToken !== state.radioReqToken) return;
+      const d = await api(`/api/web/radio?playlist=${encodeURIComponent(pid || '')}`, { signal });
+      if (token !== state.queueActionToken || reqToken !== state.radioReqToken) return;
       state.radioLoading = false;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
@@ -2087,21 +3481,24 @@
       if (reqToken === state.radioReqToken) {
         state.radioLoading = false;
       }
+      if (e && e.name === 'AbortError') return;
       showToast(e.message);
     }
   }
 
   async function startRadioForId(seedId) {
+    const { token, signal } = beginQueueFetch();
     const seed = state.trackMap.get(seedId);
     const reqToken = ++state.radioReqToken;
     const cur = currentTrack();
     const keepingCurrent = !!(cur && cur.id === seedId);
     state.radioLoading = true;
+    state.radioInFlight = null;
     if (keepingCurrent) renderQueuePanel();
     showToast('Starting track radio...');
     try {
-      const d = await api(`/api/web/radio?seed=${encodeURIComponent(seedId || '')}`);
-      if (reqToken !== state.radioReqToken) return;
+      const d = await api(`/api/web/radio?seed=${encodeURIComponent(seedId || '')}`, { signal });
+      if (token !== state.queueActionToken || reqToken !== state.radioReqToken) return;
       state.radioLoading = false;
       const recs = cacheTracks(d.tracks || []);
       const filtered = recs.filter((r) => r.id !== seedId);
@@ -2127,6 +3524,7 @@
         state.radioLoading = false;
         renderQueuePanel();
       }
+      if (e && e.name === 'AbortError') return;
       showToast(e.message);
     }
   }
@@ -2160,7 +3558,14 @@
 
   async function nextTrack(manual = false) {
     const cur = currentTrack();
-    if (manual && cur && audio.currentTime < 25 && state.lastScrobbleCompleteId !== cur.id) {
+    if (
+      manual &&
+      cur &&
+      cur.id === state.lastCommittedTrackId &&
+      audio.currentTime < 25 &&
+      state.lastScrobbleCompleteId !== cur.id
+    ) {
+      state.lastCommittedTrackId = '';
       sendTrackEvent(cur.id, 'skip', 1);
     }
     if (!state.queue.length) return;
@@ -2181,10 +3586,13 @@
       return playQueueAt(0);
     }
     if (state.autoplay && cur) {
+      if (state.radioLoading || state.radioInFlight) return;
+      const idxBefore = state.queueIndex;
       const added = await appendRadioTracks(cur.id);
-      if (added > 0 && state.queueIndex + 1 < state.queue.length) {
+      if (added > 0 && state.queueIndex === idxBefore && state.queueIndex + 1 < state.queue.length) {
         return playQueueAt(state.queueIndex + 1);
       }
+      return;
     }
     updatePlayButton(false);
   }
@@ -2206,8 +3614,10 @@
       }
     });
     audio.addEventListener('error', () => {
+      if (state.playCommitTimer) return;
       const cur = currentTrack();
       if (!cur || !audio.error || !audio.getAttribute('src')) return;
+      const errToken = state.activeAudioToken;
       const code = audio.error.code;
       if (
         (code === 3 || code === 4) &&
@@ -2218,6 +3628,7 @@
         const pos = audio.currentTime || 0;
         audio.src = buildStreamUrl(cur, true, pos);
         audio.play().catch(() => {
+          if (errToken !== state.activeAudioToken) return;
           updatePlayButton(false);
         });
         return;
@@ -2226,6 +3637,7 @@
       showToast(`Unable to play "${cur.title}" right now`);
     });
     audio.addEventListener('ended', () => {
+      if (state.playCommitTimer) return;
       const cur = currentTrack();
       if (state.repeat === 'one') {
         audio.currentTime = 0;
@@ -2336,12 +3748,23 @@
   }
 
   async function loadLyricsForTrack(id) {
+    if (state.lyricsAbortController) {
+      try {
+        state.lyricsAbortController.abort();
+      } catch {}
+    }
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.lyricsAbortController = ctrl;
+    const reqToken = ++state.lyricsReqToken;
     $('lyrics-container').innerHTML = `<p class="muted-center">Fetching lyrics...</p>`;
     $('fs-lyrics-body').innerHTML = `<p class="muted-center">Fetching lyrics...</p>`;
     state.lyrics = { synced: false, plain: '', lines: [] };
     state.activeLyricIdx = -1;
     try {
-      const data = await api(`/api/web/lyrics/${encodeURIComponent(id)}`);
+      const data = await api(`/api/web/lyrics/${encodeURIComponent(id)}`, {
+        signal: ctrl ? ctrl.signal : undefined,
+      });
+      if (reqToken !== state.lyricsReqToken || currentTrack()?.id !== id) return;
       state.lyrics = data;
       const lines = data.lines || [];
       const html = lines.length
@@ -2356,9 +3779,14 @@
         : `<p class="muted-center">No lyrics available for this track.</p>`;
       $('lyrics-container').innerHTML = html;
       $('fs-lyrics-body').innerHTML = html;
-    } catch {
+    } catch (e) {
+      if ((e && e.name === 'AbortError') || reqToken !== state.lyricsReqToken) return;
       $('lyrics-container').innerHTML = `<p class="muted-center">No lyrics available.</p>`;
       $('fs-lyrics-body').innerHTML = `<p class="muted-center">No lyrics available.</p>`;
+    } finally {
+      if (state.lyricsAbortController === ctrl) {
+        state.lyricsAbortController = null;
+      }
     }
   }
 
@@ -2395,7 +3823,8 @@
   // ---------------------------------------------------------------------------
   async function toggleTrackLike(id, btnEl) {
     const t = state.trackMap.get(id);
-    if (!t) return;
+    if (!t || state.likeInFlight.has(id)) return;
+    state.likeInFlight.add(id);
     const next = !t.isStarred;
     try {
       await api('/api/web/star', {
@@ -2420,6 +3849,8 @@
       showToast(next ? 'Added to Liked Songs' : 'Removed from Liked Songs');
     } catch (e) {
       showToast(e.message);
+    } finally {
+      state.likeInFlight.delete(id);
     }
   }
 
@@ -2433,6 +3864,34 @@
     if (trackMenuCloser) {
       window.removeEventListener('click', trackMenuCloser);
       trackMenuCloser = null;
+    }
+  }
+
+  function positionContextMenu(menu, backdrop, event) {
+    menu.classList.remove('hidden');
+    if (window.innerWidth <= 780) {
+      menu.style.left = '';
+      menu.style.top = '';
+      if (backdrop) backdrop.classList.remove('hidden');
+    } else {
+      if (backdrop) backdrop.classList.add('hidden');
+      const maxH = Math.min(440, window.innerHeight - 24);
+      const rect = menu.getBoundingClientRect();
+      const menuW = Math.max(220, rect.width || 220);
+      const menuH = Math.min(maxH, rect.height || 320);
+      const cx = event && Number.isFinite(event.clientX) ? event.clientX : window.innerWidth / 2;
+      const cy = event && Number.isFinite(event.clientY) ? event.clientY : window.innerHeight / 2;
+      const x = Math.min(window.innerWidth - menuW - 10, cx);
+      const y = Math.min(window.innerHeight - menuH - 10, cy);
+      menu.style.left = `${Math.max(8, x)}px`;
+      menu.style.top = `${Math.max(8, y)}px`;
+
+      trackMenuCloser = (e) => {
+        if (!menu.contains(e.target)) closeTrackMenu();
+      };
+      setTimeout(() => {
+        if (trackMenuCloser) window.addEventListener('click', trackMenuCloser);
+      }, 10);
     }
   }
 
@@ -2468,6 +3927,11 @@
         <button class="icon-btn" title="Close" onclick="App.closeTrackMenu()">${ICONS.close}</button>
       </div>
       ${plActions}
+      <button class="ctx-item ctx-item-icon accent" onclick="App.closeTrackMenu();App.shareTrack(${tidArg})">
+        ${ICONS.share}
+        <span>Share Song Link</span>
+      </button>
+      <hr class="ctx-sep">
       <button class="ctx-item" onclick="App.closeTrackMenu();App.playNext(${tidArg})">Play Next</button>
       <button class="ctx-item" onclick="App.closeTrackMenu();App.addToQueue(${tidArg})">Add to Queue</button>
       <button class="ctx-item" onclick="App.closeTrackMenu();App.startRadioForId(${tidArg})">Start Song Radio</button>
@@ -2487,31 +3951,68 @@
         )
         .join('')}
     `;
-    menu.classList.remove('hidden');
-    if (window.innerWidth <= 780) {
-      menu.style.left = '';
-      menu.style.top = '';
-      if (backdrop) backdrop.classList.remove('hidden');
-    } else {
-      if (backdrop) backdrop.classList.add('hidden');
-      const maxH = Math.min(440, window.innerHeight - 24);
-      const rect = menu.getBoundingClientRect();
-      const menuW = Math.max(220, rect.width || 220);
-      const menuH = Math.min(maxH, rect.height || 320);
-      const cx = event && Number.isFinite(event.clientX) ? event.clientX : window.innerWidth / 2;
-      const cy = event && Number.isFinite(event.clientY) ? event.clientY : window.innerHeight / 2;
-      const x = Math.min(window.innerWidth - menuW - 10, cx);
-      const y = Math.min(window.innerHeight - menuH - 10, cy);
-      menu.style.left = `${Math.max(8, x)}px`;
-      menu.style.top = `${Math.max(8, y)}px`;
+    positionContextMenu(menu, backdrop, event);
+  }
 
-      trackMenuCloser = (e) => {
-        if (!menu.contains(e.target)) closeTrackMenu();
-      };
-      setTimeout(() => {
-        if (trackMenuCloser) window.addEventListener('click', trackMenuCloser);
-      }, 10);
+  function openEntityMenu(event, info) {
+    if (event && typeof event.stopPropagation === 'function') {
+      event.stopPropagation();
     }
+    if (!info || !info.kind || !info.id) return;
+    closeTrackMenu();
+    const menu = $('context-menu');
+    const backdrop = $('ctx-backdrop');
+    const kindArg = esc(JSON.stringify(info.kind));
+    const idArg = esc(JSON.stringify(info.id));
+    const titleArg = esc(JSON.stringify(info.title || ''));
+    const subArg = esc(JSON.stringify(info.sub || ''));
+    const coverArg = esc(JSON.stringify(info.cover || ''));
+    const shareLabel =
+      info.kind === 'mix'
+        ? 'Share Instant Mix'
+        : info.kind === 'playlist'
+          ? 'Share Playlist'
+          : info.kind === 'album'
+            ? 'Share Album'
+            : 'Share Artist';
+
+    let navAction = '';
+    let playAction = '';
+    if (info.kind === 'playlist') {
+      playAction = `<button class="ctx-item" onclick="App.closeTrackMenu();App.playPlaylistNow(${idArg})">Play Playlist</button>`;
+      navAction = `<button class="ctx-item" onclick="App.closeTrackMenu();App.navigate('playlist/${encodeURIComponent(info.id)}')">Open Playlist</button>`;
+    } else if (info.kind === 'album') {
+      playAction = `<button class="ctx-item" onclick="App.closeTrackMenu();App.playAlbumNow(${idArg})">Play Album</button>`;
+      navAction = `<button class="ctx-item" onclick="App.closeTrackMenu();App.navigate('album/${encodeURIComponent(info.id)}')">Open Album</button>`;
+    } else if (info.kind === 'artist') {
+      navAction = `<button class="ctx-item" onclick="App.closeTrackMenu();App.navigate('artist/${encodeURIComponent(info.id)}')">Open Artist</button>`;
+    } else if (info.kind === 'mix') {
+      playAction = `<button class="ctx-item" onclick="App.closeTrackMenu();App.playInstantMix(false, 0)">Play Mix</button>`;
+    }
+
+    const shareAction =
+      info.kind === 'mix'
+        ? `App.shareCurrentInstantMix()`
+        : `App.shareEntity({ kind: ${kindArg}, targetId: ${idArg}, title: ${titleArg}, subtitle: ${subArg}, coverUrl: ${coverArg} })`;
+
+    menu.innerHTML = `
+      <div class="ctx-sheet-head">
+        ${info.cover ? `<img src="${esc(info.cover)}" alt="" />` : ''}
+        <div class="ctx-sheet-meta">
+          <div class="ctx-sheet-title">${esc(info.title || 'Share')}</div>
+          <div class="ctx-sheet-sub">${esc(info.sub || '')}</div>
+        </div>
+        <button class="icon-btn" title="Close" onclick="App.closeTrackMenu()">${ICONS.close}</button>
+      </div>
+      <button class="ctx-item ctx-item-icon accent" onclick="App.closeTrackMenu();${shareAction}">
+        ${ICONS.share}
+        <span>${shareLabel}</span>
+      </button>
+      ${playAction || navAction ? '<hr class="ctx-sep">' : ''}
+      ${playAction}
+      ${navAction}
+    `;
+    positionContextMenu(menu, backdrop, event);
   }
 
   function wireTrackGestures() {
@@ -2535,21 +4036,47 @@
       if (!tid || !state.trackMap.has(tid)) return null;
       const plId = row.dataset.plId || null;
       const plPos = row.dataset.plPos != null ? parseInt(row.dataset.plPos, 10) : -1;
-      return { tid, plId, plPos: Number.isFinite(plPos) ? plPos : -1 };
+      return { type: 'track', tid, plId, plPos: Number.isFinite(plPos) ? plPos : -1 };
+    };
+
+    const getEntityArgs = (target) => {
+      const card = target.closest('[data-share-kind]');
+      if (!card || target.closest('input, textarea, select')) return null;
+      const kind = card.dataset.shareKind;
+      const id = card.dataset.shareId;
+      if (!kind || !id) return null;
+      return {
+        type: 'entity',
+        kind,
+        id,
+        title: card.dataset.shareTitle || '',
+        sub: card.dataset.shareSub || '',
+        cover: card.dataset.shareCover || '',
+      };
+    };
+
+    const getTargetArgs = (target) => getRowArgs(target) || getEntityArgs(target);
+
+    const openTargetMenu = (evt, info) => {
+      if (info.type === 'track') {
+        openTrackMenu(evt, info.tid, info.plId, info.plPos);
+      } else {
+        openEntityMenu(evt, info);
+      }
     };
 
     document.addEventListener('contextmenu', (e) => {
-      const info = getRowArgs(e.target);
+      const info = getTargetArgs(e.target);
       if (!info) return;
       e.preventDefault();
       if (Date.now() - longPressFiredAt < 700) return;
-      openTrackMenu(e, info.tid, info.plId, info.plPos);
+      openTargetMenu(e, info);
     });
 
     document.addEventListener('pointerdown', (e) => {
       if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
-      if (e.target.closest('button, a, input, select, textarea, .tr-actions')) return;
-      const info = getRowArgs(e.target);
+      if (e.target.closest('button:not(.pl-link), a, input, select, textarea, .tr-actions')) return;
+      const info = getTargetArgs(e.target);
       if (!info) return;
       clearHold();
       startX = e.clientX;
@@ -2563,7 +4090,7 @@
             navigator.vibrate(15);
           } catch {}
         }
-        openTrackMenu({ clientX: startX, clientY: startY }, info.tid, info.plId, info.plPos);
+        openTargetMenu({ clientX: startX, clientY: startY }, info);
       }, 480);
     });
 
@@ -2591,6 +4118,79 @@
       },
       true
     );
+  }
+
+  async function shareEntity({ kind, targetId, title = '', subtitle = '', trackIds = [], coverUrl = '' }) {
+    if (state.shareInFlight) return;
+    state.shareInFlight = true;
+    try {
+      const res = await api('/api/web/share', {
+        method: 'POST',
+        body: JSON.stringify({
+          kind,
+          targetId,
+          title,
+          subtitle,
+          trackIds,
+        }),
+      });
+      const fullUrl = res.url || `${location.origin}${res.path}`;
+      state.currentShareUrl = fullUrl;
+      let autoCopied = false;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(fullUrl);
+          autoCopied = true;
+        }
+      } catch {}
+
+      const art = coverUrl || `/s/${encodeURIComponent(res.id)}/cover`;
+      const kindBadge =
+        res.kind === 'track'
+          ? 'SONG SHARE'
+          : res.kind === 'mix'
+            ? 'INSTANT MIX SHARE'
+            : res.kind === 'playlist'
+              ? 'PLAYLIST SHARE'
+              : res.kind === 'album'
+                ? 'ALBUM SHARE'
+                : 'ARTIST SHARE';
+
+      const nativeShareBtn =
+        typeof navigator.share === 'function'
+          ? `<button class="btn-secondary" onclick="App.nativeShareCurrent()">Share via Device</button>`
+          : '';
+
+      openModal(`
+        <div class="modal-head">
+          <h3>Share ${esc(res.kind === 'track' ? 'Song' : res.kind === 'mix' ? 'Instant Mix' : res.kind.charAt(0).toUpperCase() + res.kind.slice(1))}</h3>
+          <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+        </div>
+        <div class="share-preview-card">
+          <img src="${esc(art)}" alt="" />
+          <div class="share-preview-meta">
+            <span class="share-kind-pill">${kindBadge} · DISCORD EMBED READY</span>
+            <div class="share-preview-title">${esc(res.title || title)}</div>
+            <div class="share-preview-sub">${esc(res.subtitle || subtitle)}${res.trackCount > 1 ? ` · ${res.trackCount} tracks` : ''}</div>
+          </div>
+        </div>
+        <div class="share-url-row">
+          <input id="share-url-input" type="text" readonly value="${esc(fullUrl)}" onclick="this.select()" />
+          <button class="btn-primary" onclick="App.copyText(document.getElementById('share-url-input').value, 'Share link copied!')">Copy Link</button>
+        </div>
+        <div class="share-modal-note">
+          ${autoCopied ? '✓ Copied to clipboard! ' : ''}Paste into Discord for a rich playable embed, or open in any browser — anyone can listen without signing in.
+        </div>
+        <div class="share-modal-actions">
+          <a class="btn-secondary" href="${esc(fullUrl)}" target="_blank" rel="noopener">Open Public Player ↗</a>
+          ${nativeShareBtn}
+        </div>
+      `);
+    } catch (e) {
+      showToast(e.message || 'Could not create share link');
+    } finally {
+      state.shareInFlight = false;
+    }
   }
 
   async function markNotInterested(trackId) {
@@ -2636,6 +4236,8 @@
           state.queueIndex = newQueue.length - 1;
           await nextTrack(false);
         } else {
+          cancelPendingPlaybackWork();
+          state.activeAudioToken++;
           state.queueIndex = -1;
           audio.pause();
           audio.removeAttribute('src');
@@ -2935,23 +4537,33 @@
       const tag = (e.target && e.target.tagName) || '';
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (e.code === 'Space') {
+        if (e.repeat) return;
         e.preventDefault();
         togglePlay();
       } else if (e.key === '/') {
+        if (e.repeat) return;
         e.preventDefault();
         setExpandedPlayer(false);
         $('global-search').focus();
       } else if (e.key === 'ArrowRight' && e.shiftKey) {
+        const now = Date.now();
+        if (e.repeat && now - state.lastSkipKeyAt < 75) return;
+        state.lastSkipKeyAt = now;
         nextTrack(true);
       } else if (e.key === 'ArrowLeft' && e.shiftKey) {
+        const now = Date.now();
+        if (e.repeat && now - state.lastSkipKeyAt < 75) return;
+        state.lastSkipKeyAt = now;
         prevTrack();
       } else if (e.key === 'ArrowRight') {
         audio.currentTime = Math.min(audio.duration || 9999, (audio.currentTime || 0) + 5);
       } else if (e.key === 'ArrowLeft') {
         audio.currentTime = Math.max(0, (audio.currentTime || 0) - 5);
       } else if (e.key.toLowerCase() === 'm') {
+        if (e.repeat) return;
         App.toggleMute();
       } else if (e.key.toLowerCase() === 'l') {
+        if (e.repeat) return;
         App.toggleCurrentLike();
       }
     });
@@ -2997,6 +4609,15 @@
       }
     },
     setLibTab: (tab) => renderLibrary(tab),
+    setStatsRange: (range) => {
+      state.statsRange = range || 'all';
+      navigate(state.statsRange === 'all' ? 'stats' : `stats?range=${encodeURIComponent(state.statsRange)}`);
+    },
+    setStatsMetric: (metric) => {
+      state.statsMetric = metric === 'mins' ? 'mins' : 'streams';
+      renderStatsView();
+    },
+    refreshStats: () => renderStats(state.statsRange || 'all'),
     setRightTab: (tab) => {
       $('tab-queue').classList.toggle('active', tab === 'queue');
       $('tab-lyrics').classList.toggle('active', tab === 'lyrics');
@@ -3137,6 +4758,76 @@
     },
     openTrackMenu,
     closeTrackMenu,
+    shareEntity,
+    shareTrack: (tid) => {
+      const t = state.trackMap.get(tid);
+      if (!t) return;
+      shareEntity({
+        kind: 'track',
+        targetId: t.id,
+        title: t.title,
+        subtitle: t.artist,
+        coverUrl: t.coverUrl,
+      });
+    },
+    shareCurrentTrack: () => {
+      const cur = currentTrack();
+      if (!cur) return showToast('Play a track first to share');
+      window.App.shareTrack(cur.id);
+    },
+    sharePlaylist: (id, title, ownerName, coverUrl = '') => {
+      shareEntity({
+        kind: 'playlist',
+        targetId: id,
+        title,
+        subtitle: ownerName ? `Playlist by ${ownerName}` : 'Playlist',
+        coverUrl,
+      });
+    },
+    shareAlbum: (id, title, artist, coverUrl = '') => {
+      shareEntity({
+        kind: 'album',
+        targetId: id,
+        title,
+        subtitle: artist || 'Album',
+        coverUrl,
+      });
+    },
+    shareArtist: (id, name, coverUrl = '') => {
+      shareEntity({
+        kind: 'artist',
+        targetId: id,
+        title: name,
+        subtitle: 'Artist',
+        coverUrl,
+      });
+    },
+    shareCurrentInstantMix: () => {
+      const mix = state.searchState && state.searchState.instantMix;
+      if (!mix || !mix.tracks || !mix.tracks.length) return;
+      shareEntity({
+        kind: 'mix',
+        targetId: `mix:${mix.title || state.searchState.query || 'custom'}`,
+        title: mix.title,
+        subtitle: mix.subtitle || 'Instant Custom Mix',
+        trackIds: mix.tracks.map((t) => t.id),
+        coverUrl: mix.tracks[0]?.coverUrl || '',
+      });
+    },
+    shareCurrentMoodMix: () => {
+      if (!state.currentMoodShare) return;
+      shareEntity(state.currentMoodShare);
+    },
+    shareCurrentGenreMix: () => {
+      if (!state.currentGenreShare) return;
+      shareEntity(state.currentGenreShare);
+    },
+    nativeShareCurrent: async () => {
+      if (!state.currentShareUrl || !navigator.share) return;
+      try {
+        await navigator.share({ title: 'Beatlab', url: state.currentShareUrl });
+      } catch {}
+    },
     markNotInterested,
     openSettingsModal,
     setSettingsTab: (tab) => {

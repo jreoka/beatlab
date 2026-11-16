@@ -143,9 +143,13 @@ impl XmlElem {
             groups.entry(c.name.clone()).or_default().push(c.to_json());
         }
         for name in order {
-            let items = groups.remove(&name).unwrap();
+            let Some(items) = groups.remove(&name) else {
+                continue;
+            };
             if items.len() == 1 && !is_subsonic_array_child(&self.name, &name) {
-                obj.insert(name, items.into_iter().next().unwrap());
+                if let Some(single) = items.into_iter().next() {
+                    obj.insert(name, single);
+                }
             } else {
                 obj.insert(name, Value::Array(items));
             }

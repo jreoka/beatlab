@@ -12,14 +12,44 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::io::ReaderStream;
 use tracing::{debug, warn};
+
+struct NotifyLeaderGuard {
+    map: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
+    key: String,
+    notify: Arc<Notify>,
+}
+
+impl Drop for NotifyLeaderGuard {
+    fn drop(&mut self) {
+        let mut guard = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cur) = guard.get(&self.key) {
+            if Arc::ptr_eq(cur, &self.notify) {
+                guard.remove(&self.key);
+            }
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+struct InFlightSetGuard {
+    set: Arc<StdMutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for InFlightSetGuard {
+    fn drop(&mut self) {
+        let mut guard = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        guard.remove(&self.key);
+    }
+}
 
 #[derive(Clone)]
 pub struct CachedResolved {
@@ -53,11 +83,18 @@ pub struct StreamEngine {
     pub stream_http: reqwest::Client,
     pub cache_dir: PathBuf,
     pub cover_dir: PathBuf,
+    pub embed_dir: PathBuf,
     pub max_cache_bytes: i64,
     pub ffmpeg_available: bool,
     resolved_cache: Arc<RwLock<HashMap<String, CachedResolved>>>,
-    in_flight_resolutions: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    in_flight_downloads: Arc<Mutex<HashSet<String>>>,
+    in_flight_resolutions: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
+    in_flight_downloads: Arc<StdMutex<HashSet<String>>>,
+    in_flight_warms: Arc<StdMutex<HashSet<String>>>,
+    in_flight_embeds: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
+    warm_sem: Arc<Semaphore>,
+    cache_sem: Arc<Semaphore>,
+    stream_proc_sem: Arc<Semaphore>,
+    embed_sem: Arc<Semaphore>,
 }
 
 impl StreamEngine {
@@ -69,8 +106,10 @@ impl StreamEngine {
     ) -> Self {
         let cache_dir = data_dir.join("cache").join("audio");
         let cover_dir = data_dir.join("cache").join("covers");
+        let embed_dir = data_dir.join("cache").join("embeds");
         let _ = std::fs::create_dir_all(&cache_dir);
         let _ = std::fs::create_dir_all(&cover_dir);
+        let _ = std::fs::create_dir_all(&embed_dir);
 
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(12))
@@ -103,11 +142,18 @@ impl StreamEngine {
             stream_http,
             cache_dir,
             cover_dir,
+            embed_dir,
             max_cache_bytes: ((max_cache_gb.max(0.5)) * 1024.0 * 1024.0 * 1024.0) as i64,
             ffmpeg_available,
             resolved_cache: Arc::new(RwLock::new(HashMap::new())),
-            in_flight_resolutions: Arc::new(Mutex::new(HashMap::new())),
-            in_flight_downloads: Arc::new(Mutex::new(HashSet::new())),
+            in_flight_resolutions: Arc::new(StdMutex::new(HashMap::new())),
+            in_flight_downloads: Arc::new(StdMutex::new(HashSet::new())),
+            in_flight_warms: Arc::new(StdMutex::new(HashSet::new())),
+            in_flight_embeds: Arc::new(StdMutex::new(HashMap::new())),
+            warm_sem: Arc::new(Semaphore::new(2)),
+            cache_sem: Arc::new(Semaphore::new(3)),
+            stream_proc_sem: Arc::new(Semaphore::new(8)),
+            embed_sem: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -284,7 +330,10 @@ impl StreamEngine {
         // Coordinate concurrent requests for the same track ID.
         loop {
             let (notify, is_leader) = {
-                let mut map = self.in_flight_resolutions.lock().await;
+                let mut map = self
+                    .in_flight_resolutions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 if let Some(existing) = map.get(&track.id) {
                     (Arc::clone(existing), false)
                 } else {
@@ -295,7 +344,7 @@ impl StreamEngine {
             };
 
             if !is_leader {
-                notify.notified().await;
+                let _ = tokio::time::timeout(Duration::from_secs(25), notify.notified()).await;
                 let guard = self.resolved_cache.read().await;
                 if let Some(cached) = guard.get(&track.id) {
                     if cached.expires_at > Utc::now().timestamp() {
@@ -305,13 +354,12 @@ impl StreamEngine {
                 continue;
             }
 
-            let res = self.perform_ytm_resolve(track).await;
-            {
-                let mut map = self.in_flight_resolutions.lock().await;
-                map.remove(&track.id);
-            }
-            notify.notify_waiters();
-            return res;
+            let _guard = NotifyLeaderGuard {
+                map: Arc::clone(&self.in_flight_resolutions),
+                key: track.id.clone(),
+                notify: Arc::clone(&notify),
+            };
+            return self.perform_ytm_resolve(track).await;
         }
     }
 
@@ -376,6 +424,36 @@ impl StreamEngine {
                 Ok(())
             }
         }
+    }
+
+    /// Deduplicates and bounds background warm hints so rapid track skipping cannot pile up tasks.
+    pub fn spawn_warm_track(&self, track: Track) {
+        if let Ok(Some(entry)) = self.store.get_cache_entry(&track.id) {
+            if Path::new(&entry.path).exists() {
+                return;
+            }
+        }
+        let Ok(permit) = self.warm_sem.clone().try_acquire_owned() else {
+            return;
+        };
+        {
+            let mut set = self
+                .in_flight_warms
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !set.insert(track.id.clone()) {
+                return;
+            }
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _guard = InFlightSetGuard {
+                set: Arc::clone(&this.in_flight_warms),
+                key: track.id.clone(),
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(30), this.warm_track(&track)).await;
+        });
     }
 
     pub async fn serve_track_stream(
@@ -628,7 +706,23 @@ impl StreamEngine {
         (StatusCode::BAD_GATEWAY, "Failed to proxy upstream audio").into_response()
     }
 
+    async fn acquire_stream_proc_permit(&self) -> Result<OwnedSemaphorePermit, Response> {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.stream_proc_sem.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err((StatusCode::SERVICE_UNAVAILABLE, "Stream processor busy").into_response()),
+        }
+    }
+
     async fn serve_ytdlp_pipe(&self, watch_url: &str) -> Response {
+        let permit = match self.acquire_stream_proc_permit().await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
         let mut cmd = Command::new(self.sources.ytm.ytdlp_bin());
         cmd.args([
             "--no-playlist",
@@ -641,7 +735,7 @@ impl StreamEngine {
             "-",
             watch_url,
         ]);
-        stream_child_stdout(cmd, "audio/mp4", "Failed to spawn yt-dlp pipe")
+        stream_child_stdout(cmd, "audio/mp4", "Failed to spawn yt-dlp pipe", Some(permit))
     }
 
     async fn serve_ffmpeg_transcode(
@@ -652,6 +746,10 @@ impl StreamEngine {
         bitrate_kbps: i32,
         time_offset: f64,
     ) -> Response {
+        let permit = match self.acquire_stream_proc_permit().await {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
         let (input_arg, custom_headers, ct) = match target {
             PlayTarget::LocalFile { path, .. } => (
                 path.to_string_lossy().to_string(),
@@ -755,7 +853,7 @@ impl StreamEngine {
             }
         }
 
-        stream_child_stdout(cmd, ct, "Failed to launch ffmpeg")
+        stream_child_stdout(cmd, ct, "Failed to launch ffmpeg", Some(permit))
     }
 
     pub fn spawn_background_cache(
@@ -770,6 +868,18 @@ impl StreamEngine {
                 return;
             }
         }
+        let Ok(permit) = self.cache_sem.clone().try_acquire_owned() else {
+            return;
+        };
+        {
+            let mut set = self
+                .in_flight_downloads
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !set.insert(track_id.to_string()) {
+                return;
+            }
+        }
 
         let this = self.clone();
         let tid = track_id.to_string();
@@ -778,15 +888,12 @@ impl StreamEngine {
         let ext_s = if ext.is_empty() { "m4a" } else { ext }.to_string();
 
         tokio::spawn(async move {
-            {
-                let mut set = this.in_flight_downloads.lock().await;
-                if !set.insert(tid.clone()) {
-                    return;
-                }
-            }
+            let _permit = permit;
+            let _guard = InFlightSetGuard {
+                set: Arc::clone(&this.in_flight_downloads),
+                key: tid.clone(),
+            };
             let _ = this.download_to_disk_cache(&tid, &u, &hdrs, &ext_s).await;
-            let mut set = this.in_flight_downloads.lock().await;
-            set.remove(&tid);
         });
     }
 
@@ -849,7 +956,8 @@ impl StreamEngine {
 
         // Convert mp4 progressive streams cleanly into fast-start audio-only m4a if ffmpeg is installed.
         let remuxed = if self.ffmpeg_available && (ext == "mp4" || ext == "m4a") {
-            let status = Command::new("ffmpeg")
+            let mut cmd = Command::new("ffmpeg");
+            cmd.kill_on_drop(true)
                 .args([
                     "-y",
                     "-hide_banner",
@@ -864,10 +972,20 @@ impl StreamEngine {
                     "+faststart",
                     &final_path.to_string_lossy(),
                 ])
-                .status()
-                .await
-                .map(|s| s.success())
-                .unwrap_or(false);
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let status = match cmd.spawn() {
+                Ok(mut child) => {
+                    match tokio::time::timeout(Duration::from_secs(45), child.wait()).await {
+                        Ok(Ok(s)) => s.success(),
+                        _ => {
+                            let _ = child.kill().await;
+                            false
+                        }
+                    }
+                }
+                Err(_) => false,
+            };
             if status && final_path.exists() {
                 let _ = tokio::fs::remove_file(&part_path).await;
                 true
@@ -1076,6 +1194,233 @@ impl StreamEngine {
             .and_then(|s| s.as_str())
             .map(upgrade_cover_url)
             .unwrap_or_default()
+    }
+
+    pub async fn cover_raster_bytes(&self, raw_id: &str) -> Option<(Vec<u8>, String)> {
+        let resp = self.serve_cover(raw_id).await;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let mime = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        if mime.contains("svg") {
+            return None;
+        }
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .ok()?;
+        if bytes.is_empty() {
+            None
+        } else {
+            Some((bytes.to_vec(), mime))
+        }
+    }
+
+    pub fn embed_mp4_path(&self, track_id: &str) -> PathBuf {
+        self.embed_dir.join(format!("{}.mp4", sha1_hex(track_id)))
+    }
+
+    pub fn has_cached_embed_mp4(&self, track_id: &str) -> bool {
+        let p = self.embed_mp4_path(track_id);
+        std::fs::metadata(&p).map(|m| m.len() > 4096).unwrap_or(false)
+    }
+
+    pub async fn ensure_share_embed_mp4(
+        &self,
+        track: &Track,
+        fallback_png: &[u8],
+    ) -> Option<PathBuf> {
+        if !self.ffmpeg_available {
+            return None;
+        }
+        let out_path = self.embed_mp4_path(&track.id);
+        if tokio::fs::metadata(&out_path)
+            .await
+            .map(|m| m.len() > 4096)
+            .unwrap_or(false)
+        {
+            return Some(out_path);
+        }
+
+        let (notify, is_leader) = {
+            let mut guard = self
+                .in_flight_embeds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = guard.get(&track.id) {
+                (existing.clone(), false)
+            } else {
+                let n = Arc::new(Notify::new());
+                guard.insert(track.id.clone(), n.clone());
+                (n, true)
+            }
+        };
+
+        if !is_leader {
+            let _ = tokio::time::timeout(Duration::from_secs(30), notify.notified()).await;
+            return if tokio::fs::metadata(&out_path)
+                .await
+                .map(|m| m.len() > 4096)
+                .unwrap_or(false)
+            {
+                Some(out_path)
+            } else {
+                None
+            };
+        }
+
+        let _guard = NotifyLeaderGuard {
+            map: Arc::clone(&self.in_flight_embeds),
+            key: track.id.clone(),
+            notify: Arc::clone(&notify),
+        };
+        let result = self.build_share_embed_mp4(track, &out_path, fallback_png).await;
+        if result {
+            Some(out_path)
+        } else {
+            None
+        }
+    }
+
+    async fn build_share_embed_mp4(
+        &self,
+        track: &Track,
+        out_path: &Path,
+        fallback_png: &[u8],
+    ) -> bool {
+        let Ok(_permit) = tokio::time::timeout(Duration::from_secs(20), self.embed_sem.acquire()).await else {
+            return false;
+        };
+        let key = sha1_hex(&track.id);
+        let cover_tmp = self.embed_dir.join(format!("{}.cover", key));
+        let part_path = self.embed_dir.join(format!("{}.part.mp4", key));
+
+        let (cover_bytes, _) = match self.cover_raster_bytes(&track.id).await {
+            Some(v) => v,
+            None => (fallback_png.to_vec(), "image/png".to_string()),
+        };
+        if tokio::fs::write(&cover_tmp, &cover_bytes).await.is_err() {
+            return false;
+        }
+
+        let resolved = match self.resolve_target(track).await {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&cover_tmp).await;
+                return false;
+            }
+        };
+
+        let (input_arg, custom_headers) = match resolved {
+            PlayTarget::LocalFile { path, .. } => (path.to_string_lossy().to_string(), vec![]),
+            PlayTarget::RemoteHttp { url, headers, .. } => (url, headers),
+        };
+
+        let audio_bitrate = if track.duration > 480 { "112k" } else { "160k" };
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.kill_on_drop(true);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        cmd.args(["-loop", "1", "-framerate", "1", "-i"]);
+        cmd.arg(&cover_tmp);
+
+        if input_arg.starts_with("http://") || input_arg.starts_with("https://") {
+            let mut ua = String::new();
+            let mut hdr_blob = String::new();
+            for (k, v) in &custom_headers {
+                if k.eq_ignore_ascii_case("user-agent") {
+                    ua = v.clone();
+                } else {
+                    hdr_blob.push_str(&format!("{}: {}\r\n", k, v));
+                }
+            }
+            if !ua.is_empty() {
+                cmd.args(["-user_agent", &ua]);
+            }
+            if !hdr_blob.is_empty() {
+                cmd.args(["-headers", &hdr_blob]);
+            }
+        }
+        cmd.args(["-i", &input_arg]);
+        cmd.args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            "scale=480:480:force_original_aspect_ratio=increase,crop=480:480",
+            "-c:v",
+            "libx264",
+            "-tune",
+            "stillimage",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            "1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            audio_bitrate,
+            "-ac",
+            "2",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+        ]);
+        cmd.arg(&part_path);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+
+        let ok = match cmd.spawn() {
+            Ok(mut child) => {
+                match tokio::time::timeout(Duration::from_secs(45), child.wait()).await {
+                    Ok(Ok(status)) => status.success(),
+                    _ => {
+                        let _ = child.kill().await;
+                        false
+                    }
+                }
+            }
+            Err(_) => false,
+        };
+
+        let _ = tokio::fs::remove_file(&cover_tmp).await;
+        if ok
+            && tokio::fs::metadata(&part_path)
+                .await
+                .map(|m| m.len() > 4096)
+                .unwrap_or(false)
+        {
+            let renamed = tokio::fs::rename(&part_path, out_path).await.is_ok();
+            if renamed {
+                return true;
+            }
+        }
+        let _ = tokio::fs::remove_file(&part_path).await;
+        false
+    }
+
+    pub async fn serve_share_embed_mp4(
+        &self,
+        track: &Track,
+        req_headers: &HeaderMap,
+        fallback_png: &[u8],
+    ) -> Response {
+        let Some(mp4_path) = self.ensure_share_embed_mp4(track, fallback_png).await else {
+            return (StatusCode::NOT_FOUND, "Embed media unavailable").into_response();
+        };
+        let range_hdr = req_headers
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok());
+        serve_local_file_range(&mp4_path, "video/mp4", range_hdr).await
     }
 
     pub async fn fetch_lyrics(&self, track: &Track) -> LyricsData {
@@ -1328,6 +1673,7 @@ fn sanitize_time_offset(t: f64) -> f64 {
 struct ChildStdoutStream {
     reader: ReaderStream<tokio::process::ChildStdout>,
     _child: tokio::process::Child,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl futures::Stream for ChildStdoutStream {
@@ -1347,6 +1693,7 @@ fn stream_child_stdout(
     mut cmd: Command,
     content_type: &str,
     spawn_err: &'static str,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Response {
     cmd.kill_on_drop(true)
         .stdout(Stdio::piped())
@@ -1360,6 +1707,7 @@ fn stream_child_stdout(
     let stream = ChildStdoutStream {
         reader: ReaderStream::new(stdout),
         _child: child,
+        _permit: permit,
     };
     Response::builder()
         .status(StatusCode::OK)
@@ -2072,6 +2420,70 @@ mod tests {
             _ => panic!("expected local fallback"),
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn notify_leader_guard_cleans_up_on_cancellation_and_warm_respects_bounds() {
+        let map = Arc::new(StdMutex::new(HashMap::new()));
+        let notify = Arc::new(Notify::new());
+        {
+            let mut m = map.lock().unwrap();
+            m.insert("track-x".to_string(), Arc::clone(&notify));
+        }
+
+        // Simulate a cancelled HTTP stream leader future dropping mid-await.
+        let waiter = notify.notified();
+        tokio::pin!(waiter);
+        let fut = {
+            let map_c = Arc::clone(&map);
+            let n_c = Arc::clone(&notify);
+            async move {
+                let _guard = NotifyLeaderGuard {
+                    map: map_c,
+                    key: "track-x".to_string(),
+                    notify: n_c,
+                };
+                futures::future::pending::<()>().await;
+            }
+        };
+        let timed = tokio::time::timeout(Duration::from_millis(20), fut).await;
+        assert!(timed.is_err());
+
+        // Map entry must be removed AND waiter must wake immediately (no deadlock).
+        assert!(!map.lock().unwrap().contains_key("track-x"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), waiter)
+                .await
+                .is_ok(),
+            "follower waiter should be woken when cancelled leader drops"
+        );
+
+        // Rapid spawn_warm_track bursts must never block or panic.
+        let dir = std::env::temp_dir().join(format!("beatlab_warm_burst_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("song.mp3");
+        std::fs::write(&audio, vec![0u8; 8192]).unwrap();
+        let store = Store::open_memory().unwrap();
+        let sources = crate::sources::SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), dir.join("slsk")),
+        );
+        let engine = StreamEngine::new(store, sources, &dir, 1.0);
+        for i in 0..40 {
+            let t = Track {
+                id: format!("local:burst-{}", i),
+                source: "local".into(),
+                stream_url: format!("file:{}", audio.display()),
+                ..Default::default()
+            };
+            engine.spawn_warm_track(t);
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(engine.in_flight_warms.lock().unwrap().len() <= 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

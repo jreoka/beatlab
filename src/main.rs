@@ -1,7 +1,9 @@
 mod engine;
 mod models;
 mod navidrome;
+mod share_page;
 mod sources;
+mod stats;
 mod store;
 mod subsonic;
 mod taste;
@@ -170,6 +172,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/album/{id}", get(webapp::album_detail))
         .route("/api/web/artist/{id}", get(webapp::artist_detail))
         .route("/api/web/library", get(webapp::library))
+        .route("/api/web/stats", get(webapp::stats))
         .route("/api/web/playlists", post(webapp::create_playlist))
         .route(
             "/api/web/playlist/{id}",
@@ -212,6 +215,19 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/stream/{id}", get(webapp::stream_track))
         .route("/api/web/cover/{id}", get(webapp::cover_art))
         .route("/api/web/sources", get(webapp::sources_info))
+        .route("/api/web/share", post(webapp::create_share))
+        // Public Share Pages & Discord-Compatible Embed Endpoints
+        .route("/s/{id}", get(webapp::public_share_page))
+        .route("/s/{id}/embed", get(webapp::public_share_embed_page))
+        .route("/s/{id}/cover", get(webapp::public_share_cover))
+        .route("/s/{id}/stream", get(webapp::public_share_stream_primary))
+        .route("/s/{id}/stream/{track_id}", get(webapp::public_share_stream_track))
+        .route("/s/{id}/embed.mp4", get(webapp::public_share_embed_mp4))
+        .route("/s/{id}/oembed", get(webapp::public_share_oembed))
+        .route(
+            "/api/public/share/{id}/lyrics/{track_id}",
+            get(webapp::public_share_lyrics),
+        )
         // Subsonic / OpenSubsonic REST API
         .route("/rest/{*action}", any(subsonic::dispatch))
         // Navidrome Auth & Native API (auto-creates new user accounts on first login!)

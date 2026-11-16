@@ -1722,7 +1722,7 @@ impl TasteEngine {
         artist_id: &str,
         user_id: i64,
     ) -> Option<(ArtistSummary, Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
-        let mut local_summary = self.store.artist_summary_by_id(artist_id).ok().flatten();
+        let local_summary = self.store.artist_summary_by_id(artist_id).ok().flatten();
         let dz_artist_id = local_summary
             .as_ref()
             .map(|a| a.deezer_id.clone())
@@ -1770,13 +1770,7 @@ impl TasteEngine {
                     self.store.artist_albums(user_id, &meta.id).unwrap_or_default(),
                     dz_albums,
                 );
-                local_summary = Some(meta);
-                return Some((
-                    local_summary.unwrap(),
-                    merged_tracks,
-                    merged_albums,
-                    related,
-                ));
+                return Some((meta, merged_tracks, merged_albums, related));
             }
         }
 
@@ -3597,7 +3591,8 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         if raw_words.len() >= 2 {
             let last_clean = raw_words
                 .last()
-                .unwrap()
+                .copied()
+                .unwrap_or_default()
                 .trim_matches(|c: char| !c.is_alphanumeric())
                 .to_lowercase();
             if matches!(last_clean.as_str(), "mix" | "playlist" | "radio" | "vibe" | "vibes") {

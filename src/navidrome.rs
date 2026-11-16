@@ -828,7 +828,7 @@ pub async fn move_playlist_track(
     let to_pos = if from_pos < before_idx {
         before_idx.saturating_sub(1)
     } else {
-        before_idx.min(current.len() - 1)
+        before_idx.min(current.len().saturating_sub(1))
     };
     match state.store.move_playlist_track(&id, from_pos, to_pos) {
         Ok(()) => json_ok(json!({ "ok": true }), None),
