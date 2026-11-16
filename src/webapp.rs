@@ -7,43 +7,184 @@ use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 const INDEX_HTML: &str = include_str!("web/index.html");
 const STYLES_CSS: &str = include_str!("web/styles.css");
 const APP_JS: &str = include_str!("web/app.js");
 const FAVICON_SVG: &str = include_str!("web/favicon.svg");
 
-pub async fn serve_index() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        INDEX_HTML,
-    )
+const CSS_LINK_TAG: &str = r#"<link rel="stylesheet" href="/web/styles.css" />"#;
+const JS_SCRIPT_TAG: &str = r#"<script src="/web/app.js"></script>"#;
+const FAVICON_HREF: &str = r#"href="/web/favicon.svg""#;
+const ASSET_CACHE_CONTROL: &str = "no-cache, must-revalidate";
+
+struct CachedAsset {
+    body: &'static str,
+    etag: String,
+    short_hash: String,
 }
 
-pub async fn serve_css() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        STYLES_CSS,
-    )
+fn asset_from_str(body: &'static str) -> CachedAsset {
+    let digest = hex::encode(Sha1::digest(body.as_bytes()));
+    let short_hash = digest[..12].to_string();
+    let etag = format!("\"{short_hash}\"");
+    CachedAsset {
+        body,
+        etag,
+        short_hash,
+    }
 }
 
-pub async fn serve_js() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        APP_JS,
-    )
+/// Escapes closing raw-text HTML tags (case-insensitively) before inlining CSS/JS.
+fn escape_inline_closing_tag(
+    src: &'static str,
+    needle_lower: &[u8],
+    replacement: &str,
+) -> Cow<'static, str> {
+    let bytes = src.as_bytes();
+    let n = needle_lower.len();
+    let Some(first) = bytes
+        .windows(n)
+        .position(|w| w.eq_ignore_ascii_case(needle_lower))
+    else {
+        return Cow::Borrowed(src);
+    };
+
+    let mut out = String::with_capacity(src.len() + 16);
+    out.push_str(&src[..first]);
+    out.push_str(replacement);
+    let mut cursor = first + n;
+    while cursor + n <= bytes.len() {
+        if bytes[cursor..cursor + n].eq_ignore_ascii_case(needle_lower) {
+            out.push_str(replacement);
+            cursor += n;
+        } else {
+            let ch = src[cursor..].chars().next().unwrap();
+            out.push(ch);
+            cursor += ch.len_utf8();
+        }
+    }
+    out.push_str(&src[cursor..]);
+    Cow::Owned(out)
 }
 
-pub async fn serve_favicon() -> impl IntoResponse {
+/// Bundles `index.html`, `styles.css`, and `app.js` into a single self-contained HTML
+/// response so CDN edge caches and multi-node deployments cannot serve mismatched versions.
+fn build_bundled_index(favicon_hash: &str) -> String {
+    let safe_css = escape_inline_closing_tag(STYLES_CSS, b"</style", r"\3c /style");
+    let safe_js = escape_inline_closing_tag(APP_JS, b"</script", r"<\/script");
+
+    let (before_css, after_css) = INDEX_HTML
+        .split_once(CSS_LINK_TAG)
+        .expect("index.html must contain /web/styles.css link tag");
+    let (between_css_js, after_js) = after_css
+        .split_once(JS_SCRIPT_TAG)
+        .expect("index.html must contain /web/app.js script tag");
+
+    let mut out = String::with_capacity(INDEX_HTML.len() + safe_css.len() + safe_js.len() + 64);
+    if let Some((before_fav, after_fav)) = before_css.split_once(FAVICON_HREF) {
+        out.push_str(before_fav);
+        out.push_str(r#"href="/web/favicon.svg?v="#);
+        out.push_str(favicon_hash);
+        out.push('"');
+        out.push_str(after_fav);
+    } else {
+        out.push_str(before_css);
+    }
+    out.push_str("<style>\n");
+    out.push_str(&safe_css);
+    out.push_str("\n  </style>");
+    out.push_str(between_css_js);
+    out.push_str("<script>\n");
+    out.push_str(&safe_js);
+    out.push_str("\n  </script>");
+    out.push_str(after_js);
+    out
+}
+
+fn css_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_str(STYLES_CSS))
+}
+
+fn js_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_str(APP_JS))
+}
+
+fn favicon_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| asset_from_str(FAVICON_SVG))
+}
+
+fn index_asset() -> &'static CachedAsset {
+    static ASSET: OnceLock<CachedAsset> = OnceLock::new();
+    ASSET.get_or_init(|| {
+        let html: &'static str =
+            Box::leak(build_bundled_index(&favicon_asset().short_hash).into_boxed_str());
+        asset_from_str(html)
+    })
+}
+
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(val) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    val.split(',').any(|part| {
+        let candidate = part.trim();
+        let normalized = candidate.strip_prefix("W/").unwrap_or(candidate).trim();
+        normalized == "*" || normalized == etag
+    })
+}
+
+fn serve_asset(
+    headers: &HeaderMap,
+    content_type: &'static str,
+    asset: &'static CachedAsset,
+) -> Response {
+    if etag_matches(headers, &asset.etag) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+                (header::ETAG, asset.etag.as_str()),
+            ],
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
-        FAVICON_SVG,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+            (header::ETAG, asset.etag.as_str()),
+        ],
+        asset.body,
     )
+        .into_response()
+}
+
+pub async fn serve_index(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "text/html; charset=utf-8", index_asset())
+}
+
+pub async fn serve_css(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "text/css; charset=utf-8", css_asset())
+}
+
+pub async fn serve_js(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "application/javascript; charset=utf-8", js_asset())
+}
+
+pub async fn serve_favicon(headers: HeaderMap) -> Response {
+    serve_asset(&headers, "image/svg+xml; charset=utf-8", favicon_asset())
 }
 
 #[derive(Serialize)]
@@ -2003,5 +2144,93 @@ mod tests {
         assert!(store.hidden_tracks_list(u.id).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn escape_inline_closing_tag_handles_case_and_utf8() {
+        let input = "const label = '🎵</ScRiPt>—</script>';";
+        let escaped = escape_inline_closing_tag(input, b"</script", r"<\/script");
+        assert_eq!(escaped, r"const label = '🎵<\/script>—<\/script>';");
+
+        let clean = "console.log('ok');";
+        assert!(matches!(
+            escape_inline_closing_tag(clean, b"</script", r"<\/script"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn serve_index_bundles_assets_and_respects_etag() {
+        use axum::body::to_bytes;
+
+        let res = serve_index(HeaderMap::new()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache, must-revalidate"
+        );
+        let etag = res
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(!html.contains(CSS_LINK_TAG));
+        assert!(!html.contains(JS_SCRIPT_TAG));
+        assert!(html.contains("<style>\n"));
+        assert!(html.contains(".settings-btn {"));
+        assert!(html.contains(".mobile-brand {"));
+        assert!(html.contains("<script>\n"));
+        assert!(html.contains("openSettingsModal"));
+        assert!(html.contains(&format!(
+            r#"href="/web/favicon.svg?v={}""#,
+            favicon_asset().short_hash
+        )));
+
+        // Exact ETag and weak Cloudflare ETag both return 304 Not Modified
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        assert_eq!(serve_index(req_headers).await.status(), StatusCode::NOT_MODIFIED);
+
+        let mut weak_headers = HeaderMap::new();
+        weak_headers.insert(
+            header::IF_NONE_MATCH,
+            format!("W/{etag}").parse().unwrap(),
+        );
+        assert_eq!(serve_index(weak_headers).await.status(), StatusCode::NOT_MODIFIED);
+
+        // Mismatched ETag returns full 200 OK
+        let mut stale_headers = HeaderMap::new();
+        stale_headers.insert(header::IF_NONE_MATCH, "\"000000000000\"".parse().unwrap());
+        assert_eq!(serve_index(stale_headers).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn direct_asset_endpoints_disable_edge_caching_and_support_etag() {
+        for (handler_name, res) in [
+            ("css", serve_css(HeaderMap::new()).await),
+            ("js", serve_js(HeaderMap::new()).await),
+            ("favicon", serve_favicon(HeaderMap::new()).await),
+        ] {
+            assert_eq!(res.status(), StatusCode::OK, "{handler_name} status");
+            assert_eq!(
+                res.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-cache, must-revalidate",
+                "{handler_name} cache-control"
+            );
+            assert!(
+                res.headers().get(header::ETAG).is_some(),
+                "{handler_name} etag"
+            );
+        }
+
+        let css_etag = css_asset().etag.clone();
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::IF_NONE_MATCH, css_etag.parse().unwrap());
+        assert_eq!(serve_css(hdrs).await.status(), StatusCode::NOT_MODIFIED);
     }
 }
