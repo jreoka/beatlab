@@ -2107,7 +2107,6 @@ a {
   flex-shrink: 0;
 }
 .fs-mobile-collapse,
-.fs-mobile-eq-btn,
 .fs-mobile-tabs,
 .fs-mobile-controls,
 .fs-like-btn {
@@ -2244,27 +2243,6 @@ a {
   justify-content: flex-end;
   gap: 10px;
   flex-wrap: wrap;
-}
-
-.eq-bands {
-  display: grid;
-  grid-template-columns: repeat(10, 1fr);
-  gap: 6px;
-  margin: 18px 0;
-}
-.eq-col {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.eq-col input[type="range"] {
-  writing-mode: bt-lr;
-  -webkit-appearance: slider-vertical;
-  width: 24px;
-  height: 120px;
 }
 
 .kv-card {
@@ -3866,10 +3844,6 @@ a {
     gap: 6px;
     min-width: 0;
   }
-  .topbar-eq-btn {
-    padding: 6px 9px;
-    font-size: 12px;
-  }
   .topbar-install-btn {
     padding: 6px 8px;
   }
@@ -4409,11 +4383,6 @@ a {
   .fs-desktop-collapse {
     display: none;
   }
-  .fs-mobile-eq-btn {
-    display: inline-flex;
-    padding: 6px 10px;
-    font-size: 12px;
-  }
   .fs-topbar-title {
     flex: 1;
     justify-content: center;
@@ -4683,54 +4652,6 @@ a {
 @media (max-width: 560px) {
   .auth-card {
     padding: 22px 18px;
-  }
-  .eq-bands {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    margin: 14px 0 6px;
-  }
-  .eq-col {
-    display: grid;
-    grid-template-columns: 34px minmax(0, 1fr) 44px;
-    align-items: center;
-    gap: 10px;
-    font-size: 12px;
-  }
-  .eq-col span:last-child {
-    order: -1;
-    text-align: left;
-    font-weight: 600;
-  }
-  .eq-col span:first-child {
-    order: 3;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-  }
-  .eq-col input[type="range"] {
-    order: 2;
-    writing-mode: horizontal-tb;
-    -webkit-appearance: none;
-    appearance: none;
-    width: 100%;
-    height: 6px;
-    border-radius: 3px;
-    background: var(--surface-3);
-  }
-  .eq-col input[type="range"]::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    width: 18px;
-    height: 18px;
-    border: none;
-    border-radius: 50%;
-    background: var(--accent);
-  }
-  .eq-col input[type="range"]::-moz-range-thumb {
-    width: 18px;
-    height: 18px;
-    border: none;
-    border-radius: 50%;
-    background: var(--accent);
   }
 }
 

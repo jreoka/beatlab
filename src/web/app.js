@@ -1,23 +1,7 @@
 (() => {
   'use strict';
 
-  const EQ_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
-  const EQ_LABELS = ['32', '64', '125', '250', '500', '1k', '2k', '4k', '8k', '16k'];
-  const EQ_PRESETS = {
-    Flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    'Bass Boost': [6, 5, 4, 2, 0, 0, 0, 1, 2, 2],
-    Vocal: [-2, -1, 0, 2, 4, 5, 4, 2, 1, 0],
-    Electronic: [5, 4, 1, -2, -1, 1, 2, 4, 5, 4],
-    Rock: [4, 3, 1, -1, -2, 0, 2, 4, 5, 4],
-    'Late Night': [3, 2, 1, 0, 0, -1, -1, 0, 1, 2],
-  };
-
   const audio = document.getElementById('audio-el');
-  let audioCtx = null;
-  let audioSource = null;
-  let eqFilters = [];
-  let analyser = null;
-  let masterGainNode = null;
   let rafVisualizer = null;
 
   const ICONS = {
@@ -84,20 +68,6 @@
       .join('');
   }
 
-  function loadEqGains() {
-    const flat = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    try {
-      const parsed = JSON.parse(localStorage.getItem('beatlab_eq_gains') || 'null');
-      if (Array.isArray(parsed) && parsed.length === EQ_FREQS.length) {
-        return parsed.map((v) => {
-          const n = Number(v);
-          return Number.isFinite(n) ? Math.max(-12, Math.min(12, n)) : 0;
-        });
-      }
-    } catch {}
-    return flat;
-  }
-
   const state = {
     token: localStorage.getItem('beatlab_token') || '',
     user: null,
@@ -137,8 +107,6 @@
     fsMobileView: 'player',
     lyrics: { synced: false, plain: '', lines: [] },
     activeLyricIdx: -1,
-    eqEnabled: localStorage.getItem('beatlab_eq_on') === 'true',
-    eqGains: loadEqGains(),
     searchTimer: null,
     searchComposing: false,
     ownSearchNavQuery: null,
@@ -635,90 +603,19 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Web Audio Equalizer & Visualizer
+  // Playback output & visualizer
   // ---------------------------------------------------------------------------
   function applyOutputVolume() {
     const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
-    if (masterGainNode && audioCtx) {
-      audio.muted = false;
-      audio.volume = 1;
-      masterGainNode.gain.setTargetAtTime(effectiveVol, audioCtx.currentTime, 0.015);
-    } else {
-      audio.muted = state.muted;
-      audio.volume = effectiveVol;
-    }
+    audio.muted = state.muted;
+    audio.volume = effectiveVol;
   }
 
-  function isAppleMobileDevice() {
-    const ua = navigator.userAgent || '';
-    return /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  }
-
-  function ensureAudioGraph() {
-    if (audioCtx) {
-      if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
-        audioCtx.resume().catch(() => {});
-      }
-      return;
-    }
-    const fsOpen = $('fullscreen-player')?.classList.contains('open');
-    const needsWebAudio = state.eqEnabled || (fsOpen && !isAppleMobileDevice());
-    if (!needsWebAudio) return;
+  function setMediaPlaybackState(value) {
+    if (!('mediaSession' in navigator)) return;
     try {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return;
-      audioCtx = new AC();
-      audioSource = audioCtx.createMediaElementSource(audio);
-
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 128;
-
-      masterGainNode = audioCtx.createGain();
-      const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
-      masterGainNode.gain.value = effectiveVol;
-
-      eqFilters = EQ_FREQS.map((freq, idx) => {
-        const f = audioCtx.createBiquadFilter();
-        f.type = idx === 0 ? 'lowshelf' : idx === EQ_FREQS.length - 1 ? 'highshelf' : 'peaking';
-        f.frequency.value = freq;
-        f.Q.value = 1.2;
-        f.gain.value = state.eqEnabled ? (state.eqGains[idx] || 0) : 0;
-        return f;
-      });
-
-      let node = audioSource;
-      for (const f of eqFilters) {
-        node.connect(f);
-        node = f;
-      }
-      node.connect(analyser);
-      analyser.connect(masterGainNode);
-      masterGainNode.connect(audioCtx.destination);
-
-      audioCtx.addEventListener('statechange', () => {
-        if (audioCtx && (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') && !audio.paused) {
-          audioCtx.resume().catch(() => {});
-        }
-      });
-      if (audioCtx.state !== 'running') {
-        audioCtx.resume().catch(() => {});
-      }
-
-      applyOutputVolume();
-    } catch (e) {
-      console.warn('WebAudio init skipped:', e);
-    }
-  }
-
-  function applyEqGains() {
-    localStorage.setItem('beatlab_eq_on', state.eqEnabled ? 'true' : 'false');
-    localStorage.setItem('beatlab_eq_gains', JSON.stringify(state.eqGains));
-    if (state.eqEnabled) {
-      ensureAudioGraph();
-    }
-    eqFilters.forEach((f, idx) => {
-      if (f) f.gain.value = state.eqEnabled ? (state.eqGains[idx] || 0) : 0;
-    });
+      navigator.mediaSession.playbackState = value;
+    } catch {}
   }
 
   function setExpandedPlayer(open) {
@@ -740,7 +637,6 @@
       btn.title = next ? 'Collapse player' : 'Expand player';
     }
     if (next && !rafVisualizer) {
-      ensureAudioGraph();
       drawVisualizer();
     }
   }
@@ -806,20 +702,23 @@
       return;
     }
     const canvas = $('fs-visualizer');
-    if (canvas && analyser) {
+    if (canvas) {
       const ctx = canvas.getContext('2d');
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      analyser.getByteFrequencyData(data);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
       const bars = 40;
       const bw = canvas.width / bars;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = '#1ed760';
+      // Lightweight synthetic animation that reflects play state. Keeping this
+      // independent of the Web Audio API lets the <audio> element play natively,
+      // which is required for background / lock-screen playback on mobile.
+      const t = (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000;
+      const playing = !!audio && !audio.paused && !audio.ended;
       for (let i = 0; i < bars; i++) {
-        const val = data[i] / 255;
-        const h = Math.max(4, val * canvas.height);
-        const x = i * bw + 2;
-        const y = canvas.height - h;
-        ctx.fillRect(x, y, Math.max(3, bw - 4), h);
+        const wave = playing
+          ? 0.18 + 0.45 * Math.abs(Math.sin(t * 2.1 + i * 0.42)) + 0.25 * Math.abs(Math.sin(t * 3.6 - i * 0.27))
+          : 0.08;
+        const h = Math.min(canvas.height, Math.max(3, wave * canvas.height * 0.9));
+        ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
       }
     }
     rafVisualizer = requestAnimationFrame(drawVisualizer);
@@ -919,6 +818,7 @@
       toast.classList.add('hidden');
     }
     document.title = 'Beatlab — Stream Everything';
+    setMediaPlaybackState('none');
     if ('mediaSession' in navigator) {
       try {
         navigator.mediaSession.metadata = null;
@@ -4112,7 +4012,6 @@
     try {
       if (!audio.paused) audio.pause();
     } catch {}
-    ensureAudioGraph();
     audio.src = buildStreamUrl(track);
     audio.play().catch((e) => {
       if (loadToken !== state.activeAudioToken) return;
@@ -4240,7 +4139,6 @@
     state.lastScrobbleCompleteId = '';
     state.compatAttemptedId = '';
 
-    ensureAudioGraph();
     updateNowPlayingUI(track, true, isBurst);
     renderQueuePanel();
     saveServerQueue();
@@ -4750,7 +4648,6 @@
     const cur = currentTrack();
     if (!cur) return;
     haptic('medium');
-    ensureAudioGraph();
     if (!audio.getAttribute('src')) {
       audio.src = buildStreamUrl(cur);
     }
@@ -4822,21 +4719,12 @@
 
   function wireAudioEvents() {
     audio.addEventListener('play', () => {
-      ensureAudioGraph();
       updatePlayButton(true);
-    });
-    audio.addEventListener('playing', () => {
-      if (audioCtx && (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted')) {
-        audioCtx.resume().catch(() => {});
-      }
-    });
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && !audio.paused && audioCtx && audioCtx.state !== 'running') {
-        audioCtx.resume().catch(() => {});
-      }
+      setMediaPlaybackState('playing');
     });
     audio.addEventListener('pause', () => {
       updatePlayButton(false);
+      setMediaPlaybackState(audio.ended ? 'none' : 'paused');
       if (!audio.ended && state.queue.length) saveServerQueue();
     });
     audio.addEventListener('loadedmetadata', () => {
@@ -4874,6 +4762,7 @@
       showToast(`Unable to play "${cur.title}" right now`);
     });
     audio.addEventListener('ended', () => {
+      setMediaPlaybackState('none');
       if (state.playCommitTimer) return;
       const cur = currentTrack();
       if (state.repeat === 'one') {
@@ -5578,37 +5467,6 @@
     });
   }
 
-  function openEqModal() {
-    ensureAudioGraph();
-    openModal(`
-      <div class="modal-head">
-        <h3>10-Band Audio Equalizer</h3>
-        <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-        <label class="toggle-row">
-          <input type="checkbox" ${state.eqEnabled ? 'checked' : ''} onchange="App.toggleEq(this.checked)" />
-          <span><strong>Enable Equalizer</strong></span>
-        </label>
-        <div style="display:flex;gap:6px;flex-wrap:wrap">
-          ${Object.keys(EQ_PRESETS)
-            .map((name) => `<button class="mini-btn" onclick="App.applyEqPreset('${name}')">${name}</button>`)
-            .join('')}
-        </div>
-      </div>
-      <div class="eq-bands">
-        ${EQ_LABELS.map(
-          (lbl, i) => `
-          <div class="eq-col">
-            <span id="eq-val-${i}">${state.eqGains[i] > 0 ? '+' : ''}${state.eqGains[i]}dB</span>
-            <input type="range" min="-12" max="12" step="1" value="${state.eqGains[i]}" oninput="App.setEqBand(${i}, this.value)" />
-            <span>${lbl}</span>
-          </div>`
-        ).join('')}
-      </div>
-    `);
-  }
-
   function renderSettingsModalBody() {
     const body = $('settings-body');
     if (!body) return;
@@ -5622,7 +5480,6 @@
     });
 
     if (tab === 'general') {
-      const eqActive = state.eqEnabled || state.eqGains.some((v) => v !== 0);
       const standalone = isStandalonePwa();
       const installControl = standalone
         ? `<span class="pwa-status-pill">Installed</span>`
@@ -5666,13 +5523,6 @@
               <input type="checkbox" ${state.hapticsEnabled ? 'checked' : ''} onchange="App.toggleHaptics(this.checked)" />
               <span class="switch-track"></span>
             </label>
-          </div>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <div class="settings-row-label">10-Band Audio Equalizer</div>
-              <div class="settings-row-desc">${eqActive ? 'Custom EQ filter active' : 'Flat response (off)'}</div>
-            </div>
-            <button class="btn-secondary" onclick="App.openEqModal()">Configure EQ</button>
           </div>
         </div>
 
@@ -7277,31 +7127,8 @@
         showToast(err.message);
       }
     },
-    openEqModal,
     closeModal,
     installPwa,
-    toggleEq: (on) => {
-      haptic('select');
-      state.eqEnabled = on;
-      applyEqGains();
-    },
-    setEqBand: (idx, val) => {
-      const n = parseInt(val, 10) || 0;
-      if (n === 0 || Math.abs(n) === 12) haptic('tick');
-      state.eqGains[idx] = n;
-      const lbl = $(`eq-val-${idx}`);
-      if (lbl) lbl.textContent = `${n > 0 ? '+' : ''}${n}dB`;
-      applyEqGains();
-    },
-    applyEqPreset: (name) => {
-      const vals = EQ_PRESETS[name];
-      if (!vals) return;
-      haptic('select');
-      state.eqGains = [...vals];
-      state.eqEnabled = name !== 'Flat';
-      applyEqGains();
-      openEqModal();
-    },
     regenApiKey: async () => {
       try {
         const res = await api('/api/web/account/apikey', { method: 'POST' });
