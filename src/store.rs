@@ -302,6 +302,9 @@ impl Store {
                 avatar_color TEXT NOT NULL DEFAULT '',
                 location TEXT NOT NULL DEFAULT '',
                 updated INTEGER NOT NULL,
+                avatar BLOB,
+                avatar_mime TEXT NOT NULL DEFAULT '',
+                avatar_version INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
@@ -350,6 +353,9 @@ impl Store {
         )?;
         ensure_column(&conn, "radio_stations", "user_id", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "albums_meta", "artist_id", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "user_profiles", "avatar", "BLOB")?;
+        ensure_column(&conn, "user_profiles", "avatar_mime", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "user_profiles", "avatar_version", "INTEGER NOT NULL DEFAULT 0")?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_deezer ON tracks(deezer_id)",
             [],
@@ -597,7 +603,9 @@ impl Store {
                COALESCE(p.location, '') AS location,
                (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.id) AS followers_count,
                (SELECT COUNT(*) FROM follows f WHERE f.follower_id = u.id) AS following_count,
-               EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ?1 AND f.following_id = u.id) AS is_following
+               EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ?1 AND f.following_id = u.id) AS is_following,
+               COALESCE(p.avatar_version, 0) AS avatar_version,
+               COALESCE(p.avatar_mime, '') AS avatar_mime
         FROM users u
         LEFT JOIN user_profiles p ON p.user_id = u.id
     ";
@@ -667,6 +675,55 @@ impl Store {
             location,
             updated: now,
         })
+    }
+
+    /// Stores (or replaces) the user's uploaded profile picture. The row is
+    /// created with defaults if the user has never edited their profile.
+    pub fn set_avatar(&self, user_id: i64, bytes: &[u8], mime: &str) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO user_profiles(user_id, updated, avatar, avatar_mime, avatar_version)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 updated = excluded.updated,
+                 avatar = excluded.avatar,
+                 avatar_mime = excluded.avatar_mime,
+                 avatar_version = user_profiles.avatar_version + 1",
+            params![user_id, now, bytes, mime],
+        )?;
+        Ok(())
+    }
+
+    /// Removes the uploaded picture so the generated initial/color avatar shows.
+    pub fn clear_avatar(&self, user_id: i64) -> AppResult<()> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO user_profiles(user_id, updated, avatar_mime, avatar_version)
+             VALUES (?1, ?2, '', 1)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 updated = excluded.updated,
+                 avatar = NULL,
+                 avatar_mime = '',
+                 avatar_version = user_profiles.avatar_version + 1",
+            params![user_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Reads the stored picture and its MIME type, if the user has one.
+    pub fn get_avatar(&self, user_id: i64) -> AppResult<Option<(Vec<u8>, String)>> {
+        let conn = self.lock();
+        let result = conn
+            .query_row(
+                "SELECT avatar, avatar_mime FROM user_profiles
+                 WHERE user_id = ?1 AND avatar IS NOT NULL AND avatar_mime != ''",
+                params![user_id],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(result)
     }
 
     pub fn get_public_user(&self, target_id: i64, viewer_id: i64) -> AppResult<Option<PublicUser>> {
@@ -990,7 +1047,59 @@ impl Store {
     /// Returns user-affinity tracks (starred, manual playlists, played, rated, expanded radio links,
     /// same-artist/local/same-genre catalog matches) unioned with recent catalog tracks so personalized
     /// mixes never lose taste candidates past recent-insert offset limits.
+    /// True once the account has produced any personal listening/taste signal.
+    /// Brand-new accounts are kept on a clean, chart-only starter slate so they
+    /// never inherit other listeners' activity or cached/local songs.
+    pub fn has_listening_history(&self, user_id: i64) -> AppResult<bool> {
+        if user_id <= 0 {
+            return Ok(false);
+        }
+        let conn = self.lock();
+        let signals: i64 = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM user_track_stats WHERE user_id = ?1) +
+                (SELECT COUNT(*) FROM stars WHERE user_id = ?1) +
+                (SELECT COUNT(*) FROM ratings WHERE user_id = ?1) +
+                (SELECT COUNT(*) FROM playlists WHERE user_id = ?1 AND is_auto = 0) +
+                (SELECT COUNT(*) FROM user_taste_links WHERE user_id = ?1) +
+                (SELECT COUNT(*) FROM followed_artists WHERE user_id = ?1)",
+            params![user_id],
+            |r| r.get(0),
+        )?;
+        Ok(signals > 0)
+    }
+
+    /// External, currently-popular chart tracks only. This is the entire
+    /// starter pool for fresh accounts — no instance listening, no local files,
+    /// no cached search/listen results. Returns empty until charts are loaded,
+    /// rather than falling back to arbitrary rows from the shared catalog.
+    pub fn popular_chart_tracks_for_new_user(&self, limit: usize) -> AppResult<Vec<Track>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.lock();
+        let tcols = prefixed_track_cols("t");
+        let sql = format!(
+            "SELECT {} FROM chart_catalog c
+             JOIN tracks t ON t.id = c.track_id
+             WHERE t.source = 'deezer'
+             ORDER BY c.rank_pos ASC, c.updated DESC
+             LIMIT ?1",
+            tcols
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![limit as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn candidate_tracks_for_user(&self, user_id: i64, limit: usize) -> AppResult<Vec<Track>> {
+        // Cold users get a dedicated clean-slate pool; normal recommendation
+        // paths (including the recent-catalog fallback) are skipped entirely.
+        if user_id > 0 && !self.has_listening_history(user_id)? {
+            return self.popular_chart_tracks_for_new_user(limit);
+        }
         let conn = self.lock();
         let tcols = prefixed_track_cols("t");
         let mut out = Vec::new();
@@ -3623,6 +3732,15 @@ fn row_to_public_user(row: &Row) -> rusqlite::Result<PublicUser> {
         .to_uppercase()
         .to_string();
     let is_following: i64 = row.get(9)?;
+    let avatar_version: i64 = row.get(10)?;
+    let avatar_mime: String = row.get(11)?;
+    // The picture itself is served from a dedicated endpoint. A monotonic
+    // version acts as a cache-buster so replaced pictures refresh everywhere.
+    let avatar_url = if avatar_mime.is_empty() {
+        String::new()
+    } else {
+        format!("/api/web/social/avatar/{}?v={}", id, avatar_version)
+    };
     Ok(PublicUser {
         id,
         username,
@@ -3630,6 +3748,7 @@ fn row_to_public_user(row: &Row) -> rusqlite::Result<PublicUser> {
         bio: row.get(4)?,
         avatar_color,
         avatar_letter,
+        avatar_url,
         location: row.get(6)?,
         created: row.get(2)?,
         followers_count: row.get(7)?,
@@ -4327,6 +4446,40 @@ mod tests {
     }
 
     #[test]
+    fn profile_picture_set_replace_and_clear_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let (user, _) = store.authenticate_or_create_user("picuser", "pw").unwrap();
+
+        // No picture yet: generated avatar only.
+        assert!(store.get_avatar(user.id).unwrap().is_none());
+        assert!(store.get_public_user(user.id, user.id).unwrap().unwrap().avatar_url.is_empty());
+
+        store.set_avatar(user.id, b"first-image-bytes", "image/jpeg").unwrap();
+        let (bytes, mime) = store.get_avatar(user.id).unwrap().unwrap();
+        assert_eq!(bytes, b"first-image-bytes");
+        assert_eq!(mime, "image/jpeg");
+        let with_pic = store.get_public_user(user.id, user.id).unwrap().unwrap();
+        assert!(with_pic.avatar_url.starts_with("/api/web/social/avatar/"));
+
+        // Replacing keeps the text profile fields intact and bumps the version.
+        store.update_profile(user.id, "Pic User", "hello", "", "").unwrap();
+        let v1 = store.get_public_user(user.id, user.id).unwrap().unwrap().avatar_url;
+        store.set_avatar(user.id, b"second-image-bytes", "image/png").unwrap();
+        let v2 = store.get_public_user(user.id, user.id).unwrap().unwrap().avatar_url;
+        assert_ne!(v1, v2);
+        assert_eq!(store.get_profile(user.id).unwrap().display_name, "Pic User");
+        let (bytes, mime) = store.get_avatar(user.id).unwrap().unwrap();
+        assert_eq!(bytes, b"second-image-bytes");
+        assert_eq!(mime, "image/png");
+
+        // Clearing removes the bytes but preserves the profile text.
+        store.clear_avatar(user.id).unwrap();
+        assert!(store.get_avatar(user.id).unwrap().is_none());
+        assert!(store.get_public_user(user.id, user.id).unwrap().unwrap().avatar_url.is_empty());
+        assert_eq!(store.get_profile(user.id).unwrap().display_name, "Pic User");
+    }
+
+    #[test]
     fn per_user_stats_and_playlists_isolated() {
         let store = Store::open_memory().unwrap();
         let (u1, _) = store.authenticate_or_create_user("bob", "pw1").unwrap();
@@ -4626,6 +4779,43 @@ mod tests {
         store.update_playlist(&pl.id, Some("   "), None, None).unwrap();
         let after = store.get_playlist(&pl.id).unwrap().unwrap();
         assert_eq!(after.name, "Original Name");
+    }
+
+    #[test]
+    fn playlist_visibility_set_at_creation_and_editable_anytime() {
+        let store = Store::open_memory().unwrap();
+        let (owner, _) = store.authenticate_or_create_user("visowner", "pw").unwrap();
+        let (other, _) = store.authenticate_or_create_user("visother", "pw").unwrap();
+
+        let secret = store.create_playlist(owner.id, "Secret", "", false, &[]).unwrap();
+        let shared = store.create_playlist(owner.id, "Shared", "", true, &[]).unwrap();
+        assert!(!secret.public);
+        assert!(shared.public);
+
+        // Another listener only sees the public one.
+        let visible: HashSet<String> = store
+            .list_playlists(other.id, true)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert!(visible.contains(&shared.id));
+        assert!(!visible.contains(&secret.id));
+
+        // Visibility can be flipped freely after creation, in both directions.
+        store.update_playlist(&secret.id, None, None, Some(true)).unwrap();
+        assert!(store.get_playlist(&secret.id).unwrap().unwrap().public);
+        store.update_playlist(&shared.id, None, None, Some(false)).unwrap();
+        assert!(!store.get_playlist(&shared.id).unwrap().unwrap().public);
+
+        let visible_after: HashSet<String> = store
+            .list_playlists(other.id, true)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert!(visible_after.contains(&secret.id));
+        assert!(!visible_after.contains(&shared.id));
     }
 
     #[test]
@@ -4951,5 +5141,40 @@ mod tests {
         let u1_ids: HashSet<&str> = u1_pool.iter().map(|t| t.id.as_str()).collect();
         assert!(u1_ids.contains("ytm:u1_niche"));
         assert!(!u1_ids.contains("ytm:u2_niche"));
+    }
+
+    #[test]
+    fn new_user_cold_slate_never_falls_back_to_cached_or_local_tracks() {
+        let store = Store::open_memory().unwrap();
+        let (fresh, _) = store.authenticate_or_create_user("fresh", "pw").unwrap();
+
+        // Only cached/local songs exist — no external chart data at all.
+        let mut cached = sample_track("soulseek:cached", "Cached Song", "Someone", "Album");
+        cached.source = "soulseek".into();
+        cached.created = 9000;
+        let mut local = sample_track("local:file", "Local Song", "Local Artist", "Album");
+        local.source = "local".into();
+        local.created = 9500;
+        store.upsert_tracks(&[cached.clone(), local.clone()]).unwrap();
+
+        assert!(!store.has_listening_history(fresh.id).unwrap());
+        let pool = store.candidate_tracks_for_user(fresh.id, 50).unwrap();
+        assert!(pool.is_empty(), "cold users must not receive cached/local songs");
+
+        // When external charts arrive, only those fill the starter slate.
+        let chart = sample_track("dz:chart", "Popular Now", "Chart Artist", "Charts");
+        store.upsert_tracks(&[chart.clone()]).unwrap();
+        store.record_chart_tracks(&[chart.clone()], 1).unwrap();
+        let pool = store.candidate_tracks_for_user(fresh.id, 50).unwrap();
+        let ids: HashSet<&str> = pool.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains("dz:chart"));
+        assert!(!ids.contains("soulseek:cached"));
+        assert!(!ids.contains("local:file"));
+
+        // Once the user listens to something they are no longer on the cold slate.
+        store.record_event(fresh.id, &local.id, "play", 1.0).unwrap();
+        assert!(store.has_listening_history(fresh.id).unwrap());
+        let pool = store.candidate_tracks_for_user(fresh.id, 50).unwrap();
+        assert!(pool.iter().any(|t| t.id == local.id));
     }
 }

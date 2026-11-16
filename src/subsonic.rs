@@ -324,7 +324,7 @@ fn authenticate_subsonic(
                     let taste = state.taste.clone();
                     let uid = user.id;
                     tokio::spawn(async move {
-                        taste.rebuild_auto_playlists(uid);
+                        taste.prime_new_user(uid).await;
                     });
                 }
                 return Ok(user);
@@ -453,7 +453,7 @@ pub async fn dispatch(
             let p = params.get("password").map(|s| s.as_str()).unwrap_or("");
             match state.store.create_user(u, p) {
                 Ok(new_user) => {
-                    state.taste.rebuild_auto_playlists(new_user.id);
+                    state.taste.prime_new_user(new_user.id).await;
                     respond(&params, true, None)
                 }
                 Err(e) => error_resp(&params, 0, &e.to_string()),
@@ -1179,7 +1179,13 @@ pub async fn dispatch(
             let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
             state.engine.serve_cover(id).await
         }
-        "getAvatar" => state.engine.serve_cover(&format!("ar:{}", user.username)).await,
+        "getAvatar" => {
+            if let Ok(Some((bytes, mime))) = state.store.get_avatar(uid) {
+                (StatusCode::OK, [(header::CONTENT_TYPE, mime.as_str())], bytes).into_response()
+            } else {
+                state.engine.serve_cover(&format!("ar:{}", user.username)).await
+            }
+        }
 
         _ => error_resp(&params, 0, &format!("Unsupported endpoint '{}'", endpoint)),
     }

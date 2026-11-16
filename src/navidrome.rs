@@ -151,7 +151,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> 
                 let taste = state.taste.clone();
                 let uid = user.id;
                 tokio::spawn(async move {
-                    taste.rebuild_auto_playlists(uid);
+                    taste.prime_new_user(uid).await;
                 });
             }
             match state.store.create_session(user.id, "nd", 30 * 86400) {
@@ -169,7 +169,7 @@ pub async fn signup(State(state): State<AppState>, Json(req): Json<LoginReq>) ->
             let taste = state.taste.clone();
             let uid = user.id;
             tokio::spawn(async move {
-                taste.rebuild_auto_playlists(uid);
+                taste.prime_new_user(uid).await;
             });
             match state.store.create_session(user.id, "nd", 30 * 86400) {
                 Ok(token) => json_ok(build_login_response(&state, &user, &token), None),

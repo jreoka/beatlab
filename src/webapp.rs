@@ -3,6 +3,7 @@ use crate::models::{
     UserProfile, UserTrackStats,
 };
 use crate::subsonic::AppState;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -486,6 +487,18 @@ fn require_web_user(state: &AppState, headers: &HeaderMap) -> Result<User, Respo
     })
 }
 
+/// Small helper used by auth endpoints so the shell can paint the signed-in
+/// user's custom picture immediately after load/sign-in.
+fn self_avatar_url(state: &AppState, user_id: i64) -> String {
+    state
+        .store
+        .get_public_user(user_id, user_id)
+        .ok()
+        .flatten()
+        .map(|u| u.avatar_url)
+        .unwrap_or_default()
+}
+
 fn json_res(val: Value) -> Response {
     (
         StatusCode::OK,
@@ -639,6 +652,7 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
                     "username": u.username,
                     "apiKey": api_key,
                     "created": u.created,
+                    "avatarUrl": self_avatar_url(&state, u.id),
                 }
             }))
         }
@@ -656,7 +670,7 @@ pub async fn signin(State(state): State<AppState>, Json(req): Json<AuthReq>) -> 
                 let taste = state.taste.clone();
                 let uid = user.id;
                 tokio::spawn(async move {
-                    taste.rebuild_auto_playlists(uid);
+                    taste.prime_new_user(uid).await;
                 });
             }
             match state.store.create_session(user.id, "web", 30 * 86400) {
@@ -670,6 +684,7 @@ pub async fn signin(State(state): State<AppState>, Json(req): Json<AuthReq>) -> 
                             "username": user.username,
                             "apiKey": api_key,
                             "created": user.created,
+                            "avatarUrl": self_avatar_url(&state, user.id),
                         }
                     }))
                 }
@@ -686,7 +701,7 @@ pub async fn signup(State(state): State<AppState>, Json(req): Json<AuthReq>) -> 
             let taste = state.taste.clone();
             let uid = user.id;
             tokio::spawn(async move {
-                taste.rebuild_auto_playlists(uid);
+                taste.prime_new_user(uid).await;
             });
             match state.store.create_session(user.id, "web", 30 * 86400) {
                 Ok(token) => {
@@ -699,6 +714,7 @@ pub async fn signup(State(state): State<AppState>, Json(req): Json<AuthReq>) -> 
                             "username": user.username,
                             "apiKey": api_key,
                             "created": user.created,
+                            "avatarUrl": self_avatar_url(&state, user.id),
                         }
                     }))
                 }
@@ -3471,6 +3487,7 @@ fn public_user_json(u: &PublicUser) -> Value {
         "bio": u.bio,
         "avatarColor": u.avatar_color,
         "avatarLetter": u.avatar_letter,
+        "avatarUrl": u.avatar_url,
         "location": u.location,
         "created": u.created,
         "followersCount": u.followers_count,
@@ -3588,6 +3605,97 @@ pub async fn social_update_profile(
             }))
         }
         Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Profile pictures — uploaded by the web player, stored in SQLite, served via
+// a small public endpoint so profile cards and shares can display them too.
+// ---------------------------------------------------------------------------
+
+const MAX_AVATAR_BYTES: usize = 1024 * 1024;
+
+/// Sniffs the magic bytes of an upload so we never persist arbitrary data as an
+/// image. The web player crops/resizes to a small JPEG before uploading, but
+/// the server validates independently.
+fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+pub async fn social_set_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if body.is_empty() || body.len() > MAX_AVATAR_BYTES {
+        return err_res(StatusCode::BAD_REQUEST, "Picture must be an image under 1 MB");
+    }
+    let Some(mime) = detect_image_mime(&body) else {
+        return err_res(StatusCode::BAD_REQUEST, "Unsupported image format");
+    };
+    match state.store.set_avatar(user.id, &body, mime) {
+        Ok(()) => {
+            let public = state.store.get_public_user(user.id, user.id).ok().flatten();
+            json_res(json!({
+                "ok": true,
+                "user": public.as_ref().map(public_user_json).unwrap_or(Value::Null),
+            }))
+        }
+        Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+pub async fn social_clear_avatar(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match state.store.clear_avatar(user.id) {
+        Ok(()) => {
+            let public = state.store.get_public_user(user.id, user.id).ok().flatten();
+            json_res(json!({
+                "ok": true,
+                "user": public.as_ref().map(public_user_json).unwrap_or(Value::Null),
+            }))
+        }
+        Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Serves an uploaded picture. Public so profile cards and shared links can
+/// display it; the URL carries a version query for cache busting.
+pub async fn social_avatar_image(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Response {
+    let Some(user_id) = resolve_user_ref(&state, &reference) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match state.store.get_avatar(user_id) {
+        Ok(Some((bytes, mime))) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mime.as_str()),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -4925,6 +5033,93 @@ mod tests {
         assert_eq!(exp_body["mix"]["key"], "80s_hits");
         assert_eq!(exp_body["mix"]["title"], "80s Hits");
         assert!(exp_body["tracks"].as_array().unwrap().len() >= 8);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn profile_picture_endpoints_upload_serve_and_clear() {
+        use crate::engine::StreamEngine;
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use crate::store::Store;
+        use crate::taste::TasteEngine;
+        use axum::body::to_bytes;
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-avatar-{}", uuid::Uuid::new_v4()));
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+        };
+        let (u, _) = store.authenticate_or_create_user("avataruser", "pw").unwrap();
+        let tok = store.create_session(u.id, "web", 3600).unwrap();
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", tok).parse().unwrap(),
+        );
+
+        // Non-image bytes are rejected before touching storage.
+        let bad =
+            social_set_avatar(State(state.clone()), hdrs.clone(), Bytes::from_static(b"nope")).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        // Upload a magic-valid JPEG and check the returned user exposes a URL.
+        let jpeg = b"\xFF\xD8\xFF\xE0fake-jpeg-bytes";
+        let up = social_set_avatar(
+            State(state.clone()),
+            hdrs.clone(),
+            Bytes::from_static(jpeg),
+        )
+        .await;
+        assert_eq!(up.status(), StatusCode::OK);
+        let up_body: Value =
+            serde_json::from_slice(&to_bytes(up.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert!(up_body["user"]["avatarUrl"]
+            .as_str()
+            .unwrap()
+            .contains("/api/web/social/avatar/"));
+
+        // The public endpoint serves the exact bytes with the sniffed MIME type.
+        let img = social_avatar_image(State(state.clone()), Path(u.id.to_string())).await;
+        assert_eq!(img.status(), StatusCode::OK);
+        assert_eq!(img.headers().get(header::CONTENT_TYPE).unwrap(), "image/jpeg");
+        let served = to_bytes(img.into_body(), 1024 * 64).await.unwrap();
+        assert_eq!(&served[..], &jpeg[..]);
+
+        // Unknown users and cleared avatars 404.
+        assert_eq!(
+            social_avatar_image(State(state.clone()), Path("999999".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let clr = social_clear_avatar(State(state.clone()), hdrs.clone()).await;
+        assert_eq!(clr.status(), StatusCode::OK);
+        assert_eq!(
+            social_avatar_image(State(state.clone()), Path(u.id.to_string()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

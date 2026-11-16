@@ -226,6 +226,14 @@ async fn main() -> models::AppResult<()> {
             "/api/web/social/me",
             get(webapp::social_me).post(webapp::social_update_profile),
         )
+        .route(
+            "/api/web/social/avatar",
+            post(webapp::social_set_avatar).delete(webapp::social_clear_avatar),
+        )
+        .route(
+            "/api/web/social/avatar/{user}",
+            get(webapp::social_avatar_image),
+        )
         .route("/api/web/social/profile/{user}", get(webapp::social_profile))
         .route(
             "/api/web/social/follow/{user}",

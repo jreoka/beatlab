@@ -159,6 +159,8 @@
       profileData: null,
       profileTab: 'radio',
       editColor: '',
+      // null = untouched, a data URL = pending new picture, 'REMOVE' = clear.
+      editAvatarData: null,
     },
     settingsTab: 'general',
     settingsData: {
@@ -1438,7 +1440,7 @@
     resetAuthForm();
     showAppShell();
     $('user-name').textContent = state.user.username;
-    $('user-avatar').textContent = (state.user.username[0] || 'B').toUpperCase();
+    $('user-avatar').innerHTML = avatarInner(selfAvatarUser());
     await Promise.all([refreshSidebarPlaylists(), restoreServerQueue()]);
     renderCurrentHash();
   }
@@ -2457,6 +2459,36 @@
     }
   }
 
+  function playlistVisibilityHtml(isPublic) {
+    return `
+      <div class="social-edit-row">
+        <label>Visibility</label>
+        <div class="pl-visibility-row">
+          <button type="button" class="pl-visibility-opt ${isPublic ? '' : 'selected'}" data-vis="private" onclick="App.pickPlaylistVisibility('private')">🔒 Private</button>
+          <button type="button" class="pl-visibility-opt ${isPublic ? 'selected' : ''}" data-vis="public" onclick="App.pickPlaylistVisibility('public')">🌐 Public</button>
+        </div>
+        <span class="pl-visibility-hint">${isPublic
+          ? 'Anyone on this instance can find and view this playlist.'
+          : 'Only you can see this playlist. You can change this anytime.'}</span>
+      </div>`;
+  }
+
+  function pickPlaylistVisibility(value) {
+    document.querySelectorAll('.pl-visibility-opt').forEach((el) => {
+      el.classList.toggle('selected', el.dataset.vis === value);
+    });
+    const hint = document.querySelector('.pl-visibility-hint');
+    if (hint) {
+      hint.textContent = value === 'public'
+        ? 'Anyone on this instance can find and view this playlist.'
+        : 'Only you can see this playlist. You can change this anytime.';
+    }
+  }
+
+  function selectedPlaylistVisibility() {
+    return document.querySelector('.pl-visibility-opt.selected')?.dataset.vis === 'public';
+  }
+
   async function renderPlaylist(id) {
     const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading playlist...');
@@ -2472,13 +2504,15 @@
         <div class="hero-info">
           <div class="hero-kicker">${pl.isAuto ? 'MADE FOR YOU' : 'PLAYLIST'}</div>
           <h1 class="hero-title">${esc(pl.name)}</h1>
-          <div class="hero-sub">By <strong>${esc(pl.ownerName)}</strong>${pl.comment ? ` · ${esc(pl.comment)}` : ''} · ${tracks.length} songs · ${fmtTotalDur(pl.duration)}</div>
+          <div class="hero-sub">By <strong>${esc(pl.ownerName)}</strong>${pl.comment ? ` · ${esc(pl.comment)}` : ''} · ${tracks.length} songs · ${fmtTotalDur(pl.duration)}
+            <span class="pl-visibility-badge" title="${pl.public ? 'Anyone can view this playlist' : 'Only you can view this playlist'}">${pl.public ? '🌐 Public' : '🔒 Private'}</span>
+          </div>
           <div class="hero-actions">
             ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>` : ''}
             ${tracks.length > 1 ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
             ${tracks.length ? `<button class="btn-secondary" onclick="App.startPlaylistRadio(${esc(JSON.stringify(pl.id))})">Start Radio</button>` : ''}
-            ${tracks.length ? `<button class="btn-secondary" onclick="App.sharePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))}, ${esc(JSON.stringify(pl.ownerName))}, ${esc(JSON.stringify(pl.coverUrl))})">${ICONS.share} Share</button>` : ''}
-            ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" onclick="App.promptRenamePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))})">Rename</button>` : ''}
+            ${tracks.length && pl.public ? `<button class="btn-secondary" onclick="App.sharePlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))}, ${esc(JSON.stringify(pl.ownerName))}, ${esc(JSON.stringify(pl.coverUrl))})">${ICONS.share} Share</button>` : ''}
+            ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" onclick="App.promptEditPlaylist(${esc(JSON.stringify(pl.id))}, ${esc(JSON.stringify(pl.name))}, ${esc(JSON.stringify(pl.comment || ''))}, ${!!pl.public})">Edit</button>` : ''}
             <button class="btn-secondary" id="pl-hero-pin-btn" onclick="App.togglePinPlaylist(${esc(JSON.stringify(pl.id))})">${ICONS.pin} ${isPlaylistPinned(pl.id) ? 'Pinned' : 'Pin to Sidebar'}</button>
             ${d.isOwner && !pl.isAuto ? `<button class="btn-secondary" style="color:#fda4af" onclick="App.deletePlaylist(${esc(JSON.stringify(pl.id))})">Delete</button>` : ''}
           </div>
@@ -3243,8 +3277,6 @@
       ['365d', '1 Year'],
       ['all', 'All Time'],
     ];
-    const initial = ((state.user?.username || 'B')[0] || 'B').toUpperCase();
-
     let html = `<div class="stats-page">`;
 
     // Hero Banner with Listener Persona + Controls
@@ -3252,7 +3284,7 @@
       <section class="stats-hero">
         <div class="stats-hero-left">
           <div class="stats-hero-identity">
-            <span class="avatar-dot large">${esc(initial)}</span>
+            <span class="avatar-dot large">${avatarInner(selfAvatarUser())}</span>
             <div>
               <div class="hero-kicker">LISTENING ANALYTICS · ${esc(d.rangeLabel || 'All Time')}</div>
               <h1 class="stats-hero-title">${esc(state.user?.username || 'Your')}’s Listening Stats</h1>
@@ -5718,12 +5750,11 @@
       return;
     }
 
-    const initial = (state.user.username[0] || 'B').toUpperCase();
     body.innerHTML = `
       <div class="settings-section">
         <div class="settings-section-title">Account Profile</div>
         <div class="settings-profile-card">
-          <span class="avatar-dot large">${esc(initial)}</span>
+          <span class="avatar-dot large">${avatarInner(selfAvatarUser())}</span>
           <div>
             <div class="settings-profile-name">${esc(state.user.username)}</div>
             <div class="settings-row-desc">Web, OpenSubsonic &amp; Navidrome account</div>
@@ -5840,6 +5871,22 @@
     '#f59e0b', '#ec4899', '#6366f1', '#14b8a6', '#f97316',
   ];
 
+  // Users with an uploaded picture render an <img>; everyone else keeps the
+  // generated initial/color avatar. The container supplies size + background.
+  function avatarInner(u) {
+    if (u && u.avatarUrl) {
+      return `<img class="avatar-img" src="${esc(u.avatarUrl)}" alt="" />`;
+    }
+    return esc((u && u.avatarLetter) || '?');
+  }
+
+  function selfAvatarUser() {
+    return {
+      avatarUrl: state.user?.avatarUrl || '',
+      avatarLetter: (state.user?.username?.[0] || 'B').toUpperCase(),
+    };
+  }
+
   function timeAgo(ts) {
     const secs = Math.floor(Date.now() / 1000 - Number(ts || 0));
     if (!Number.isFinite(secs) || secs < 0) return '';
@@ -5865,7 +5912,7 @@
     const following = !!u.isFollowing;
     return `<div class="person-card">
       <div class="person-card-top">
-        <span class="person-avatar" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${esc(u.avatarLetter)}</span>
+        <span class="person-avatar" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${avatarInner(u)}</span>
         <div class="person-card-name-wrap" onclick="App.openUserProfile(${ref})">
           <div class="person-card-name">${esc(u.displayName || u.username)}</div>
           <div class="person-card-handle">@${esc(u.username)}</div>
@@ -5887,7 +5934,7 @@
     const ref = esc(JSON.stringify(u.username));
     const following = !!u.isFollowing;
     return `<div class="user-card">
-      <span class="mention-avatar" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${esc(u.avatarLetter)}</span>
+      <span class="mention-avatar" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${avatarInner(u)}</span>
       <div class="user-card-info" onclick="App.openUserProfile(${ref})">
         <div class="user-card-name">${esc(u.displayName || u.username)}</div>
         <div class="user-card-handle">@${esc(u.username)} · ${u.followersCount} followers</div>
@@ -6077,7 +6124,7 @@
       const name = u.displayName || u.username;
 
       let html = `<div class="hero-header" style="border-color:${esc(color)}55;background:${esc(color)}14">
-        <div class="profile-avatar" style="background:${esc(color)}">${esc(u.avatarLetter)}</div>
+        <div class="profile-avatar" style="background:${esc(color)}">${avatarInner(u)}</div>
         <div class="hero-info">
           <div class="profile-verified">${isSelf ? 'Your public profile' : 'Beatlab listener'}</div>
           <h1 class="hero-title">${esc(name)}</h1>
@@ -6160,13 +6207,124 @@
     }
   }
 
+  function avatarInitial(u) {
+    const src = (u && (u.displayName || u.username)) || state.user?.username || '?';
+    return (String(src).trim()[0] || '?').toUpperCase();
+  }
+
+  function renderAvatarPreview() {
+    const el = $('prof-avatar-preview');
+    if (!el) return;
+    const pending = state.social.editAvatarData;
+    const u = state.social.profileData?.user;
+    el.style.background = u?.avatarColor || '#1ed760';
+    if (pending && pending !== 'REMOVE') {
+      el.innerHTML = `<img class="avatar-img" src="${esc(pending)}" alt="" />`;
+    } else if (pending === 'REMOVE') {
+      el.innerHTML = esc(avatarInitial(u));
+    } else if (u?.avatarUrl) {
+      el.innerHTML = `<img class="avatar-img" src="${esc(u.avatarUrl)}" alt="" />`;
+    } else {
+      el.innerHTML = esc(avatarInitial(u));
+    }
+    const removeBtn = $('prof-avatar-remove');
+    if (removeBtn) {
+      const hasPicture = pending ? pending !== 'REMOVE' : !!u?.avatarUrl;
+      removeBtn.classList.toggle('hidden', !hasPicture);
+    }
+  }
+
+  function base64ToBlob(base64, mime) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+
+  function pickAvatarFile() {
+    const input = $('prof-avatar-file');
+    if (input) input.click();
+  }
+
+  async function onAvatarFileSelected(event) {
+    const file = event?.target?.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showToast('Please choose an image file');
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      showToast('Image is too large (max 8 MB)');
+      return;
+    }
+    try {
+      state.social.editAvatarData = await cropAvatarFile(file);
+      renderAvatarPreview();
+    } catch (err) {
+      showToast(err?.message || 'Could not read that image');
+    } finally {
+      if (event?.target) event.target.value = '';
+    }
+  }
+
+  // Center-crop to a square and downscale before upload. Keeps uploads small
+  // and makes every profile picture render consistently across the UI.
+  function cropAvatarFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('Could not read that image'));
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error('Unsupported image'));
+        img.onload = () => {
+          try {
+            const size = 256;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const side = Math.min(img.width, img.height);
+            const sx = (img.width - side) / 2;
+            const sy = (img.height - side) / 2;
+            ctx.drawImage(img, sx, sy, side, side, 0, 0, size, size);
+            resolve(canvas.toDataURL('image/jpeg', 0.88));
+          } catch (e) {
+            reject(e);
+          }
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function removeAvatar() {
+    state.social.editAvatarData = 'REMOVE';
+    renderAvatarPreview();
+  }
+
   function openProfileEditor() {
     const p = state.social.profileData?.profile || {};
+    const user = state.social.profileData?.user;
     state.social.editColor = p.avatarColor || '';
+    state.social.editAvatarData = null;
+    const hasPicture = !!user?.avatarUrl;
     openModal(`
       <div class="modal-head">
         <h3>Edit your profile</h3>
         <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+      </div>
+      <div class="social-edit-row">
+        <label>Profile picture</label>
+        <div class="social-avatar-editor">
+          <div class="social-avatar-preview" id="prof-avatar-preview" style="background:${esc(user?.avatarColor || '#1ed760')}">${avatarInner(user || selfAvatarUser())}</div>
+          <div class="social-avatar-actions">
+            <input type="file" id="prof-avatar-file" accept="image/*" class="hidden" onchange="App.onAvatarFileSelected(event)" />
+            <button type="button" class="btn-secondary" onclick="App.pickAvatarFile()">Choose image…</button>
+            <button type="button" id="prof-avatar-remove" class="social-avatar-remove ${hasPicture ? '' : 'hidden'}" onclick="App.removeAvatar()">Remove picture</button>
+            <span class="social-avatar-hint">Square crop · up to 8 MB</span>
+          </div>
+        </div>
       </div>
       <div class="social-edit-row">
         <label>Display name</label>
@@ -6199,8 +6357,21 @@
 
   async function submitProfileUpdate(e) {
     if (e) e.preventDefault();
+    const btn = e?.target;
     try {
-      await api('/api/web/social/me', {
+      if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+      const pending = state.social.editAvatarData;
+      if (pending === 'REMOVE') {
+        await api('/api/web/social/avatar', { method: 'DELETE' });
+      } else if (pending) {
+        const base64 = pending.slice(pending.indexOf(',') + 1);
+        await api('/api/web/social/avatar', {
+          method: 'POST',
+          headers: { 'Content-Type': 'image/jpeg' },
+          body: base64ToBlob(base64, 'image/jpeg'),
+        });
+      }
+      const res = await api('/api/web/social/me', {
         method: 'POST',
         body: JSON.stringify({
           displayName: $('prof-name')?.value || '',
@@ -6209,11 +6380,16 @@
           avatarColor: state.social.editColor || '',
         }),
       });
+      if (typeof res.user?.avatarUrl === 'string') state.user.avatarUrl = res.user.avatarUrl;
+      state.social.editAvatarData = null;
       closeModal();
       showToast('Profile updated');
+      $('user-avatar').innerHTML = avatarInner(selfAvatarUser());
       renderCurrentHash();
     } catch (err) {
       showToast(err.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Save profile'; }
     }
   }
 
@@ -6250,7 +6426,7 @@
               const idsJson = esc(JSON.stringify(tracks.map((t) => t.id)));
               return `<div class="community-radio-card">
                 <div class="community-radio-head">
-                  <span class="person-avatar small" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${esc(u.avatarLetter)}</span>
+                  <span class="person-avatar small" style="background:${esc(u.avatarColor)}" onclick="App.openUserProfile(${ref})">${avatarInner(u)}</span>
                   <div class="community-radio-meta" onclick="App.openUserProfile(${ref})">
                     <b>${esc(u.displayName || u.username)}'s Radio</b>
                     <span>@${esc(u.username)} · ${typeof r.trackCount === 'number' ? r.trackCount : tracks.length} tracks · updates automatically</span>
@@ -6283,7 +6459,7 @@
     if (opening) {
       const name = state.user ? state.user.username : 'User';
       $('user-menu-name').textContent = name;
-      $('user-menu-avatar').textContent = (name[0] || 'B').toUpperCase();
+      $('user-menu-avatar').innerHTML = avatarInner(selfAvatarUser());
     }
     if (!userMenuDocWired) {
       userMenuDocWired = true;
@@ -6326,7 +6502,11 @@
     toggleSaveRadio,
     openProfileEditor,
     pickProfileColor,
+    pickAvatarFile,
+    onAvatarFileSelected,
+    removeAvatar,
     submitProfileUpdate,
+    pickPlaylistVisibility,
     renderCommunity,
     toggleUserMenu,
     closeUserMenu,
@@ -6728,6 +6908,7 @@
         <form onsubmit="App.submitCreatePlaylist(event, ${initialTrackId ? esc(JSON.stringify(initialTrackId)) : 'null'})" style="display:flex;flex-direction:column;gap:12px">
           <input id="new-pl-name" type="text" placeholder="Playlist name" required autofocus />
           <input id="new-pl-desc" type="text" placeholder="Description (optional)" />
+          ${playlistVisibilityHtml(false)}
           <button type="submit" class="btn-primary">Create</button>
         </form>
       `);
@@ -6744,7 +6925,7 @@
       try {
         const res = await api('/api/web/playlists', {
           method: 'POST',
-          body: JSON.stringify({ name, comment, trackIds: tid ? [tid] : [] }),
+          body: JSON.stringify({ name, comment, public: selectedPlaylistVisibility(), trackIds: tid ? [tid] : [] }),
         });
         haptic('success');
         closeModal();
@@ -6907,18 +7088,22 @@
         showToast(err.message);
       }
     },
-    promptRenamePlaylist: (pid, curName) => {
+    promptEditPlaylist: (pid, curName, curComment = '', curPublic = false) => {
       openModal(`
-        <div class="modal-head"><h3>Rename Playlist</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
-        <form onsubmit="App.submitRenamePlaylist(event, ${esc(JSON.stringify(pid))})" style="display:flex;flex-direction:column;gap:12px">
-          <input id="rename-pl-input" type="text" value="${esc(curName)}" required />
-          <button type="submit" class="btn-primary">Save</button>
+        <div class="modal-head"><h3>Edit Playlist</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
+        <form onsubmit="App.submitEditPlaylist(event, ${esc(JSON.stringify(pid))})" style="display:flex;flex-direction:column;gap:12px">
+          <input id="edit-pl-name" type="text" value="${esc(curName)}" placeholder="Playlist name" required />
+          <input id="edit-pl-desc" type="text" value="${esc(curComment || '')}" placeholder="Description (optional)" />
+          ${playlistVisibilityHtml(!!curPublic)}
+          <button type="submit" class="btn-primary">Save changes</button>
         </form>
       `);
     },
-    submitRenamePlaylist: async (e, pid) => {
+    // Kept as an alias for any older callers.
+    promptRenamePlaylist: (pid, curName) => window.App.promptEditPlaylist(pid, curName),
+    submitEditPlaylist: async (e, pid) => {
       e.preventDefault();
-      const name = $('rename-pl-input').value.trim();
+      const name = $('edit-pl-name')?.value.trim();
       if (!name) {
         showToast('Please enter a playlist name');
         return;
@@ -6926,15 +7111,21 @@
       try {
         await api(`/api/web/playlists/${encodeURIComponent(pid)}`, {
           method: 'PATCH',
-          body: JSON.stringify({ name }),
+          body: JSON.stringify({
+            name,
+            comment: $('edit-pl-desc')?.value.trim() || '',
+            public: selectedPlaylistVisibility(),
+          }),
         });
         closeModal();
         await refreshSidebarPlaylists();
         renderPlaylist(pid);
+        showToast('Playlist updated');
       } catch (err) {
         showToast(err.message);
       }
     },
+    submitRenamePlaylist: async (e, pid) => window.App.submitEditPlaylist(e, pid),
     togglePinPlaylist: (pid) => {
       const ids = getPinnedPlaylistIds();
       const idx = ids.indexOf(pid);

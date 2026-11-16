@@ -395,6 +395,13 @@ pub fn render_share_html(
       display: grid;
       place-items: center;
     }}
+    .avatar-img {{
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      border-radius: inherit;
+    }}
 
     .player-card {{
       background: var(--surface);
@@ -1302,7 +1309,11 @@ pub fn render_share_html(
       if (!state.user) return;
       const init = (state.user.username[0] || 'B').toUpperCase();
       $('topbar-auth').innerHTML = `
-        <span class="user-chip"><span class="avatar-dot">${{esc(init)}}</span><span>${{esc(state.user.username)}}</span></span>
+        <span class="user-chip"><span class="avatar-dot">${{
+          state.user.avatarUrl
+            ? `<img class="avatar-img" src="${{esc(state.user.avatarUrl)}}" alt="" />`
+            : esc(init)
+        }}</span><span>${{esc(state.user.username)}}</span></span>
         <a class="btn-primary" href="/">Open Full Player</a>
       `;
       $('cta-banner').classList.add('hidden');

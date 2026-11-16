@@ -420,13 +420,15 @@ a {
   border-radius: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   border: none;
   border-right: 1px solid var(--border);
 }
 
 .sidebar-top {
   padding: 16px 14px 12px;
+  flex-shrink: 0;
 }
 
 .brand-row {
@@ -488,8 +490,7 @@ a {
 }
 
 .sidebar-library {
-  flex: 1;
-  min-height: 0;
+  flex: 1 0 auto;
   display: flex;
   flex-direction: column;
   padding: 10px 10px;
@@ -565,8 +566,6 @@ a {
 }
 
 .sidebar-playlists {
-  flex: 1;
-  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -686,6 +685,7 @@ a {
 .sidebar-footer {
   padding: 10px 12px;
   border-top: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .settings-btn {
@@ -916,6 +916,14 @@ a {
   display: grid;
   place-items: center;
   flex-shrink: 0;
+}
+/* Uploaded profile pictures fill whatever avatar container they're placed in. */
+.avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  border-radius: inherit;
 }
 .avatar-dot.large {
   width: 44px;
@@ -5075,6 +5083,68 @@ html.is-standalone .fs-inner {
 .social-color-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .social-color-swatch { width: 28px; height: 28px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
 .social-color-swatch.selected { border-color: #fff; transform: scale(1.12); }
+.social-avatar-editor { display: flex; align-items: center; gap: 14px; }
+.social-avatar-preview {
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 30px;
+  font-weight: 800;
+  color: #fff;
+  flex-shrink: 0;
+  overflow: hidden;
+  background: var(--accent);
+}
+.social-avatar-actions { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.social-avatar-hint { color: var(--text-dim); font-size: 11px; line-height: 1.4; }
+.social-avatar-remove {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.social-avatar-remove:hover { text-decoration: underline; }
+.pl-visibility-row { display: flex; gap: 8px; }
+.pl-visibility-opt {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.14s, color 0.14s, background 0.14s;
+}
+.pl-visibility-opt:hover { color: var(--text); border-color: var(--border-bright); }
+.pl-visibility-opt.selected {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(30, 215, 96, 0.1);
+}
+.pl-visibility-hint { color: var(--text-dim); font-size: 11px; line-height: 1.4; }
+.pl-visibility-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
 
 @media (max-width: 780px) {
   /* Six bottom-nav items once Social is included. */

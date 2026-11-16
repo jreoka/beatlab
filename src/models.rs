@@ -66,6 +66,9 @@ pub struct PublicUser {
     pub bio: String,
     pub avatar_color: String,
     pub avatar_letter: String,
+    /// Relative URL of the user's uploaded picture, or empty when they use the
+    /// generated initial/color avatar. Includes a cache-busting version query.
+    pub avatar_url: String,
     pub location: String,
     pub created: i64,
     pub followers_count: i64,

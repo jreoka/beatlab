@@ -1513,12 +1513,15 @@ impl TasteEngine {
             || !sctx.prof.related_artist_affinity.is_empty()
             || !sctx.prof.genre_affinity.is_empty();
         if !has_taste {
+            // Fresh accounts only see artists from the external Deezer charts,
+            // never local/cached artists that happen to exist in the catalog.
             return self
                 .store
-                .featured_artist_summaries(limit)
+                .featured_artist_summaries(limit * 3)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|a| !followed.contains(&a.id))
+                .filter(|a| !a.deezer_id.trim().is_empty() && !followed.contains(&a.id))
+                .take(limit)
                 .collect();
         }
 
@@ -1824,6 +1827,37 @@ impl TasteEngine {
             &format!("taste:rebuilt_at:{}", user_id),
             &Utc::now().timestamp().to_string(),
         );
+    }
+
+    /// Seeds a brand-new account from external, currently-popular charts only.
+    /// No instance-wide listening history, no local files, no cached search or
+    /// listen results ever enter a fresh user's starter auto-playlists.
+    pub async fn prime_new_user(&self, user_id: i64) {
+        if user_id <= 0 || self.store.has_listening_history(user_id).unwrap_or(false) {
+            return;
+        }
+        let dz = &self.sources.deezer;
+        let (global, pop, hiphop) = tokio::join!(
+            dz.fetch_chart_tracks(50),
+            dz.fetch_genre_chart_tracks(132, "Pop", 20),
+            dz.fetch_genre_chart_tracks(116, "Hip-Hop", 20),
+        );
+        let mut all = global.clone();
+        all.extend(pop.iter().cloned());
+        all.extend(hiphop.iter().cloned());
+        if !all.is_empty() {
+            let _ = self.store.upsert_tracks(&all);
+        }
+        if !global.is_empty() {
+            let _ = self.store.record_chart_tracks(&global, 1);
+        }
+        let mut genre = pop;
+        genre.extend(hiphop);
+        if !genre.is_empty() {
+            let _ = self.store.record_chart_tracks(&genre, 1000);
+        }
+        // Rebuild from the clean, chart-only slate produced above.
+        self.rebuild_auto_playlists(user_id);
     }
 
     /// Cold-start / periodic background warming using pure HTTP Deezer global + multi-genre charts,
@@ -8077,6 +8111,9 @@ mod tests {
             ..Default::default()
         };
         store.upsert_tracks(&[obscure.clone(), hit.clone()]).unwrap();
+        // Cold users are seeded from external charts only, so register these
+        // catalog tracks as chart entries before asking for quick picks.
+        store.record_chart_tracks(&[hit.clone(), obscure.clone()], 1).unwrap();
         let picks = taste.quick_picks(u.id, 5);
         assert_eq!(picks[0].id, "dz:hit");
     }
@@ -8620,6 +8657,9 @@ mod tests {
         store
             .upsert_tracks(&[keep.clone(), hide_dz.clone(), hide_ytm_dupe.clone()])
             .unwrap();
+        // Cold users only receive chart-backed tracks; the ytm duplicate must
+        // stay out of the starter pool regardless of the hide action.
+        store.record_chart_tracks(&[keep.clone(), hide_dz.clone()], 1).unwrap();
 
         taste.mark_not_interested(u.id, &hide_dz.id);
         assert_eq!(store.hidden_tracks_list(u.id).unwrap().len(), 1);
