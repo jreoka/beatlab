@@ -685,7 +685,7 @@ pub async fn signin(
             };
             match state
                 .store
-                .create_session_with_meta(user.id, "web", 30 * 86400, &meta)
+                .create_session_with_meta(user.id, "web", &meta)
             {
                 Ok(token) => {
                     let api_key = state.store.get_or_create_api_key(user.id).unwrap_or_default();
@@ -727,7 +727,7 @@ pub async fn signup(
             };
             match state
                 .store
-                .create_session_with_meta(user.id, "web", 30 * 86400, &meta)
+                .create_session_with_meta(user.id, "web", &meta)
             {
                 Ok(token) => {
                     let api_key = state.store.get_or_create_api_key(user.id).unwrap_or_default();
@@ -779,7 +779,6 @@ pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
                 "id": s.token,
                 "kind": s.kind,
                 "created": s.created,
-                "expires": s.expires,
                 "lastSeen": s.last_seen,
                 "userAgent": s.user_agent,
                 "ip": s.ip,
@@ -4251,7 +4250,7 @@ mod tests {
         };
         store.upsert_tracks(&[t1.clone()]).unwrap();
         let (u, _) = store.authenticate_or_create_user("webuser", "pw123").unwrap();
-        let tok = store.create_session(u.id, "web", 3600).unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
         let pl = store.create_playlist(u.id, "Funky Cuts", "", false, &[]).unwrap();
 
         let state = AppState {
@@ -4352,7 +4351,7 @@ mod tests {
         };
         store.upsert_tracks(&[t1, t2]).unwrap();
         let (u, _) = store.authenticate_or_create_user("mixuser", "pw123").unwrap();
-        let tok = store.create_session(u.id, "web", 3600).unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
 
         let state = AppState {
             store: store.clone(),
@@ -4690,8 +4689,8 @@ mod tests {
 
         let (u1, _) = store.authenticate_or_create_user("stat_alice", "pw123").unwrap();
         let (u2, _) = store.authenticate_or_create_user("stat_bob", "pw123").unwrap();
-        let tok1 = store.create_session(u1.id, "web", 3600).unwrap();
-        let tok2 = store.create_session(u2.id, "web", 3600).unwrap();
+        let tok1 = store.create_session(u1.id, "web").unwrap();
+        let tok2 = store.create_session(u2.id, "web").unwrap();
 
         store.record_event(u1.id, &t1.id, "play", 1.0).unwrap();
         store.record_event(u1.id, &t1.id, "complete", 1.0).unwrap();
@@ -4834,8 +4833,8 @@ mod tests {
 
         let (u1, _) = store.authenticate_or_create_user("sharer", "pw123").unwrap();
         let (u2, _) = store.authenticate_or_create_user("other", "pw123").unwrap();
-        let tok1 = store.create_session(u1.id, "web", 3600).unwrap();
-        let tok2 = store.create_session(u2.id, "web", 3600).unwrap();
+        let tok1 = store.create_session(u1.id, "web").unwrap();
+        let tok2 = store.create_session(u2.id, "web").unwrap();
 
         let pl = store
             .create_playlist(u1.id, "Private Chill", "Late night synth", false, &[t1.id.clone()])
@@ -4983,7 +4982,7 @@ mod tests {
     async fn rapid_warm_event_and_queue_bursts_succeed_without_errors() {
         let store = crate::Store::open_memory().unwrap();
         let (u, _) = store.authenticate_or_create_user("burst_u", "pw").unwrap();
-        let tok = store.create_session(u.id, "web", 3600).unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
 
         let tmp = std::env::temp_dir().join(format!("beatlab_webapp_burst_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -5128,7 +5127,7 @@ mod tests {
         };
         store.upsert_tracks(&[t1, t2]).unwrap();
         let (u, _) = store.authenticate_or_create_user("ondemanduser", "pw123").unwrap();
-        let tok = store.create_session(u.id, "web", 3600).unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
 
         let state = AppState {
             store: store.clone(),
@@ -5263,7 +5262,7 @@ mod tests {
             now_playing: Arc::new(Mutex::new(Default::default())),
         };
         let (u, _) = store.authenticate_or_create_user("avataruser", "pw").unwrap();
-        let tok = store.create_session(u.id, "web", 3600).unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
         let mut hdrs = HeaderMap::new();
         hdrs.insert(
             header::AUTHORIZATION,

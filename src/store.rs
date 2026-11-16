@@ -10,6 +10,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+/// Sessions stay signed in until the user revokes or signs them out. The
+/// `expires` column is kept for schema compatibility and set to a far-future
+/// sentinel; it is never consulted.
+const SESSION_NO_EXPIRY: i64 = 4_102_444_800; // 2100-01-01 UTC
+
 const TRACK_COLS: &str = "id, source, title, artist, album, genre, moods, year, track_no, disc_no, \
     duration, bitrate, sample_rate, bit_depth, format, size, stream_url, cover_url, meta, deezer_id, created";
 
@@ -45,7 +50,6 @@ pub struct SessionInfo {
     pub token: String,
     pub kind: String,
     pub created: i64,
-    pub expires: i64,
     pub last_seen: i64,
     pub user_agent: String,
     pub ip: String,
@@ -385,6 +389,12 @@ impl Store {
         ensure_column(&conn, "sessions", "client", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "sessions", "last_seen", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "sessions", "revoked", "INTEGER NOT NULL DEFAULT 0")?;
+        // Sessions used to expire after 30 days; normalise old rows so the
+        // stored value matches the now-persistent behaviour.
+        conn.execute(
+            "UPDATE sessions SET expires = ?1 WHERE expires < ?1",
+            params![SESSION_NO_EXPIRY],
+        )?;
         // Older builds indexed client sessions by (client, user-agent); drop
         // that so a client name maps to a single session even when its app
         // version (and therefore User-Agent) changes.
@@ -526,22 +536,17 @@ impl Store {
 
     /// Convenience wrapper used by tests; production callers pass full metadata.
     #[cfg(test)]
-    pub fn create_session(
-        &self,
-        user_id: i64,
-        kind: &str,
-        ttl_secs: i64,
-    ) -> AppResult<String> {
-        self.create_session_with_meta(user_id, kind, ttl_secs, &SessionMeta::default())
+    pub fn create_session(&self, user_id: i64, kind: &str) -> AppResult<String> {
+        self.create_session_with_meta(user_id, kind, &SessionMeta::default())
     }
 
     /// Create a session while recording where/how it was opened so the
-    /// settings "Sessions" tab can describe it to the user.
+    /// settings "Sessions" tab can describe it to the user. Sessions never
+    /// expire on their own — sign-out or revocation is the only way to end one.
     pub fn create_session_with_meta(
         &self,
         user_id: i64,
         kind: &str,
-        ttl_secs: i64,
         meta: &SessionMeta,
     ) -> AppResult<String> {
         let token = format!(
@@ -550,16 +555,11 @@ impl Store {
             Uuid::new_v4().simple()
         );
         let now = Utc::now().timestamp();
-        let expires = now + ttl_secs.max(300);
         let conn = self.lock();
-        conn.execute(
-            "DELETE FROM sessions WHERE expires < ?1",
-            params![now],
-        )?;
         conn.execute(
             "INSERT INTO sessions(token, user_id, kind, created, expires, last_seen, user_agent, ip, client, revoked)
              VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6, ?7, ?8, 0)",
-            params![token, user_id, kind, now, expires, meta.user_agent, meta.ip, meta.client],
+            params![token, user_id, kind, now, SESSION_NO_EXPIRY, meta.user_agent, meta.ip, meta.client],
         )?;
         Ok(token)
     }
@@ -568,14 +568,13 @@ impl Store {
         if token.trim().is_empty() {
             return Ok(None);
         }
-        let now = Utc::now().timestamp();
         let conn = self.lock();
         let user = conn
             .query_row(
                 "SELECT u.id, u.username, u.password, u.created
                  FROM sessions s JOIN users u ON u.id = s.user_id
-                 WHERE s.token = ?1 AND s.expires >= ?2 AND s.revoked = 0",
-                params![token.trim(), now],
+                 WHERE s.token = ?1 AND s.revoked = 0",
+                params![token.trim()],
                 row_to_user,
             )
             .optional()?;
@@ -600,7 +599,6 @@ impl Store {
         ip: &str,
     ) -> AppResult<(String, bool)> {
         let now = Utc::now().timestamp();
-        let expires = now + 30 * 86400;
         let conn = self.lock();
         // Keyed on client name only: a client's User-Agent changes with every
         // app update, and revocation must survive that.
@@ -620,9 +618,9 @@ impl Store {
             if now - last_seen >= 60 || saved_ip != ip || saved_ua != user_agent {
                 if revoked == 0 {
                     conn.execute(
-                        "UPDATE sessions SET last_seen = ?1, expires = ?2, ip = ?3, user_agent = ?4
-                         WHERE token = ?5",
-                        params![now, expires, ip, user_agent, token],
+                        "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3
+                         WHERE token = ?4",
+                        params![now, ip, user_agent, token],
                     )?;
                 } else {
                     conn.execute(
@@ -641,34 +639,31 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions(token, user_id, kind, created, expires, last_seen, user_agent, ip, client, revoked)
              VALUES (?1, ?2, 'subsonic', ?3, ?4, ?3, ?5, ?6, ?7, 0)",
-            params![token, user_id, now, expires, user_agent, ip, client],
+            params![token, user_id, now, SESSION_NO_EXPIRY, user_agent, ip, client],
         )?;
         Ok((token, false))
     }
 
-    /// List the active (unexpired) sessions belonging to a user, newest first.
-    /// Expired rows are pruned opportunistically.
+    /// List the sessions belonging to a user, newest first. Sessions persist
+    /// until revoked or signed out, so nothing is pruned here.
     pub fn list_sessions(&self, user_id: i64) -> AppResult<Vec<SessionInfo>> {
-        let now = Utc::now().timestamp();
         let conn = self.lock();
-        conn.execute("DELETE FROM sessions WHERE expires < ?1", params![now])?;
         let mut stmt = conn.prepare(
-            "SELECT token, kind, created, expires, last_seen, user_agent, ip, client, revoked
-             FROM sessions WHERE user_id = ?1 AND expires >= ?2
+            "SELECT token, kind, created, last_seen, user_agent, ip, client, revoked
+             FROM sessions WHERE user_id = ?1
              ORDER BY revoked ASC, created DESC",
         )?;
         let rows = stmt
-            .query_map(params![user_id, now], |r| {
+            .query_map(params![user_id], |r| {
                 Ok(SessionInfo {
                     token: r.get(0)?,
                     kind: r.get(1)?,
                     created: r.get(2)?,
-                    expires: r.get(3)?,
-                    last_seen: r.get(4)?,
-                    user_agent: r.get(5)?,
-                    ip: r.get(6)?,
-                    client: r.get(7)?,
-                    revoked: r.get::<_, i64>(8)? != 0,
+                    last_seen: r.get(3)?,
+                    user_agent: r.get(4)?,
+                    ip: r.get(5)?,
+                    client: r.get(6)?,
+                    revoked: r.get::<_, i64>(7)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -704,9 +699,9 @@ impl Store {
     pub fn allow_session_for_user(&self, token: &str, user_id: i64) -> AppResult<bool> {
         let conn = self.lock();
         Ok(conn.execute(
-            "UPDATE sessions SET revoked = 0, expires = ?1
-             WHERE token = ?2 AND user_id = ?3 AND kind = 'subsonic'",
-            params![Utc::now().timestamp() + 30 * 86400, token, user_id],
+            "UPDATE sessions SET revoked = 0
+             WHERE token = ?1 AND user_id = ?2 AND kind = 'subsonic'",
+            params![token, user_id],
         )? > 0)
     }
 
@@ -4611,7 +4606,7 @@ mod tests {
         assert!(store.authenticate_or_create_user("alice", "wrongpass").is_err());
 
         // Session roundtrip.
-        let tok = store.create_session(alice.id, "nd", 3600).unwrap();
+        let tok = store.create_session(alice.id, "nd").unwrap();
         let loaded = store.get_session_user(&tok).unwrap().unwrap();
         assert_eq!(loaded.id, alice.id);
         store.delete_session(&tok).unwrap();
@@ -4631,9 +4626,9 @@ mod tests {
         let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
         let (bob, _) = store.authenticate_or_create_user("bob", "secret123").unwrap();
 
-        let t1 = store.create_session(alice.id, "web", 3600).unwrap();
-        let t2 = store.create_session(alice.id, "nd", 3600).unwrap();
-        let bob_tok = store.create_session(bob.id, "web", 3600).unwrap();
+        let t1 = store.create_session(alice.id, "web").unwrap();
+        let t2 = store.create_session(alice.id, "nd").unwrap();
+        let bob_tok = store.create_session(bob.id, "web").unwrap();
 
         let sessions = store.list_sessions(alice.id).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -4669,7 +4664,7 @@ mod tests {
             client: String::new(),
         };
         let tok = store
-            .create_session_with_meta(alice.id, "web", 3600, &meta)
+            .create_session_with_meta(alice.id, "web", &meta)
             .unwrap();
         let sessions = store.list_sessions(alice.id).unwrap();
         assert_eq!(sessions.len(), 1);
@@ -4723,6 +4718,28 @@ mod tests {
         let sessions = store.list_sessions(alice.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].revoked);
+    }
+
+    #[test]
+    fn sessions_do_not_expire() {
+        let store = Store::open_memory().unwrap();
+        let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
+        let tok = store.create_session(alice.id, "web").unwrap();
+
+        // Even a row left over from the old 30-day scheme with a past expiry
+        // stays valid: expiry is no longer consulted or pruned.
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE sessions SET expires = 1 WHERE token = ?1",
+                params![tok],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.get_session_user(&tok).unwrap().unwrap().id, alice.id);
+        let sessions = store.list_sessions(alice.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].token, tok);
     }
 
     #[test]

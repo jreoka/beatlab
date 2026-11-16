@@ -5493,17 +5493,6 @@
     return formatSessionDate(ts);
   }
 
-  function timeUntil(ts) {
-    if (!ts) return 'unknown';
-    const diff = ts * 1000 - Date.now();
-    if (diff <= 0) return 'expired';
-    const days = Math.floor(diff / 86400000);
-    if (days >= 1) return `in ${days} ${days === 1 ? 'day' : 'days'}`;
-    const hours = Math.floor(diff / 3600000);
-    if (hours >= 1) return `in ${hours} ${hours === 1 ? 'hour' : 'hours'}`;
-    return 'soon';
-  }
-
   function parseUserAgent(ua) {
     if (!ua) return 'Unknown device';
     let browser = '';
@@ -5702,7 +5691,7 @@
                           ${revoked ? '<span class="session-revoked-pill">Revoked</span>' : ''}
                         </div>
                         <div class="session-sub">${esc(info.kindLabel)} &middot; Signed in ${esc(formatSessionDate(s.created))}</div>
-                        <div class="session-sub">Last active ${esc(timeAgo(s.lastSeen || s.created))} &middot; Expires ${esc(timeUntil(s.expires))}</div>
+                        <div class="session-sub">Last active ${esc(timeAgo(s.lastSeen || s.created))}</div>
                         ${s.ip ? `<div class="session-sub">IP ${esc(s.ip)}</div>` : ''}
                         ${ua ? `<div class="session-ua" title="${esc(ua)}">${esc(ua)}</div>` : ''}
                       </div>

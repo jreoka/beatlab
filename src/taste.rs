@@ -5122,6 +5122,29 @@ impl TasteEngine {
                         if !is_fallback_compatible(&e.track, ag, e.era_match, e.theme_match) {
                             continue;
                         }
+                        // A thematic mix may only be padded with tracks that carry some
+                        // verifiable link to the query. Without this, a degraded run
+                        // (no curated playlists / no radio, e.g. Deezer timed out) falls
+                        // back to generic popular tracks and then labels them as the
+                        // requested genre/mood ("jrock" -> unrelated rap hits).
+                        if intent.is_theme_mix {
+                            let meta_low = format!("{} {}", e.track.genre, ag).to_lowercase();
+                            let genre_confirmed = !intent.genres.is_empty()
+                                && intent
+                                    .genres
+                                    .iter()
+                                    .any(|g| genre_matches_text(&meta_low, g));
+                            let ytm_backed =
+                                e.track.source == "ytm" || e.track.id.starts_with("ytm:");
+                            let has_evidence = e.curated_prior > 0.0
+                                || e.theme_match >= 0.25
+                                || e.era_match > 0.0
+                                || genre_confirmed
+                                || ytm_backed;
+                            if !has_evidence {
+                                continue;
+                            }
+                        }
                         // For genre/era queries without curated playlists, avoid letting
                         // user taste or general popularity lift unverified tracks over relevant hits.
                         if seen_fallback_keys.insert(e.track.song_key()) {
@@ -9223,6 +9246,61 @@ mod tests {
         assert!(!ids.contains(&"dz:80sbaby"), "ids={:?}", ids);
         assert!(!ids.contains(&"ytm:slowed"), "ids={:?}", ids);
         assert!(!ids.contains(&"dz:trap24"), "ids={:?}", ids);
+    }
+
+    #[test]
+    fn theme_mix_fallback_never_promotes_unrelated_tracks_when_no_evidence_exists() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jrock_fallback", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        // A fuzzy "jrock" search returns rap tracks (Deezer also has rappers
+        // literally named "J-Rock"/"Jrock"). Like all curated/search tracks,
+        // they have no genre metadata, so has_genre_clash() cannot reject them.
+        let mk = |id: &str, title: &str, artist: &str, rank: u64| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: title.into(),
+            genre: String::new(),
+            duration: 200,
+            bitrate: 256,
+            meta: format!(r#"{{"rank":{}}}"#, rank),
+            ..Default::default()
+        };
+        let unrelated: Vec<Track> = vec![
+            mk("dz:rap1", "Fuck Love", "XXXTENTACION, Trippie Redd", 950000),
+            mk("dz:rap2", "Stick Up", "Rag baby", 940000),
+            mk("dz:rap3", "Palm Angels, Palms Itching", "Babyface Ray", 930000),
+            mk("dz:rap4", "Still Hustlin'", "FCG Heem", 920000),
+            mk("dz:rap5", "Party With The Boys", "Don Toliver", 910000),
+            mk("dz:rap6", "Ya Hit", "Future", 900000),
+        ];
+
+        // No curated playlists and no radio: the degraded/offline path.
+        let res = taste.search_and_refine_with_context(
+            u.id,
+            "jrock",
+            unrelated.clone(),
+            vec![],
+            SearchMixContext::default(),
+        );
+        let leaked = res.instant_mix.as_ref().map(|m| {
+            m.tracks.iter().map(|t| t.title.clone()).collect::<Vec<_>>()
+        });
+        assert!(
+            res.instant_mix.is_none(),
+            "unrelated rap tracks must not be labelled a J-Rock mix: {:?}",
+            leaked
+        );
     }
 
     #[test]

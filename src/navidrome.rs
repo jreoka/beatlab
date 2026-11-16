@@ -185,7 +185,7 @@ pub async fn login(
             };
             match state
                 .store
-                .create_session_with_meta(user.id, "nd", 30 * 86400, &meta)
+                .create_session_with_meta(user.id, "nd", &meta)
             {
                 Ok(token) => json_ok(build_login_response(&state, &user, &token), None),
                 Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -214,7 +214,7 @@ pub async fn signup(
             };
             match state
                 .store
-                .create_session_with_meta(user.id, "nd", 30 * 86400, &meta)
+                .create_session_with_meta(user.id, "nd", &meta)
             {
                 Ok(token) => json_ok(build_login_response(&state, &user, &token), None),
                 Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -1204,7 +1204,7 @@ mod tests {
             ])
             .unwrap();
         let (u, _) = st.store.authenticate_or_create_user("ndmv", "pw123").unwrap();
-        let tok = st.store.create_session(u.id, "nd", 3600).unwrap();
+        let tok = st.store.create_session(u.id, "nd").unwrap();
         let pl = st
             .store
             .create_playlist(
