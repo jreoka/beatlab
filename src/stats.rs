@@ -1,4 +1,4 @@
-use crate::models::{primary_artist, Mood, QualityTier, Track, User, UserEventRow};
+use crate::models::{primary_artist, Mood, Track, User, UserEventRow};
 use crate::store::Store;
 use crate::taste::{classify_moods_str, split_genres};
 use chrono::{Datelike, DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
@@ -92,8 +92,6 @@ pub struct SummaryStats {
     pub lossless_streams: usize,
     pub lossless_pct: f64,
     pub avg_bitrate: i64,
-    pub favorite_source: String,
-    pub favorite_source_label: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,16 +114,6 @@ pub struct StreakStats {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SignalsInRange {
-    pub stars: usize,
-    pub playlist_adds: usize,
-    pub search_picks: usize,
-    pub mix_plays: usize,
-    pub ratings: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LibraryStats {
     pub liked_tracks: usize,
     pub saved_albums: usize,
@@ -137,7 +125,6 @@ pub struct LibraryStats {
     pub rated_tracks: usize,
     pub avg_rating: f64,
     pub ratings_dist: [usize; 5],
-    pub signals_in_range: SignalsInRange,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -227,27 +214,6 @@ pub struct GenreStat {
     pub secs: i64,
     pub pct: f64,
     pub unique_tracks: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QualityTierStat {
-    pub tier: String,
-    pub label: String,
-    pub color: String,
-    pub streams: usize,
-    pub secs: i64,
-    pub pct: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyCountStat {
-    pub key: String,
-    pub label: String,
-    pub streams: usize,
-    pub secs: i64,
-    pub pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -347,9 +313,6 @@ pub struct ComputedStats {
     pub peak_weekday: Option<String>,
     pub moods: Vec<MoodStat>,
     pub genres: Vec<GenreStat>,
-    pub quality_tiers: Vec<QualityTierStat>,
-    pub formats: Vec<KeyCountStat>,
-    pub sources: Vec<KeyCountStat>,
     pub decades: Vec<DecadeStat>,
     pub oldest_track: Option<YearTrackRef>,
     pub newest_track: Option<YearTrackRef>,
@@ -466,7 +429,7 @@ pub fn compute_stats_from_data(
         .filter(|(_, at)| range_start_ts.map_or(true, |start| *at >= start))
         .collect();
 
-    // Library counts + range interaction signals.
+    // Library counts.
     let mut manual_playlists = 0usize;
     let mut auto_playlists = 0usize;
     let mut curated_tracks = 0usize;
@@ -493,27 +456,6 @@ pub fn compute_stats_from_data(
         0.0
     };
 
-    let mut signals = SignalsInRange {
-        stars: 0,
-        playlist_adds: 0,
-        search_picks: 0,
-        mix_plays: 0,
-        ratings: 0,
-    };
-    for ev in events {
-        if range_start_ts.map_or(false, |start| ev.at < start) {
-            continue;
-        }
-        match ev.kind.as_str() {
-            "star" => signals.stars += 1,
-            "playlist_add" => signals.playlist_adds += 1,
-            "search_pick" => signals.search_picks += 1,
-            "mix_play" => signals.mix_plays += 1,
-            "rate" => signals.ratings += 1,
-            _ => {}
-        }
-    }
-
     let library = LibraryStats {
         liked_tracks: starred.len(),
         saved_albums: saved_albums.len(),
@@ -525,7 +467,6 @@ pub fn compute_stats_from_data(
         rated_tracks,
         avg_rating,
         ratings_dist,
-        signals_in_range: signals,
     };
 
     // Aggregate metrics for filtered listens.
@@ -549,9 +490,6 @@ pub fn compute_stats_from_data(
     let mut weekday_counts = vec![(0usize, 0i64); 7]; // 0 = Mon .. 6 = Sun
     let mut mood_counts: HashMap<String, (usize, i64)> = HashMap::new();
     let mut genre_counts: HashMap<String, GenreAccum> = HashMap::new();
-    let mut quality_counts: HashMap<&'static str, (usize, i64)> = HashMap::new();
-    let mut format_counts: HashMap<String, (usize, i64)> = HashMap::new();
-    let mut source_counts: HashMap<String, (usize, i64)> = HashMap::new();
     let mut decade_counts: BTreeMap<i32, (usize, i64)> = BTreeMap::new();
 
     struct TrackAccum {
@@ -643,31 +581,6 @@ pub fn compute_stats_from_data(
             if t.is_lossless() {
                 lossless_streams += 1;
             }
-
-            let tier_key = match t.quality_tier() {
-                QualityTier::HiRes => "hi_res",
-                QualityTier::Lossless => "lossless",
-                QualityTier::HighLossy => "high_lossy",
-                QualityTier::Standard => "standard",
-                QualityTier::Low => "low",
-            };
-            let qt = quality_counts.entry(tier_key).or_insert((0, 0));
-            qt.0 += 1;
-            qt.1 += l.listened_secs;
-
-            let fmt_key = infer_format_key(t);
-            let fe = format_counts.entry(fmt_key).or_insert((0, 0));
-            fe.0 += 1;
-            fe.1 += l.listened_secs;
-
-            let src_key = if t.source.trim().is_empty() {
-                "unknown".to_string()
-            } else {
-                t.source.trim().to_lowercase()
-            };
-            let se = source_counts.entry(src_key).or_insert((0, 0));
-            se.0 += 1;
-            se.1 += l.listened_secs;
 
             if (1900..=2099).contains(&t.year) {
                 let dec = (t.year / 10) * 10;
@@ -900,61 +813,7 @@ pub fn compute_stats_from_data(
         0
     };
 
-    // Build sorted sources, formats, quality tiers, genres, moods, decades.
-    let mut sources: Vec<KeyCountStat> = source_counts
-        .into_iter()
-        .map(|(key, (streams, secs))| KeyCountStat {
-            label: source_label(&key),
-            key,
-            streams,
-            secs,
-            pct: pct(streams, total_streams),
-        })
-        .collect();
-    sources.sort_by(|a, b| b.streams.cmp(&a.streams).then(b.secs.cmp(&a.secs)));
-    let favorite_source = sources.first().map(|s| s.key.clone()).unwrap_or_default();
-    let favorite_source_label = sources
-        .first()
-        .map(|s| s.label.clone())
-        .unwrap_or_else(|| "None yet".to_string());
-
-    let mut formats: Vec<KeyCountStat> = format_counts
-        .into_iter()
-        .map(|(key, (streams, secs))| KeyCountStat {
-            label: key.to_ascii_uppercase(),
-            key,
-            streams,
-            secs,
-            pct: pct(streams, total_streams),
-        })
-        .collect();
-    formats.sort_by(|a, b| b.streams.cmp(&a.streams).then(b.secs.cmp(&a.secs)));
-
-    let quality_order = [
-        ("hi_res", "Hi-Res Lossless", "#fbbf24"),
-        ("lossless", "CD Lossless", "#1ed760"),
-        ("high_lossy", "High (256k+)", "#38bdf8"),
-        ("standard", "Standard Stream", "#a855f7"),
-        ("low", "Low Bitrate", "#6b7485"),
-    ];
-    let quality_tiers: Vec<QualityTierStat> = quality_order
-        .iter()
-        .filter_map(|&(tier, label, color)| {
-            let &(streams, secs) = quality_counts.get(tier)?;
-            if streams == 0 {
-                return None;
-            }
-            Some(QualityTierStat {
-                tier: tier.to_string(),
-                label: label.to_string(),
-                color: color.to_string(),
-                streams,
-                secs,
-                pct: pct(streams, total_streams),
-            })
-        })
-        .collect();
-
+    // Build sorted moods, genres, decades.
     let total_mood_hits: usize = mood_counts.values().map(|v| v.0).sum();
     let moods: Vec<MoodStat> = Mood::ALL
         .iter()
@@ -1168,8 +1027,6 @@ pub fn compute_stats_from_data(
         lossless_streams,
         lossless_pct,
         avg_bitrate,
-        favorite_source,
-        favorite_source_label,
     };
 
     let persona = build_persona(
@@ -1201,9 +1058,6 @@ pub fn compute_stats_from_data(
         peak_weekday,
         moods,
         genres,
-        quality_tiers,
-        formats,
-        sources,
         decades,
         oldest_track,
         newest_track,
@@ -1766,37 +1620,6 @@ fn build_persona(
         style: style.to_string(),
         headline,
         badges,
-    }
-}
-
-fn infer_format_key(t: &Track) -> String {
-    let f = t.format.trim().to_lowercase();
-    if !f.is_empty() {
-        return f;
-    }
-    match t.source.as_str() {
-        "deezer" | "ytm" => "aac".to_string(),
-        _ => "stream".to_string(),
-    }
-}
-
-fn source_label(src: &str) -> String {
-    match src {
-        "local" => "Local Library".to_string(),
-        "deezer" => "Deezer".to_string(),
-        "ytm" => "YouTube Music".to_string(),
-        "soulseek" => "Soulseek".to_string(),
-        "archive" => "Internet Archive".to_string(),
-        "soundcloud" => "SoundCloud".to_string(),
-        "youtube" => "YouTube".to_string(),
-        "" | "unknown" => "Unknown".to_string(),
-        other => {
-            let mut chars = other.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-                None => "Unknown".to_string(),
-            }
-        }
     }
 }
 

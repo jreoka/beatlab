@@ -2168,44 +2168,6 @@
     </svg>`;
   }
 
-  function renderStatsDonutSvg(segments, centerTop, centerBottom) {
-    const W = 176;
-    const H = 176;
-    const cx = 88;
-    const cy = 88;
-    const rOuter = 74;
-    const rInner = 48;
-    const total = segments.reduce((acc, s) => acc + (s.value || 0), 0);
-
-    let ringSvg = '';
-    if (total <= 0) {
-      ringSvg = `<circle cx="${cx}" cy="${cy}" r="${(rOuter + rInner) / 2}" fill="none" stroke="#232834" stroke-width="${rOuter - rInner}" />`;
-    } else if (segments.filter((s) => s.value > 0).length === 1) {
-      const only = segments.find((s) => s.value > 0);
-      ringSvg = `<circle class="stats-tip-target" cx="${cx}" cy="${cy}" r="${(rOuter + rInner) / 2}" fill="none" stroke="${esc(only.color)}" stroke-width="${rOuter - rInner}" data-tip-title="${esc(only.label)}" data-tip-body="${esc(only.tipBody || '')}" />`;
-    } else {
-      let angle = -90;
-      const active = segments.filter((s) => s.value > 0);
-      const gap = active.length > 1 ? 1.6 : 0;
-      ringSvg = active
-        .map((seg) => {
-          const sweep = (seg.value / total) * 360;
-          const start = angle + gap / 2;
-          const end = angle + sweep - gap / 2;
-          angle += sweep;
-          if (end <= start) return '';
-          return `<path class="stats-tip-target" d="${svgDonutSlicePath(cx, cy, rOuter, rInner, start, end)}" fill="${esc(seg.color)}" data-tip-title="${esc(seg.label)}" data-tip-body="${esc(seg.tipBody || '')}" />`;
-        })
-        .join('');
-    }
-
-    return `<svg class="stats-donut-svg" viewBox="0 0 ${W} ${H}">
-      ${ringSvg}
-      <text x="${cx}" y="${cy - 2}" text-anchor="middle" fill="#f3f5f8" font-size="20" font-weight="800">${esc(centerTop)}</text>
-      <text x="${cx}" y="${cy + 15}" text-anchor="middle" fill="#98a2b3" font-size="10.5" font-weight="600">${esc(centerBottom)}</text>
-    </svg>`;
-  }
-
   async function renderStats(range = 'all') {
     const { reqToken, signal } = beginViewRequest();
     const cleanRange = ['7d', '30d', '90d', '365d', 'all'].includes(range) ? range : 'all';
@@ -2336,7 +2298,7 @@
         <div class="stats-kpi-card accent-purple">
           <div class="stats-kpi-label">Audio Fidelity</div>
           <div class="stats-kpi-val">${s.losslessPct || 0}% <span class="stats-kpi-unit">lossless</span></div>
-          <div class="stats-kpi-sub">${s.avgBitrate ? `${s.avgBitrate} kbps avg · ` : ''}${esc(s.favoriteSourceLabel || '—')}</div>
+          <div class="stats-kpi-sub">${s.totalStreams ? `${s.avgBitrate ? `${s.avgBitrate} kbps avg · ` : ''}${s.losslessStreams || 0} of ${s.totalStreams} streams` : 'No streams logged'}</div>
         </div>
         <div class="stats-kpi-card">
           <div class="stats-kpi-label">Library &amp; Taste</div>
@@ -2529,123 +2491,40 @@
       </section>
     `;
 
-    // Row 3: Genres + Audio Quality & Sources/Formats
+    // Row 3: Top Genres
     const genres = d.genres || [];
     const maxGenreStreams = Math.max(1, ...genres.map((g) => g.streams || 0));
-    const qualityTiers = d.qualityTiers || [];
-    const qualitySegments = qualityTiers.map((q) => ({
-      label: q.label,
-      value: q.streams,
-      color: q.color,
-      tipBody: `${q.streams} streams (${q.pct}%) · ${fmtStatsDuration(q.secs)}`,
-    }));
-    const srcColors = ['#1ed760', '#38bdf8', '#a855f7', '#fbbf24', '#ec4899', '#14b8a6'];
-    const sources = d.sources || [];
-    const sourceSegments = sources.map((src, idx) => ({
-      label: src.label,
-      value: src.streams,
-      color: srcColors[idx % srcColors.length],
-      tipBody: `${src.streams} streams (${src.pct}%) · ${fmtStatsDuration(src.secs)}`,
-    }));
 
     html += `
-      <section class="stats-grid-3">
-        <div class="stats-card">
-          <div class="stats-card-head">
-            <div>
-              <h2>Top Genres</h2>
-              <p class="stats-card-sub">${genres.length ? 'Click any genre to explore & play' : 'Genre tags from streamed tracks'}</p>
-            </div>
-          </div>
-          ${
-            genres.length
-              ? `<div class="stats-genre-list">
-                  ${genres
-                    .slice(0, 10)
-                    .map((g, idx) => {
-                      const wPct = Math.max(6, (g.streams / maxGenreStreams) * 100);
-                      return `
-                        <div class="stats-hbar-row clickable" onclick="App.navigate('genre/${encodeURIComponent(g.name)}')">
-                          <div class="stats-hbar-top">
-                            <span class="stats-hbar-name"><span class="stats-rank-num">#${idx + 1}</span> ${esc(g.name)}</span>
-                            <span class="stats-hbar-val">${g.streams} · ${fmtStatsDuration(g.secs)} (${g.pct}%)</span>
-                          </div>
-                          <div class="stats-hbar-track">
-                            <div class="stats-hbar-fill" style="width:${wPct.toFixed(1)}%;background:${idx === 0 ? '#1ed760' : idx < 3 ? '#38bdf8' : '#a855f7'}"></div>
-                          </div>
-                        </div>`;
-                    })
-                    .join('')}
-                </div>`
-              : '<p class="muted-center">No genre tags logged yet.</p>'
-          }
-        </div>
-
-        <div class="stats-card">
-          <div class="stats-card-head">
-            <div>
-              <h2>Audio Quality &amp; Codecs</h2>
-              <p class="stats-card-sub">${s.avgBitrate ? `Average bitrate ${s.avgBitrate} kbps` : 'Stream quality tiers'}</p>
-            </div>
-          </div>
-          <div class="stats-donut-layout">
-            ${renderStatsDonutSvg(qualitySegments, `${s.losslessPct || 0}%`, 'Lossless')}
-            <div class="stats-donut-legend">
-              ${qualityTiers
-                .map(
-                  (q) => `
-                <div class="stats-legend-row">
-                  <span class="stats-dot" style="background:${esc(q.color)}"></span>
-                  <span class="stats-legend-name">${esc(q.label)}</span>
-                  <span class="stats-legend-val">${q.streams} (${q.pct}%)</span>
-                </div>`
-                )
-                .join('')}
-            </div>
-          </div>
-          ${
-            (d.formats || []).length
-              ? `<div class="stats-chip-row">
-                  ${d.formats
-                    .map(
-                      (f) =>
-                        `<span class="stats-codec-pill stats-tip-target" data-tip-title="${esc(f.label)}" data-tip-body="${f.streams} streams (${f.pct}%) · ${fmtStatsDuration(f.secs)}">${esc(f.label)} · ${f.pct}%</span>`
-                    )
-                    .join('')}
-                </div>`
-              : ''
-          }
-        </div>
-
-        <div class="stats-card">
-          <div class="stats-card-head">
-            <div>
-              <h2>Sources &amp; Signals</h2>
-              <p class="stats-card-sub">Where your streams come from &amp; taste actions</p>
-            </div>
-          </div>
-          <div class="stats-donut-layout">
-            ${renderStatsDonutSvg(sourceSegments, `${sources.length}`, sources.length === 1 ? 'Source' : 'Sources')}
-            <div class="stats-donut-legend">
-              ${sources
-                .map(
-                  (src, idx) => `
-                <div class="stats-legend-row">
-                  <span class="stats-dot" style="background:${srcColors[idx % srcColors.length]}"></span>
-                  <span class="stats-legend-name">${esc(src.label)}</span>
-                  <span class="stats-legend-val">${src.streams} (${src.pct}%)</span>
-                </div>`
-                )
-                .join('')}
-            </div>
-          </div>
-          <div class="stats-signal-grid">
-            <div class="stats-sig-box"><strong>${lib.signalsInRange?.stars || 0}</strong><span>Likes</span></div>
-            <div class="stats-sig-box"><strong>${lib.signalsInRange?.playlistAdds || 0}</strong><span>Playlisted</span></div>
-            <div class="stats-sig-box"><strong>${lib.signalsInRange?.searchPicks || 0}</strong><span>Search Picks</span></div>
-            <div class="stats-sig-box"><strong>${lib.signalsInRange?.mixPlays || 0}</strong><span>Mix Plays</span></div>
+      <section class="stats-card stats-section-gap">
+        <div class="stats-card-head">
+          <div>
+            <h2>Top Genres</h2>
+            <p class="stats-card-sub">${genres.length ? 'Click any genre to explore & play' : 'Genre tags from streamed tracks'}</p>
           </div>
         </div>
+        ${
+          genres.length
+            ? `<div class="stats-genre-list">
+                ${genres
+                  .slice(0, 10)
+                  .map((g, idx) => {
+                    const wPct = Math.max(6, (g.streams / maxGenreStreams) * 100);
+                    return `
+                      <div class="stats-hbar-row clickable" onclick="App.navigate('genre/${encodeURIComponent(g.name)}')">
+                        <div class="stats-hbar-top">
+                          <span class="stats-hbar-name"><span class="stats-rank-num">#${idx + 1}</span> ${esc(g.name)}</span>
+                          <span class="stats-hbar-val">${g.streams} · ${fmtStatsDuration(g.secs)} (${g.pct}%)</span>
+                        </div>
+                        <div class="stats-hbar-track">
+                          <div class="stats-hbar-fill" style="width:${wPct.toFixed(1)}%;background:${idx === 0 ? '#1ed760' : idx < 3 ? '#38bdf8' : '#a855f7'}"></div>
+                        </div>
+                      </div>`;
+                  })
+                  .join('')}
+              </div>`
+            : '<p class="muted-center">No genre tags logged yet.</p>'
+        }
       </section>
     `;
 

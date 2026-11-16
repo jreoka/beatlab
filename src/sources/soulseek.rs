@@ -5,7 +5,7 @@ use crate::store::Store;
 use async_trait::async_trait;
 use flate2::read::ZlibDecoder;
 use md5::{Digest, Md5};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -94,6 +94,8 @@ pub struct SoulseekSource {
     store: Store,
     download_dir: PathBuf,
     runtime: RwLock<SlskRuntime>,
+    connect_notify: Notify,
+    disconnect_notify: Notify,
     pending_searches: Mutex<HashMap<u32, mpsc::Sender<Vec<SlskSearchHit>>>>,
     peer_addrs: Mutex<HashMap<String, Option<(Ipv4Addr, u32)>>>,
     addr_notify: Notify,
@@ -127,6 +129,8 @@ impl SoulseekSource {
                 writer: None,
                 session_id: 0,
             }),
+            connect_notify: Notify::new(),
+            disconnect_notify: Notify::new(),
             pending_searches: Mutex::new(HashMap::new()),
             peer_addrs: Mutex::new(HashMap::new()),
             addr_notify: Notify::new(),
@@ -143,13 +147,48 @@ impl SoulseekSource {
         if let (Some(u), Some(p)) = (saved_user, saved_pass) {
             let s = Arc::clone(&src);
             tokio::spawn(async move {
-                if let Err(e) = s.connect(&u, &p, Some(&saved_server)).await {
-                    warn!(error = %e, "soulseek auto-connect failed");
-                }
+                s.maintain_connection(u, p, Some(saved_server)).await;
             });
         }
 
         src
+    }
+
+    pub fn available_or_connecting(&self) -> bool {
+        self.runtime
+            .try_read()
+            .map(|r| r.connected || r.connecting)
+            .unwrap_or(false)
+    }
+
+    pub async fn maintain_connection(
+        self: &Arc<Self>,
+        username: String,
+        password: String,
+        server: Option<String>,
+    ) {
+        let mut backoff_secs = 5u64;
+        loop {
+            let notified = self.disconnect_notify.notified();
+            let already_connected = self.runtime.read().await.connected;
+            if already_connected {
+                notified.await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            match self.connect(&username, &password, server.as_deref()).await {
+                Ok(()) => {
+                    backoff_secs = 5;
+                    notified.await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    warn!(error = %e, retry_in_secs = backoff_secs, "soulseek connect attempt failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(60);
+                }
+            }
+        }
     }
 
     pub async fn connect(
@@ -277,6 +316,7 @@ impl SoulseekSource {
             rt.last_error = None;
             rt.writer = Some(tx.clone());
         }
+        self.connect_notify.notify_waiters();
 
         info!(username = %user, server = %srv, port = listen_port, "soulseek connected");
 
@@ -295,6 +335,26 @@ impl SoulseekSource {
             }
         });
 
+        // Keepalive ping task (prevents silent NAT / idle server disconnects)
+        let self_ping = Arc::clone(self);
+        let tx_ping = tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(45));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                {
+                    let rt = self_ping.runtime.read().await;
+                    if !rt.connected || rt.session_id != session_id {
+                        break;
+                    }
+                }
+                if tx_ping.send(build_empty_frame(MSG_PING)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         // Reader task
         let self_rd = Arc::clone(self);
         let tx_rd = tx.clone();
@@ -307,12 +367,22 @@ impl SoulseekSource {
                             .await;
                     }
                     Err(e) => {
-                        let mut rt = self_rd.runtime.write().await;
-                        if rt.session_id == session_id {
-                            rt.connected = false;
-                            rt.connecting = false;
-                            rt.writer = None;
-                            rt.last_error = Some(format!("Disconnected: {}", e));
+                        let was_active = {
+                            let mut rt = self_rd.runtime.write().await;
+                            if rt.session_id == session_id {
+                                rt.connected = false;
+                                rt.connecting = false;
+                                rt.writer = None;
+                                rt.last_error = Some(format!("Disconnected: {}", e));
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        self_rd.connect_notify.notify_waiters();
+                        if was_active {
+                            warn!(error = %e, "soulseek disconnected; notifying supervisor");
+                            self_rd.disconnect_notify.notify_waiters();
                         }
                         break;
                     }
@@ -355,6 +425,7 @@ impl SoulseekSource {
             rt.writer = None;
             rt.last_error = Some(msg.to_string());
         }
+        self.connect_notify.notify_waiters();
     }
 
     async fn handle_server_message(
@@ -1004,36 +1075,82 @@ impl MusicSource for SoulseekSource {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
-        let writer = {
-            let rt = self.runtime.read().await;
-            if !rt.connected {
-                return vec![];
+        let mut writer = {
+            let notified = self.connect_notify.notified();
+            let (connected, connecting, w) = {
+                let rt = self.runtime.read().await;
+                (rt.connected, rt.connecting, rt.writer.clone())
+            };
+            if connected {
+                w
+            } else if connecting {
+                let _ = tokio::time::timeout(Duration::from_millis(2500), notified).await;
+                let rt = self.runtime.read().await;
+                if rt.connected {
+                    rt.writer.clone()
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-            rt.writer.clone()
         };
-        let Some(writer) = writer else {
+        let Some(writer) = writer.take() else {
             return vec![];
         };
 
         let token = self.next_search_token().await;
-        let (tx, mut rx) = mpsc::channel::<Vec<SlskSearchHit>>(32);
-        self.pending_searches.lock().await.insert(token, tx);
+        let flac_query = build_flac_search_query(query);
+        let token_flac = if flac_query.is_some() {
+            Some(self.next_search_token().await)
+        } else {
+            None
+        };
 
-        let frame = build_search_frame(token, query);
-        if writer.send(frame).await.is_err() {
-            self.pending_searches.lock().await.remove(&token);
+        let (tx, mut rx) = mpsc::channel::<Vec<SlskSearchHit>>(48);
+        {
+            let mut ps = self.pending_searches.lock().await;
+            ps.insert(token, tx.clone());
+            if let Some(tf) = token_flac {
+                ps.insert(tf, tx.clone());
+            }
+        }
+        drop(tx);
+
+        let sent_main = writer.send(build_search_frame(token, query)).await.is_ok();
+        let sent_flac = match (&flac_query, token_flac) {
+            (Some(fq), Some(tf)) => writer.send(build_search_frame(tf, fq)).await.is_ok(),
+            _ => false,
+        };
+        if !sent_main && !sent_flac {
+            let mut ps = self.pending_searches.lock().await;
+            ps.remove(&token);
+            if let Some(tf) = token_flac {
+                ps.remove(&tf);
+            }
             return vec![];
         }
 
         let mut collected: Vec<SlskSearchHit> = Vec::new();
-        let deadline = tokio::time::sleep(Duration::from_millis(4500));
+        let mut lossless_keys: HashSet<String> = HashSet::new();
+        let mut batch_count = 0usize;
+        let started = tokio::time::Instant::now();
+        let deadline = tokio::time::sleep(Duration::from_millis(5500));
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
                 Some(batch) = rx.recv() => {
+                    batch_count += 1;
+                    for hit in &batch {
+                        if hit.track.is_lossless() {
+                            lossless_keys.insert(hit.track.song_key());
+                        }
+                    }
                     collected.extend(batch);
-                    if collected.len() >= limit * 4 {
+                    if (lossless_keys.len() >= limit && batch_count >= 2 && started.elapsed() >= Duration::from_millis(2200))
+                        || collected.len() >= 1500
+                    {
                         break;
                     }
                 }
@@ -1041,33 +1158,15 @@ impl MusicSource for SoulseekSource {
             }
         }
 
-        self.pending_searches.lock().await.remove(&token);
-        // Group hits by song_key, prefer peers with a free slot and higher upload speed,
-        // and retain up to 4 alternate peer URLs per song_key for download fallback.
-        let mut by_key: HashMap<String, Vec<SlskSearchHit>> = HashMap::new();
-        for hit in collected {
-            by_key.entry(hit.track.song_key()).or_default().push(hit);
-        }
-
-        let mut out: Vec<SlskSearchHit> = Vec::with_capacity(by_key.len());
-        let mut alt_updates: Vec<(String, Vec<String>)> = Vec::new();
-        for (key, mut hits) in by_key {
-            hits.sort_by_key(|h| {
-                std::cmp::Reverse((h.slot_free as u8, h.track.quality_score(), h.avg_speed))
-            });
-            let urls: Vec<String> = hits
-                .iter()
-                .map(|h| h.track.stream_url.clone())
-                .take(4)
-                .collect();
-            if urls.len() > 1 {
-                alt_updates.push((key, urls));
-            }
-            if let Some(best) = hits.into_iter().next() {
-                out.push(best);
+        {
+            let mut ps = self.pending_searches.lock().await;
+            ps.remove(&token);
+            if let Some(tf) = token_flac {
+                ps.remove(&tf);
             }
         }
 
+        let (tracks, alt_updates) = rank_and_dedup_hits(collected, (limit * 2).max(limit));
         if !alt_updates.is_empty() {
             let mut alts = self.alt_streams.lock().await;
             if alts.len() >= 2048 {
@@ -1077,17 +1176,80 @@ impl MusicSource for SoulseekSource {
                 alts.insert(k, urls);
             }
         }
-
-        out.sort_by_key(|h| {
-            std::cmp::Reverse((h.slot_free as u8, h.track.quality_score(), h.avg_speed))
-        });
-        out.into_iter().take(limit).map(|h| h.track).collect()
+        tracks
     }
 
     async fn resolve_stream(&self, stream_ref: &str) -> Option<String> {
         let arc = self.self_weak.get().and_then(|w| w.upgrade())?;
         arc.resolve_stream_singleflight(stream_ref).await
     }
+}
+
+fn build_flac_search_query(query: &str) -> Option<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let has_format_token = q.split_whitespace().any(|w| {
+        matches!(
+            w.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase().as_str(),
+            "flac" | "alac" | "wav" | "aiff" | "lossless" | "24bit" | "hires" | "mp3" | "aac" | "320"
+        )
+    });
+    if has_format_token {
+        None
+    } else {
+        Some(format!("{} flac", q))
+    }
+}
+
+fn rank_and_dedup_hits(
+    collected: Vec<SlskSearchHit>,
+    limit: usize,
+) -> (Vec<Track>, Vec<(String, Vec<String>)>) {
+    let mut by_key: HashMap<String, Vec<SlskSearchHit>> = HashMap::new();
+    for hit in collected {
+        by_key.entry(hit.track.song_key()).or_default().push(hit);
+    }
+
+    let mut out: Vec<SlskSearchHit> = Vec::with_capacity(by_key.len());
+    let mut alt_updates: Vec<(String, Vec<String>)> = Vec::new();
+    for (key, mut hits) in by_key {
+        hits.sort_by_key(|h| {
+            std::cmp::Reverse((
+                h.track.is_lossless() as u8,
+                h.track.quality_tier() as u8,
+                h.slot_free as u8,
+                h.track.quality_score(),
+                h.avg_speed,
+            ))
+        });
+        let mut seen_urls = HashSet::new();
+        let urls: Vec<String> = hits
+            .iter()
+            .filter(|h| seen_urls.insert(h.track.stream_url.clone()))
+            .map(|h| h.track.stream_url.clone())
+            .take(4)
+            .collect();
+        if urls.len() > 1 {
+            alt_updates.push((key, urls));
+        }
+        if let Some(best) = hits.into_iter().next() {
+            out.push(best);
+        }
+    }
+
+    out.sort_by_key(|h| {
+        std::cmp::Reverse((
+            h.track.is_lossless() as u8,
+            h.track.quality_tier() as u8,
+            h.slot_free as u8,
+            h.track.quality_score(),
+            h.avg_speed,
+        ))
+    });
+    let tracks = out.into_iter().take(limit).map(|h| h.track).collect();
+    (tracks, alt_updates)
 }
 
 // --- Binary protocol helpers ---
@@ -1304,7 +1466,7 @@ fn parse_search_response(compressed: &[u8], peer_hint: Option<&str>) -> Option<(
     let count = cur.read_u32()? as usize;
 
     let mut parsed_tracks = Vec::new();
-    for _ in 0..count.min(200) {
+    for _ in 0..count.min(400) {
         let _code = cur.read_u8()?;
         let filename = cur.read_string()?;
         let size = cur.read_u64()?;
@@ -1926,5 +2088,67 @@ mod tests {
         peer_task.await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_flac_search_query_appends_flac_when_absent() {
+        assert_eq!(build_flac_search_query("Daft Punk").as_deref(), Some("Daft Punk flac"));
+        assert_eq!(build_flac_search_query("Daft Punk flac"), None);
+        assert_eq!(build_flac_search_query("Discovery lossless"), None);
+        assert_eq!(build_flac_search_query("   "), None);
+    }
+
+    #[test]
+    fn rank_and_dedup_hits_prefers_lossless_flac_over_free_slot_mp3() {
+        let mp3_free = SlskSearchHit {
+            track: Track {
+                id: "slsk:mp3".into(),
+                source: "soulseek".into(),
+                title: "Ao To Natsu".into(),
+                artist: "Mrs. GREEN APPLE".into(),
+                format: "mp3".into(),
+                bitrate: 320,
+                stream_url: "slsk://peer_mp3/ao.mp3".into(),
+                ..Default::default()
+            },
+            slot_free: true,
+            avg_speed: 5000,
+        };
+        let flac_queued = SlskSearchHit {
+            track: Track {
+                id: "slsk:flac".into(),
+                source: "soulseek".into(),
+                title: "Ao To Natsu".into(),
+                artist: "Mrs. GREEN APPLE".into(),
+                format: "flac".into(),
+                bitrate: 950,
+                stream_url: "slsk://peer_flac/ao.flac".into(),
+                ..Default::default()
+            },
+            slot_free: false,
+            avg_speed: 800,
+        };
+        let other_mp3_free = SlskSearchHit {
+            track: Track {
+                id: "slsk:mp3_other".into(),
+                source: "soulseek".into(),
+                title: "Inferno".into(),
+                artist: "Mrs. GREEN APPLE".into(),
+                format: "mp3".into(),
+                bitrate: 320,
+                stream_url: "slsk://peer_mp3/inferno.mp3".into(),
+                ..Default::default()
+            },
+            slot_free: true,
+            avg_speed: 9000,
+        };
+
+        let (ranked, alts) = rank_and_dedup_hits(vec![mp3_free, flac_queued, other_mp3_free], 2);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].id, "slsk:flac");
+        assert!(ranked[0].is_lossless());
+        assert_eq!(ranked[1].id, "slsk:mp3_other");
+        assert_eq!(alts.len(), 1);
+        assert_eq!(alts[0].1[0], "slsk://peer_flac/ao.flac");
     }
 }

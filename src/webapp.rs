@@ -1561,9 +1561,6 @@ pub async fn stats(
         "peakWeekday": computed.peak_weekday,
         "moods": computed.moods,
         "genres": computed.genres,
-        "qualityTiers": computed.quality_tiers,
-        "formats": computed.formats,
-        "sources": computed.sources,
         "decades": computed.decades,
         "oldestTrack": computed.oldest_track,
         "newestTrack": computed.newest_track,
@@ -2604,7 +2601,6 @@ pub async fn public_share_oembed(
         "provider_name": "Beatlab",
         "provider_url": origin,
         "title": title,
-        "author_name": share.creator_name,
         "thumbnail_url": cover_url,
         "thumbnail_width": 600,
         "thumbnail_height": 600,
@@ -2994,6 +2990,13 @@ mod tests {
         assert!(html.contains("renderStatsView"));
         assert!(html.contains("shareEntity"));
         assert!(html.contains("data-route=\"stats\""));
+        assert!(!html.contains("Audio Quality &amp; Codecs"));
+        assert!(!html.contains("Sources &amp; Signals"));
+        assert!(!html.contains("favoriteSourceLabel"));
+        assert!(!html.contains("renderStatsDonutSvg"));
+        assert!(!html.contains(".stats-grid-3"));
+        assert!(!html.contains(".stats-signal-grid"));
+        assert!(!html.contains("linear-gradient"));
         assert!(html.contains(&format!(
             r#"href="/web/favicon.svg?v={}""#,
             favicon_asset().short_hash
@@ -3155,7 +3158,20 @@ mod tests {
             format: "m4a".into(),
             ..Default::default()
         };
-        store.upsert_tracks(&[t1.clone(), t2.clone()]).unwrap();
+        let t3 = Track {
+            id: "ytm:st3".into(),
+            source: "ytm".into(),
+            title: "Veridis Quo".into(),
+            artist: "Daft Punk".into(),
+            album: "Discovery".into(),
+            genre: "Electronic".into(),
+            year: 2001,
+            duration: 345,
+            bitrate: 256,
+            format: "m4a".into(),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[t1.clone(), t2.clone(), t3.clone()]).unwrap();
 
         let (u1, _) = store.authenticate_or_create_user("stat_alice", "pw123").unwrap();
         let (u2, _) = store.authenticate_or_create_user("stat_bob", "pw123").unwrap();
@@ -3168,7 +3184,7 @@ mod tests {
         store.record_event(u1.id, &t2.id, "skip", 1.0).unwrap();
         store.star_track(u1.id, &t1.id).unwrap();
         store.set_rating(u1.id, &t1.id, 5).unwrap();
-        store.record_event(u2.id, &t2.id, "complete", 1.0).unwrap();
+        store.record_event(u2.id, &t3.id, "complete", 1.0).unwrap();
 
         let state = AppState {
             store: store.clone(),
@@ -3214,8 +3230,14 @@ mod tests {
         assert!(b1["weekdays"].as_array().unwrap().len() == 7);
         assert!(b1["moods"].as_array().unwrap().len() == 10);
         assert!(b1["timeline"]["points"].as_array().unwrap().len() == 30);
+        assert!(b1.get("qualityTiers").is_none());
+        assert!(b1.get("formats").is_none());
+        assert!(b1.get("sources").is_none());
+        assert!(b1["summary"].get("favoriteSource").is_none());
+        assert!(b1["summary"].get("favoriteSourceLabel").is_none());
+        assert!(b1["library"].get("signalsInRange").is_none());
 
-        // Bob sees only his 1 completed stream
+        // Bob sees only his 1 completed stream (and no source/codec stats)
         let mut h2 = HeaderMap::new();
         h2.insert(header::AUTHORIZATION, format!("Bearer {}", tok2).parse().unwrap());
         let res2 = stats(
@@ -3224,10 +3246,19 @@ mod tests {
             h2,
         )
         .await;
-        let b2: Value = serde_json::from_slice(&to_bytes(res2.into_body(), 1024 * 256).await.unwrap()).unwrap();
+        let b2_bytes = to_bytes(res2.into_body(), 1024 * 256).await.unwrap();
+        let b2_str = std::str::from_utf8(&b2_bytes).unwrap();
+        assert!(!b2_str.contains("YouTube Music"));
+        let b2: Value = serde_json::from_slice(&b2_bytes).unwrap();
         assert_eq!(b2["summary"]["totalStreams"], 1);
         assert_eq!(b2["summary"]["completedStreams"], 1);
         assert_eq!(b2["library"]["likedTracks"], 0);
+        assert!(b2.get("qualityTiers").is_none());
+        assert!(b2.get("formats").is_none());
+        assert!(b2.get("sources").is_none());
+        assert!(b2["summary"].get("favoriteSource").is_none());
+        assert!(b2["summary"].get("favoriteSourceLabel").is_none());
+        assert!(b2["library"].get("signalsInRange").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3339,6 +3370,24 @@ mod tests {
         assert!(html.contains("Sign In"));
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("&lt;/script&gt;"));
+        assert!(!html.contains("backdrop-wrap"));
+        assert!(!html.contains("radial-gradient"));
+        assert!(!html.contains("linear-gradient"));
+        assert!(!html.contains("Shared by sharer on Beatlab"));
+
+        // 2b. oEmbed and iframe embed omit sharer username and gradients
+        let oembed_res = public_share_oembed(State(state.clone()), Path(share_id.clone()), bot_hdrs.clone()).await;
+        assert_eq!(oembed_res.status(), StatusCode::OK);
+        let oembed_bytes = to_bytes(oembed_res.into_body(), 1024 * 64).await.unwrap();
+        let oembed_val: Value = serde_json::from_slice(&oembed_bytes).unwrap();
+        assert!(oembed_val.get("author_name").is_none());
+        assert!(!std::str::from_utf8(&oembed_bytes).unwrap().contains("sharer"));
+
+        let embed_res = public_share_embed_page(State(state.clone()), Path(share_id.clone()), bot_hdrs.clone()).await;
+        assert_eq!(embed_res.status(), StatusCode::OK);
+        let embed_html = String::from_utf8(to_bytes(embed_res.into_body(), 1024 * 64).await.unwrap().to_vec()).unwrap();
+        assert!(!embed_html.contains("linear-gradient"));
+        assert!(!embed_html.contains("sharer"));
 
         // 3. Cover endpoint always returns raster image (PNG/JPEG), never SVG
         let cov_res = public_share_cover(State(state.clone()), Path(share_id.clone())).await;

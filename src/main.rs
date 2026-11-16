@@ -31,7 +31,7 @@ use store::Store;
 use subsonic::AppState;
 use taste::TasteEngine;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 fn web_ui_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
@@ -100,9 +100,7 @@ async fn main() -> models::AppResult<()> {
         let srv = std::env::var("BEATLAB_SLSK_SERVER").ok();
         let slsk = soulseek.clone();
         tokio::spawn(async move {
-            if let Err(e) = slsk.connect(&u, &p, srv.as_deref()).await {
-                warn!(error = %e, "soulseek env login failed");
-            }
+            slsk.maintain_connection(u, p, srv).await;
         });
     }
 

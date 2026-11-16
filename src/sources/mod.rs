@@ -101,7 +101,7 @@ impl SourceRegistry {
                 &self.ytm,
                 &self.archive,
             ];
-            if self.soulseek.available() {
+            if self.soulseek.available_or_connecting() {
                 v.push(&*self.soulseek);
             }
             v
@@ -129,6 +129,38 @@ impl SourceRegistry {
     }
 }
 
+/// Picks the higher-quality track between `a` and `b` while preserving missing metadata
+/// (artwork, genre, moods, year, Deezer ID, popularity metadata, album).
+pub fn merge_track_pair(a: Track, b: Track) -> Track {
+    let (mut winner, loser) = if a.quality_score() > b.quality_score() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    if winner.cover_url.is_empty() && !loser.cover_url.is_empty() {
+        winner.cover_url = loser.cover_url;
+    }
+    if winner.genre.is_empty() && !loser.genre.is_empty() {
+        winner.genre = loser.genre;
+    }
+    if winner.moods.is_empty() && !loser.moods.is_empty() {
+        winner.moods = loser.moods;
+    }
+    if winner.year == 0 && loser.year > 0 {
+        winner.year = loser.year;
+    }
+    if winner.deezer_id.is_empty() && !loser.deezer_id.is_empty() {
+        winner.deezer_id = loser.deezer_id;
+    }
+    if winner.meta.is_empty() && !loser.meta.is_empty() {
+        winner.meta = loser.meta;
+    }
+    if (winner.album.is_empty() || winner.album == winner.title) && !loser.album.is_empty() {
+        winner.album = loser.album;
+    }
+    winner
+}
+
 /// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality
 /// and clean metadata.
 pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
@@ -137,33 +169,7 @@ pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
         let key = t.song_key();
         match best_by_key.remove(&key) {
             Some(existing) => {
-                let (mut winner, loser) = if t.quality_score() > existing.quality_score() {
-                    (t, existing)
-                } else {
-                    (existing, t)
-                };
-                if winner.cover_url.is_empty() && !loser.cover_url.is_empty() {
-                    winner.cover_url = loser.cover_url;
-                }
-                if winner.genre.is_empty() && !loser.genre.is_empty() {
-                    winner.genre = loser.genre;
-                }
-                if winner.moods.is_empty() && !loser.moods.is_empty() {
-                    winner.moods = loser.moods;
-                }
-                if winner.year == 0 && loser.year > 0 {
-                    winner.year = loser.year;
-                }
-                if winner.deezer_id.is_empty() && !loser.deezer_id.is_empty() {
-                    winner.deezer_id = loser.deezer_id;
-                }
-                if winner.meta.is_empty() && !loser.meta.is_empty() {
-                    winner.meta = loser.meta;
-                }
-                if (winner.album.is_empty() || winner.album == winner.title) && !loser.album.is_empty() {
-                    winner.album = loser.album;
-                }
-                best_by_key.insert(key, winner);
+                best_by_key.insert(key, merge_track_pair(t, existing));
             }
             None => {
                 best_by_key.insert(key, t);

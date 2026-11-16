@@ -1,7 +1,7 @@
 use crate::models::{
     primary_artist, slug, AlbumSummary, ArtistSummary, Mood, Track, UserTrackStats,
 };
-use crate::sources::{dedup_tracks_prefer_quality, SourceRegistry};
+use crate::sources::{dedup_tracks_prefer_quality, merge_track_pair, SourceRegistry};
 use crate::store::{search_match_score, Store};
 use chrono::Utc;
 use serde::Serialize;
@@ -678,6 +678,7 @@ pub struct TasteEngine {
     pub store: Store,
     pub sources: SourceRegistry,
     expanding_users: std::sync::Arc<std::sync::Mutex<HashSet<i64>>>,
+    slsk_checked: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>,
 }
 
 impl TasteEngine {
@@ -686,7 +687,26 @@ impl TasteEngine {
             store,
             sources,
             expanding_users: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+            slsk_checked: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    fn should_probe_slsk(&self, cache_key: &str) -> bool {
+        if !self.sources.soulseek.available_or_connecting() {
+            return false;
+        }
+        let now = Utc::now().timestamp();
+        let mut guard = self.slsk_checked.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.len() > 2048 {
+            guard.retain(|_, ts| now - *ts < 1800);
+        }
+        if let Some(&ts) = guard.get(cache_key) {
+            if now - ts < 1800 {
+                return false;
+            }
+        }
+        guard.insert(cache_key.to_string(), now);
+        true
     }
 
     pub fn mark_taste_dirty(&self, user_id: i64) {
@@ -1691,7 +1711,8 @@ impl TasteEngine {
                 if let Some((meta, tracks)) = self.sources.deezer.fetch_album(dz_id).await {
                     let _ = self.store.upsert_album_meta(&meta);
                     let _ = self.store.upsert_tracks(&tracks);
-                    let final_tracks = self.store.album_tracks(&meta.id).unwrap_or(tracks);
+                    let stored = self.store.album_tracks(&meta.id).unwrap_or(tracks);
+                    let final_tracks = self.upgrade_album_from_soulseek(&meta, stored).await;
                     return Some((meta, final_tracks));
                 }
             }
@@ -1703,17 +1724,108 @@ impl TasteEngine {
             } else {
                 existing_tracks
             };
-            return Some((summary, tracks));
+            let upgraded = self.upgrade_album_from_soulseek(&summary, tracks).await;
+            return Some((summary, upgraded));
         }
 
         if let Some(dz_id) = dz_album_id {
             if let Some((meta, tracks)) = self.sources.deezer.fetch_album(&dz_id).await {
                 let _ = self.store.upsert_album_meta(&meta);
                 let _ = self.store.upsert_tracks(&tracks);
-                return Some((meta, tracks));
+                let upgraded = self.upgrade_album_from_soulseek(&meta, tracks).await;
+                return Some((meta, upgraded));
             }
         }
         None
+    }
+
+    async fn upgrade_album_from_soulseek(
+        &self,
+        meta: &AlbumSummary,
+        tracks: Vec<Track>,
+    ) -> Vec<Track> {
+        if tracks.is_empty()
+            || tracks.iter().all(|t| t.is_lossless())
+            || !self.should_probe_slsk(&format!("al:{}", meta.id))
+        {
+            return tracks;
+        }
+        use crate::sources::MusicSource;
+        let q = format!("{} {} flac", primary_artist(&meta.artist), meta.name);
+        let hits = match tokio::time::timeout(
+            std::time::Duration::from_millis(3200),
+            self.sources.soulseek.search(&q, 25),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => return tracks,
+        };
+
+        let mut base_by_key: HashMap<String, Track> = HashMap::new();
+        for t in &tracks {
+            base_by_key.entry(t.song_key()).or_insert_with(|| t.clone());
+        }
+
+        let mut upgraded = Vec::new();
+        for mut h in hits {
+            if !h.is_lossless() {
+                continue;
+            }
+            if let Some(base) = base_by_key.get(&h.song_key()) {
+                enrich_slsk_hit_with_base(&mut h, base, true);
+                upgraded.push(h);
+            }
+        }
+        if upgraded.is_empty() {
+            return tracks;
+        }
+        let _ = self.store.upsert_tracks(&upgraded);
+        self.store.album_tracks(&meta.id).unwrap_or(tracks)
+    }
+
+    async fn upgrade_artist_from_soulseek(
+        &self,
+        meta: &ArtistSummary,
+        tracks: Vec<Track>,
+    ) -> Vec<Track> {
+        if tracks.iter().any(|t| t.is_lossless())
+            || !self.should_probe_slsk(&format!("ar:{}", meta.id))
+        {
+            return tracks;
+        }
+        use crate::sources::MusicSource;
+        let q = format!("{} flac", meta.name);
+        let hits = match tokio::time::timeout(
+            std::time::Duration::from_millis(3200),
+            self.sources.soulseek.search(&q, 25),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => return tracks,
+        };
+
+        let mut base_by_key: HashMap<String, Track> = HashMap::new();
+        for t in &tracks {
+            base_by_key.entry(t.song_key()).or_insert_with(|| t.clone());
+        }
+
+        let mut matched = Vec::new();
+        for mut h in hits {
+            if !h.is_lossless() || !is_same_or_featured_artist(&h.artist, &meta.name) {
+                continue;
+            }
+            if let Some(base) = base_by_key.get(&h.song_key()) {
+                enrich_slsk_hit_with_base(&mut h, base, false);
+            }
+            matched.push(h);
+        }
+        if matched.is_empty() {
+            return tracks;
+        }
+        let _ = self.store.upsert_tracks(&matched);
+        merge_tracks_dedup(matched, tracks)
     }
 
     /// Loads full artist profile + top tracks + albums + related artists, hydrating live from Deezer when available.
@@ -1766,18 +1878,20 @@ impl TasteEngine {
                     self.store.artist_tracks(&meta.id).unwrap_or_default(),
                     top_tracks,
                 );
+                let upgraded_tracks = self.upgrade_artist_from_soulseek(&meta, merged_tracks).await;
                 let merged_albums = merge_albums_dedup(
                     self.store.artist_albums(user_id, &meta.id).unwrap_or_default(),
                     dz_albums,
                 );
-                return Some((meta, merged_tracks, merged_albums, related));
+                return Some((meta, upgraded_tracks, merged_albums, related));
             }
         }
 
         let summary = local_summary?;
         let tracks = self.store.artist_tracks(&summary.id).unwrap_or_default();
+        let upgraded = self.upgrade_artist_from_soulseek(&summary, tracks).await;
         let albums = self.store.artist_albums(user_id, &summary.id).unwrap_or_default();
-        Some((summary, tracks, albums, vec![]))
+        Some((summary, upgraded, albums, vec![]))
     }
 
     pub async fn similar_songs_async(&self, seed: &Track, count: usize) -> Vec<Track> {
@@ -4872,11 +4986,49 @@ fn dedup_and_interleave_with_anchor(
     out
 }
 
+fn enrich_slsk_hit_with_base(hit: &mut Track, base: &Track, lock_album_track_pos: bool) {
+    hit.artist = base.artist.clone();
+    if lock_album_track_pos || !base.album.is_empty() {
+        hit.album = base.album.clone();
+    }
+    if lock_album_track_pos {
+        if base.track_no > 0 {
+            hit.track_no = base.track_no;
+        }
+        if base.disc_no > 0 {
+            hit.disc_no = base.disc_no;
+        }
+    }
+    if hit.year == 0 && base.year > 0 {
+        hit.year = base.year;
+    }
+    if hit.genre.is_empty() && !base.genre.is_empty() {
+        hit.genre = base.genre.clone();
+    }
+    if hit.moods.is_empty() && !base.moods.is_empty() {
+        hit.moods = base.moods.clone();
+    }
+    if hit.cover_url.is_empty() && !base.cover_url.is_empty() {
+        hit.cover_url = base.cover_url.clone();
+    }
+    if hit.deezer_id.is_empty() && !base.deezer_id.is_empty() {
+        hit.deezer_id = base.deezer_id.clone();
+    }
+    if !base.meta.is_empty() {
+        hit.meta = base.meta.clone();
+    }
+}
+
 fn merge_tracks_dedup(primary: Vec<Track>, secondary: Vec<Track>) -> Vec<Track> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut index_by_key: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<Track> = Vec::new();
     for t in primary.into_iter().chain(secondary) {
-        if seen.insert(t.song_key()) {
+        let key = t.song_key();
+        if let Some(&idx) = index_by_key.get(&key) {
+            let existing = std::mem::take(&mut out[idx]);
+            out[idx] = merge_track_pair(existing, t);
+        } else {
+            index_by_key.insert(key, out.len());
             out.push(t);
         }
     }

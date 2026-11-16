@@ -75,7 +75,7 @@ pub fn build_share_meta(share: &ShareRecord, tracks: &[Track]) -> (String, Strin
             if !t.genre.trim().is_empty() {
                 parts.push(t.genre.trim().to_string());
             }
-            parts.push(format!("Shared by {} on Beatlab", share.creator_name));
+            parts.push("Listen on Beatlab".to_string());
             return (title, parts.join(" · "));
         }
     }
@@ -107,7 +107,7 @@ pub fn build_share_meta(share: &ShareRecord, tracks: &[Track]) -> (String, Strin
     if total_secs > 0 {
         header_parts.push(fmt_total_dur(total_secs));
     }
-    header_parts.push(format!("Shared by {} on Beatlab", share.creator_name));
+    header_parts.push("Listen on Beatlab".to_string());
 
     let preview_lines: Vec<String> = tracks
         .iter()
@@ -305,28 +305,6 @@ pub fn render_share_html(
     button {{ cursor: pointer; border: none; background: none; }}
     .hidden {{ display: none !important; }}
 
-    .backdrop-wrap {{
-      position: fixed;
-      inset: 0;
-      z-index: 0;
-      overflow: hidden;
-      pointer-events: none;
-    }}
-    .backdrop-img {{
-      position: absolute;
-      inset: -48px;
-      background-size: cover;
-      background-position: center;
-      filter: blur(70px) saturate(1.4) brightness(0.28);
-      transform: scale(1.12);
-      transition: background-image 0.45s ease;
-    }}
-    .backdrop-vignette {{
-      position: absolute;
-      inset: 0;
-      background: radial-gradient(circle at 50% 15%, rgba(12,14,19,0.25) 0%, rgba(12,14,19,0.92) 72%, #0c0e13 100%);
-    }}
-
     .shell {{
       position: relative;
       z-index: 1;
@@ -335,7 +313,7 @@ pub fn render_share_html(
       padding: 18px 18px 48px;
       display: flex;
       flex-direction: column;
-      gap: 20px;
+      gap: 18px;
     }}
 
     .topbar {{
@@ -345,11 +323,9 @@ pub fn render_share_html(
       gap: 12px;
       flex-wrap: wrap;
       padding: 10px 14px;
-      background: rgba(18, 21, 28, 0.78);
-      backdrop-filter: blur(18px);
-      -webkit-backdrop-filter: blur(18px);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
     }}
     .brand {{
       display: inline-flex;
@@ -371,7 +347,7 @@ pub fn render_share_html(
       color: #06120b;
       font-weight: 700;
       padding: 8px 16px;
-      border-radius: 8px;
+      border-radius: 6px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -382,12 +358,12 @@ pub fn render_share_html(
     .btn-primary:hover {{ background: var(--accent-hover); }}
     .btn-primary:active {{ transform: scale(0.98); }}
     .btn-secondary {{
-      background: rgba(25, 29, 38, 0.9);
+      background: var(--surface-2);
       border: 1px solid var(--border-bright);
       color: var(--text);
       font-weight: 600;
       padding: 8px 14px;
-      border-radius: 8px;
+      border-radius: 6px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -402,7 +378,7 @@ pub fn render_share_html(
       align-items: center;
       gap: 7px;
       padding: 4px 11px 4px 5px;
-      border-radius: 8px;
+      border-radius: 6px;
       background: var(--surface-2);
       border: 1px solid var(--border);
       font-size: 13px;
@@ -411,7 +387,7 @@ pub fn render_share_html(
     .avatar-dot {{
       width: 24px;
       height: 24px;
-      border-radius: 6px;
+      border-radius: 4px;
       background: var(--accent);
       color: #06120b;
       font-weight: 800;
@@ -421,26 +397,22 @@ pub fn render_share_html(
     }}
 
     .player-card {{
-      background: rgba(18, 21, 28, 0.84);
-      backdrop-filter: blur(22px);
-      -webkit-backdrop-filter: blur(22px);
-      border: 1px solid rgba(255,255,255,0.09);
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 22px;
       display: grid;
       grid-template-columns: 248px minmax(0, 1fr);
-      gap: 24px;
+      gap: 22px;
       align-items: center;
     }}
     .art-box {{
       position: relative;
       width: 100%;
       aspect-ratio: 1 / 1;
-      border-radius: 12px;
+      border-radius: 6px;
       overflow: hidden;
-      border: 1px solid rgba(255,255,255,0.1);
-      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.55);
+      border: 1px solid var(--border);
       background: var(--surface-2);
     }}
     .art-box img {{
@@ -453,14 +425,14 @@ pub fn render_share_html(
       position: absolute;
       left: 10px;
       bottom: 10px;
-      background: rgba(12, 14, 19, 0.86);
-      border: 1px solid rgba(30, 215, 96, 0.45);
+      background: var(--bg);
+      border: 1px solid var(--border-bright);
       color: var(--accent);
       font-size: 10.5px;
       font-weight: 700;
       letter-spacing: 0.04em;
-      padding: 3px 9px;
-      border-radius: 999px;
+      padding: 3px 8px;
+      border-radius: 4px;
     }}
 
     .meta-col {{
@@ -530,9 +502,9 @@ pub fn render_share_html(
       gap: 10px;
       margin-top: 4px;
       padding: 14px 16px;
-      background: rgba(12, 14, 19, 0.55);
-      border: 1px solid rgba(255,255,255,0.07);
-      border-radius: 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
     }}
     .progress-row {{
       display: flex;
@@ -615,11 +587,9 @@ pub fn render_share_html(
     }}
 
     .card-panel {{
-      background: rgba(18, 21, 28, 0.82);
-      backdrop-filter: blur(18px);
-      -webkit-backdrop-filter: blur(18px);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
       padding: 18px 20px;
     }}
     .panel-head {{
@@ -726,9 +696,10 @@ pub fn render_share_html(
       gap: 16px;
       flex-wrap: wrap;
       padding: 18px 22px;
-      background: linear-gradient(135deg, rgba(30, 215, 96, 0.12) 0%, rgba(18, 21, 28, 0.92) 70%);
-      border: 1px solid rgba(30, 215, 96, 0.28);
-      border-radius: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border-bright);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
     }}
     .cta-banner h3 {{ font-size: 17px; font-weight: 800; margin-bottom: 3px; }}
     .cta-banner p {{ font-size: 13px; color: var(--text-muted); }}
@@ -748,7 +719,7 @@ pub fn render_share_html(
       max-width: 400px;
       background: var(--surface);
       border: 1px solid var(--border-bright);
-      border-radius: 12px;
+      border-radius: 6px;
       padding: 24px;
       display: flex;
       flex-direction: column;
@@ -793,14 +764,13 @@ pub fn render_share_html(
       bottom: 24px;
       transform: translateX(-50%);
       z-index: 300;
-      background: var(--surface-2);
+      background: var(--text);
       border: 1px solid var(--border-bright);
-      color: var(--text);
-      padding: 9px 16px;
-      border-radius: 999px;
+      color: var(--bg);
+      padding: 9px 18px;
+      border-radius: 6px;
       font-size: 13px;
-      font-weight: 600;
-      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+      font-weight: 700;
     }}
 
     @media (max-width: 720px) {{
@@ -824,11 +794,6 @@ pub fn render_share_html(
   </style>
 </head>
 <body>
-  <div class="backdrop-wrap" aria-hidden="true">
-    <div id="bg-blur" class="backdrop-img" style="background-image:url('/s/{esc_id}/cover')"></div>
-    <div class="backdrop-vignette"></div>
-  </div>
-
   <div class="shell">
     <header class="topbar">
       <a class="brand" href="/">
@@ -1083,7 +1048,6 @@ pub fn render_share_html(
       if (!t) return;
       const art = t.coverUrl || DATA.coverUrl;
       $('cover-img').src = art;
-      $('bg-blur').style.backgroundImage = `url('${{art}}')`;
       $('now-title').textContent = DATA.kind === 'track' ? t.title : (tracks.length > 1 ? `${{t.title}}` : DATA.title);
       const subParts = [t.artist];
       if (t.album) subParts.push(t.album);
@@ -1479,13 +1443,13 @@ pub fn render_embed_html(origin: &str, share: &ShareRecord, tracks: &[Track]) ->
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     html, body {{ height: 100%; background: #0c0e13; color: #f3f5f8; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }}
-    .wrap {{ height: 100%; display: flex; align-items: center; gap: 14px; padding: 12px 14px; background: linear-gradient(135deg, rgba(30,215,96,0.12), #12151c 70%); border: 1px solid #232834; }}
-    .art {{ width: 104px; height: 104px; border-radius: 8px; object-fit: cover; flex-shrink: 0; background: #191d26; }}
+    .wrap {{ height: 100%; display: flex; align-items: center; gap: 14px; padding: 12px 14px; background: #12151c; border: 1px solid #232834; }}
+    .art {{ width: 104px; height: 104px; border-radius: 6px; object-fit: cover; flex-shrink: 0; background: #191d26; border: 1px solid #232834; }}
     .body {{ flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }}
     .head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }}
     .title {{ font-size: 15px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .sub {{ font-size: 12.5px; color: #98a2b3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .open {{ font-size: 11px; font-weight: 700; color: #1ed760; text-decoration: none; flex-shrink: 0; padding: 3px 8px; border-radius: 999px; background: rgba(30,215,96,0.12); border: 1px solid rgba(30,215,96,0.3); }}
+    .open {{ font-size: 11px; font-weight: 700; color: #1ed760; text-decoration: none; flex-shrink: 0; padding: 3px 8px; border-radius: 4px; background: #191d26; border: 1px solid #343b4c; }}
     .ctrl {{ display: flex; align-items: center; gap: 10px; }}
     .play {{ width: 38px; height: 38px; border-radius: 50%; border: none; background: #1ed760; color: #06120b; display: grid; place-items: center; cursor: pointer; flex-shrink: 0; }}
     .play svg {{ width: 18px; height: 18px; display: block; }}
