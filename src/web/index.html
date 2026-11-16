@@ -188,14 +188,6 @@
       </div>
 
       <div id="rp-queue-body" class="rp-body">
-        <div class="queue-controls">
-          <label class="toggle-row" title="Automatically play related songs when queue ends">
-            <span>Autoplay Radio</span>
-            <input id="autoplay-toggle" type="checkbox" checked onchange="App.toggleAutoplay(this.checked)" />
-          </label>
-          <button class="mini-btn" onclick="App.startRadioFromCurrent()">Track Radio</button>
-          <button class="mini-btn ghost" onclick="App.clearQueue()">Clear</button>
-        </div>
         <div id="queue-now-playing" class="queue-section"></div>
         <div id="queue-up-next" class="queue-section"></div>
       </div>
@@ -334,16 +326,6 @@
             <button id="fs-tab-lyrics" class="fs-tab" onclick="App.setFsTab('lyrics')">Lyrics</button>
           </div>
           <div id="fs-queue-panel" class="fs-panel-body">
-            <div class="queue-controls">
-              <label class="toggle-row" title="Automatically play related songs when queue ends">
-                <span>Autoplay Radio</span>
-                <input id="fs-autoplay-toggle" type="checkbox" checked onchange="App.toggleAutoplay(this.checked)" />
-              </label>
-              <div class="fs-queue-actions">
-                <button class="mini-btn" onclick="App.startRadioFromCurrent()">Track Radio</button>
-                <button class="mini-btn ghost" onclick="App.clearQueue()">Clear</button>
-              </div>
-            </div>
             <div id="fs-queue-now-playing" class="queue-section"></div>
             <div id="fs-queue-up-next" class="queue-section"></div>
           </div>

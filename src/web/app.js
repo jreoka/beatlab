@@ -641,8 +641,6 @@
     $('pb-volume').value = String(state.volume);
     updateVolumeIcon();
     localStorage.removeItem('beatlab_quality');
-    $('autoplay-toggle').checked = state.autoplay;
-    $('fs-autoplay-toggle').checked = state.autoplay;
     wirePlayerBarToggle();
     wireFsSwipeClose();
     wirePwaLifecycle();
@@ -2765,20 +2763,6 @@
             <div class="settings-metric"><span>Audio Cache</span><strong>${srcData.cacheMb} MB</strong></div>
             <div class="settings-metric"><span>FFmpeg</span><strong>${srcData.ffmpeg ? 'Ready' : 'Off'}</strong></div>
           </div>
-          <div class="settings-source-list">
-            ${(srcData.sources || [])
-              .map(
-                (s) => `
-              <div class="settings-source-item">
-                <div class="settings-source-head">
-                  <span class="status-dot ${s.available ? 'on' : 'off'}"></span>
-                  <strong>${esc(s.name)}</strong>
-                </div>
-                <div class="settings-source-status">${esc(s.status)}</div>
-              </div>`
-              )
-              .join('') || '<p class="settings-empty">Loading source status...</p>'}
-          </div>
         </div>
       `;
       return;
@@ -3069,16 +3053,7 @@
     },
     toggleAutoplay: (v) => {
       state.autoplay = !!v;
-      $('autoplay-toggle').checked = state.autoplay;
-      if ($('fs-autoplay-toggle')) $('fs-autoplay-toggle').checked = state.autoplay;
       localStorage.setItem('beatlab_autoplay', state.autoplay ? 'true' : 'false');
-    },
-    clearQueue: () => {
-      const cur = currentTrack();
-      state.queue = cur ? [cur] : [];
-      state.queueIndex = cur ? 0 : -1;
-      renderQueuePanel();
-      saveServerQueue();
     },
     removeFromQueue: (idx) => {
       if (idx > state.queueIndex && idx < state.queue.length) {
@@ -3086,10 +3061,6 @@
         renderQueuePanel();
         saveServerQueue();
       }
-    },
-    startRadioFromCurrent: () => {
-      const cur = currentTrack();
-      startRadioForId(cur ? cur.id : '');
     },
     startRadioForId,
     playListByIds,
