@@ -38,6 +38,16 @@ pub struct Store {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// A lightweight view of a persisted login session, safe to return to the
+/// browser. `token` doubles as the session id used by the revoke endpoints.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub token: String,
+    pub kind: String,
+    pub created: i64,
+    pub expires: i64,
+}
+
 impl Store {
     pub fn open(path: &Path) -> AppResult<Self> {
         if let Some(parent) = path.parent() {
@@ -538,6 +548,47 @@ impl Store {
         let conn = self.lock();
         conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
         Ok(())
+    }
+
+    /// List the active (unexpired) sessions belonging to a user, newest first.
+    /// Expired rows are pruned opportunistically.
+    pub fn list_sessions(&self, user_id: i64) -> AppResult<Vec<SessionInfo>> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute("DELETE FROM sessions WHERE expires < ?1", params![now])?;
+        let mut stmt = conn.prepare(
+            "SELECT token, kind, created, expires FROM sessions
+             WHERE user_id = ?1 AND expires >= ?2 ORDER BY created DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, now], |r| {
+                Ok(SessionInfo {
+                    token: r.get(0)?,
+                    kind: r.get(1)?,
+                    created: r.get(2)?,
+                    expires: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Revoke a single session, but only if it belongs to the given user.
+    /// Returns true when a row was actually removed.
+    pub fn delete_session_for_user(&self, token: &str, user_id: i64) -> AppResult<bool> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM sessions WHERE token = ?1 AND user_id = ?2",
+            params![token, user_id],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Revoke every session belonging to a user. Returns the number removed.
+    pub fn delete_all_sessions_for_user(&self, user_id: i64) -> AppResult<usize> {
+        let conn = self.lock();
+        let removed = conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        Ok(removed)
     }
 
     pub fn get_or_create_api_key(&self, user_id: i64) -> AppResult<String> {
@@ -4439,6 +4490,39 @@ mod tests {
         let key2 = store.regenerate_api_key(alice.id).unwrap();
         assert_ne!(key1, key2);
         assert!(store.get_user_by_api_key(&key1).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_listing_and_revocation_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
+        let (bob, _) = store.authenticate_or_create_user("bob", "secret123").unwrap();
+
+        let t1 = store.create_session(alice.id, "web", 3600).unwrap();
+        let t2 = store.create_session(alice.id, "nd", 3600).unwrap();
+        let bob_tok = store.create_session(bob.id, "web", 3600).unwrap();
+
+        let sessions = store.list_sessions(alice.id).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|s| s.token == t1 && s.kind == "web"));
+        assert!(sessions.iter().any(|s| s.token == t2 && s.kind == "nd"));
+        assert_eq!(store.list_sessions(bob.id).unwrap().len(), 1);
+
+        // A user cannot revoke somebody else's session.
+        assert!(!store.delete_session_for_user(&bob_tok, alice.id).unwrap());
+        assert_eq!(store.list_sessions(bob.id).unwrap().len(), 1);
+
+        // Revoke one of our own sessions.
+        assert!(store.delete_session_for_user(&t1, alice.id).unwrap());
+        let sessions = store.list_sessions(alice.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].token, t2);
+
+        // Revoke every remaining session.
+        assert_eq!(store.delete_all_sessions_for_user(alice.id).unwrap(), 1);
+        assert!(store.list_sessions(alice.id).unwrap().is_empty());
+        // Other users are untouched.
+        assert_eq!(store.list_sessions(bob.id).unwrap().len(), 1);
     }
 
     #[test]

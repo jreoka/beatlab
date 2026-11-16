@@ -732,6 +732,67 @@ pub async fn signout(State(state): State<AppState>, headers: HeaderMap) -> Respo
     json_res(json!({ "ok": true }))
 }
 
+#[derive(Deserialize)]
+pub struct RevokeSessionReq {
+    pub id: String,
+}
+
+/// List the active login sessions for the signed-in user. The full session id
+/// is returned so the UI can revoke individual entries; only authenticated
+/// owners can reach this endpoint.
+pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let current_token = extract_web_token(&headers, None).unwrap_or_default();
+    let sessions = state.store.list_sessions(user.id).unwrap_or_default();
+    let items: Vec<Value> = sessions
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id": s.token,
+                "kind": s.kind,
+                "created": s.created,
+                "expires": s.expires,
+                "current": s.token == current_token,
+            })
+        })
+        .collect();
+    json_res(json!({ "count": items.len(), "sessions": items }))
+}
+
+/// Revoke one session belonging to the signed-in user.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeSessionReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let removed = state
+        .store
+        .delete_session_for_user(&req.id, user.id)
+        .unwrap_or(false);
+    if removed {
+        json_res(json!({ "ok": true }))
+    } else {
+        err_res(StatusCode::NOT_FOUND, "Session not found")
+    }
+}
+
+/// Revoke every session belonging to the signed-in user, including this one.
+pub async fn revoke_all_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let revoked = state.store.delete_all_sessions_for_user(user.id).unwrap_or(0);
+    json_res(json!({ "ok": true, "revoked": revoked }))
+}
+
 pub async fn regenerate_api_key(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,

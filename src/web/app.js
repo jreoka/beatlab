@@ -134,7 +134,9 @@
     settingsData: {
       sources: null,
       hidden: null,
+      sessions: null,
       confirmResetHidden: false,
+      confirmRevokeAll: false,
     },
     deferredInstallPrompt: null,
     isStandalone: false,
@@ -5467,6 +5469,26 @@
     });
   }
 
+  const SESSION_ICON_WEB = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>';
+  const SESSION_ICON_APP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>';
+
+  function formatSessionDate(ts) {
+    try {
+      return new Date(ts * 1000).toLocaleString(undefined, {
+        month: 'short', day: 'numeric', year: 'numeric',
+        hour: 'numeric', minute: '2-digit',
+      });
+    } catch {
+      return 'Unknown';
+    }
+  }
+
+  function sessionDevice(s) {
+    return s.kind === 'nd'
+      ? { label: 'Subsonic / Navidrome client', icon: SESSION_ICON_APP }
+      : { label: 'Web browser', icon: SESSION_ICON_WEB };
+  }
+
   function renderSettingsModalBody() {
     const body = $('settings-body');
     if (!body) return;
@@ -5587,6 +5609,67 @@
       return;
     }
 
+    if (tab === 'sessions') {
+      const data = state.settingsData.sessions || { count: 0, sessions: [] };
+      const sessions = data.sessions || [];
+      const confirmAll = !!state.settingsData.confirmRevokeAll;
+      body.innerHTML = `
+        <div class="settings-section">
+          <div class="settings-section-title">Active Sessions</div>
+          <div class="settings-row-desc" style="margin-bottom:12px">Devices currently signed in to your account. Revoke any session you don't recognize &mdash; the device will be signed out immediately.</div>
+          ${
+            sessions.length > 0
+              ? `<div class="session-list">
+                  ${sessions
+                    .map((s) => {
+                      const dev = sessionDevice(s);
+                      const isCurrent = s.current || s.id === state.token;
+                      return `
+                    <div class="session-card${isCurrent ? ' current' : ''}">
+                      <span class="session-icon">${dev.icon}</span>
+                      <div class="session-meta">
+                        <div class="session-title">
+                          ${esc(dev.label)}
+                          ${isCurrent ? '<span class="session-current-pill">This device</span>' : ''}
+                        </div>
+                        <div class="session-sub">Signed in ${esc(formatSessionDate(s.created))}</div>
+                        <div class="session-sub">Expires ${esc(formatSessionDate(s.expires))}</div>
+                      </div>
+                      <button class="mini-btn danger-btn session-revoke" title="Revoke this session" onclick="App.revokeSession(${esc(JSON.stringify(s.id))})">Revoke</button>
+                    </div>`;
+                    })
+                    .join('')}
+                </div>`
+              : `<div class="settings-empty">No active sessions found.</div>`
+          }
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Sign Out Everywhere</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Log out of all sessions</div>
+              <div class="settings-row-desc">Revoke every active session, including this one. You'll need to sign in again on all your devices.</div>
+            </div>
+          </div>
+          ${
+            confirmAll
+              ? `<div class="settings-confirm-bar">
+                  <span>Are you sure? Every device will be signed out immediately and you'll need to sign in again.</span>
+                  <div class="settings-confirm-actions">
+                    <button class="btn-secondary danger-btn" onclick="App.confirmRevokeAll()">Yes, sign out everywhere</button>
+                    <button class="mini-btn ghost" onclick="App.cancelRevokeAll()">Cancel</button>
+                  </div>
+                </div>`
+              : `<div class="settings-actions-row">
+                  <button class="btn-secondary danger-btn" onclick="App.promptRevokeAll()">Sign out of every session</button>
+                </div>`
+          }
+        </div>
+      `;
+      return;
+    }
+
     if (tab === 'apps') {
       const clients = ['Symfonium', 'Feishin', 'Supersonic', 'Tempo', 'DSub', 'Amperfy'];
       body.innerHTML = `
@@ -5647,6 +5730,7 @@
             <button type="button" class="btn-secondary danger-btn" onclick="App.signOut()">Sign out</button>
           </div>
         </form>
+        <button class="btn-secondary" style="margin-top:10px;width:100%" onclick="App.setSettingsTab('sessions')">Manage active sessions &rarr;</button>
       </div>
     `;
   }
@@ -5654,6 +5738,7 @@
   async function openSettingsModal(initialTab = 'general') {
     state.settingsTab = initialTab || 'general';
     state.settingsData.confirmResetHidden = false;
+    state.settingsData.confirmRevokeAll = false;
     openModal(`
       <div class="settings-shell">
         <div class="modal-head settings-modal-head">
@@ -5664,6 +5749,7 @@
           <nav class="settings-nav" aria-label="Settings sections">
             <button class="settings-nav-btn" data-stab="general" onclick="App.setSettingsTab('general')">General</button>
             <button class="settings-nav-btn" data-stab="hidden" onclick="App.setSettingsTab('hidden')">Hidden Songs</button>
+            <button class="settings-nav-btn" data-stab="sessions" onclick="App.setSettingsTab('sessions')">Sessions</button>
             <button class="settings-nav-btn" data-stab="apps" onclick="App.setSettingsTab('apps')">Apps &amp; API</button>
             <button class="settings-nav-btn" data-stab="account" onclick="App.setSettingsTab('account')">Account</button>
           </nav>
@@ -5674,12 +5760,14 @@
     renderSettingsModalBody();
 
     try {
-      const [srcRes, hidRes] = await Promise.all([
+      const [srcRes, hidRes, sessRes] = await Promise.all([
         api('/api/web/sources').catch(() => null),
         api('/api/web/hidden').catch(() => null),
+        api('/api/web/sessions').catch(() => null),
       ]);
       if (srcRes) state.settingsData.sources = srcRes;
       if (hidRes) state.settingsData.hidden = hidRes;
+      if (sessRes) state.settingsData.sessions = sessRes;
       if ($('settings-body')) {
         renderSettingsModalBody();
       }
@@ -6767,6 +6855,7 @@
       haptic('tap');
       state.settingsTab = tab;
       state.settingsData.confirmResetHidden = false;
+      state.settingsData.confirmRevokeAll = false;
       renderSettingsModalBody();
     },
     promptResetHidden: () => {
@@ -6802,6 +6891,46 @@
         renderSettingsModalBody();
         showToast('Song restored');
         renderCurrentHash();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    revokeSession: async (id) => {
+      try {
+        await api('/api/web/sessions/revoke', { method: 'POST', body: JSON.stringify({ id }) });
+        const wasCurrent = id === state.token;
+        const sessRes = await api('/api/web/sessions').catch(() => null);
+        if (sessRes) state.settingsData.sessions = sessRes;
+        state.settingsData.confirmRevokeAll = false;
+        showToast('Session revoked');
+        if (wasCurrent) {
+          window.App.signOut();
+        } else {
+          renderSettingsModalBody();
+        }
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    promptRevokeAll: () => {
+      state.settingsData.confirmRevokeAll = true;
+      renderSettingsModalBody();
+    },
+    cancelRevokeAll: () => {
+      state.settingsData.confirmRevokeAll = false;
+      renderSettingsModalBody();
+    },
+    confirmRevokeAll: async () => {
+      try {
+        const res = await api('/api/web/sessions/revoke-all', { method: 'POST' });
+        state.settingsData.sessions = { count: 0, sessions: [] };
+        state.settingsData.confirmRevokeAll = false;
+        showToast(
+          res && res.revoked > 0
+            ? `Signed out of ${res.revoked} ${res.revoked === 1 ? 'session' : 'sessions'}`
+            : 'All sessions cleared'
+        );
+        window.App.signOut();
       } catch (err) {
         showToast(err.message);
       }
