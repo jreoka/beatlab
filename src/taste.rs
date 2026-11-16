@@ -898,6 +898,12 @@ impl TasteEngine {
             .collect()
     }
 
+    fn neural_blend_weight(&self, base: f64, sctx: &ScoringContext) -> f64 {
+        let hist_len =
+            sctx.stats.len() + sctx.prof.starred.len() + sctx.prof.manual_playlist_ids.len();
+        base * self.neural.adaptive_multiplier(hist_len)
+    }
+
     pub fn train_and_distill_background(&self, max_steps: usize) -> crate::transformer::TrainEpochStats {
         self.neural
             .train_background_epoch(&self.store, max_steps, 8, true)
@@ -1220,7 +1226,20 @@ impl TasteEngine {
             .into_iter()
             .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
             .collect();
-        let n_scores = self.neural_scores(user_id, &[], None, &[], &[], &filtered);
+        let session_ctx: Vec<Track> = if user_id > 0 {
+            self.store
+                .user_recent_tracks(user_id, 8, 0)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(t, _)| t)
+                .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
+                .take(4)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let n_scores = self.neural_scores(user_id, &session_ctx, None, &[], &[], &filtered);
+        let n_w = self.neural_blend_weight(0.85, &sctx);
 
         let mut scored: Vec<(f64, Track)> = filtered
             .into_iter()
@@ -1231,7 +1250,7 @@ impl TasteEngine {
                     &sctx.prof,
                     &sctx.stats,
                     ScoreMode::Supermix,
-                ) + n_scores.get(idx).copied().unwrap_or(0.0) * 0.85;
+                ) + n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
                 (s, t)
             })
             .collect();
@@ -1363,6 +1382,7 @@ impl TasteEngine {
             })
             .collect();
         let n_scores = self.neural_scores(user_id, &[], None, &[], &[], &filtered);
+        let n_w = self.neural_blend_weight(0.95, &sctx);
 
         let mut scored: Vec<(f64, Track)> = filtered
             .into_iter()
@@ -1373,7 +1393,7 @@ impl TasteEngine {
                     &sctx.prof,
                     &sctx.stats,
                     ScoreMode::Discover,
-                ) + n_scores.get(idx).copied().unwrap_or(0.0) * 0.95;
+                ) + n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
                 (s, t)
             })
             .collect();
@@ -1460,7 +1480,7 @@ impl TasteEngine {
             || !sctx.prof.related_artist_affinity.is_empty()
             || !sctx.prof.genre_affinity.is_empty();
 
-        let mut scored: Vec<(f64, ArtistSummary)> = summaries
+        let prefiltered: Vec<(ArtistSummary, String, f64, f64, &str)> = summaries
             .into_iter()
             .filter(|a| {
                 !followed.contains(&a.id)
@@ -1492,6 +1512,26 @@ impl TasteEngine {
                     .get(&primary_artist(&a.name).to_lowercase())
                     .map(|s| s.as_str())
                     .unwrap_or("");
+                Some((a, ak, direct_aff, rel_aff, ag))
+            })
+            .collect();
+
+        let artist_pairs: Vec<(String, String)> = prefiltered
+            .iter()
+            .map(|(a, _, _, _, ag)| (a.name.clone(), (*ag).to_string()))
+            .collect();
+        let n_artist_scores = if user_id > 0 {
+            self.neural
+                .score_artist_candidates(&self.store, user_id, &artist_pairs)
+        } else {
+            Vec::new()
+        };
+        let n_w = self.neural_blend_weight(0.75, &sctx);
+
+        let mut scored: Vec<(f64, ArtistSummary)> = prefiltered
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, (a, _ak, direct_aff, rel_aff, ag))| {
                 let mut genre_aff = 0.0f64;
                 for g in split_genres(ag) {
                     if let Some(&gw) = sctx.prof.genre_affinity.get(&g) {
@@ -1501,8 +1541,9 @@ impl TasteEngine {
                         genre_aff += pgw * 0.7;
                     }
                 }
+                let n_score = n_artist_scores.get(idx).copied().unwrap_or(0.0) as f64;
                 let taste_rel = rel_aff * 6.5 + genre_aff.min(6.0) * 2.2 - direct_aff * 0.4;
-                if has_taste && rel_aff <= 0.0 && genre_aff <= 0.0 {
+                if has_taste && rel_aff <= 0.0 && genre_aff <= 0.0 && n_score <= 0.35 {
                     return None;
                 }
 
@@ -1520,7 +1561,7 @@ impl TasteEngine {
                 }
                 pop_score += (a.song_count.min(15) as f64) * 0.15;
 
-                Some((taste_rel + pop_score, a))
+                Some((taste_rel + pop_score + n_score * n_w, a))
             })
             .collect();
 
@@ -1569,6 +1610,7 @@ impl TasteEngine {
             .collect();
         let sample_ctx: Vec<Track> = pl_tracks.iter().take(12).cloned().collect();
         let n_scores = self.neural_scores(user_id, &sample_ctx, None, &[], &[], &filtered);
+        let n_w = self.neural_blend_weight(0.85, &sctx);
 
         let mut scored: Vec<(f64, Track)> = filtered
             .into_iter()
@@ -1586,7 +1628,7 @@ impl TasteEngine {
                 } else {
                     0.5
                 };
-                let n_boost = n_scores.get(idx).copied().unwrap_or(0.0) * 0.85;
+                let n_boost = n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
                 (sim * 2.2 + taste * 0.7 + fam_bonus + n_boost, t)
             })
             .collect();
@@ -2106,13 +2148,14 @@ impl TasteEngine {
             .filter(|t| !is_hidden_track(t, &sctx.prof) && !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
             .collect();
         let n_scores = self.neural_scores(user_id, &[], Some(spec.query), &[], &[], &filtered);
+        let n_w = self.neural_blend_weight(0.55, &sctx);
         let mut scored: Vec<(f64, Track)> = filtered
             .into_iter()
             .enumerate()
             .map(|(idx, t)| {
                 let taste_s = score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix);
                 let rank_s = (35usize.saturating_sub(idx) as f64) * 0.25;
-                let n_boost = n_scores.get(idx).copied().unwrap_or(0.0) * 0.55;
+                let n_boost = n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
                 (rank_s + taste_s * 0.35 + parse_rank_bonus(&t.meta) * 0.3 + n_boost, t)
             })
             .collect();
@@ -2229,7 +2272,7 @@ impl TasteEngine {
             .collect();
 
         let seed_artist_slugs: HashSet<String> = ranked_seeds.iter().map(|(ak, _, _)| ak.clone()).collect();
-        let unexpanded_followed: Vec<(String, String)> = followed
+        let mut unexpanded_followed: Vec<(String, String)> = followed
             .into_iter()
             .filter_map(|fid| {
                 let ak = slug(fid.strip_prefix("ar:").unwrap_or(&fid));
@@ -2247,6 +2290,26 @@ impl TasteEngine {
             })
             .take(2)
             .collect();
+
+        // Also let Transformer-distilled artist discoveries drive external catalog expansion.
+        let mut seen_exp: HashSet<String> = unexpanded_followed.iter().map(|(ak, _)| ak.clone()).collect();
+        if let Ok(neural_artists) = self.store.load_neural_artist_links(user_id, 10) {
+            let mut added_neural = 0usize;
+            for (ak, _w) in neural_artists {
+                if added_neural >= 2 {
+                    break;
+                }
+                if ak.is_empty()
+                    || seed_artist_slugs.contains(&ak)
+                    || expanded_map.contains_key(&ak)
+                    || !seen_exp.insert(ak.clone())
+                {
+                    continue;
+                }
+                unexpanded_followed.push((ak.clone(), ak.replace('-', " ")));
+                added_neural += 1;
+            }
+        }
 
         if unexpanded_tracks.is_empty() && unexpanded_followed.is_empty() {
             return 0;
@@ -3251,6 +3314,7 @@ impl TasteEngine {
 
         let eligible_tracks: Vec<Track> = eligible.iter().map(|(t, _, _, _)| t.clone()).collect();
         let n_scores = self.neural_scores(user_id, &[], None, &[mood], &[], &eligible_tracks);
+        let n_w = self.neural_blend_weight(0.55, &sctx);
 
         let mut scored: Vec<(f64, Track)> = eligible
             .into_iter()
@@ -3267,7 +3331,7 @@ impl TasteEngine {
                     || sctx.prof.starred.contains(&t.id)
                     || sctx.prof.manual_playlist_ids.contains(&t.id);
 
-                let mut score = taste_s * 0.45 + n_scores.get(idx).copied().unwrap_or(0.0) * 0.55;
+                let mut score = taste_s * 0.45 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
                 if meta_match {
                     score += 4.5;
                 } else if is_curated {
@@ -3357,6 +3421,7 @@ impl TasteEngine {
             &[],
             &dedup_candidates,
         );
+        let n_w = self.neural_blend_weight(0.75, &sctx);
 
         let mut scored: Vec<(f64, Track)> = dedup_candidates
             .into_iter()
@@ -3369,7 +3434,7 @@ impl TasteEngine {
                     &sctx.stats,
                     ScoreMode::PlaylistDna,
                 );
-                let n_boost = n_scores.get(idx).copied().unwrap_or(0.0) * 0.75;
+                let n_boost = n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
                 let combined = if pl_tracks.is_empty() {
                     c_sim * 2.0 + u_taste * 0.9 + n_boost
                 } else {
@@ -3512,6 +3577,7 @@ impl TasteEngine {
                 } else {
                     Vec::new()
                 };
+                let n_w = self.neural_blend_weight(0.55, &sctx);
                 let mut scored: Vec<(f64, Track)> = eligible
                     .into_iter()
                     .enumerate()
@@ -3521,7 +3587,7 @@ impl TasteEngine {
                         let sim_prior = ((total - idx as f64) / total) * 4.5;
                         let user_fit = if user_id > 0 {
                             score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix) * 0.45
-                                + n_scores.get(idx).copied().unwrap_or(0.0) * 0.55
+                                + n_scores.get(idx).copied().unwrap_or(0.0) * n_w
                         } else {
                             0.0
                         };
@@ -4123,8 +4189,9 @@ impl TasteEngine {
                     &intent.genres,
                     &mix_only,
                 );
+                let n_w = self.neural_blend_weight(0.45, &sctx);
                 for (i, (s, _)) in mix_pool.iter_mut().enumerate() {
-                    *s += n_scores.get(i).copied().unwrap_or(0.0) * 0.45;
+                    *s += n_scores.get(i).copied().unwrap_or(0.0) * n_w;
                 }
             }
 
@@ -4501,8 +4568,9 @@ impl TasteEngine {
                     &[],
                     &mix_only,
                 );
+                let n_w = self.neural_blend_weight(0.45, &sctx);
                 for (i, (s, _)) in scored_mix.iter_mut().enumerate() {
-                    *s += n_scores.get(i).copied().unwrap_or(0.0) * 0.45;
+                    *s += n_scores.get(i).copied().unwrap_or(0.0) * n_w;
                 }
             }
 

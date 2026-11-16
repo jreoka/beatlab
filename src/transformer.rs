@@ -904,13 +904,45 @@ impl TransformerNet {
             let a_b = (fnv1a_hash(pa.as_bytes()) as usize) % N_ARTIST_BUCKETS;
             feats.push((ARTIST_OFFSET + a_b, 1.25));
         }
+        // Also hash secondary/featured artists so collaborations bridge artist graphs.
+        let artist_low = t.artist.to_lowercase();
+        let mut sec_artists = 0usize;
+        for part in artist_low
+            .replace(" feat. ", "|")
+            .replace(" feat ", "|")
+            .replace(" ft. ", "|")
+            .replace(" ft ", "|")
+            .replace(" with ", "|")
+            .replace(" & ", "|")
+            .replace(" x ", "|")
+            .split([',', '|', ';'])
+        {
+            let ps = slug(part.trim());
+            if !ps.is_empty() && ps != pa && ps != "unknown-artist" {
+                let a_b = (fnv1a_hash(ps.as_bytes()) as usize) % N_ARTIST_BUCKETS;
+                feats.push((ARTIST_OFFSET + a_b, 0.70));
+                sec_artists += 1;
+                if sec_artists >= 3 {
+                    break;
+                }
+            }
+        }
 
         let mut genre_count = 0usize;
+        let mut genre_sub_seen: HashSet<String> = HashSet::new();
         for g in t.genre.split([',', ';', '/']) {
             let gl = g.trim().to_lowercase();
             if gl.len() >= 2 {
                 let g_b = (fnv1a_hash(gl.as_bytes()) as usize) % N_GENRE_BUCKETS;
                 feats.push((GENRE_OFFSET + g_b, 1.15));
+                // Emit sub-genre tokens (e.g. "indie rock" -> "indie", "rock") for cross-genre generalization.
+                for sub in gl.split([' ', '-']) {
+                    let s = sub.trim();
+                    if s.len() >= 3 && s != gl && genre_sub_seen.insert(s.to_string()) {
+                        let sg_b = (fnv1a_hash(s.as_bytes()) as usize) % N_GENRE_BUCKETS;
+                        feats.push((GENRE_OFFSET + sg_b, 0.55));
+                    }
+                }
                 genre_count += 1;
                 if genre_count >= 4 {
                     break;
@@ -924,6 +956,29 @@ impl TransformerNet {
             if (mood_seen & (1 << idx)) == 0 {
                 mood_seen |= 1 << idx;
                 feats.push((MOOD_OFFSET + idx, 0.95));
+            }
+        }
+        // Infer coarse mood signals from genre/title when explicit mood tags are absent.
+        if mood_seen == 0 {
+            let combined = format!("{} {}", t.genre, t.title).to_lowercase();
+            let inferred: &[(&[&str], Mood)] = &[
+                (&["chill", "lofi", "lo-fi", "ambient", "downtempo", "relax"], Mood::Chill),
+                (&["workout", "metal", "punk", "hardcore", "energy", "trap"], Mood::Energy),
+                (&["focus", "instrumental", "classical", "study", "piano"], Mood::Focus),
+                (&["dance", "house", "disco", "edm", "club", "party", "techno"], Mood::Party),
+                (&["sad", "ballad", "melanchol", "blues", "heartbreak"], Mood::Melancholy),
+                (&["acoustic", "unplugged", "folk", "singer-songwriter"], Mood::Acoustic),
+                (&["indie", "rock", "grunge", "shoegaze", "alternative"], Mood::RockIndie),
+                (&["soul", "r&b", "rnb", "funk", "groove", "jazz"], Mood::Groove),
+            ];
+            for (kws, m) in inferred {
+                if kws.iter().any(|kw| combined.contains(kw)) {
+                    let idx = mood_to_idx(*m);
+                    if (mood_seen & (1 << idx)) == 0 {
+                        mood_seen |= 1 << idx;
+                        feats.push((MOOD_OFFSET + idx, 0.55));
+                    }
+                }
             }
         }
 
@@ -1517,6 +1572,50 @@ impl TransformerEngine {
         scores
     }
 
+    /// Confidence-adaptive multiplier in `[0.45, 1.60]` (or `0.0` if untrained) that scales
+    /// the Transformer's influence up as both `step_count` and user `history_count` grow.
+    pub fn adaptive_multiplier(&self, history_count: usize) -> f64 {
+        let steps = self.step_count() as f64;
+        if steps <= 0.0 {
+            return 0.0;
+        }
+        let model_factor = 0.55 + 0.80 * (steps / 120.0).clamp(0.0, 1.0);
+        let user_factor = 0.75 + 0.45 * ((history_count as f64) / 30.0).clamp(0.0, 1.0);
+        (model_factor * user_factor).clamp(0.45, 1.60)
+    }
+
+    /// Scores `(artist_name, genres)` pairs against the user's Transformer context vector.
+    pub fn score_artist_candidates(
+        &self,
+        store: &Store,
+        user_id: i64,
+        artists: &[(String, String)],
+    ) -> Vec<f32> {
+        if artists.is_empty() {
+            return Vec::new();
+        }
+        let net = self.net.read().unwrap_or_else(|e| e.into_inner());
+        if net.step_count == 0 {
+            return vec![0.0; artists.len()];
+        }
+        let confidence = (net.step_count as f32 / 24.0).clamp(0.05, 1.0);
+        let ctx_vec = self.compute_context_vector_locked(&net, store, user_id, &[], None, &[], &[]);
+        let mut scores = Vec::with_capacity(artists.len());
+        for (name, genres) in artists {
+            let mut synth = Track::default();
+            synth.artist = name.clone();
+            synth.genre = genres.clone();
+            let (t_unit, _, _, _, _) = net.encode_track_unit(&synth);
+            let mut cos = 0.0f32;
+            for d in 0..D_MODEL {
+                cos += ctx_vec[d] * t_unit[d];
+            }
+            let s = cos * net.logit_scale * confidence;
+            scores.push(if s.is_finite() { s } else { 0.0 });
+        }
+        scores
+    }
+
     fn compute_context_vector_locked(
         &self,
         net: &TransformerNet,
@@ -1610,7 +1709,7 @@ impl TransformerEngine {
         distill_users: bool,
     ) -> TrainEpochStats {
         let _train_guard = self.train_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let corpus = match store.load_transformer_corpus(100, 1200) {
+        let corpus = match store.load_transformer_corpus(100, 3600) {
             Ok(c) => c,
             Err(_) => return TrainEpochStats::default(),
         };
@@ -1737,9 +1836,9 @@ fn distill_corpus_users(
         }
         scored_tracks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut track_links = Vec::with_capacity(60);
+        let mut track_links = Vec::with_capacity(150);
         let mut artist_scores: HashMap<String, f64> = HashMap::new();
-        for (w, t) in scored_tracks.into_iter().take(60) {
+        for (w, t) in scored_tracks.into_iter().take(150) {
             track_links.push((t.id.clone(), w));
             let ak = slug(&primary_artist(&t.artist));
             if !ak.is_empty() && ak != "unknown-artist" {
@@ -1751,7 +1850,7 @@ fn distill_corpus_users(
         }
         let mut artist_links: Vec<(String, f64)> = artist_scores.into_iter().collect();
         artist_links.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        artist_links.truncate(24);
+        artist_links.truncate(48);
 
         if !track_links.is_empty() {
             let _ = store.replace_neural_taste_links(uid, &track_links, &artist_links);
@@ -2440,5 +2539,62 @@ mod tests {
         let rock_scores_reloaded =
             reloaded.score_candidates(&store, u_rock.id, &[], None, &[], &[], &test_cands);
         assert!((rock_scores[0] - rock_scores_reloaded[0]).abs() < 1e-4);
+
+        // Verify adaptive_multiplier scales with history_count
+        let low_hist = engine.adaptive_multiplier(0);
+        let high_hist = engine.adaptive_multiplier(40);
+        assert!(low_hist > 0.0 && high_hist > low_hist);
+
+        // Verify distilled neural_artist links are queryable
+        let neural_artists = store.load_neural_artist_links(u_rock.id, 10).unwrap();
+        assert!(!neural_artists.is_empty());
+
+        // Verify score_artist_candidates differentiates rock vs pop artists for u_rock
+        let art_scores = engine.score_artist_candidates(
+            &store,
+            u_rock.id,
+            &[
+                ("Slowdive".to_string(), "Shoegaze, Rock".to_string()),
+                ("Dua Lipa".to_string(), "Dance Pop, Disco".to_string()),
+            ],
+        );
+        assert!(
+            art_scores[0] > art_scores[1],
+            "Rock user should score Slowdive ({}) higher than Dua Lipa ({})",
+            art_scores[0],
+            art_scores[1]
+        );
+    }
+
+    #[test]
+    fn extract_features_captures_subgenres_collabs_and_inferred_moods() {
+        let store = Store::open_memory().unwrap();
+        let engine = TransformerEngine::load_or_new(&store);
+        assert_eq!(engine.adaptive_multiplier(10), 0.0);
+
+        let collab = mk_track(
+            "x1",
+            "Midnight Acoustic Ballad",
+            "Daft Punk feat. Julian Casablancas",
+            "Indie Rock",
+            "",
+            2013,
+        );
+        let (feats, _) = TransformerNet::extract_track_features(&collab);
+        let has_artist = feats
+            .iter()
+            .filter(|(idx, _)| *idx >= ARTIST_OFFSET && *idx < TEXT_OFFSET)
+            .count();
+        let has_genre = feats
+            .iter()
+            .filter(|(idx, _)| *idx >= GENRE_OFFSET && *idx < MOOD_OFFSET)
+            .count();
+        let has_mood = feats
+            .iter()
+            .filter(|(idx, _)| *idx >= MOOD_OFFSET && *idx < ERA_OFFSET)
+            .count();
+        assert!(has_artist >= 2, "expected primary + featured artist buckets");
+        assert!(has_genre >= 3, "expected full + sub-genre buckets");
+        assert!(has_mood >= 1, "expected inferred mood buckets when moods is empty");
     }
 }

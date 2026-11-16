@@ -2090,19 +2090,44 @@ impl Store {
                 "neural_artist" => {
                     rel_artists
                         .entry(key)
-                        .and_modify(|w| *w = (*w).max(decayed * 0.7))
-                        .or_insert(decayed * 0.7);
+                        .and_modify(|w| *w = (*w).max(decayed * 0.85))
+                        .or_insert(decayed * 0.85);
                 }
                 "neural_track" => {
                     rel_tracks
                         .entry(key)
-                        .and_modify(|w| *w = (*w).max(decayed * 0.7))
-                        .or_insert(decayed * 0.7);
+                        .and_modify(|w| *w = (*w).max(decayed * 0.85))
+                        .or_insert(decayed * 0.85);
                 }
                 _ => {}
             }
         }
         Ok((rel_artists, rel_tracks))
+    }
+
+    /// Returns the top Transformer-distilled `neural_artist` slugs and weights for `user_id`.
+    pub fn load_neural_artist_links(
+        &self,
+        user_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<(String, f64)>> {
+        if user_id <= 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, weight FROM user_taste_links
+             WHERE user_id = ?1 AND kind = 'neural_artist'
+             ORDER BY weight DESC, updated DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            })?
+            .flatten()
+            .collect();
+        Ok(rows)
     }
 
     /// Replaces the Transformer-distilled `neural_track` and `neural_artist` links for `user_id`
