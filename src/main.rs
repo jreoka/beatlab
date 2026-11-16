@@ -275,6 +275,10 @@ async fn main() -> models::AppResult<()> {
         app
     };
 
+    // Mount /health outside enforce_allowed_url so container/platform health checks
+    // (which hit 127.0.0.1 or private IPs without the public Host) still succeed.
+    let app = app.route("/health", get(|| async { "ok" }));
+
     let addr: SocketAddr = addr_str.parse()?;
     if let Some(ref raw_url) = allowed_url_raw {
         info!(address = %addr, data_dir = %data_dir.display(), url = %raw_url, "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
@@ -524,7 +528,8 @@ mod tests {
         let allowed = AllowedUrl::parse("https://music.example.com").unwrap();
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
-            .layer(middleware::from_fn_with_state(allowed, enforce_allowed_url));
+            .layer(middleware::from_fn_with_state(allowed, enforce_allowed_url))
+            .route("/health", get(|| async { "ok" }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -538,6 +543,14 @@ mod tests {
         // Direct access with 127.0.0.1:<port> Host -> 403 Forbidden
         let forbidden_resp = client.get(&base_url).send().await.unwrap();
         assert_eq!(forbidden_resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // Health check on /health bypasses AllowedUrl -> 200 OK
+        let health_resp = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), reqwest::StatusCode::OK);
 
         // Access matching URL via forwarded headers -> 200 OK
         let ok_resp = client
