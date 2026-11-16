@@ -642,13 +642,21 @@
     }
   }
 
+  function isAppleMobileDevice() {
+    const ua = navigator.userAgent || '';
+    return /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  }
+
   function ensureAudioGraph() {
     if (audioCtx) {
-      if (audioCtx.state === 'suspended') {
+      if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
         audioCtx.resume().catch(() => {});
       }
       return;
     }
+    const fsOpen = $('fullscreen-player')?.classList.contains('open');
+    const needsWebAudio = state.eqEnabled || (fsOpen && !isAppleMobileDevice());
+    if (!needsWebAudio) return;
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return;
@@ -659,6 +667,8 @@
       analyser.fftSize = 128;
 
       masterGainNode = audioCtx.createGain();
+      const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
+      masterGainNode.gain.value = effectiveVol;
 
       eqFilters = EQ_FREQS.map((freq, idx) => {
         const f = audioCtx.createBiquadFilter();
@@ -678,6 +688,15 @@
       analyser.connect(masterGainNode);
       masterGainNode.connect(audioCtx.destination);
 
+      audioCtx.addEventListener('statechange', () => {
+        if (audioCtx && (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') && !audio.paused) {
+          audioCtx.resume().catch(() => {});
+        }
+      });
+      if (audioCtx.state !== 'running') {
+        audioCtx.resume().catch(() => {});
+      }
+
       applyOutputVolume();
     } catch (e) {
       console.warn('WebAudio init skipped:', e);
@@ -687,6 +706,9 @@
   function applyEqGains() {
     localStorage.setItem('beatlab_eq_on', state.eqEnabled ? 'true' : 'false');
     localStorage.setItem('beatlab_eq_gains', JSON.stringify(state.eqGains));
+    if (state.eqEnabled) {
+      ensureAudioGraph();
+    }
     eqFilters.forEach((f, idx) => {
       if (f) f.gain.value = state.eqEnabled ? (state.eqGains[idx] || 0) : 0;
     });
@@ -4703,6 +4725,16 @@
     audio.addEventListener('play', () => {
       ensureAudioGraph();
       updatePlayButton(true);
+    });
+    audio.addEventListener('playing', () => {
+      if (audioCtx && (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted')) {
+        audioCtx.resume().catch(() => {});
+      }
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && !audio.paused && audioCtx && audioCtx.state !== 'running') {
+        audioCtx.resume().catch(() => {});
+      }
     });
     audio.addEventListener('pause', () => {
       updatePlayButton(false);

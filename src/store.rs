@@ -285,6 +285,14 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_shares_user_kind_target
                 ON shares(user_id, kind, target_id);
+
+            CREATE TABLE IF NOT EXISTS chart_catalog (
+                track_id TEXT PRIMARY KEY,
+                rank_pos INTEGER NOT NULL DEFAULT 0,
+                updated INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chart_catalog_rank
+                ON chart_catalog(rank_pos ASC, updated DESC);
             ",
         )?;
 
@@ -790,35 +798,37 @@ impl Store {
                 artist_pats.truncate(24);
                 genre_pats.truncate(12);
 
-                // Query 2a: same/related artists + user's local library
-                let rem = (limit - out.len()).min(limit / 2 + 200);
-                let mut clauses = Vec::with_capacity(artist_pats.len() + 1);
-                for idx in 0..artist_pats.len() {
-                    clauses.push(format!("lower(artist) LIKE ?{} ESCAPE '\\'", idx + 1));
-                }
-                clauses.push("source = 'local'".to_string());
-                let lim_param_idx = artist_pats.len() + 1;
-                let aff_sql = format!(
-                    "SELECT {} FROM tracks WHERE ({}) ORDER BY created DESC LIMIT ?{}",
-                    TRACK_COLS,
-                    clauses.join(" OR "),
-                    lim_param_idx
-                );
-                let mut values: Vec<Box<dyn ToSql>> = artist_pats
-                    .into_iter()
-                    .map(|p| Box::new(p) as Box<dyn ToSql>)
-                    .collect();
-                values.push(Box::new(rem as i64));
-                let mut astmt = conn.prepare(&aff_sql)?;
-                for t in astmt
-                    .query_map(params_from_iter(values.iter().map(|v| v.as_ref())), row_to_track)?
-                    .collect::<Result<Vec<_>, _>>()?
-                {
-                    if out.len() >= limit {
-                        break;
+                // Query 2a: same/related artists + user's local library (only when user has taste signals)
+                if !out.is_empty() || !artist_pats.is_empty() || !genre_pats.is_empty() {
+                    let rem = (limit - out.len()).min(limit / 2 + 200);
+                    let mut clauses = Vec::with_capacity(artist_pats.len() + 1);
+                    for idx in 0..artist_pats.len() {
+                        clauses.push(format!("lower(artist) LIKE ?{} ESCAPE '\\'", idx + 1));
                     }
-                    if seen.insert(t.id.clone()) {
-                        out.push(t);
+                    clauses.push("source = 'local'".to_string());
+                    let lim_param_idx = artist_pats.len() + 1;
+                    let aff_sql = format!(
+                        "SELECT {} FROM tracks WHERE ({}) ORDER BY created DESC LIMIT ?{}",
+                        TRACK_COLS,
+                        clauses.join(" OR "),
+                        lim_param_idx
+                    );
+                    let mut values: Vec<Box<dyn ToSql>> = artist_pats
+                        .into_iter()
+                        .map(|p| Box::new(p) as Box<dyn ToSql>)
+                        .collect();
+                    values.push(Box::new(rem as i64));
+                    let mut astmt = conn.prepare(&aff_sql)?;
+                    for t in astmt
+                        .query_map(params_from_iter(values.iter().map(|v| v.as_ref())), row_to_track)?
+                        .collect::<Result<Vec<_>, _>>()?
+                    {
+                        if out.len() >= limit {
+                            break;
+                        }
+                        if seen.insert(t.id.clone()) {
+                            out.push(t);
+                        }
                     }
                 }
 
@@ -857,15 +867,20 @@ impl Store {
 
         if out.len() < limit {
             let remaining = limit - out.len();
-            let cat_sql = format!(
-                "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
-                TRACK_COLS
+            let chart_sql = format!(
+                "SELECT {} FROM chart_catalog c
+                 JOIN tracks t ON t.id = c.track_id
+                 ORDER BY c.rank_pos ASC, c.updated DESC
+                 LIMIT ?1",
+                tcols
             );
-            let mut cstmt = conn.prepare(&cat_sql)?;
-            for t in cstmt
+            let mut chart_stmt = conn.prepare(&chart_sql)?;
+            let mut chart_added = 0usize;
+            for t in chart_stmt
                 .query_map(params![remaining as i64], row_to_track)?
                 .collect::<Result<Vec<_>, _>>()?
             {
+                chart_added += 1;
                 if out.len() >= limit {
                     break;
                 }
@@ -873,9 +888,80 @@ impl Store {
                     out.push(t);
                 }
             }
+
+            // Only fall back to arbitrary recent catalog tracks if chart_catalog is not yet populated
+            // (e.g., offline first boot or unit tests), so user-cached searches/listens never leak across users.
+            let chart_total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM chart_catalog", [], |r| r.get(0))
+                .unwrap_or(0);
+            if chart_total < 20 && chart_added == 0 && out.len() < limit {
+                let rem2 = limit - out.len();
+                let cat_sql = format!(
+                    "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
+                    TRACK_COLS
+                );
+                let mut cstmt = conn.prepare(&cat_sql)?;
+                for t in cstmt
+                    .query_map(params![rem2 as i64], row_to_track)?
+                    .collect::<Result<Vec<_>, _>>()?
+                {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    if seen.insert(t.id.clone()) {
+                        out.push(t);
+                    }
+                }
+            }
         }
 
         Ok(out)
+    }
+
+    pub fn record_chart_tracks(&self, tracks: &[Track], base_pos: usize) -> AppResult<()> {
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chart_catalog(track_id, rank_pos, updated) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(track_id) DO UPDATE SET
+                   rank_pos = CASE
+                     WHEN (?3 - chart_catalog.updated) > 21600 THEN excluded.rank_pos
+                     ELSE MIN(chart_catalog.rank_pos, excluded.rank_pos)
+                   END,
+                   updated = excluded.updated",
+            )?;
+            for (idx, t) in tracks.iter().enumerate() {
+                if t.id.trim().is_empty() {
+                    continue;
+                }
+                let pos = (base_pos + idx) as i64;
+                stmt.execute(params![t.id, pos, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn popular_chart_tracks(&self, limit: usize) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let tcols = prefixed_track_cols("t");
+        let sql = format!(
+            "SELECT {} FROM chart_catalog c
+             JOIN tracks t ON t.id = c.track_id
+             ORDER BY c.rank_pos ASC, c.updated DESC
+             LIMIT ?1",
+            tcols
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![limit as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn newest_tracks(&self, limit: usize, offset: usize) -> AppResult<Vec<Track>> {
@@ -4334,5 +4420,57 @@ mod tests {
         assert!(followed.contains("ar:dz:14873123"));
         assert!(!followed.contains("ar:yorushika"));
         assert!(store.get_artist_meta("ar:yorushika").unwrap().is_none());
+    }
+
+    #[test]
+    fn candidate_tracks_isolate_users_and_serve_popular_charts_to_new_users() {
+        let store = Store::open_memory().unwrap();
+        let (u1, _) = store.authenticate_or_create_user("user1", "pw").unwrap();
+        let (u2, _) = store.authenticate_or_create_user("user2", "pw").unwrap();
+        let (u_new, _) = store.authenticate_or_create_user("brandnew", "pw").unwrap();
+
+        let mut charts = Vec::new();
+        for i in 0..25 {
+            let mut t = sample_track(
+                &format!("dz:chart_{}", i),
+                &format!("Global Hit {}", i),
+                &format!("Chart Artist {}", i),
+                "Top Charts",
+            );
+            t.genre = "Pop".into();
+            t.created = 1000 + i;
+            charts.push(t);
+        }
+        store.upsert_tracks(&charts).unwrap();
+        store.record_chart_tracks(&charts, 1).unwrap();
+
+        // User 1 searches/listens to a niche track (newer created timestamp)
+        let mut u1_niche = sample_track("ytm:u1_niche", "Obscure B-Side", "Niche Act 1", "Deep Cuts");
+        u1_niche.source = "ytm".into();
+        u1_niche.genre = "Experimental".into();
+        u1_niche.created = 9000;
+
+        // User 2 searches/listens to a different niche track (even newer created timestamp)
+        let mut u2_niche = sample_track("ytm:u2_niche", "Mom Favorite", "Niche Act 2", "Classics");
+        u2_niche.source = "ytm".into();
+        u2_niche.genre = "Country".into();
+        u2_niche.created = 9500;
+
+        store.upsert_tracks(&[u1_niche.clone(), u2_niche.clone()]).unwrap();
+        store.record_event(u1.id, &u1_niche.id, "play", 1.0).unwrap();
+        store.record_event(u2.id, &u2_niche.id, "play", 1.0).unwrap();
+
+        // Brand-new user should only see popular chart tracks, not u1's or u2's cached listens.
+        let new_pool = store.candidate_tracks_for_user(u_new.id, 100).unwrap();
+        let new_ids: HashSet<&str> = new_pool.iter().map(|t| t.id.as_str()).collect();
+        assert!(new_ids.contains("dz:chart_0"));
+        assert!(!new_ids.contains("ytm:u1_niche"));
+        assert!(!new_ids.contains("ytm:u2_niche"));
+
+        // User 1 should see their own track + charts, never User 2's niche listen.
+        let u1_pool = store.candidate_tracks_for_user(u1.id, 100).unwrap();
+        let u1_ids: HashSet<&str> = u1_pool.iter().map(|t| t.id.as_str()).collect();
+        assert!(u1_ids.contains("ytm:u1_niche"));
+        assert!(!u1_ids.contains("ytm:u2_niche"));
     }
 }

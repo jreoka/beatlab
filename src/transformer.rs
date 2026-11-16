@@ -1789,7 +1789,7 @@ fn distill_corpus_users(
     store: &Store,
     corpus: &NeuralTrainingCorpus,
 ) -> usize {
-    if net.step_count == 0 || corpus.catalog_ids.is_empty() {
+    if net.step_count < 10 || corpus.catalog_ids.is_empty() {
         return 0;
     }
     let mut catalog_encoded: Vec<(&Track, [f32; D_MODEL])> = Vec::with_capacity(corpus.catalog_ids.len());
@@ -1806,7 +1806,7 @@ fn distill_corpus_users(
     let mut distilled = 0usize;
     for &uid in &corpus.user_ids {
         let seq_items = build_user_sequence_from_corpus(uid, corpus, MAX_SEQ_LEN - 1);
-        if seq_items.is_empty() {
+        if seq_items.len() < 2 {
             continue;
         }
         let ctx = net.forward_context(uid, &seq_items).ctx_unit;
@@ -1829,16 +1829,16 @@ fn distill_corpus_users(
             for d in 0..D_MODEL {
                 cos += ctx[d] * t_unit[d];
             }
-            if cos > 0.08 {
+            if cos > 0.22 {
                 let w = ((cos as f64) * 3.0).clamp(0.1, 3.5);
                 scored_tracks.push((w, *t));
             }
         }
         scored_tracks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut track_links = Vec::with_capacity(150);
+        let mut track_links = Vec::with_capacity(60);
         let mut artist_scores: HashMap<String, f64> = HashMap::new();
-        for (w, t) in scored_tracks.into_iter().take(150) {
+        for (w, t) in scored_tracks.into_iter().take(60) {
             track_links.push((t.id.clone(), w));
             let ak = slug(&primary_artist(&t.artist));
             if !ak.is_empty() && ak != "unknown-artist" {

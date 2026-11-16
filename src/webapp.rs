@@ -757,6 +757,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     );
     if !chart_tracks.is_empty() {
         let _ = state.store.upsert_tracks(&chart_tracks);
+        let _ = state.store.record_chart_tracks(&chart_tracks, 1);
     }
     for a in &chart_albums {
         let _ = state.store.upsert_album_meta(a);
@@ -771,7 +772,12 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
         if !chart_tracks.is_empty() {
             chart_tracks
         } else {
-            state.store.newest_tracks(16, 0).unwrap_or_default()
+            let pop = state.store.popular_chart_tracks(16).unwrap_or_default();
+            if !pop.is_empty() {
+                pop
+            } else {
+                state.store.newest_tracks(16, 0).unwrap_or_default()
+            }
         },
     );
     let albums = if !chart_albums.is_empty() {
@@ -834,6 +840,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     );
     if !chart_tracks.is_empty() {
         let _ = state.store.upsert_tracks(&chart_tracks);
+        let _ = state.store.record_chart_tracks(&chart_tracks, 1);
     }
     for a in &chart_albums {
         let _ = state.store.upsert_album_meta(a);
@@ -929,7 +936,12 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         if !chart_tracks.is_empty() {
             chart_tracks
         } else {
-            state.store.newest_tracks(30, 0).unwrap_or_default()
+            let pop = state.store.popular_chart_tracks(30).unwrap_or_default();
+            if !pop.is_empty() {
+                pop
+            } else {
+                state.store.newest_tracks(30, 0).unwrap_or_default()
+            }
         },
     );
 

@@ -1257,8 +1257,15 @@ impl TasteEngine {
         } else {
             Vec::new()
         };
-        let n_scores = self.neural_scores(user_id, &session_ctx, None, &[], &[], &filtered);
-        let n_w = self.neural_blend_weight(0.85, &sctx);
+        let has_user_taste = !sctx.stats.is_empty() || profile_has_taste(&sctx.prof);
+        let (n_scores, n_w) = if has_user_taste {
+            (
+                self.neural_scores(user_id, &session_ctx, None, &[], &[], &filtered),
+                self.neural_blend_weight(0.85, &sctx),
+            )
+        } else {
+            (Vec::new(), 0.0)
+        };
 
         let mut scored: Vec<(f64, Track)> = filtered
             .into_iter()
@@ -1400,8 +1407,15 @@ impl TasteEngine {
                 !heard && !known_fav && !is_strongly_disliked(t, &sctx.prof, &sctx.stats)
             })
             .collect();
-        let n_scores = self.neural_scores(user_id, &[], None, &[], &[], &filtered);
-        let n_w = self.neural_blend_weight(0.95, &sctx);
+        let has_user_taste = !sctx.stats.is_empty() || profile_has_taste(&sctx.prof);
+        let (n_scores, n_w) = if has_user_taste {
+            (
+                self.neural_scores(user_id, &[], None, &[], &[], &filtered),
+                self.neural_blend_weight(0.95, &sctx),
+            )
+        } else {
+            (Vec::new(), 0.0)
+        };
 
         let mut scored: Vec<(f64, Track)> = filtered
             .into_iter()
@@ -1498,6 +1512,15 @@ impl TasteEngine {
         let has_taste = profile_has_taste(&sctx.prof)
             || !sctx.prof.related_artist_affinity.is_empty()
             || !sctx.prof.genre_affinity.is_empty();
+        if !has_taste {
+            return self
+                .store
+                .featured_artist_summaries(limit)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| !followed.contains(&a.id))
+                .collect();
+        }
 
         let prefiltered: Vec<(ArtistSummary, String, f64, f64, &str)> = summaries
             .into_iter()
@@ -1757,7 +1780,9 @@ impl TasteEngine {
             dz.fetch_genre_chart_tracks(85, "Alternative", 20),
         );
 
+        let global_chart_tracks = chart_tracks.clone();
         let mut all_tracks = chart_tracks;
+        let mut genre_chart_tracks = Vec::new();
         for batch in [
             pop_tracks,
             hiphop_tracks,
@@ -1766,10 +1791,17 @@ impl TasteEngine {
             rnb_tracks,
             alt_tracks,
         ] {
+            genre_chart_tracks.extend(batch.iter().cloned());
             all_tracks.extend(batch);
         }
         if !all_tracks.is_empty() {
             let _ = self.store.upsert_tracks(&all_tracks);
+        }
+        if !global_chart_tracks.is_empty() {
+            let _ = self.store.record_chart_tracks(&global_chart_tracks, 1);
+        }
+        if !genre_chart_tracks.is_empty() {
+            let _ = self.store.record_chart_tracks(&genre_chart_tracks, 1000);
         }
         for alb in &chart_albums {
             let _ = self.store.upsert_album_meta(alb);
@@ -1834,6 +1866,7 @@ impl TasteEngine {
             );
             if !chart_tracks.is_empty() {
                 let _ = self.store.upsert_tracks(&chart_tracks);
+                let _ = self.store.record_chart_tracks(&chart_tracks, 1);
             }
             for alb in &chart_albums {
                 let _ = self.store.upsert_album_meta(alb);
@@ -7462,6 +7495,8 @@ fn score_track_core(
         && !has_direct_or_related
     {
         2.6 * (total_pos_genre / 3.0).clamp(0.5, 1.0)
+    } else if has_taste && !on_taste && !has_explicit_genre {
+        1.4
     } else {
         0.0
     };
