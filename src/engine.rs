@@ -1,6 +1,6 @@
 use crate::models::{err_msg, primary_artist, upgrade_cover_url, AppResult, LyricLine, LyricsData, Track};
 use crate::sources::local::extract_embedded_cover;
-use crate::sources::{MusicSource, SourceRegistry};
+use crate::sources::SourceRegistry;
 use crate::store::Store;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -50,6 +50,7 @@ pub struct StreamEngine {
     pub store: Store,
     pub sources: SourceRegistry,
     pub http: reqwest::Client,
+    pub stream_http: reqwest::Client,
     pub cache_dir: PathBuf,
     pub cover_dir: PathBuf,
     pub max_cache_bytes: i64,
@@ -72,7 +73,17 @@ impl StreamEngine {
         let _ = std::fs::create_dir_all(&cover_dir);
 
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(12))
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(8))
+            .build()
+            .unwrap_or_default();
+
+        // Streaming/caching client: cap connect & per-read idle stalls without aborting valid
+        // multi-minute lossless FLAC downloads at a 30s total transfer ceiling.
+        let stream_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(45))
             .redirect(reqwest::redirect::Policy::limited(8))
             .build()
             .unwrap_or_default();
@@ -89,6 +100,7 @@ impl StreamEngine {
             store,
             sources,
             http,
+            stream_http,
             cache_dir,
             cover_dir,
             max_cache_bytes: ((max_cache_gb.max(0.5)) * 1024.0 * 1024.0 * 1024.0) as i64,
@@ -129,32 +141,45 @@ impl StreamEngine {
             return Err(err_msg("Local audio file missing"));
         }
 
-        // 3. Soulseek P2P source -> downloads into cache directory via MusicSource::resolve_stream.
+        // 3. Soulseek P2P source -> downloads into cache directory; falls back cleanly to
+        // local/cached siblings or YouTube Music if peers are unreachable/queued/offline.
         if track.stream_url.starts_with("slsk://") {
-            let resolved = self
-                .sources
-                .soulseek
-                .resolve_stream(&track.stream_url)
-                .await
-                .ok_or_else(|| err_msg("Soulseek download failed"))?;
-            let local_path = PathBuf::from(resolved.strip_prefix("file:").unwrap_or(&resolved));
-            if !local_path.exists() {
-                return Err(err_msg("Soulseek download failed: cached file missing"));
+            if let Some(resolved) = self.sources.soulseek.resolve_track(track).await {
+                let local_path = PathBuf::from(resolved.strip_prefix("file:").unwrap_or(&resolved));
+                if local_path.exists() {
+                    let bytes = std::fs::metadata(&local_path)
+                        .map(|m| m.len() as i64)
+                        .unwrap_or(0);
+                    if bytes > 4096 {
+                        let _ = self.store.upsert_cache_entry(
+                            &track.id,
+                            &local_path.to_string_lossy(),
+                            bytes,
+                        );
+                        let _ = self.store.prune_cache(self.max_cache_bytes);
+                        let ext = local_path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or(&track.format);
+                        return Ok(PlayTarget::LocalFile {
+                            content_type: mime_for_audio_ext(ext).to_string(),
+                            path: local_path,
+                        });
+                    }
+                }
             }
-            let bytes = std::fs::metadata(&local_path)
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
-            let _ = self
-                .store
-                .upsert_cache_entry(&track.id, &local_path.to_string_lossy(), bytes);
-            let _ = self.store.prune_cache(self.max_cache_bytes);
-            let ext = local_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or(&track.format);
-            return Ok(PlayTarget::LocalFile {
-                content_type: mime_for_audio_ext(ext).to_string(),
-                path: local_path,
+            if let Some(local) = self.find_local_or_cached_sibling(track) {
+                return Ok(local);
+            }
+            let resolved = self.resolve_ytm_singleflight(track, false).await?;
+            return Ok(PlayTarget::RemoteHttp {
+                content_type: mime_for_audio_ext(&resolved.ext).to_string(),
+                url: resolved.url,
+                headers: resolved.headers,
+                ext: resolved.ext,
+                webpage_url: resolved.webpage_url,
+                // Keep resolved URL in memory without overwriting a lossless track's disk cache.
+                cacheable: false,
             });
         }
 
@@ -198,7 +223,13 @@ impl StreamEngine {
 
     fn find_local_or_cached_sibling(&self, track: &Track) -> Option<PlayTarget> {
         let key = track.song_key();
-        let clean_title = crate::models::core_song_title(&track.title);
+        let (clean_art, clean_title_str) = clean_track_query_for_fallback(track);
+        let cleaned_key = format!(
+            "{}|{}",
+            crate::models::slug(&clean_art),
+            crate::models::core_song_title(&clean_title_str)
+        );
+        let clean_title = crate::models::core_song_title(&clean_title_str);
         let search_title = if clean_title.trim().is_empty() {
             track.title.as_str()
         } else {
@@ -206,7 +237,8 @@ impl StreamEngine {
         };
         let candidates = self.store.search_tracks(search_title, 40, 0).ok()?;
         for c in candidates {
-            if c.id == track.id || c.song_key() != key {
+            let ckey = c.song_key();
+            if c.id == track.id || (ckey != key && ckey != cleaned_key) {
                 continue;
             }
             if track.duration > 0 && c.duration > 0 && (track.duration - c.duration).abs() > 20 {
@@ -302,7 +334,14 @@ impl StreamEngine {
                     err_msg(format!("No playable match found on YouTube Music for {} - {}", art, title))
                 })?
         } else {
-            return Err(err_msg("Unsupported resolution specifier"));
+            let (art, title) = clean_track_query_for_fallback(track);
+            self.sources
+                .ytm
+                .find_best_video_for_track(&art, &title, track.duration)
+                .await
+                .ok_or_else(|| {
+                    err_msg(format!("No playable match found on YouTube Music for {} - {}", art, title))
+                })?
         };
 
         let resolved = self.sources.ytm.resolve_stream(&video_id).await?;
@@ -382,7 +421,7 @@ impl StreamEngine {
 
     /// Streams a track for the web player at the highest browser-compatible quality:
     /// passes through the original audio untouched when natively playable, or automatically
-    /// transcodes unsupported formats (lossless -> FLAC, lossy -> 320k MP3).
+    /// transcodes unsupported formats (lossless -> FLAC, lossy -> 320k MP3, or `compat=1` retry -> 320k MP3).
     pub async fn serve_web_stream(
         &self,
         track: &Track,
@@ -399,14 +438,20 @@ impl StreamEngine {
         };
 
         let resolved_ext = play_target_ext(&resolved, track);
+        let is_alac = is_alac_m4a(&resolved_ext, track);
         let needs_compat = force_compat
             || !is_browser_native_ext(&resolved_ext)
-            || (is_alac_m4a(&resolved_ext, track) && !is_safari_ua(req_headers))
+            || (is_alac && !is_safari_ua(req_headers))
             || (is_safari_ua(req_headers) && is_safari_unfriendly_ext(&resolved_ext));
 
         let safe_offset = sanitize_time_offset(time_offset);
         if self.ffmpeg_available && (safe_offset > 0.5 || needs_compat) {
-            let (fmt, br) = choose_web_transcode_params(&resolved_ext, track);
+            let (fmt, br) = choose_web_compat_transcode_params(
+                &resolved_ext,
+                track,
+                force_compat,
+                is_alac,
+            );
             return self
                 .serve_ffmpeg_transcode(track, &resolved, &fmt, br, safe_offset)
                 .await;
@@ -455,6 +500,60 @@ impl StreamEngine {
         }
     }
 
+    async fn send_stream_proxy(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        content_type: &str,
+        range_hdr: Option<&str>,
+    ) -> Result<Response, reqwest::StatusCode> {
+        let mut req = self.stream_http.get(url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(r) = range_hdr {
+            req = req.header(header::RANGE, r);
+        }
+
+        match req.send().await {
+            Ok(resp)
+                if resp.status().is_success()
+                    || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT =>
+            {
+                let status = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                };
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CACHE_CONTROL, "private, max-age=3600");
+                if let Some(len) = resp.headers().get(header::CONTENT_LENGTH) {
+                    builder = builder.header(header::CONTENT_LENGTH, len);
+                }
+                if let Some(cr) = resp.headers().get(header::CONTENT_RANGE) {
+                    builder = builder.header(header::CONTENT_RANGE, cr);
+                }
+                let stream = resp.bytes_stream().map(|res| {
+                    res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                });
+                Ok(builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }))
+            }
+            Ok(resp) => {
+                warn!(status = %resp.status(), url = %url, "upstream stream failed");
+                Err(resp.status())
+            }
+            Err(e) => {
+                warn!(error = %e, "upstream stream request error");
+                Err(reqwest::StatusCode::BAD_GATEWAY)
+            }
+        }
+    }
+
     async fn serve_remote_http_range(
         &self,
         track: &Track,
@@ -467,50 +566,25 @@ impl StreamEngine {
         let mut active_url = url.to_string();
         let mut active_headers = headers.to_vec();
         let mut active_ct = content_type.to_string();
+        let is_ytm_origin = webpage_url.contains("youtube.com")
+            || webpage_url.contains("youtu.be")
+            || track.stream_url.starts_with("resolve:")
+            || track.stream_url.starts_with("ytm:");
 
         for attempt in 0..2 {
-            let mut req = self.http.get(&active_url);
-            for (k, v) in &active_headers {
-                req = req.header(k.as_str(), v.as_str());
-            }
-            if let Some(r) = range_hdr {
-                req = req.header(header::RANGE, r);
-            }
-
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                    let status = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                        StatusCode::PARTIAL_CONTENT
-                    } else {
-                        StatusCode::OK
-                    };
-                    let mut builder = Response::builder()
-                        .status(status)
-                        .header(header::CONTENT_TYPE, &active_ct)
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .header(header::CACHE_CONTROL, "private, max-age=3600");
-                    if let Some(len) = resp.headers().get(header::CONTENT_LENGTH) {
-                        builder = builder.header(header::CONTENT_LENGTH, len);
-                    }
-                    if let Some(cr) = resp.headers().get(header::CONTENT_RANGE) {
-                        builder = builder.header(header::CONTENT_RANGE, cr);
-                    }
-                    let stream = resp.bytes_stream().map(|res| {
-                        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                    });
-                    return builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    });
-                }
-                Ok(resp)
+            match self
+                .send_stream_proxy(&active_url, &active_headers, &active_ct, range_hdr)
+                .await
+            {
+                Ok(resp) => return resp,
+                Err(status)
                     if attempt == 0
-                        && (resp.status() == reqwest::StatusCode::FORBIDDEN
-                            || resp.status() == reqwest::StatusCode::GONE)
-                        && (track.stream_url.starts_with("resolve:")
-                            || track.stream_url.starts_with("ytm:")) =>
+                        && is_ytm_origin
+                        && (status == reqwest::StatusCode::FORBIDDEN
+                            || status == reqwest::StatusCode::GONE) =>
                 {
                     // Cached upstream signed URL expired or IP-shifted; re-resolve cleanly.
-                    debug!(track_id = %track.id, status = %resp.status(), "refreshing expired stream URL");
+                    debug!(track_id = %track.id, status = %status, "refreshing expired stream URL");
                     if let Ok(fresh) = self.resolve_ytm_singleflight(track, true).await {
                         active_url = fresh.url;
                         active_headers = fresh.headers;
@@ -519,20 +593,37 @@ impl StreamEngine {
                     }
                     break;
                 }
-                Ok(resp) => {
-                    warn!(status = %resp.status(), url = %active_url, "upstream stream failed");
-                    break;
-                }
-                Err(e) => {
-                    warn!(error = %e, "upstream stream request error");
-                    break;
-                }
+                Err(_) => break,
             }
         }
 
         // Last-resort direct pipe via yt-dlp -o - if upstream direct URL failed.
         if webpage_url.contains("youtube.com") || webpage_url.contains("youtu.be") {
             return self.serve_ytdlp_pipe(webpage_url).await;
+        }
+
+        // Non-radio HTTP tracks (e.g. Archive.org FLAC returning 403/404/503) fall back cleanly
+        // to local/cached siblings or YouTube Music.
+        if track.source != "radio" {
+            if let Some(PlayTarget::LocalFile { path, content_type }) =
+                self.find_local_or_cached_sibling(track)
+            {
+                return serve_local_file_range(&path, &content_type, range_hdr).await;
+            }
+            if let Ok(fresh) = self.resolve_ytm_singleflight(track, false).await {
+                let ct = mime_for_audio_ext(&fresh.ext);
+                if let Ok(resp) = self
+                    .send_stream_proxy(&fresh.url, &fresh.headers, ct, range_hdr)
+                    .await
+                {
+                    return resp;
+                }
+                if fresh.webpage_url.contains("youtube.com")
+                    || fresh.webpage_url.contains("youtu.be")
+                {
+                    return self.serve_ytdlp_pipe(&fresh.webpage_url).await;
+                }
+            }
         }
         (StatusCode::BAD_GATEWAY, "Failed to proxy upstream audio").into_response()
     }
@@ -609,6 +700,8 @@ impl StreamEngine {
         match fmt {
             "opus" => {
                 cmd.args([
+                    "-ac",
+                    "2",
                     "-c:a",
                     "libopus",
                     "-b:a",
@@ -620,6 +713,8 @@ impl StreamEngine {
             }
             "ogg" => {
                 cmd.args([
+                    "-ac",
+                    "2",
                     "-c:a",
                     "libvorbis",
                     "-b:a",
@@ -634,6 +729,8 @@ impl StreamEngine {
             }
             "aac" | "m4a" => {
                 cmd.args([
+                    "-ac",
+                    "2",
                     "-c:a",
                     "aac",
                     "-b:a",
@@ -645,6 +742,8 @@ impl StreamEngine {
             }
             _ => {
                 cmd.args([
+                    "-ac",
+                    "2",
                     "-c:a",
                     "libmp3lame",
                     "-b:a",
@@ -718,7 +817,7 @@ impl StreamEngine {
             let _ = tokio::fs::remove_file(&final_path).await;
         }
 
-        let mut req = self.http.get(url);
+        let mut req = self.stream_http.get(url);
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
         }
@@ -1324,9 +1423,55 @@ fn is_safari_ua(headers: &HeaderMap) -> bool {
         && !ua.contains("Android")
 }
 
+fn clean_track_query_for_fallback(track: &Track) -> (String, String) {
+    if track.source == "soulseek" || track.stream_url.starts_with("slsk://") {
+        let (art, title, _) = crate::sources::soulseek::clean_slsk_title_and_artist(
+            &track.artist,
+            &track.album,
+            &track.title,
+        );
+        return (art, title);
+    }
+    let pa = primary_artist(&track.artist);
+    let art = if pa.is_empty() {
+        track.artist.trim().to_string()
+    } else {
+        pa
+    };
+    let clean_title = crate::models::strip_release_tags(&track.title);
+    let title = if clean_title.is_empty() {
+        track.title.trim().to_string()
+    } else {
+        clean_title
+    };
+    (art, title)
+}
+
 fn is_alac_m4a(resolved_ext: &str, track: &Track) -> bool {
     let ext = resolved_ext.trim().trim_start_matches('.').to_lowercase();
-    ext == "m4a" && (track.bit_depth > 0 || track.bitrate > 450)
+    let track_fmt = track.format.trim().trim_start_matches('.').to_lowercase();
+    ext == "m4a"
+        && (track_fmt.is_empty() || matches!(track_fmt.as_str(), "m4a" | "mp4" | "alac"))
+        && (track.bit_depth > 0 || track.bitrate > 450)
+}
+
+fn choose_web_compat_transcode_params(
+    resolved_ext: &str,
+    track: &Track,
+    force_compat: bool,
+    is_alac: bool,
+) -> (String, i32) {
+    // If the browser already rejected a native format (e.g. problematic/high-rate FLAC) and
+    // retried with `compat=1`, transcode to 320k MP3 rather than looping back to FLAC.
+    if force_compat && is_browser_native_ext(resolved_ext) && !is_alac {
+        let br = if track.bitrate > 0 && !is_lossless_ext(resolved_ext) {
+            track.bitrate.clamp(256, 320)
+        } else {
+            320
+        };
+        return ("mp3".to_string(), br);
+    }
+    choose_web_transcode_params(resolved_ext, track)
 }
 
 fn choose_web_transcode_params(resolved_ext: &str, track: &Track) -> (String, i32) {
@@ -1824,6 +1969,108 @@ mod tests {
         let missing_bytes = to_bytes(missing_resp.into_body(), 1024 * 64).await.unwrap();
         assert_eq!(auto_bytes, track_bytes);
         assert_ne!(auto_bytes, missing_bytes);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compat_transcode_handles_flac_fallback_and_ytm_m4a_fallback_cleanly() {
+        // When a Soulseek/Archive FLAC falls back to a YTM m4a stream, is_alac_m4a must be false
+        // so lossy m4a streams directly instead of bogus transcode to FLAC.
+        let flac_track = Track {
+            format: "flac".to_string(),
+            bitrate: 950,
+            bit_depth: 16,
+            ..Default::default()
+        };
+        assert!(!is_alac_m4a("m4a", &flac_track));
+
+        // Native FLAC with force_compat=true (retry after browser error) transcodes to 320k MP3.
+        assert_eq!(
+            choose_web_compat_transcode_params("flac", &flac_track, true, false),
+            ("mp3".to_string(), 320)
+        );
+        // Time-offset seek without force_compat keeps FLAC.
+        assert_eq!(
+            choose_web_compat_transcode_params("flac", &flac_track, false, false),
+            ("flac".to_string(), 0)
+        );
+
+        // ALAC in .m4a still converts to lossless FLAC.
+        let alac_m4a = Track {
+            format: "m4a".to_string(),
+            bitrate: 950,
+            bit_depth: 16,
+            ..Default::default()
+        };
+        assert!(is_alac_m4a("m4a", &alac_m4a));
+        assert_eq!(
+            choose_web_compat_transcode_params("m4a", &alac_m4a, true, true),
+            ("flac".to_string(), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn soulseek_track_falls_back_to_local_sibling_when_offline() {
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+
+        let dir = std::env::temp_dir().join(format!("beatlab_slsk_fb_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_flac = dir.join("look_at_the_sky.flac");
+        std::fs::write(&local_flac, vec![0u8; 8192]).unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), dir.join("slsk")),
+        );
+        let engine = StreamEngine::new(store.clone(), sources, &dir, 1.0);
+
+        let local_track = Track {
+            id: "local:porter-sky".into(),
+            source: "local".into(),
+            title: "Look at the Sky".into(),
+            artist: "Porter Robinson".into(),
+            album: "Nurture".into(),
+            duration: 309,
+            format: "flac".into(),
+            bitrate: 1000,
+            stream_url: format!("file:{}", local_flac.display()),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[local_track]).unwrap();
+
+        // Even an older uncleaned Soulseek DB entry falls back cleanly when Soulseek is offline.
+        let slsk_track = Track {
+            id: "soulseek:deadbeef".into(),
+            source: "soulseek".into(),
+            title: "Nurture - Look at the Sky".into(),
+            artist: "Porter.Robinson".into(),
+            album: "Nurture".into(),
+            duration: 309,
+            format: "flac".into(),
+            bitrate: 950,
+            bit_depth: 16,
+            stream_url: "slsk://offline_peer/@@offline_peer/Nurture - Look at the Sky.flac".into(),
+            ..Default::default()
+        };
+
+        let (clean_art, clean_title) = clean_track_query_for_fallback(&slsk_track);
+        assert_eq!(clean_art, "Porter Robinson");
+        assert_eq!(clean_title, "Look at the Sky");
+
+        match engine.resolve_target(&slsk_track).await.unwrap() {
+            PlayTarget::LocalFile { path, .. } => assert_eq!(path, local_flac),
+            _ => panic!("expected local fallback"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

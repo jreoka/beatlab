@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 const DEFAULT_SERVER: &str = "server.slsknet.org:2242";
@@ -39,6 +39,9 @@ const PEER_MSG_SEARCH_RESPONSE: u32 = 9;
 const PEER_MSG_TRANSFER_REQUEST: u32 = 40;
 const PEER_MSG_TRANSFER_RESPONSE: u32 = 41;
 const PEER_MSG_QUEUE_UPLOAD: u32 = 43;
+const PEER_MSG_PLACE_IN_QUEUE_RESPONSE: u32 = 44;
+const PEER_MSG_UPLOAD_FAILED: u32 = 46;
+const PEER_MSG_UPLOAD_DENIED: u32 = 50;
 
 struct SlskRuntime {
     connected: bool,
@@ -57,13 +60,50 @@ struct SlskSearchHit {
     avg_speed: u32,
 }
 
+struct PendingTransfer {
+    peer_lower: String,
+    remote_path: String,
+    remote_path_norm: String,
+    upload_info: Mutex<Option<(u32, u64)>>,
+    legacy_dl_token: u32,
+    file_socket: Mutex<Option<(u32, TcpStream)>>,
+    failed_reason: Mutex<Option<String>>,
+    notify: Notify,
+}
+
+impl PendingTransfer {
+    fn new(peer: &str, remote_path: &str, legacy_dl_token: u32) -> Self {
+        Self {
+            peer_lower: peer.to_lowercase(),
+            remote_path: remote_path.to_string(),
+            remote_path_norm: normalize_slsk_path(remote_path),
+            upload_info: Mutex::new(None),
+            legacy_dl_token,
+            file_socket: Mutex::new(None),
+            failed_reason: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    fn matches_path(&self, fname: &str) -> bool {
+        self.remote_path == fname || self.remote_path_norm == normalize_slsk_path(fname)
+    }
+}
+
 pub struct SoulseekSource {
     store: Store,
     download_dir: PathBuf,
     runtime: RwLock<SlskRuntime>,
     pending_searches: Mutex<HashMap<u32, mpsc::Sender<Vec<SlskSearchHit>>>>,
-    peer_addrs: Mutex<HashMap<String, (Ipv4Addr, u32)>>,
+    peer_addrs: Mutex<HashMap<String, Option<(Ipv4Addr, u32)>>>,
+    addr_notify: Notify,
+    pending_transfers: Mutex<Vec<Arc<PendingTransfer>>>,
+    pending_by_token: Mutex<HashMap<u32, Arc<PendingTransfer>>>,
+    pending_pierce_peers: Mutex<HashMap<u32, (String, String)>>,
+    in_flight_downloads: Mutex<HashMap<String, Arc<Notify>>>,
+    alt_streams: Mutex<HashMap<String, Vec<String>>>,
     next_token: Mutex<u32>,
+    self_weak: OnceLock<Weak<Self>>,
 }
 
 impl SoulseekSource {
@@ -89,8 +129,16 @@ impl SoulseekSource {
             }),
             pending_searches: Mutex::new(HashMap::new()),
             peer_addrs: Mutex::new(HashMap::new()),
+            addr_notify: Notify::new(),
+            pending_transfers: Mutex::new(Vec::new()),
+            pending_by_token: Mutex::new(HashMap::new()),
+            pending_pierce_peers: Mutex::new(HashMap::new()),
+            in_flight_downloads: Mutex::new(HashMap::new()),
+            alt_streams: Mutex::new(HashMap::new()),
             next_token: Mutex::new(1000),
+            self_weak: OnceLock::new(),
         });
+        let _ = src.self_weak.set(Arc::downgrade(&src));
 
         if let (Some(u), Some(p)) = (saved_user, saved_pass) {
             let s = Arc::clone(&src);
@@ -192,8 +240,17 @@ impl SoulseekSource {
             return Err(msg);
         }
 
-        // Bind local peer listener on ephemeral port
-        let listener = TcpListener::bind("0.0.0.0:0").await.ok();
+        // Bind local peer listener (respect optional BEATLAB_SLSK_PORT or bind ephemeral port)
+        let bind_addr = std::env::var("BEATLAB_SLSK_PORT")
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|&p| p > 0)
+            .map(|p| format!("0.0.0.0:{}", p))
+            .unwrap_or_else(|| "0.0.0.0:0".to_string());
+        let listener = match TcpListener::bind(&bind_addr).await {
+            Ok(l) => Some(l),
+            Err(_) => TcpListener::bind("0.0.0.0:0").await.ok(),
+        };
         let listen_port = listener
             .as_ref()
             .and_then(|l| l.local_addr().ok())
@@ -315,8 +372,9 @@ impl SoulseekSource {
                 if let (Some(peer), Some(ip_raw), Some(port)) =
                     (cur.read_string(), cur.read_u32(), cur.read_u32())
                 {
-                    let ip = Ipv4Addr::from(ip_raw);
-                    self.cache_peer_addr(peer, ip, port).await;
+                    let addr = (ip_raw != 0 && port > 0 && port <= 65535)
+                        .then(|| (Ipv4Addr::from(ip_raw), port));
+                    self.cache_peer_addr(peer, addr).await;
                 }
             }
             MSG_CONNECT_TO_PEER => {
@@ -328,12 +386,20 @@ impl SoulseekSource {
                     cur.read_u32(),
                     cur.read_u32(),
                 ) {
+                    let valid = ip_raw != 0 && port > 0 && port <= 65535;
                     let ip = Ipv4Addr::from(ip_raw);
-                    self.cache_peer_addr(peer.clone(), ip, port).await;
-                    if conn_type == "P" {
+                    if valid {
+                        self.cache_peer_addr(peer.clone(), Some((ip, port))).await;
+                    }
+                    if valid && conn_type == "P" {
                         let sp = Arc::clone(self);
                         tokio::spawn(async move {
                             sp.connect_peer_pierce(&peer, ip, port, token).await;
+                        });
+                    } else if valid && conn_type == "F" {
+                        let sp = Arc::clone(self);
+                        tokio::spawn(async move {
+                            sp.connect_peer_pierce_file(ip, port, token).await;
                         });
                     }
                 }
@@ -344,7 +410,13 @@ impl SoulseekSource {
         }
     }
 
-    async fn connect_peer_pierce(&self, peer: &str, ip: Ipv4Addr, port: u32, token: u32) {
+    async fn connect_peer_pierce(
+        self: &Arc<Self>,
+        peer: &str,
+        ip: Ipv4Addr,
+        port: u32,
+        token: u32,
+    ) {
         let addr = format!("{}:{}", ip, port);
         let Ok(Ok(mut sock)) =
             tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await
@@ -362,45 +434,242 @@ impl SoulseekSource {
             .await;
     }
 
-    async fn cache_peer_addr(&self, peer: String, ip: Ipv4Addr, port: u32) {
-        let mut guard = self.peer_addrs.lock().await;
-        if guard.len() >= 4096 {
-            guard.clear();
+    async fn connect_peer_pierce_file(&self, ip: Ipv4Addr, port: u32, token: u32) {
+        let addr = format!("{}:{}", ip, port);
+        let Ok(Ok(mut sock)) =
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await
+        else {
+            return;
+        };
+        let mut init_payload = Vec::with_capacity(5);
+        init_payload.push(PEER_PIERCE_FIREWALL);
+        init_payload.extend_from_slice(&token.to_le_bytes());
+        let frame = wrap_len(&init_payload);
+        if sock.write_all(&frame).await.is_err() {
+            return;
         }
-        guard.insert(peer, (ip, port));
+        self.handle_file_socket(sock).await;
     }
 
-    async fn handle_incoming_peer(&self, mut sock: TcpStream) {
+    async fn cache_peer_addr(&self, peer: String, addr: Option<(Ipv4Addr, u32)>) {
+        {
+            let mut guard = self.peer_addrs.lock().await;
+            if guard.len() >= 4096 {
+                guard.clear();
+            }
+            guard.insert(peer, addr);
+        }
+        self.addr_notify.notify_waiters();
+    }
+
+    async fn handle_incoming_peer(self: &Arc<Self>, mut sock: TcpStream) {
         let Ok(Ok((first_byte, rest))) =
             tokio::time::timeout(Duration::from_secs(5), read_raw_peer_init(&mut sock)).await
         else {
             return;
         };
-        let peer_name = if first_byte == PEER_INIT {
+        if first_byte == PEER_INIT {
             let mut cur = Cursor::new(&rest);
-            cur.read_string()
-        } else {
-            None
+            let peer_name = cur.read_string();
+            let conn_type = cur.read_string();
+            if conn_type.as_deref() == Some("F") {
+                self.handle_file_socket(sock).await;
+                return;
+            }
+            self.read_peer_messages(&mut sock, peer_name).await;
+        } else if first_byte == PEER_PIERCE_FIREWALL {
+            let mut cur = Cursor::new(&rest);
+            if let Some(tok) = cur.read_u32() {
+                if let Some((peer, remote_path)) =
+                    self.pending_pierce_peers.lock().await.remove(&tok)
+                {
+                    let q = build_queue_upload_frame(&remote_path);
+                    if sock.write_all(&q).await.is_ok() {
+                        self.read_peer_messages(&mut sock, Some(peer)).await;
+                    }
+                    return;
+                }
+            }
+            self.read_peer_messages(&mut sock, None).await;
+        }
+    }
+
+    async fn handle_file_socket(&self, mut sock: TcpStream) {
+        let mut tok_buf = [0u8; 4];
+        let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut tok_buf)).await
+        else {
+            return;
         };
-        self.read_peer_messages(&mut sock, peer_name).await;
+        let upload_token = u32::from_le_bytes(tok_buf);
+        let pending = self.pending_by_token.lock().await.get(&upload_token).cloned();
+        if let Some(p) = pending {
+            *p.file_socket.lock().await = Some((upload_token, sock));
+            p.notify.notify_waiters();
+        }
+    }
+
+    async fn find_pending_transfer(
+        &self,
+        peer_hint: Option<&str>,
+        filename: &str,
+    ) -> Option<Arc<PendingTransfer>> {
+        let guard = self.pending_transfers.lock().await;
+        if let Some(peer) = peer_hint {
+            let peer_low = peer.to_lowercase();
+            if let Some(hit) = guard
+                .iter()
+                .find(|p| p.peer_lower == peer_low && p.matches_path(filename))
+            {
+                return Some(Arc::clone(hit));
+            }
+        }
+        guard
+            .iter()
+            .find(|p| p.matches_path(filename))
+            .cloned()
     }
 
     async fn read_peer_messages(&self, sock: &mut TcpStream, peer_hint: Option<String>) {
         loop {
             let Ok(Ok((code, payload))) =
-                tokio::time::timeout(Duration::from_secs(10), read_frame(sock)).await
+                tokio::time::timeout(Duration::from_secs(15), read_frame(sock)).await
             else {
                 break;
             };
-            if code == PEER_MSG_SEARCH_RESPONSE {
-                if let Some((token, hits)) =
-                    parse_search_response(&payload, peer_hint.as_deref())
-                {
-                    let sender = self.pending_searches.lock().await.get(&token).cloned();
-                    if let Some(tx) = sender {
-                        let _ = tx.send(hits).await;
+            match code {
+                PEER_MSG_SEARCH_RESPONSE => {
+                    if let Some((token, hits)) =
+                        parse_search_response(&payload, peer_hint.as_deref())
+                    {
+                        let sender = self.pending_searches.lock().await.get(&token).cloned();
+                        if let Some(tx) = sender {
+                            let _ = tx.send(hits).await;
+                        }
                     }
                 }
+                PEER_MSG_TRANSFER_REQUEST => {
+                    let mut cur = Cursor::new(&payload);
+                    let Some(direction) = cur.read_u32() else {
+                        continue;
+                    };
+                    let Some(req_tok) = cur.read_u32() else {
+                        continue;
+                    };
+                    let Some(filename) = cur.read_string() else {
+                        continue;
+                    };
+                    let size = if direction == 1 {
+                        cur.read_u64().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if direction == 1 {
+                        if let Some(p) = self
+                            .find_pending_transfer(peer_hint.as_deref(), &filename)
+                            .await
+                        {
+                            if size > 4096 && size < 250 * 1024 * 1024 {
+                                self.pending_by_token
+                                    .lock()
+                                    .await
+                                    .insert(req_tok, Arc::clone(&p));
+                                *p.upload_info.lock().await = Some((req_tok, size));
+                                let resp = build_transfer_response_frame(req_tok, true, None);
+                                if sock.write_all(&resp).await.is_err() {
+                                    self.pending_by_token.lock().await.remove(&req_tok);
+                                    *p.failed_reason.lock().await =
+                                        Some("Failed to send transfer acceptance".to_string());
+                                    p.notify.notify_waiters();
+                                    break;
+                                }
+                                p.notify.notify_waiters();
+                                continue;
+                            }
+                        }
+                        let deny = build_transfer_response_frame(req_tok, false, Some("Cancelled"));
+                        let _ = sock.write_all(&deny).await;
+                    } else {
+                        let deny = build_transfer_response_frame(req_tok, false, Some("Cancelled"));
+                        let _ = sock.write_all(&deny).await;
+                    }
+                }
+                PEER_MSG_TRANSFER_RESPONSE => {
+                    let mut cur = Cursor::new(&payload);
+                    if let (Some(resp_tok), Some(allowed)) = (cur.read_u32(), cur.read_u8()) {
+                        let pending = {
+                            let guard = self.pending_transfers.lock().await;
+                            guard
+                                .iter()
+                                .find(|p| p.legacy_dl_token == resp_tok)
+                                .cloned()
+                        };
+                        if let Some(p) = pending {
+                            if allowed != 0 {
+                                let size = cur.read_u64().unwrap_or(0);
+                                if size > 4096 && size < 250 * 1024 * 1024 {
+                                    self.pending_by_token
+                                        .lock()
+                                        .await
+                                        .insert(resp_tok, Arc::clone(&p));
+                                    *p.upload_info.lock().await = Some((resp_tok, size));
+                                    p.notify.notify_waiters();
+                                }
+                            } else {
+                                let reason = cur.read_string().unwrap_or_default();
+                                if !reason.eq_ignore_ascii_case("Queued") {
+                                    *p.failed_reason.lock().await = Some(if reason.is_empty() {
+                                        "Transfer rejected".to_string()
+                                    } else {
+                                        reason
+                                    });
+                                    p.notify.notify_waiters();
+                                }
+                            }
+                        }
+                    }
+                }
+                PEER_MSG_PLACE_IN_QUEUE_RESPONSE => {
+                    let mut cur = Cursor::new(&payload);
+                    if let (Some(filename), Some(place)) = (cur.read_string(), cur.read_u32()) {
+                        if place > 5 {
+                            if let Some(p) = self
+                                .find_pending_transfer(peer_hint.as_deref(), &filename)
+                                .await
+                            {
+                                *p.failed_reason.lock().await =
+                                    Some(format!("Queued at position {}", place));
+                                p.notify.notify_waiters();
+                            }
+                        }
+                    }
+                }
+                PEER_MSG_UPLOAD_DENIED => {
+                    let mut cur = Cursor::new(&payload);
+                    if let Some(filename) = cur.read_string() {
+                        let reason = cur.read_string().unwrap_or_else(|| "Denied".to_string());
+                        if let Some(p) = self
+                            .find_pending_transfer(peer_hint.as_deref(), &filename)
+                            .await
+                        {
+                            *p.failed_reason.lock().await = Some(reason);
+                            p.notify.notify_waiters();
+                        }
+                    }
+                }
+                PEER_MSG_UPLOAD_FAILED => {
+                    let mut cur = Cursor::new(&payload);
+                    if let Some(filename) = cur.read_string() {
+                        if let Some(p) = self
+                            .find_pending_transfer(peer_hint.as_deref(), &filename)
+                            .await
+                        {
+                            *p.failed_reason.lock().await = Some("Upload failed".to_string());
+                            p.notify.notify_waiters();
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -409,6 +678,299 @@ impl SoulseekSource {
         let mut tok = self.next_token.lock().await;
         *tok = tok.wrapping_add(1);
         *tok
+    }
+
+    async fn resolve_peer_addr(&self, peer: &str) -> Option<(Ipv4Addr, u32)> {
+        if let Some(cached) = self.peer_addrs.lock().await.get(peer).copied() {
+            return cached;
+        }
+        let writer = self.runtime.read().await.writer.clone()?;
+        let _ = writer
+            .send(build_string_frame(MSG_GET_PEER_ADDRESS, peer))
+            .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1600);
+        loop {
+            let notified = self.addr_notify.notified();
+            if let Some(cached) = self.peer_addrs.lock().await.get(peer).copied() {
+                return cached;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let _ = tokio::time::timeout(deadline - now, notified).await;
+            if let Some(cached) = self.peer_addrs.lock().await.get(peer).copied() {
+                return cached;
+            }
+        }
+    }
+
+    /// Tries the primary `track.stream_url` first, then up to 2 cached alternate Soulseek peers
+    /// for the same `song_key` if the primary peer is unavailable, firewalled, or queued.
+    pub async fn resolve_track(self: &Arc<Self>, track: &Track) -> Option<String> {
+        if let Some(path) = self.resolve_stream(&track.stream_url).await {
+            return Some(path);
+        }
+        let key = track.song_key();
+        let alts = {
+            let guard = self.alt_streams.lock().await;
+            guard.get(&key).cloned().unwrap_or_default()
+        };
+        let mut tried = 0usize;
+        for alt_url in alts {
+            if alt_url == track.stream_url {
+                continue;
+            }
+            tried += 1;
+            if let Some(path) = self.resolve_stream(&alt_url).await {
+                return Some(path);
+            }
+            if tried >= 2 {
+                break;
+            }
+        }
+        None
+    }
+
+    async fn resolve_stream_singleflight(self: &Arc<Self>, stream_ref: &str) -> Option<String> {
+        let rest = stream_ref.strip_prefix("slsk://")?;
+        let (peer, remote_path) = rest.split_once('/')?;
+
+        let _ = std::fs::create_dir_all(&self.download_dir);
+        let ext = sanitize_slsk_ext(remote_path);
+        let base_hash = hash_str(stream_ref);
+        let local_path = self.download_dir.join(format!("{}.{}", base_hash, ext));
+        if tokio::fs::metadata(&local_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+            > 4096
+        {
+            return Some(format!("file:{}", local_path.display()));
+        }
+
+        loop {
+            let (notify, is_leader) = {
+                let mut map = self.in_flight_downloads.lock().await;
+                if let Some(existing) = map.get(stream_ref) {
+                    (Arc::clone(existing), false)
+                } else {
+                    let n = Arc::new(Notify::new());
+                    map.insert(stream_ref.to_string(), Arc::clone(&n));
+                    (n, true)
+                }
+            };
+
+            if !is_leader {
+                notify.notified().await;
+                if tokio::fs::metadata(&local_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+                    > 4096
+                {
+                    return Some(format!("file:{}", local_path.display()));
+                }
+                return None;
+            }
+
+            let res = self
+                .download_from_peer(peer, remote_path, &local_path, &base_hash)
+                .await;
+            {
+                let mut map = self.in_flight_downloads.lock().await;
+                map.remove(stream_ref);
+            }
+            notify.notify_waiters();
+            return res;
+        }
+    }
+
+    async fn download_from_peer(
+        self: &Arc<Self>,
+        peer: &str,
+        remote_path: &str,
+        local_path: &Path,
+        base_hash: &str,
+    ) -> Option<String> {
+        // Wait briefly only if auto-connect is actively in progress; otherwise fail fast when offline.
+        for _ in 0..8 {
+            let (connected, connecting) = {
+                let rt = self.runtime.read().await;
+                (rt.connected, rt.connecting)
+            };
+            if connected {
+                break;
+            }
+            if !connecting {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !self.runtime.read().await.connected {
+            return None;
+        }
+
+        let part_path = self.download_dir.join(format!("{}.part", base_hash));
+        let token = self.next_search_token().await;
+        let pending = Arc::new(PendingTransfer::new(peer, remote_path, token));
+        self.pending_transfers.lock().await.push(Arc::clone(&pending));
+
+        let res = self
+            .execute_peer_transfer(peer, remote_path, local_path, &part_path, token, &pending)
+            .await;
+
+        // Clean up transfer coordination state cleanly on any exit path.
+        {
+            let mut list = self.pending_transfers.lock().await;
+            list.retain(|p| !Arc::ptr_eq(p, &pending));
+        }
+        if let Some((upload_tok, _)) = *pending.upload_info.lock().await {
+            self.pending_by_token.lock().await.remove(&upload_tok);
+        }
+        self.pending_pierce_peers.lock().await.remove(&token);
+
+        res
+    }
+
+    async fn execute_peer_transfer(
+        self: &Arc<Self>,
+        peer: &str,
+        remote_path: &str,
+        local_path: &Path,
+        part_path: &Path,
+        token: u32,
+        pending: &Arc<PendingTransfer>,
+    ) -> Option<String> {
+        let my_user = self
+            .runtime
+            .read()
+            .await
+            .username
+            .clone()
+            .unwrap_or_default();
+        let peer_addr = self.resolve_peer_addr(peer).await;
+        let mut connected_direct = false;
+
+        if let Some((ip, port)) = peer_addr {
+            let addr = format!("{}:{}", ip, port);
+            if let Ok(Ok(mut sock)) =
+                tokio::time::timeout(Duration::from_millis(2500), TcpStream::connect(&addr)).await
+            {
+                let mut init = Vec::new();
+                init.push(PEER_INIT);
+                write_str(&mut init, &my_user);
+                write_str(&mut init, "P");
+                init.extend_from_slice(&token.to_le_bytes());
+                if sock.write_all(&wrap_len(&init)).await.is_ok()
+                    && sock
+                        .write_all(&build_queue_upload_frame(remote_path))
+                        .await
+                        .is_ok()
+                {
+                    connected_direct = true;
+                    let sp = Arc::clone(self);
+                    let peer_owned = peer.to_string();
+                    tokio::spawn(async move {
+                        sp.read_peer_messages(&mut sock, Some(peer_owned)).await;
+                    });
+                }
+            }
+        }
+
+        if !connected_direct {
+            // Peer may be firewalled; ask server to tell peer to pierce back to our listener.
+            let Some(writer) = self.runtime.read().await.writer.clone() else {
+                return None;
+            };
+            self.pending_pierce_peers
+                .lock()
+                .await
+                .insert(token, (peer.to_string(), remote_path.to_string()));
+            let _ = writer
+                .send(build_connect_to_peer_frame(token, peer, "P"))
+                .await;
+        }
+
+        // Wait for TransferRequest(dir=1) -> TransferResponse(allowed=1), or fail fast on denial/deep queue.
+        let req_timeout = if connected_direct {
+            Duration::from_millis(4500)
+        } else {
+            Duration::from_millis(2500)
+        };
+        let req_deadline = tokio::time::Instant::now() + req_timeout;
+        let (_upload_tok, size) = loop {
+            let notified = pending.notify.notified();
+            if let Some(info) = *pending.upload_info.lock().await {
+                break info;
+            }
+            if let Some(ref reason) = *pending.failed_reason.lock().await {
+                debug!(peer, reason, "soulseek transfer declined before start");
+                return None;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= req_deadline {
+                return None;
+            }
+            let _ = tokio::time::timeout(req_deadline - now, notified).await;
+        };
+
+        // Wait for incoming "F" socket (direct or via MSG_CONNECT_TO_PEER("F") -> PierceFirewall).
+        let sock_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        let (_ftok, mut fsock) = loop {
+            let notified = pending.notify.notified();
+            if let Some(sock_pair) = pending.file_socket.lock().await.take() {
+                break sock_pair;
+            }
+            if let Some(ref reason) = *pending.failed_reason.lock().await {
+                debug!(peer, reason, "soulseek transfer failed waiting for F socket");
+                return None;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= sock_deadline {
+                return None;
+            }
+            let _ = tokio::time::timeout(sock_deadline - now, notified).await;
+        };
+
+        // Send FileOffset (8-byte LE start offset = 0) and stream file bytes.
+        fsock.write_all(&0u64.to_le_bytes()).await.ok()?;
+
+        let mut file = tokio::fs::File::create(part_path).await.ok()?;
+        let mut chunk = [0u8; 32 * 1024];
+        let mut written = 0u64;
+        let xfer_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while written < size {
+            let now = tokio::time::Instant::now();
+            if now >= xfer_deadline {
+                break;
+            }
+            let need = ((size - written) as usize).min(chunk.len());
+            let step_timeout = (xfer_deadline - now).min(Duration::from_secs(8));
+            let read_res = tokio::time::timeout(step_timeout, fsock.read(&mut chunk[..need])).await;
+            match read_res {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    if file.write_all(&chunk[..n]).await.is_err() {
+                        written = 0;
+                        break;
+                    }
+                    written += n as u64;
+                }
+            }
+        }
+        let _ = file.flush().await;
+        drop(file);
+        if written != size {
+            let _ = tokio::fs::remove_file(part_path).await;
+            return None;
+        }
+        if tokio::fs::rename(part_path, local_path).await.is_err() {
+            let _ = tokio::fs::remove_file(part_path).await;
+            return None;
+        }
+        Some(format!("file:{}", local_path.display()))
     }
 }
 
@@ -480,20 +1042,42 @@ impl MusicSource for SoulseekSource {
         }
 
         self.pending_searches.lock().await.remove(&token);
-        // Prefer peers with a free upload slot and higher upload speed when deduping by song_key.
-        let mut best_by_key: HashMap<String, SlskSearchHit> = HashMap::new();
+        // Group hits by song_key, prefer peers with a free slot and higher upload speed,
+        // and retain up to 4 alternate peer URLs per song_key for download fallback.
+        let mut by_key: HashMap<String, Vec<SlskSearchHit>> = HashMap::new();
         for hit in collected {
-            let key = hit.track.song_key();
-            let hit_rank = (hit.slot_free as u8, hit.track.quality_score(), hit.avg_speed);
-            match best_by_key.get(&key) {
-                Some(cur)
-                    if (cur.slot_free as u8, cur.track.quality_score(), cur.avg_speed) >= hit_rank => {}
-                _ => {
-                    best_by_key.insert(key, hit);
-                }
+            by_key.entry(hit.track.song_key()).or_default().push(hit);
+        }
+
+        let mut out: Vec<SlskSearchHit> = Vec::with_capacity(by_key.len());
+        let mut alt_updates: Vec<(String, Vec<String>)> = Vec::new();
+        for (key, mut hits) in by_key {
+            hits.sort_by_key(|h| {
+                std::cmp::Reverse((h.slot_free as u8, h.track.quality_score(), h.avg_speed))
+            });
+            let urls: Vec<String> = hits
+                .iter()
+                .map(|h| h.track.stream_url.clone())
+                .take(4)
+                .collect();
+            if urls.len() > 1 {
+                alt_updates.push((key, urls));
+            }
+            if let Some(best) = hits.into_iter().next() {
+                out.push(best);
             }
         }
-        let mut out: Vec<SlskSearchHit> = best_by_key.into_values().collect();
+
+        if !alt_updates.is_empty() {
+            let mut alts = self.alt_streams.lock().await;
+            if alts.len() >= 2048 {
+                alts.clear();
+            }
+            for (k, urls) in alt_updates {
+                alts.insert(k, urls);
+            }
+        }
+
         out.sort_by_key(|h| {
             std::cmp::Reverse((h.slot_free as u8, h.track.quality_score(), h.avg_speed))
         });
@@ -501,144 +1085,43 @@ impl MusicSource for SoulseekSource {
     }
 
     async fn resolve_stream(&self, stream_ref: &str) -> Option<String> {
-        let rest = stream_ref.strip_prefix("slsk://")?;
-        let (peer, remote_path) = rest.split_once('/')?;
-
-        let _ = std::fs::create_dir_all(&self.download_dir);
-        let ext = sanitize_slsk_ext(remote_path);
-        let base_hash = hash_str(stream_ref);
-        let local_path = self.download_dir.join(format!("{}.{}", base_hash, ext));
-        if tokio::fs::metadata(&local_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0)
-            > 4096
-        {
-            return Some(format!("file:{}", local_path.display()));
-        }
-        let part_path = self.download_dir.join(format!("{}.part", base_hash));
-
-        // Request peer address from server if not cached
-        if !self.peer_addrs.lock().await.contains_key(peer) {
-            if let Some(writer) = self.runtime.read().await.writer.clone() {
-                let _ = writer
-                    .send(build_string_frame(MSG_GET_PEER_ADDRESS, peer))
-                    .await;
-                for _ in 0..10 {
-                    tokio::time::sleep(Duration::from_millis(120)).await;
-                    if self.peer_addrs.lock().await.contains_key(peer) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let (ip, port) = self.peer_addrs.lock().await.get(peer).copied()?;
-        let addr = format!("{}:{}", ip, port);
-        let mut sock = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
-            .await
-            .ok()?
-            .ok()?;
-
-        let my_user = self
-            .runtime
-            .read()
-            .await
-            .username
-            .clone()
-            .unwrap_or_default();
-        let token = self.next_search_token().await;
-
-        // Send PeerInit ("P")
-        let mut init = Vec::new();
-        init.push(PEER_INIT);
-        write_str(&mut init, &my_user);
-        write_str(&mut init, "P");
-        init.extend_from_slice(&token.to_le_bytes());
-        sock.write_all(&wrap_len(&init)).await.ok()?;
-
-        // Send QueueUpload (code 43) then TransferRequest (code 40)
-        let mut q = Vec::new();
-        q.extend_from_slice(&PEER_MSG_QUEUE_UPLOAD.to_le_bytes());
-        write_str(&mut q, remote_path);
-        sock.write_all(&wrap_len(&q)).await.ok()?;
-
-        let mut tr = Vec::new();
-        tr.extend_from_slice(&PEER_MSG_TRANSFER_REQUEST.to_le_bytes());
-        tr.extend_from_slice(&0u32.to_le_bytes()); // direction: 0 = download
-        tr.extend_from_slice(&token.to_le_bytes());
-        write_str(&mut tr, remote_path);
-        sock.write_all(&wrap_len(&tr)).await.ok()?;
-
-        // Wait for TransferResponse (code 41); fail fast if peer queues/denies so fallback stays responsive.
-        let (code, payload) = tokio::time::timeout(Duration::from_millis(3500), read_frame(&mut sock))
-            .await
-            .ok()?
-            .ok()?;
-        if code != PEER_MSG_TRANSFER_RESPONSE {
-            return None;
-        }
-        let mut cur = Cursor::new(&payload);
-        let _resp_tok = cur.read_u32()?;
-        let allowed = cur.read_u8()?;
-        if allowed == 0 {
-            return None;
-        }
-        let size = cur.read_u64().unwrap_or(0);
-        if size == 0 || size >= 250 * 1024 * 1024 {
-            return None;
-        }
-
-        // Open dedicated "F" (file transfer) connection to peer
-        let mut fsock = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
-            .await
-            .ok()?
-            .ok()?;
-        let mut finit = Vec::new();
-        finit.push(PEER_INIT);
-        write_str(&mut finit, &my_user);
-        write_str(&mut finit, "F");
-        finit.extend_from_slice(&0u32.to_le_bytes());
-        fsock.write_all(&wrap_len(&finit)).await.ok()?;
-        fsock.write_all(&token.to_le_bytes()).await.ok()?;
-        fsock.write_all(&0u64.to_le_bytes()).await.ok()?; // start offset 0
-
-        // Stream directly to a .part file with per-chunk idle timeout and verify complete length.
-        let mut file = tokio::fs::File::create(&part_path).await.ok()?;
-        let mut chunk = [0u8; 32 * 1024];
-        let mut written = 0u64;
-        while written < size {
-            let need = ((size - written) as usize).min(chunk.len());
-            let read_res = tokio::time::timeout(
-                Duration::from_secs(6),
-                fsock.read(&mut chunk[..need]),
-            )
-            .await;
-            match read_res {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(n)) => {
-                    if file.write_all(&chunk[..n]).await.is_err() {
-                        written = 0;
-                        break;
-                    }
-                    written += n as u64;
-                }
-            }
-        }
-        drop(file);
-        if written != size {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            return None;
-        }
-        if tokio::fs::rename(&part_path, &local_path).await.is_err() {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            return None;
-        }
-        Some(format!("file:{}", local_path.display()))
+        let arc = self.self_weak.get().and_then(|w| w.upgrade())?;
+        arc.resolve_stream_singleflight(stream_ref).await
     }
 }
 
 // --- Binary protocol helpers ---
+
+fn normalize_slsk_path(path: &str) -> String {
+    path.trim().replace('\\', "/").to_lowercase()
+}
+
+fn build_queue_upload_frame(remote_path: &str) -> Vec<u8> {
+    let mut p = Vec::with_capacity(8 + remote_path.len());
+    p.extend_from_slice(&PEER_MSG_QUEUE_UPLOAD.to_le_bytes());
+    write_str(&mut p, remote_path);
+    wrap_len(&p)
+}
+
+fn build_transfer_response_frame(token: u32, allowed: bool, reason: Option<&str>) -> Vec<u8> {
+    let mut p = Vec::with_capacity(16);
+    p.extend_from_slice(&PEER_MSG_TRANSFER_RESPONSE.to_le_bytes());
+    p.extend_from_slice(&token.to_le_bytes());
+    p.push(if allowed { 1 } else { 0 });
+    if !allowed {
+        write_str(&mut p, reason.unwrap_or("Cancelled"));
+    }
+    wrap_len(&p)
+}
+
+fn build_connect_to_peer_frame(token: u32, username: &str, conn_type: &str) -> Vec<u8> {
+    let mut p = Vec::with_capacity(16 + username.len() + conn_type.len());
+    p.extend_from_slice(&MSG_CONNECT_TO_PEER.to_le_bytes());
+    p.extend_from_slice(&token.to_le_bytes());
+    write_str(&mut p, username);
+    write_str(&mut p, conn_type);
+    wrap_len(&p)
+}
 
 fn sanitize_slsk_ext(remote_path: &str) -> String {
     let raw = remote_path
@@ -939,8 +1422,40 @@ fn is_disc_folder(s: &str) -> bool {
     false
 }
 
+fn normalize_slsk_separators(s: &str) -> String {
+    let mut work = s.replace('_', " ");
+    let trimmed = work.trim();
+    if !trimmed.contains(' ') && trimmed.contains('.') {
+        let segs: Vec<&str> = trimmed.split('.').filter(|p| !p.is_empty()).collect();
+        let has_single_letter_initial = segs
+            .iter()
+            .any(|p| p.chars().count() == 1 && p.chars().all(|c| c.is_alphanumeric()));
+        let has_abbr = segs.first().is_some_and(|p| {
+            matches!(
+                p.to_ascii_lowercase().as_str(),
+                "mr" | "ms" | "mrs" | "dr" | "st" | "jr" | "sr" | "vs" | "ft" | "pt" | "vol"
+            )
+        });
+        if segs.len() >= 2 && !has_single_letter_initial && !has_abbr {
+            work = trimmed.replace('.', " ");
+        }
+    }
+    work.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn split_leading_track_no(stem: &str) -> (i32, &str) {
-    let s = stem.trim();
+    let mut s = stem.trim();
+    // Handle optional "Track 02 - ..." or "Tr. 02 ..." prefix
+    let low = s.to_ascii_lowercase();
+    for prefix in ["track ", "tr. ", "tr "] {
+        if low.starts_with(prefix) && s.is_char_boundary(prefix.len()) {
+            let after = s[prefix.len()..].trim_start();
+            if after.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                s = after;
+                break;
+            }
+        }
+    }
     // Handle disc-track like "1-02 Track" or "01 - Track" or "01. Track" or "01 Track"
     let bytes = s.as_bytes();
     let mut idx = 0;
@@ -976,7 +1491,108 @@ fn split_leading_track_no(stem: &str) -> (i32, &str) {
             }
         }
     }
-    (0, s)
+    (0, stem.trim())
+}
+
+fn strip_leading_label_prefix(title: &str, label: &str) -> Option<String> {
+    let lbl = label.trim();
+    if lbl.is_empty() || title.len() <= lbl.len() {
+        return None;
+    }
+    let t_low = title.to_lowercase();
+    let l_low = lbl.to_lowercase();
+    if !t_low.starts_with(&l_low) || !title.is_char_boundary(lbl.len()) {
+        return None;
+    }
+    let after = &title[lbl.len()..];
+    let first = after.chars().next()?;
+    if !matches!(first, ' ' | '-' | '_' | ':' | '|') {
+        return None;
+    }
+    let rest = after
+        .trim_start_matches([' ', '-', '_', ':', '|', '\u{2013}', '\u{2014}'])
+        .trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Cleans Soulseek-style prefixes (`Artist - ...`, `Album - ...`, `Track 02 - ...`, `02 - ...`,
+/// underscores/dots) from `(artist, album, title)` for display and fallback queries.
+pub fn clean_slsk_title_and_artist(
+    raw_artist: &str,
+    raw_album: &str,
+    raw_title: &str,
+) -> (String, String, i32) {
+    let mut artist = crate::models::primary_artist(&normalize_slsk_separators(raw_artist));
+    if crate::models::is_generic_folder_name(&artist) {
+        artist.clear();
+    }
+    let album = crate::models::strip_release_tags(&normalize_slsk_separators(raw_album));
+    let mut title = crate::models::strip_release_tags(&normalize_slsk_separators(raw_title));
+    if title.is_empty() {
+        title = normalize_slsk_separators(raw_title);
+    }
+
+    let mut track_no = 0i32;
+    for _ in 0..3 {
+        let prev = title.clone();
+        if track_no == 0 {
+            let (tno, rest) = split_leading_track_no(&title);
+            if tno > 0 {
+                track_no = tno;
+                let stripped = crate::models::strip_release_tags(rest);
+                let next = if stripped.is_empty() {
+                    rest.to_string()
+                } else {
+                    stripped
+                };
+                title = next;
+            }
+        }
+        if let Some((left, right)) = title.split_once(" - ") {
+            let la = crate::models::primary_artist(&normalize_slsk_separators(left));
+            let rt = crate::models::strip_release_tags(right);
+            if !la.is_empty()
+                && !rt.is_empty()
+                && !crate::models::is_generic_folder_name(&la)
+                && (artist.is_empty() || artist.eq_ignore_ascii_case(&la))
+            {
+                artist = la;
+                title = rt;
+            } else if !album.is_empty() && !rt.is_empty() && left.trim().eq_ignore_ascii_case(&album)
+            {
+                title = rt;
+            }
+        }
+        if !artist.is_empty() {
+            if let Some(rest) = strip_leading_label_prefix(&title, &artist) {
+                title = rest;
+            }
+        }
+        if !album.is_empty() {
+            if let Some(rest) = strip_leading_label_prefix(&title, &album) {
+                title = rest;
+            }
+        }
+        if title == prev {
+            break;
+        }
+    }
+
+    if track_no == 0 {
+        let (tno, rest) = split_leading_track_no(&title);
+        if tno > 0 {
+            track_no = tno;
+            title = rest.to_string();
+        }
+    }
+
+    if artist.is_empty() {
+        artist = "Unknown Artist".to_string();
+    }
+    (artist, title, track_no)
 }
 
 /// Parses a Soulseek virtual path into `(artist, album, title, track_no)`, cleaning share
@@ -996,12 +1612,6 @@ pub fn parse_slsk_path(raw: &str) -> (String, String, String, i32) {
         .unwrap_or(fname)
         .trim();
 
-    let (track_no, raw_title) = split_leading_track_no(stem);
-    let mut title = crate::models::strip_release_tags(raw_title);
-    if title.is_empty() {
-        title = raw_title.to_string();
-    }
-
     while dirs.last().is_some_and(|d| is_disc_folder(d)) {
         dirs.pop();
     }
@@ -1020,12 +1630,12 @@ pub fn parse_slsk_path(raw: &str) -> (String, String, String, i32) {
         .copied()
         .unwrap_or("");
 
-    let mut artist = crate::models::primary_artist(raw_artist);
+    let mut artist = crate::models::primary_artist(&normalize_slsk_separators(raw_artist));
     if crate::models::is_generic_folder_name(&artist) {
         artist.clear();
     }
 
-    let mut album = crate::models::strip_release_tags(raw_album);
+    let mut album = crate::models::strip_release_tags(&normalize_slsk_separators(raw_album));
 
     // Extract "Artist | Album" or "Artist - Album" from folder name when appropriate
     if let Some((left, right)) = album.split_once(" | ").or_else(|| album.split_once(" - ")) {
@@ -1042,28 +1652,12 @@ pub fn parse_slsk_path(raw: &str) -> (String, String, String, i32) {
         }
     }
 
-    // Extract "Artist - Title" from filename stem if present
-    if let Some((left, right)) = title.split_once(" - ") {
-        let la = crate::models::primary_artist(left);
-        let rt = crate::models::strip_release_tags(right);
-        if !la.is_empty()
-            && !rt.is_empty()
-            && !crate::models::is_generic_folder_name(&la)
-            && (artist.is_empty() || artist.eq_ignore_ascii_case(&la))
-        {
-            artist = la;
-            title = rt;
-        }
-    }
-
-    if artist.is_empty() {
-        artist = "Unknown Artist".to_string();
-    }
+    let (clean_artist, title, track_no) = clean_slsk_title_and_artist(&artist, &album, stem);
     if album.is_empty() {
         album = title.clone();
     }
 
-    (artist, album, title, track_no)
+    (clean_artist, album, title, track_no)
 }
 
 #[cfg(test)]
@@ -1138,10 +1732,199 @@ mod tests {
     }
 
     #[test]
+    fn parse_slsk_path_normalizes_messy_album_track_and_dot_variants() {
+        let cases = [
+            "@@p1\\Music\\Porter Robinson\\Nurture\\Nurture - Look at the Sky.flac",
+            "@@p2\\Music\\Porter Robinson\\Nurture\\Track 02 - Look at the Sky.flac",
+            "@@p3\\Music\\Porter.Robinson\\Nurture\\Porter.Robinson.-.02.-.Look.at.the.Sky.flac",
+            "@@p4\\Music\\Porter Robinson\\Nurture\\Porter Robinson_Nurture_02_Look at the Sky.flac",
+            "@@p5\\Music\\Porter Robinson\\Nurture\\Nurture - 02 Look at the Sky.flac",
+        ];
+        for p in cases {
+            let (art, alb, title, _) = parse_slsk_path(p);
+            assert_eq!(art, "Porter Robinson", "path={}", p);
+            assert_eq!(alb, "Nurture", "path={}", p);
+            assert_eq!(title, "Look at the Sky", "path={}", p);
+        }
+
+        // Preserve dot initials like R.E.M.
+        let (rem_art, rem_alb, rem_title, rem_no) = parse_slsk_path(
+            "@@p6\\Music\\R.E.M.\\Automatic for the People\\03 - Everybody Hurts.flac",
+        );
+        assert_eq!(rem_art, "R.E.M.");
+        assert_eq!(rem_alb, "Automatic for the People");
+        assert_eq!(rem_title, "Everybody Hurts");
+        assert_eq!(rem_no, 3);
+    }
+
+    #[test]
     fn sanitize_slsk_ext_strips_traversal_and_punctuation() {
         assert_eq!(sanitize_slsk_ext("@@peer\\song.FLAC"), "flac");
         assert_eq!(sanitize_slsk_ext("folder/track.mp3?.."), "mp3");
         assert_eq!(sanitize_slsk_ext("no_extension"), "mp3");
         assert_eq!(sanitize_slsk_ext("song.???"), "mp3");
+    }
+
+    #[tokio::test]
+    async fn execute_transfer_supports_queue_upload_transfer_request_dir1_and_f_socket() {
+        let dir = std::env::temp_dir().join(format!("beatlab_slsk_xfer_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_memory().unwrap();
+        let slsk = SoulseekSource::new(store, dir.join("dl"));
+
+        // Spin up a mock Soulseek peer that speaks the modern QueueUpload -> TransferRequest(dir=1) protocol.
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer_listener.local_addr().unwrap().port() as u32;
+        let payload_bytes = vec![0x66u8; 8192]; // fake FLAC payload > 4096 bytes
+        let expected_bytes = payload_bytes.clone();
+        let remote_path = "@@mockpeer\\Music\\Porter Robinson\\Nurture\\02 - Look at the Sky.flac".to_string();
+
+        {
+            let mut rt = slsk.runtime.write().await;
+            rt.connected = true;
+            rt.username = Some("beatlab_test".to_string());
+        }
+        slsk.cache_peer_addr("mockpeer".to_string(), Some((Ipv4Addr::LOCALHOST, peer_port)))
+            .await;
+
+        let slsk_srv = Arc::clone(&slsk);
+        let remote_clone = remote_path.clone();
+        let peer_task = tokio::spawn(async move {
+            let (mut psock, _) = peer_listener.accept().await.unwrap();
+            let (first, _rest) = read_raw_peer_init(&mut psock).await.unwrap();
+            assert_eq!(first, PEER_INIT);
+
+            // Expect QueueUpload (43)
+            let (code, q_payload) = read_frame(&mut psock).await.unwrap();
+            assert_eq!(code, PEER_MSG_QUEUE_UPLOAD);
+            let mut cur = Cursor::new(&q_payload);
+            assert_eq!(cur.read_string().as_deref(), Some(remote_clone.as_str()));
+
+            // Reply with TransferRequest(direction=1, upload_token=777, filename, size)
+            let upload_token = 777u32;
+            let mut tr = Vec::new();
+            tr.extend_from_slice(&PEER_MSG_TRANSFER_REQUEST.to_le_bytes());
+            tr.extend_from_slice(&1u32.to_le_bytes());
+            tr.extend_from_slice(&upload_token.to_le_bytes());
+            write_str(&mut tr, &remote_clone);
+            tr.extend_from_slice(&(expected_bytes.len() as u64).to_le_bytes());
+            psock.write_all(&wrap_len(&tr)).await.unwrap();
+
+            // Expect TransferResponse(41, upload_token, allowed=1)
+            let (resp_code, resp_payload) = read_frame(&mut psock).await.unwrap();
+            assert_eq!(resp_code, PEER_MSG_TRANSFER_RESPONSE);
+            let mut rcur = Cursor::new(&resp_payload);
+            assert_eq!(rcur.read_u32(), Some(upload_token));
+            assert_eq!(rcur.read_u8(), Some(1));
+
+            // Simulate uploader connecting "F" (or PierceFirewall "F") and handing socket to slsk
+            let f_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let f_addr = f_listener.local_addr().unwrap();
+            let uploader_f = tokio::spawn(async move {
+                let (mut fsock, _) = f_listener.accept().await.unwrap();
+                let mut init = Vec::new();
+                init.push(PEER_INIT);
+                write_str(&mut init, "mockpeer");
+                write_str(&mut init, "F");
+                init.extend_from_slice(&0u32.to_le_bytes());
+                fsock.write_all(&wrap_len(&init)).await.unwrap();
+                fsock.write_all(&upload_token.to_le_bytes()).await.unwrap();
+                let mut off = [0u8; 8];
+                fsock.read_exact(&mut off).await.unwrap();
+                assert_eq!(u64::from_le_bytes(off), 0);
+                fsock.write_all(&expected_bytes).await.unwrap();
+            });
+            let incoming = TcpStream::connect(f_addr).await.unwrap();
+            slsk_srv.handle_incoming_peer(incoming).await;
+            uploader_f.await.unwrap();
+        });
+
+        let stream_ref = format!("slsk://mockpeer/{}", remote_path);
+        let resolved = slsk.resolve_stream(&stream_ref).await.expect("expected download to succeed");
+        let saved_path = PathBuf::from(resolved.strip_prefix("file:").unwrap());
+        assert_eq!(std::fs::read(&saved_path).unwrap(), payload_bytes);
+        peer_task.await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pierce_firewall_file_transfer_works_behind_nat() {
+        let dir = std::env::temp_dir().join(format!("beatlab_slsk_pierce_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_memory().unwrap();
+        let slsk = SoulseekSource::new(store, dir.join("dl"));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer_listener.local_addr().unwrap().port() as u32;
+        let payload_bytes = vec![0x42u8; 6144];
+        let expected_bytes = payload_bytes.clone();
+        let remote_path = "@@natpeer\\Music\\Porter Robinson\\Nurture\\02 - Look at the Sky.flac".to_string();
+
+        {
+            let mut rt = slsk.runtime.write().await;
+            rt.connected = true;
+            rt.username = Some("beatlab_nat".to_string());
+        }
+        slsk.cache_peer_addr("natpeer".to_string(), Some((Ipv4Addr::LOCALHOST, peer_port)))
+            .await;
+
+        let slsk_srv = Arc::clone(&slsk);
+        let remote_clone = remote_path.clone();
+        let peer_task = tokio::spawn(async move {
+            let (mut psock, _) = peer_listener.accept().await.unwrap();
+            let _ = read_raw_peer_init(&mut psock).await.unwrap();
+            let (code, _) = read_frame(&mut psock).await.unwrap();
+            assert_eq!(code, PEER_MSG_QUEUE_UPLOAD);
+
+            let upload_token = 991u32;
+            let mut tr = Vec::new();
+            tr.extend_from_slice(&PEER_MSG_TRANSFER_REQUEST.to_le_bytes());
+            tr.extend_from_slice(&1u32.to_le_bytes());
+            tr.extend_from_slice(&upload_token.to_le_bytes());
+            write_str(&mut tr, &remote_clone);
+            tr.extend_from_slice(&(expected_bytes.len() as u64).to_le_bytes());
+            psock.write_all(&wrap_len(&tr)).await.unwrap();
+
+            let (resp_code, _) = read_frame(&mut psock).await.unwrap();
+            assert_eq!(resp_code, PEER_MSG_TRANSFER_RESPONSE);
+
+            // Simulate downloader behind NAT: uploader listens on f_listener and server sends
+            // MSG_CONNECT_TO_PEER("F") with pierce_token = 555.
+            let f_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let f_port = f_listener.local_addr().unwrap().port() as u32;
+            let pierce_token = 555u32;
+
+            let mut msg = Vec::new();
+            write_str(&mut msg, "natpeer");
+            write_str(&mut msg, "F");
+            msg.extend_from_slice(&u32::from(Ipv4Addr::LOCALHOST).to_le_bytes());
+            msg.extend_from_slice(&f_port.to_le_bytes());
+            msg.extend_from_slice(&pierce_token.to_le_bytes());
+            let (dummy_tx, _dummy_rx) = mpsc::channel(4);
+            slsk_srv
+                .handle_server_message(MSG_CONNECT_TO_PEER, &msg, &dummy_tx)
+                .await;
+
+            let (mut fsock, _) = f_listener.accept().await.unwrap();
+            let (pfirst, prest) = read_raw_peer_init(&mut fsock).await.unwrap();
+            assert_eq!(pfirst, PEER_PIERCE_FIREWALL);
+            let mut pcur = Cursor::new(&prest);
+            assert_eq!(pcur.read_u32(), Some(pierce_token));
+
+            fsock.write_all(&upload_token.to_le_bytes()).await.unwrap();
+            let mut off = [0u8; 8];
+            fsock.read_exact(&mut off).await.unwrap();
+            assert_eq!(u64::from_le_bytes(off), 0);
+            fsock.write_all(&expected_bytes).await.unwrap();
+        });
+
+        let stream_ref = format!("slsk://natpeer/{}", remote_path);
+        let resolved = slsk.resolve_stream(&stream_ref).await.expect("expected pierce download to succeed");
+        let saved_path = PathBuf::from(resolved.strip_prefix("file:").unwrap());
+        assert_eq!(std::fs::read(&saved_path).unwrap(), payload_bytes);
+        peer_task.await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

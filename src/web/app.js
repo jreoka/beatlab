@@ -2219,8 +2219,13 @@
         state.compatAttemptedId = cur.id;
         const pos = audio.currentTime || 0;
         audio.src = buildStreamUrl(cur, true, pos);
-        audio.play().catch(() => {});
+        audio.play().catch(() => {
+          updatePlayButton(false);
+        });
+        return;
       }
+      updatePlayButton(false);
+      showToast(`Unable to play "${cur.title}" right now`);
     });
     audio.addEventListener('ended', () => {
       const cur = currentTrack();
