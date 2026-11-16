@@ -6085,8 +6085,68 @@
     });
   }
 
+  function publicStatsHtml(stats) {
+    if (!stats || !stats.totalStreams) {
+      return emptyState('No listening stats yet', 'These numbers appear once this listener starts playing music on Beatlab.');
+    }
+    const topTracks = stats.topTracks || [];
+    const cards = [
+      ['Streams', stats.totalStreams.toLocaleString(), `${(stats.completedStreams || 0).toLocaleString()} completed`],
+      ['Listening time', fmtStatsDuration(stats.totalListeningSecs || 0), 'all time'],
+      ['Songs', (stats.uniqueTracks || 0).toLocaleString(), `${stats.uniqueAlbums || 0} albums`],
+      ['Artists', (stats.uniqueArtists || 0).toLocaleString(), 'explored'],
+      ['Best streak', `${stats.longestStreak || 0}d`, 'in a row'],
+    ];
+    return `
+      <section class="public-stats">
+        <div class="stats-kpi-grid">
+          ${cards
+            .map(
+              ([label, val, sub], i) => `
+            <div class="stats-kpi-card ${i === 0 ? 'accent-green' : ''}">
+              <div class="stats-kpi-label">${esc(label)}</div>
+              <div class="stats-kpi-val">${esc(val)}</div>
+              <div class="stats-kpi-sub">${esc(sub)}</div>
+            </div>`
+            )
+            .join('')}
+        </div>
+        ${
+          stats.topArtist || stats.topGenre
+            ? `<div class="public-stats-highlights">
+                 ${stats.topArtist ? `<div class="public-stat-highlight"><span>Top artist</span><strong>${esc(stats.topArtist)}</strong></div>` : ''}
+                 ${stats.topGenre ? `<div class="public-stat-highlight"><span>Top genre</span><strong>${esc(stats.topGenre)}</strong></div>` : ''}
+               </div>`
+            : ''
+        }
+        ${
+          topTracks.length
+            ? `<section class="section">
+                 <div class="section-head"><h2>Top tracks</h2><span style="color:var(--text-dim);font-size:12px">Most played</span></div>
+                 <div class="public-top-tracks">
+                   ${topTracks
+                     .map(
+                       (t, i) => `
+                     <div class="public-top-track">
+                       <span class="public-track-rank">${i + 1}</span>
+                       <div class="public-track-meta"><strong>${esc(t.title)}</strong><span>${esc(t.artist)}</span></div>
+                       <span class="public-track-plays">${(t.streams || 0).toLocaleString()} plays</span>
+                     </div>`
+                     )
+                     .join('')}
+                 </div>
+               </section>`
+            : ''
+        }
+        <p class="public-stats-foot">Member since ${esc(fmtDateLabel(stats.memberSince))}</p>
+      </section>`;
+  }
+
   function renderProfileTabBody(data) {
     const tab = data.tab || state.social.profileTab;
+    if (tab === 'stats') {
+      return publicStatsHtml(data.stats);
+    }
     if (tab === 'radio') {
       return radioPanelHtml(data);
     }
@@ -6119,16 +6179,18 @@
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const profileRes = results[0];
       const u = profileRes.user;
+      const pstats = profileRes.stats || {};
       const radio = results[3] || emptyRadio;
       cacheTracks(radio.tracks || []);
       const isSelf = selfRef || !!u.isSelf;
-      const defaultTab = 'radio';
+      const defaultTab = 'stats';
       if (state.social.profileData && state.social.profileData.user.id !== u.id) {
         state.social.profileTab = defaultTab;
       }
       const data = {
         user: u,
         profile: profileRes.profile || {},
+        stats: profileRes.stats || null,
         playlists: profileRes.playlists || [],
         radio,
         followers: results[1]?.users || [],
@@ -6140,6 +6202,7 @@
 
       const color = u.avatarColor || '#1ed760';
       const tabs = [
+        ['stats', 'Stats'],
         ['radio', isSelf ? 'Your Radio' : 'Radio'],
         ['playlists', 'Playlists'],
         ['followers', 'Followers'],
@@ -6159,6 +6222,8 @@
             <button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('followers')"><strong>${u.followersCount}</strong><span>Followers</span></button>
             <button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('following')"><strong>${u.followingCount}</strong><span>Following</span></button>
             <button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('radio')"><strong>${(radio.tracks || []).length}</strong><span>Radio tracks</span></button>
+            ${pstats.totalStreams ? `<button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('stats')"><strong>${pstats.totalStreams.toLocaleString()}</strong><span>Streams</span></button>` : ''}
+            ${pstats.totalStreams ? `<button class="profile-stat profile-stat-btn" onclick="App.setProfileTab('stats')"><strong>${esc(fmtStatsDuration(pstats.totalListeningSecs || 0))}</strong><span>Listening</span></button>` : ''}
           </div>
           <div class="hero-actions">
             <button class="btn-primary" onclick="App.playUserRadio(${esc(JSON.stringify(u.username))})">${ICONS.play} Play ${isSelf ? 'My' : '@' + u.username + "'s"} Radio</button>

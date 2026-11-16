@@ -3780,6 +3780,20 @@ pub async fn social_profile(
     let Some(target) = state.store.get_public_user(target_id, user.id).ok().flatten() else {
         return err_res(StatusCode::NOT_FOUND, "User not found");
     };
+    // Listening stats are computed from the target's all-time history and shared
+    // as safe aggregates only (see stats::PublicStats).
+    let target_user = User {
+        id: target.id,
+        username: target.username.clone(),
+        password: String::new(),
+        created: target.created,
+    };
+    let store = state.store.clone();
+    let stats = tokio::task::spawn_blocking(move || {
+        crate::stats::build_public_stats(&store, &target_user, Utc::now().timestamp())
+    })
+    .await
+    .unwrap_or_default();
     let profile = state.store.get_profile(target_id).unwrap_or_default();
     let radio_saved = state
         .store
@@ -3799,6 +3813,7 @@ pub async fn social_profile(
     json_res(json!({
         "user": public_user_json(&target),
         "profile": profile_json(&profile),
+        "stats": serde_json::to_value(&stats).unwrap_or(Value::Null),
         "radioSaved": radio_saved,
         "playlists": playlists,
     }))

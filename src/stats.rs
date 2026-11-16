@@ -359,6 +359,62 @@ pub fn build_user_stats(
     )
 }
 
+/// A curated, privacy-safe subset of listening stats for a user's public
+/// profile. Only aggregate numbers and top-item names are exposed — no listening
+/// timestamps, hidden tracks, recent activity, or other personal details.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicStats {
+    pub total_streams: usize,
+    pub completed_streams: usize,
+    pub total_listening_secs: i64,
+    pub unique_tracks: usize,
+    pub unique_artists: usize,
+    pub unique_albums: usize,
+    pub longest_streak: usize,
+    pub member_since: i64,
+    pub top_artist: Option<String>,
+    pub top_genre: Option<String>,
+    pub top_tracks: Vec<PublicTopTrack>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTopTrack {
+    pub title: String,
+    pub artist: String,
+    pub streams: usize,
+}
+
+/// Build the stats shown on a user's public profile, based on their all-time
+/// listening history. Reuses the same computation as the private stats page so
+/// the numbers stay consistent, but strips it down to shareable aggregates.
+pub fn build_public_stats(store: &Store, user: &User, now_ts: i64) -> PublicStats {
+    let computed = build_user_stats(store, user, StatsRange::All, 0, now_ts);
+    PublicStats {
+        total_streams: computed.summary.total_streams,
+        completed_streams: computed.summary.completed_streams,
+        total_listening_secs: computed.summary.total_listening_secs,
+        unique_tracks: computed.summary.unique_tracks,
+        unique_artists: computed.summary.unique_artists,
+        unique_albums: computed.summary.unique_albums,
+        longest_streak: computed.streaks.longest_days,
+        member_since: computed.member_since,
+        top_artist: computed.top_artists.first().map(|a| a.name.clone()),
+        top_genre: computed.genres.first().map(|g| g.name.clone()),
+        top_tracks: computed
+            .top_tracks
+            .into_iter()
+            .take(5)
+            .map(|t| PublicTopTrack {
+                title: t.track.title,
+                artist: t.track.artist,
+                streams: t.streams,
+            })
+            .collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compute_stats_from_data(
     user: &User,
