@@ -33,6 +33,7 @@
     volMuted: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/>',
     repeatAll: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/>',
     repeatOne: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/><path d="M11 10.2 12.4 9.2V15"/>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
   };
 
   function loadEqGains() {
@@ -122,6 +123,11 @@
     healthHeartbeatTimer: null,
     healthCheckInFlight: null,
     recentHeard: loadRecentHeard(),
+    upcomingMode: (() => {
+      const m = localStorage.getItem('beatlab_upcoming_mode');
+      return ['default', 'familiar', 'discover'].includes(m) ? m : 'default';
+    })(),
+    radioPlaylistId: null,
   };
 
   const RECENT_HEARD_TTL_MS = 2 * 60 * 60 * 1000;
@@ -1370,10 +1376,13 @@
       box.innerHTML = state.playlists
         .map(
           (p) => `
-          <button class="pl-link" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(`${p.trackCount} tracks · ${p.ownerName}`)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
-            <span class="pl-link-name">${esc(p.name)}</span>
-            ${p.isAuto ? '<span class="pl-auto-pill">Mix</span>' : ''}
-          </button>`
+          <div class="pl-link-row">
+            <button class="pl-link" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(`${p.trackCount} tracks · ${p.ownerName}`)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
+              <span class="pl-link-name">${esc(p.name)}</span>
+              ${p.isAuto ? '<span class="pl-auto-pill">Mix</span>' : ''}
+            </button>
+            ${!p.isAuto ? `<button class="pl-del-btn" title="Delete playlist" aria-label="Delete ${esc(p.name)}" onclick="event.stopPropagation();App.deletePlaylist(${esc(JSON.stringify(p.id))})">${ICONS.trash}</button>` : ''}
+          </div>`
         )
         .join('');
     } catch {
@@ -1960,6 +1969,12 @@
             <button class="btn-primary" onclick="App.playInstantMix(false, 0)">${ICONS.play} Play Mix</button>
             <button class="btn-secondary" onclick="App.playInstantMix(true, 0)">Shuffle</button>
             <button class="btn-secondary" onclick="App.queueInstantMix()">Add to Queue</button>
+            ${
+              mix.savedPlaylistId
+                ? `<button class="btn-secondary" onclick="App.navigate('playlist/${encodeURIComponent(mix.savedPlaylistId)}')">Saved ✓</button>
+                   <button class="btn-secondary" style="color:#fda4af" onclick="App.deletePlaylist(${esc(JSON.stringify(mix.savedPlaylistId))})">Delete Playlist</button>`
+                : `<button class="btn-secondary" onclick="App.promptSaveInstantMix()">+ Save to Playlists</button>`
+            }
             <button class="btn-secondary" onclick="App.shareCurrentInstantMix()">${ICONS.share} Share Mix</button>
           </div>
         </div>
@@ -3731,6 +3746,7 @@
     return `<div class="media-card" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(p.coverUrl)}" loading="lazy" alt="" />
+        ${!p.isAuto ? `<button class="card-del-btn" title="Delete playlist" aria-label="Delete ${esc(p.name)}" onclick="event.stopPropagation();App.deletePlaylist(${esc(JSON.stringify(p.id))})">${ICONS.trash}</button>` : ''}
         <button class="card-play-fab" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(p.id))})">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(p.name)}</div>
@@ -3977,6 +3993,7 @@
   }
 
   function setQueueWithShuffle(tracks, startIndex = 0, forceShuffle = false) {
+    state.radioPlaylistId = null;
     const ordered = tracks.slice();
     if (!ordered.length) {
       state.unshuffledQueue = null;
@@ -4232,6 +4249,18 @@
     return null;
   }
 
+  function refreshActiveInstantMixCard() {
+    const card = document.querySelector('#main-view .instant-mix-card');
+    if (!card) return;
+    if (state.searchState && state.searchState.instantMix) {
+      const s = state.searchState;
+      card.outerHTML = renderInstantMixCard(s.instantMix, s.refinements, s.query, !!s.mixExpanded);
+    } else if (state.activeInstantMix && state.activeInstantMix.mix) {
+      const { mix, query, refinements, expanded } = state.activeInstantMix;
+      card.outerHTML = renderInstantMixCard(mix, refinements, query, expanded);
+    }
+  }
+
   function playInstantMix(shuffled = false, startIndex = 0) {
     const active = getActiveInstantMix();
     const mix = active && active.mix;
@@ -4320,9 +4349,16 @@
           .join(',');
         const recentParam = buildRecentRadioParam(seedId);
         const params = new URLSearchParams();
-        if (seedId) params.set('seed', seedId);
+        if (state.radioPlaylistId) {
+          params.set('playlist', state.radioPlaylistId);
+        } else if (seedId) {
+          params.set('seed', seedId);
+        }
         if (excludeIds) params.set('exclude', excludeIds);
         if (recentParam) params.set('recent', recentParam);
+        if (state.upcomingMode && state.upcomingMode !== 'default') {
+          params.set('mode', state.upcomingMode);
+        }
         const d = await api(`/api/web/radio?${params.toString()}`);
         if (reqToken !== state.radioReqToken) return 0;
         const recs = cacheTracks(d.tracks || []);
@@ -4371,12 +4407,16 @@
       params.set('playlist', pid || '');
       const recentParam = buildRecentRadioParam();
       if (recentParam) params.set('recent', recentParam);
+      if (state.upcomingMode && state.upcomingMode !== 'default') {
+        params.set('mode', state.upcomingMode);
+      }
       const d = await api(`/api/web/radio?${params.toString()}`, { signal });
       if (token !== state.queueActionToken || reqToken !== state.radioReqToken) return;
       state.radioLoading = false;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
         const idx = setQueueWithShuffle(tracks, 0, false);
+        state.radioPlaylistId = pid || null;
         playQueueAt(idx);
       } else {
         showToast('No radio tracks found for this playlist yet');
@@ -4398,6 +4438,7 @@
     const keepingCurrent = !!(cur && cur.id === seedId);
     if (cur) recordRecentHeard(cur);
     if (seed) recordRecentHeard(seed);
+    state.radioPlaylistId = null;
     state.radioLoading = true;
     state.radioInFlight = null;
     if (keepingCurrent) renderQueuePanel();
@@ -4407,6 +4448,9 @@
       params.set('seed', seedId || '');
       const recentParam = buildRecentRadioParam(seedId);
       if (recentParam) params.set('recent', recentParam);
+      if (state.upcomingMode && state.upcomingMode !== 'default') {
+        params.set('mode', state.upcomingMode);
+      }
       const d = await api(`/api/web/radio?${params.toString()}`, { signal });
       if (token !== state.queueActionToken || reqToken !== state.radioReqToken) return;
       state.radioLoading = false;
@@ -4438,6 +4482,68 @@
       if (e && e.name === 'AbortError') return;
       showToast(e.message);
     }
+  }
+
+  async function setUpcomingMode(mode) {
+    const cleanMode = ['default', 'familiar', 'discover'].includes(mode) ? mode : 'default';
+    if (cleanMode === state.upcomingMode) return;
+    state.upcomingMode = cleanMode;
+    try {
+      localStorage.setItem('beatlab_upcoming_mode', cleanMode);
+    } catch {}
+    haptic('select');
+    const cur = currentTrack();
+    if (!cur && state.queue.length === 0) {
+      renderQueuePanel();
+      return;
+    }
+    const reqToken = ++state.radioReqToken;
+    state.radioLoading = true;
+    renderQueuePanel();
+    const run = (async () => {
+      try {
+        const params = new URLSearchParams();
+        if (state.radioPlaylistId) {
+          params.set('playlist', state.radioPlaylistId);
+        } else if (cur?.id) {
+          params.set('seed', cur.id);
+        }
+        params.set('mode', cleanMode);
+        const recentParam = buildRecentRadioParam(cur?.id || '');
+        if (recentParam) params.set('recent', recentParam);
+        const d = await api(`/api/web/radio?${params.toString()}`);
+        if (reqToken !== state.radioReqToken) return;
+        const recs = cacheTracks(d.tracks || []);
+        const nowCur = currentTrack();
+        const curId = nowCur?.id;
+        const filtered = curId ? recs.filter((r) => r.id !== curId) : recs;
+        const upcoming = state.shuffle ? shuffleArray(filtered) : filtered;
+        const keepLen = nowCur ? state.queueIndex + 1 : 0;
+        if (Array.isArray(state.unshuffledQueue) && nowCur) {
+          const curUnshuffledIdx = state.unshuffledQueue.findIndex((t) => t.id === nowCur.id);
+          const baseUnshuffled =
+            curUnshuffledIdx >= 0 ? state.unshuffledQueue.slice(0, curUnshuffledIdx + 1) : [nowCur];
+          state.unshuffledQueue = baseUnshuffled.concat(filtered);
+        }
+        state.queue = state.queue.slice(0, keepLen).concat(upcoming);
+        saveServerQueue();
+        scheduleWarmNextTrack();
+      } catch (e) {
+        if (reqToken === state.radioReqToken && e && e.name !== 'AbortError') {
+          showToast(e.message);
+        }
+      } finally {
+        if (state.radioInFlight === run) {
+          state.radioInFlight = null;
+        }
+        if (reqToken === state.radioReqToken) {
+          state.radioLoading = false;
+          renderQueuePanel();
+        }
+      }
+    })();
+    state.radioInFlight = run;
+    return run;
   }
 
   function togglePlay() {
@@ -4644,12 +4750,22 @@
       : `<p class="muted-center">Queue is empty</p>`;
 
     const upcoming = state.queue.slice(state.queueIndex + 1);
-    const upNextHtml = upcoming.length
-      ? `<div class="queue-section-label">Next Up (${upcoming.length})</div>` +
-        upcoming.map((t, i) => renderQItem(t, state.queueIndex + 1 + i, false)).join('')
-      : state.radioLoading
-        ? `<div class="queue-section-label">Next Up</div><p class="muted-center">Loading track radio...</p>`
+    const modeTabsHtml =
+      cur || upcoming.length || state.radioLoading
+        ? `<div class="upcoming-mode-tabs" role="tablist" aria-label="Upcoming mode">
+            <button type="button" class="upcoming-mode-tab ${state.upcomingMode === 'default' ? 'active' : ''}" onclick="App.setUpcomingMode('default')">Default</button>
+            <button type="button" class="upcoming-mode-tab ${state.upcomingMode === 'familiar' ? 'active' : ''}" onclick="App.setUpcomingMode('familiar')">Familiar</button>
+            <button type="button" class="upcoming-mode-tab ${state.upcomingMode === 'discover' ? 'active' : ''}" onclick="App.setUpcomingMode('discover')">Discover</button>
+          </div>`
         : '';
+    const upNextHtml =
+      modeTabsHtml +
+      (upcoming.length
+        ? `<div class="queue-section-label">Next Up (${upcoming.length})${state.radioLoading ? ' · Updating...' : ''}</div>` +
+          upcoming.map((t, i) => renderQItem(t, state.queueIndex + 1 + i, false)).join('')
+        : state.radioLoading
+          ? `<div class="queue-section-label">Next Up</div><p class="muted-center">Loading upcoming tracks...</p>`
+          : '');
 
     $('queue-now-playing').innerHTML = nowHtml;
     $('queue-up-next').innerHTML = upNextHtml;
@@ -5649,6 +5765,7 @@
       }
     },
     startRadioForId,
+    setUpcomingMode,
     playListByIds,
     playShuffledIds,
     playSingle,
@@ -6030,6 +6147,52 @@
     playInstantMix,
     playInstantMixAt,
     queueInstantMix,
+    promptSaveInstantMix: () => {
+      const active = getActiveInstantMix();
+      if (!active || !active.mix || !Array.isArray(active.mix.tracks) || !active.mix.tracks.length) {
+        showToast('No instant mix tracks to save');
+        return;
+      }
+      const mix = active.mix;
+      openModal(`
+        <div class="modal-head"><h3>Save Instant Mix to Playlists</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
+        <form onsubmit="App.submitSaveInstantMix(event)" style="display:flex;flex-direction:column;gap:12px">
+          <input id="save-mix-name" type="text" value="${esc(mix.title || active.query || 'Instant Mix')}" placeholder="Playlist name" required autofocus />
+          <input id="save-mix-desc" type="text" value="${esc(mix.subtitle || '')}" placeholder="Description (optional)" />
+          <button type="submit" class="btn-primary">Save Playlist (${mix.tracks.length} tracks)</button>
+        </form>
+      `);
+    },
+    submitSaveInstantMix: async (e) => {
+      e.preventDefault();
+      const active = getActiveInstantMix();
+      if (!active || !active.mix || !Array.isArray(active.mix.tracks) || !active.mix.tracks.length) {
+        closeModal();
+        showToast('No instant mix tracks to save');
+        return;
+      }
+      const name = ($('save-mix-name')?.value || '').trim();
+      if (!name) {
+        showToast('Please enter a playlist name');
+        return;
+      }
+      const comment = ($('save-mix-desc')?.value || '').trim();
+      const trackIds = [...new Set(active.mix.tracks.map((t) => t.id).filter(Boolean))];
+      try {
+        const res = await api('/api/web/playlists', {
+          method: 'POST',
+          body: JSON.stringify({ name, comment, trackIds }),
+        });
+        active.mix.savedPlaylistId = res.playlist.id;
+        haptic('success');
+        closeModal();
+        await refreshSidebarPlaylists();
+        refreshActiveInstantMixCard();
+        showToast(`Saved "${name}" to playlists`);
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
     removePlaylistItem: async (pid, pos) => {
       try {
         await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks/${pos}`, { method: 'DELETE' });
@@ -6081,9 +6244,21 @@
       try {
         await api(`/api/web/playlists/${encodeURIComponent(pid)}`, { method: 'DELETE' });
         haptic('warning');
+        if (state.activeInstantMix?.mix?.savedPlaylistId === pid) {
+          delete state.activeInstantMix.mix.savedPlaylistId;
+        }
+        if (state.searchState?.instantMix?.savedPlaylistId === pid) {
+          delete state.searchState.instantMix.savedPlaylistId;
+        }
+        refreshActiveInstantMixCard();
         await refreshSidebarPlaylists();
         showToast('Playlist deleted');
-        navigate('library');
+        const curHash = location.hash.replace(/^#/, '');
+        if (curHash === `playlist/${encodeURIComponent(pid)}` || curHash === `playlist/${pid}`) {
+          navigate('library');
+        } else if (curHash === 'library' || curHash === '') {
+          renderLibrary(state.libTab);
+        }
       } catch (err) {
         showToast(err.message);
       }

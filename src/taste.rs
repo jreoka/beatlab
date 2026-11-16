@@ -497,6 +497,24 @@ enum ScoreMode {
     PlaylistDna,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RadioMode {
+    #[default]
+    Default,
+    Familiar,
+    Discover,
+}
+
+impl RadioMode {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_lowercase).as_deref() {
+            Some("familiar") => Self::Familiar,
+            Some("discover") => Self::Discover,
+            _ => Self::Default,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchMixResult {
     pub tracks: Vec<Track>,
@@ -3578,6 +3596,26 @@ impl TasteEngine {
         client_recent: &[(String, i64)],
         count: usize,
     ) -> Vec<Track> {
+        self.playlist_radio_tracks_with_mode(
+            user_id,
+            playlist_id,
+            exclude_ids,
+            client_recent,
+            count,
+            RadioMode::Default,
+        )
+        .await
+    }
+
+    pub async fn playlist_radio_tracks_with_mode(
+        &self,
+        user_id: i64,
+        playlist_id: &str,
+        exclude_ids: &HashSet<String>,
+        client_recent: &[(String, i64)],
+        count: usize,
+        mode: RadioMode,
+    ) -> Vec<Track> {
         let recs = self
             .recommend_for_playlist(user_id, playlist_id, count * 2)
             .await;
@@ -3603,39 +3641,78 @@ impl TasteEngine {
             .enumerate()
             .map(|(idx, t)| {
                 let order_prior = -(idx as f64) * 0.2;
-                let s = order_prior - recent_penalties.penalty_for(&t);
+                let fam_adj = if mode == RadioMode::Discover
+                    && is_familiar_track(&t, &sctx.prof, &sctx.stats)
+                {
+                    -6.0
+                } else {
+                    0.0
+                };
+                let s = order_prior + fam_adj - recent_penalties.penalty_for(&t);
                 (s, t)
             })
             .collect();
         fresh_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let fresh: Vec<Track> = fresh_scored.into_iter().map(|(_, t)| t).collect();
 
-        // Interleave ~3 fresh discoveries per 1 familiar playlist track so radio feels cohesive yet new.
         let mut combined = Vec::new();
-        let mut fi = fresh.into_iter();
-        let mut ki = familiar.into_iter();
-        while combined.len() < count * 2 {
-            let mut pushed = false;
-            for _ in 0..3 {
-                if let Some(t) = fi.next() {
-                    combined.push(t);
-                    pushed = true;
+        match mode {
+            RadioMode::Familiar => {
+                combined.extend(familiar);
+                if combined.len() < count {
+                    let mut seen: HashSet<String> = combined.iter().map(|t| t.id.clone()).collect();
+                    for t in self.for_you_tracks(user_id, count * 3) {
+                        if !exclude_ids.contains(&t.id)
+                            && is_familiar_track(&t, &sctx.prof, &sctx.stats)
+                            && seen.insert(t.id.clone())
+                        {
+                            combined.push(t);
+                        }
+                    }
+                }
+                combined.extend(fresh);
+            }
+            RadioMode::Discover => {
+                combined.extend(fresh);
+                if combined.len() < count {
+                    combined.extend(familiar);
                 }
             }
-            if let Some(t) = ki.next() {
-                combined.push(t);
-                pushed = true;
-            }
-            if !pushed {
-                break;
+            RadioMode::Default => {
+                // Interleave ~3 fresh discoveries per 1 familiar playlist track so radio feels cohesive yet new.
+                let mut fi = fresh.into_iter();
+                let mut ki = familiar.into_iter();
+                while combined.len() < count * 2 {
+                    let mut pushed = false;
+                    for _ in 0..3 {
+                        if let Some(t) = fi.next() {
+                            combined.push(t);
+                            pushed = true;
+                        }
+                    }
+                    if let Some(t) = ki.next() {
+                        combined.push(t);
+                        pushed = true;
+                    }
+                    if !pushed {
+                        break;
+                    }
+                }
             }
         }
         if combined.is_empty() {
-            let fallback: Vec<Track> = self
-                .for_you_tracks(user_id, count * 2)
-                .into_iter()
-                .filter(|t| !exclude_ids.contains(&t.id))
-                .collect();
+            let fallback: Vec<Track> = match mode {
+                RadioMode::Discover => self.discover_weekly(user_id, count * 2),
+                RadioMode::Familiar => self
+                    .for_you_tracks(user_id, count * 3)
+                    .into_iter()
+                    .filter(|t| is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .collect(),
+                RadioMode::Default => self.for_you_tracks(user_id, count * 2),
+            }
+            .into_iter()
+            .filter(|t| !exclude_ids.contains(&t.id))
+            .collect();
             return self.rank_fallback_with_recent(fallback, &recent_penalties, count);
         }
         dedup_and_interleave(combined, count, 2)
@@ -3648,6 +3725,26 @@ impl TasteEngine {
         exclude_ids: &HashSet<String>,
         client_recent: &[(String, i64)],
         count: usize,
+    ) -> Vec<Track> {
+        self.radio_next_tracks_with_mode(
+            user_id,
+            seed,
+            exclude_ids,
+            client_recent,
+            count,
+            RadioMode::Default,
+        )
+        .await
+    }
+
+    pub async fn radio_next_tracks_with_mode(
+        &self,
+        user_id: i64,
+        seed: Option<&Track>,
+        exclude_ids: &HashSet<String>,
+        client_recent: &[(String, i64)],
+        count: usize,
+        mode: RadioMode,
     ) -> Vec<Track> {
         let sctx = self.build_scoring_context(user_id);
         let recent_penalties = self.build_recent_heard_penalties(user_id, &sctx, client_recent);
@@ -3685,14 +3782,33 @@ impl TasteEngine {
                 }
             }
 
+            if mode == RadioMode::Familiar {
+                for t in self.for_you_tracks(user_id, count * 3) {
+                    if is_familiar_track(&t, &sctx.prof, &sctx.stats) && seen_ids.insert(t.id.clone())
+                    {
+                        filtered.push(t);
+                    }
+                }
+            }
+
             if !filtered.is_empty() {
-                if user_id <= 0 && recent_penalties.is_empty() {
+                if user_id <= 0 && recent_penalties.is_empty() && mode == RadioMode::Default {
                     return dedup_and_interleave(filtered, count, 2);
                 }
-                let eligible: Vec<Track> = filtered
+                let mut eligible: Vec<Track> = filtered
                     .into_iter()
                     .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
                     .collect();
+                if mode == RadioMode::Discover {
+                    let unheard: Vec<Track> = eligible
+                        .iter()
+                        .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
+                        .cloned()
+                        .collect();
+                    if unheard.len() >= count.min(4) {
+                        eligible = unheard;
+                    }
+                }
                 let total = eligible.len().max(1) as f64;
                 let n_scores = if user_id > 0 {
                     self.neural_scores(user_id, &[s.clone()], None, &[], &[], &eligible)
@@ -3700,21 +3816,44 @@ impl TasteEngine {
                     Vec::new()
                 };
                 let n_w = self.neural_blend_weight(0.55, &sctx);
+                let score_mode = match mode {
+                    RadioMode::Discover => ScoreMode::Discover,
+                    RadioMode::Default | RadioMode::Familiar => ScoreMode::Supermix,
+                };
                 let mut scored: Vec<(f64, Track)> = eligible
                     .into_iter()
                     .enumerate()
                     .map(|(idx, t)| {
-                        // Preserve strong similarity prior while tailoring order to user taste & skips,
-                        // and applying a temporary negative weight to songs the user just heard.
                         let sim_prior = ((total - idx as f64) / total) * 4.5;
                         let user_fit = if user_id > 0 {
-                            score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix) * 0.45
+                            score_track_core(&t, &sctx.prof, &sctx.stats, score_mode) * 0.45
                                 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w
                         } else {
                             0.0
                         };
+                        let mode_adj = match mode {
+                            RadioMode::Familiar => {
+                                let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
+                                let mut b = 0.0;
+                                if is_familiar_track(&t, &sctx.prof, &sctx.stats) {
+                                    b += 5.5;
+                                }
+                                if st.play_count > 0 {
+                                    b += (st.play_count as f64).min(5.0) * 0.4;
+                                }
+                                b
+                            }
+                            RadioMode::Discover => {
+                                if is_familiar_track(&t, &sctx.prof, &sctx.stats) {
+                                    -8.0
+                                } else {
+                                    1.2
+                                }
+                            }
+                            RadioMode::Default => 0.0,
+                        };
                         let temp_recent_penalty = recent_penalties.penalty_for(&t);
-                        (sim_prior + user_fit - temp_recent_penalty, t)
+                        (sim_prior + user_fit + mode_adj - temp_recent_penalty, t)
                     })
                     .collect();
                 if !scored.is_empty() {
@@ -3724,11 +3863,24 @@ impl TasteEngine {
                 }
             }
         }
-        let picks: Vec<Track> = self
-            .for_you_tracks(user_id, count * 2)
-            .into_iter()
-            .filter(|t| !exclude_ids.contains(&t.id))
-            .collect();
+        let picks: Vec<Track> = match mode {
+            RadioMode::Discover => self.discover_weekly(user_id, count * 2),
+            RadioMode::Familiar => {
+                let mut fam: Vec<Track> = self
+                    .for_you_tracks(user_id, count * 3)
+                    .into_iter()
+                    .filter(|t| is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .collect();
+                if fam.is_empty() {
+                    fam = self.for_you_tracks(user_id, count * 2);
+                }
+                fam
+            }
+            RadioMode::Default => self.for_you_tracks(user_id, count * 2),
+        }
+        .into_iter()
+        .filter(|t| !exclude_ids.contains(&t.id))
+        .collect();
         self.rank_fallback_with_recent(picks, &recent_penalties, count)
     }
 
@@ -6812,6 +6964,20 @@ fn is_strongly_disliked(t: &Track, prof: &TasteProfile, stats: &HashMap<String, 
     }
     let st = stats.get(&t.id).copied().unwrap_or_default();
     st.skip_count >= st.play_count + 2 && !prof.starred.contains(&t.id) && !prof.manual_playlist_ids.contains(&t.id)
+}
+
+fn is_familiar_track(
+    t: &Track,
+    prof: &TasteProfile,
+    stats: &HashMap<String, UserTrackStats>,
+) -> bool {
+    let st = stats.get(&t.id).copied().unwrap_or_default();
+    let key = t.song_key();
+    st.play_count > 0
+        || prof.starred.contains(&t.id)
+        || prof.playlist_track_counts.get(&t.id).copied().unwrap_or(0) > 0
+        || prof.manual_playlist_song_keys.contains(&key)
+        || prof.ratings.contains_key(&t.id)
 }
 
 fn score_track_core(

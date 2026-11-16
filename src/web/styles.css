@@ -572,7 +572,19 @@ a {
   gap: 2px;
 }
 
+.pl-link-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  transition: background 0.14s;
+}
+.pl-link-row:hover {
+  background: var(--surface-2);
+}
 .pl-link {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -582,11 +594,37 @@ a {
   font-size: 13px;
   color: var(--text-muted);
   text-align: left;
-  transition: background 0.14s, color 0.14s;
+  transition: color 0.14s;
 }
+.pl-link-row:hover .pl-link,
 .pl-link:hover {
-  background: var(--surface-2);
   color: var(--text);
+}
+.pl-del-btn {
+  opacity: 0;
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  margin-right: 4px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: opacity 0.14s, color 0.14s, background 0.14s;
+}
+.pl-del-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.pl-link-row:hover .pl-del-btn,
+.pl-del-btn:focus-visible {
+  opacity: 1;
+}
+.pl-del-btn:hover {
+  color: #fda4af;
+  background: rgba(253, 164, 175, 0.12);
 }
 .pl-link-name {
   white-space: nowrap;
@@ -1027,6 +1065,34 @@ a {
 }
 .media-card:hover .card-play-fab {
   opacity: 1;
+}
+.card-del-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  background: rgba(10, 12, 16, 0.78);
+  color: #e4e7ec;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.14s, color 0.14s, background 0.14s;
+}
+.card-del-btn svg {
+  width: 15px;
+  height: 15px;
+}
+.media-card:hover .card-del-btn,
+.card-del-btn:focus-visible {
+  opacity: 1;
+}
+.card-del-btn:hover {
+  color: #fda4af;
+  background: rgba(10, 12, 16, 0.92);
 }
 
 .card-title {
@@ -1554,6 +1620,33 @@ a {
   color: var(--text-muted);
   cursor: pointer;
   white-space: nowrap;
+}
+
+.upcoming-mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 3px;
+  margin: 4px 0 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.upcoming-mode-tab {
+  padding: 6px 8px;
+  border-radius: calc(var(--radius-sm) - 2px);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-align: center;
+  transition: background 0.14s, color 0.14s;
+}
+.upcoming-mode-tab:hover {
+  color: var(--text);
+}
+.upcoming-mode-tab.active {
+  background: var(--accent);
+  color: #06120b;
 }
 
 .queue-section-label {
