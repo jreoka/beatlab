@@ -5389,7 +5389,17 @@
     }
   }
 
+  let pendingConfirmResolve = null;
+
+  function settlePendingConfirm(result) {
+    if (!pendingConfirmResolve) return;
+    const resolve = pendingConfirmResolve;
+    pendingConfirmResolve = null;
+    resolve(result);
+  }
+
   function openModal(html, extraClass = '') {
+    settlePendingConfirm(false);
     haptic('tap');
     const box = $('modal-box');
     box.className = extraClass ? `modal-box ${extraClass}` : 'modal-box';
@@ -5400,7 +5410,42 @@
   function closeModal(event) {
     if (!event || event.target === $('modal-backdrop')) {
       $('modal-backdrop').classList.add('hidden');
+      settlePendingConfirm(false);
     }
+  }
+
+  function confirmModal({
+    title = 'Confirm',
+    message,
+    confirmLabel = 'Confirm',
+    cancelLabel = 'Cancel',
+    danger = false,
+  }) {
+    return new Promise((resolve) => {
+      openModal(`
+        <div class="modal-head">
+          <h3>${esc(title)}</h3>
+          <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+        </div>
+        <p class="confirm-modal-message">${esc(message)}</p>
+        <div class="confirm-modal-actions">
+          <button type="button" class="btn-secondary" id="confirm-modal-cancel">${esc(cancelLabel)}</button>
+          <button type="button" class="${danger ? 'btn-secondary danger-btn' : 'btn-primary'}" id="confirm-modal-ok">${esc(confirmLabel)}</button>
+        </div>
+      `);
+      pendingConfirmResolve = resolve;
+      const cancelBtn = $('confirm-modal-cancel');
+      const okBtn = $('confirm-modal-ok');
+      cancelBtn?.addEventListener('click', () => {
+        settlePendingConfirm(false);
+        closeModal();
+      });
+      okBtn?.addEventListener('click', () => {
+        settlePendingConfirm(true);
+        closeModal();
+      });
+      cancelBtn?.focus();
+    });
   }
 
   function openEqModal() {
@@ -6347,7 +6392,13 @@
       const msg = pl?.name
         ? `Are you sure you want to delete "${pl.name}"?`
         : 'Are you sure you want to delete this playlist?';
-      if (!window.confirm(msg)) return;
+      const confirmed = await confirmModal({
+        title: 'Delete Playlist',
+        message: msg,
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!confirmed) return;
       try {
         await api(`/api/web/playlists/${encodeURIComponent(pid)}`, { method: 'DELETE' });
         haptic('warning');
