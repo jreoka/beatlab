@@ -29,6 +29,53 @@ pub struct AppState {
     pub now_playing: NowPlayingMap,
 }
 
+/// Best-effort client IP from common reverse-proxy headers. Behind a proxy the
+/// socket peer is the proxy itself, so these are the only meaningful source.
+pub fn client_ip(headers: &HeaderMap) -> String {
+    for name in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip", "fly-client-ip"] {
+        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let first = v.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.chars().take(64).collect();
+            }
+        }
+    }
+    String::new()
+}
+
+pub fn user_agent(headers: &HeaderMap) -> String {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(256)
+        .collect()
+}
+
+/// Identify a Subsonic client from the standard `c` parameter (or common
+/// alternatives), falling back to a short token from the User-Agent.
+pub fn subsonic_client_name(params: &HashMap<String, String>, headers: &HeaderMap) -> String {
+    for key in ["c", "name", "client", "player"] {
+        if let Some(v) = params.get(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.chars().take(64).collect();
+            }
+        }
+    }
+    let ua = user_agent(headers);
+    if ua.is_empty() || ua.to_ascii_lowercase().contains("mozilla/") {
+        return String::new();
+    }
+    ua.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(64)
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct XmlElem {
     pub name: String,
@@ -299,6 +346,34 @@ fn error_resp(params: &HashMap<String, String>, code: i32, msg: &str) -> Respons
 fn authenticate_subsonic(
     state: &AppState,
     params: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<User, (i32, &'static str)> {
+    let user = authenticate_subsonic_credentials(state, params)?;
+
+    // Subsonic clients re-send credentials on every request rather than using
+    // a server-issued token. Track them as sessions so they appear in the
+    // Settings > Sessions tab, and honour a user's revocation.
+    let client = subsonic_client_name(params, headers);
+    if !client.is_empty() {
+        let (_, revoked) = state
+            .store
+            .touch_subsonic_client(
+                user.id,
+                &client,
+                &user_agent(headers),
+                &client_ip(headers),
+            )
+            .map_err(|_| (40, "Could not verify client session"))?;
+        if revoked {
+            return Err((40, "This client session was revoked. Reconnect to sign in again."));
+        }
+    }
+    Ok(user)
+}
+
+fn authenticate_subsonic_credentials(
+    state: &AppState,
+    params: &HashMap<String, String>,
 ) -> Result<User, (i32, &'static str)> {
     // 1. OpenSubsonic apiKey authentication
     if let Some(key) = params.get("apiKey").filter(|k| !k.trim().is_empty()) {
@@ -387,7 +462,7 @@ pub async fn dispatch(
     let endpoint = action.trim_end_matches(".view").trim_start_matches('/');
 
     // Public ping only works when authenticated in Subsonic spec (so clients detect auth failure early!).
-    let user = match authenticate_subsonic(&state, &params) {
+    let user = match authenticate_subsonic(&state, &params, &headers) {
         Ok(u) => u,
         Err((code, msg)) => return error_resp(&params, code, msg),
     };

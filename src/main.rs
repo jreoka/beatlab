@@ -165,6 +165,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/auth/signout", post(webapp::signout))
         .route("/api/web/sessions", get(webapp::list_sessions))
         .route("/api/web/sessions/revoke", post(webapp::revoke_session))
+        .route("/api/web/sessions/allow", post(webapp::allow_session))
         .route("/api/web/sessions/revoke-all", post(webapp::revoke_all_sessions))
         .route("/api/web/account/apikey", post(webapp::regenerate_api_key))
         .route("/api/web/account/password", post(webapp::change_password))

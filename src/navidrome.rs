@@ -1,5 +1,6 @@
 use crate::models::{AlbumSummary, ArtistSummary, PlayQueueState, Playlist, RadioStation, Track, User, UserTrackStats};
-use crate::subsonic::AppState;
+use crate::store::SessionMeta;
+use crate::subsonic::{client_ip, user_agent, AppState};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -11,10 +12,29 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct LoginReq {
     pub username: String,
     pub password: String,
+    /// Client-supplied name (Navidrome sends `name`, some clients send
+    /// `client` or Subsonic's `c`). Used to label the session in Settings.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub client: String,
+    #[serde(default)]
+    pub c: String,
+}
+
+impl LoginReq {
+    fn client_name(&self) -> String {
+        for candidate in [&self.name, &self.client, &self.c] {
+            if !candidate.trim().is_empty() {
+                return candidate.trim().chars().take(64).collect();
+            }
+        }
+        String::new()
+    }
 }
 
 #[derive(Deserialize)]
@@ -144,7 +164,11 @@ fn build_login_response(state: &AppState, user: &User, token: &str) -> Value {
     })
 }
 
-pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Response {
+pub async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LoginReq>,
+) -> Response {
     match state.store.authenticate_or_create_user(&req.username, &req.password) {
         Ok((user, created)) => {
             if created {
@@ -154,7 +178,15 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> 
                     taste.prime_new_user(uid).await;
                 });
             }
-            match state.store.create_session(user.id, "nd", 30 * 86400) {
+            let meta = SessionMeta {
+                user_agent: user_agent(&headers),
+                ip: client_ip(&headers),
+                client: req.client_name(),
+            };
+            match state
+                .store
+                .create_session_with_meta(user.id, "nd", 30 * 86400, &meta)
+            {
                 Ok(token) => json_ok(build_login_response(&state, &user, &token), None),
                 Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -163,7 +195,11 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> 
     }
 }
 
-pub async fn signup(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Response {
+pub async fn signup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LoginReq>,
+) -> Response {
     match state.store.create_user(&req.username, &req.password) {
         Ok(user) => {
             let taste = state.taste.clone();
@@ -171,7 +207,15 @@ pub async fn signup(State(state): State<AppState>, Json(req): Json<LoginReq>) ->
             tokio::spawn(async move {
                 taste.prime_new_user(uid).await;
             });
-            match state.store.create_session(user.id, "nd", 30 * 86400) {
+            let meta = SessionMeta {
+                user_agent: user_agent(&headers),
+                ip: client_ip(&headers),
+                client: req.client_name(),
+            };
+            match state
+                .store
+                .create_session_with_meta(user.id, "nd", 30 * 86400, &meta)
+            {
                 Ok(token) => json_ok(build_login_response(&state, &user, &token), None),
                 Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -1086,9 +1130,11 @@ mod tests {
         let st = nd_test_state();
         let resp = login(
             State(st.clone()),
+            HeaderMap::new(),
             Json(LoginReq {
                 username: "maya".into(),
                 password: "password123".into(),
+                ..Default::default()
             }),
         )
         .await;
@@ -1103,9 +1149,11 @@ mod tests {
         // Wrong password rejects
         let bad = login(
             State(st.clone()),
+            HeaderMap::new(),
             Json(LoginReq {
                 username: "maya".into(),
                 password: "wrong".into(),
+                ..Default::default()
             }),
         )
         .await;

@@ -46,6 +46,20 @@ pub struct SessionInfo {
     pub kind: String,
     pub created: i64,
     pub expires: i64,
+    pub last_seen: i64,
+    pub user_agent: String,
+    pub ip: String,
+    pub client: String,
+    pub revoked: bool,
+}
+
+/// Context captured when a session is created, used to describe it later in
+/// the settings "Sessions" tab.
+#[derive(Debug, Clone, Default)]
+pub struct SessionMeta {
+    pub user_agent: String,
+    pub ip: String,
+    pub client: String,
 }
 
 impl Store {
@@ -366,6 +380,15 @@ impl Store {
         ensure_column(&conn, "user_profiles", "avatar", "BLOB")?;
         ensure_column(&conn, "user_profiles", "avatar_mime", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "user_profiles", "avatar_version", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "sessions", "user_agent", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "sessions", "ip", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "sessions", "client", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "sessions", "last_seen", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "sessions", "revoked", "INTEGER NOT NULL DEFAULT 0")?;
+        // Older builds indexed client sessions by (client, user-agent); drop
+        // that so a client name maps to a single session even when its app
+        // version (and therefore User-Agent) changes.
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_client", [])?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_deezer ON tracks(deezer_id)",
             [],
@@ -501,11 +524,25 @@ impl Store {
         Ok(rows)
     }
 
+    /// Convenience wrapper used by tests; production callers pass full metadata.
+    #[cfg(test)]
     pub fn create_session(
         &self,
         user_id: i64,
         kind: &str,
         ttl_secs: i64,
+    ) -> AppResult<String> {
+        self.create_session_with_meta(user_id, kind, ttl_secs, &SessionMeta::default())
+    }
+
+    /// Create a session while recording where/how it was opened so the
+    /// settings "Sessions" tab can describe it to the user.
+    pub fn create_session_with_meta(
+        &self,
+        user_id: i64,
+        kind: &str,
+        ttl_secs: i64,
+        meta: &SessionMeta,
     ) -> AppResult<String> {
         let token = format!(
             "{}{}",
@@ -520,8 +557,9 @@ impl Store {
             params![now],
         )?;
         conn.execute(
-            "INSERT INTO sessions(token, user_id, kind, created, expires) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![token, user_id, kind, now, expires],
+            "INSERT INTO sessions(token, user_id, kind, created, expires, last_seen, user_agent, ip, client, revoked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6, ?7, ?8, 0)",
+            params![token, user_id, kind, now, expires, meta.user_agent, meta.ip, meta.client],
         )?;
         Ok(token)
     }
@@ -536,7 +574,7 @@ impl Store {
             .query_row(
                 "SELECT u.id, u.username, u.password, u.created
                  FROM sessions s JOIN users u ON u.id = s.user_id
-                 WHERE s.token = ?1 AND s.expires >= ?2",
+                 WHERE s.token = ?1 AND s.expires >= ?2 AND s.revoked = 0",
                 params![token.trim(), now],
                 row_to_user,
             )
@@ -550,6 +588,64 @@ impl Store {
         Ok(())
     }
 
+    /// Find and refresh a Subsonic client's session row, creating one on first
+    /// sight. Returns its token and whether it has been revoked by the user.
+    /// These clients re-send credentials on every request instead of using a
+    /// server-issued token, so the row is keyed by the client identity.
+    pub fn touch_subsonic_client(
+        &self,
+        user_id: i64,
+        client: &str,
+        user_agent: &str,
+        ip: &str,
+    ) -> AppResult<(String, bool)> {
+        let now = Utc::now().timestamp();
+        let expires = now + 30 * 86400;
+        let conn = self.lock();
+        // Keyed on client name only: a client's User-Agent changes with every
+        // app update, and revocation must survive that.
+        let existing: Option<(String, i64, i64, String, String)> = conn
+            .query_row(
+                "SELECT token, revoked, last_seen, ip, user_agent FROM sessions
+                 WHERE user_id = ?1 AND client = ?2 AND kind = 'subsonic'
+                 ORDER BY created DESC LIMIT 1",
+                params![user_id, client],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        if let Some((token, revoked, last_seen, saved_ip, saved_ua)) = existing {
+            // Subsonic clients re-authenticate on every request; throttle the
+            // write to once a minute (or when the connection details change)
+            // to avoid a DB write per media chunk.
+            if now - last_seen >= 60 || saved_ip != ip || saved_ua != user_agent {
+                if revoked == 0 {
+                    conn.execute(
+                        "UPDATE sessions SET last_seen = ?1, expires = ?2, ip = ?3, user_agent = ?4
+                         WHERE token = ?5",
+                        params![now, expires, ip, user_agent, token],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3 WHERE token = ?4",
+                        params![now, ip, user_agent, token],
+                    )?;
+                }
+            }
+            return Ok((token, revoked != 0));
+        }
+        let token = format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
+        conn.execute(
+            "INSERT INTO sessions(token, user_id, kind, created, expires, last_seen, user_agent, ip, client, revoked)
+             VALUES (?1, ?2, 'subsonic', ?3, ?4, ?3, ?5, ?6, ?7, 0)",
+            params![token, user_id, now, expires, user_agent, ip, client],
+        )?;
+        Ok((token, false))
+    }
+
     /// List the active (unexpired) sessions belonging to a user, newest first.
     /// Expired rows are pruned opportunistically.
     pub fn list_sessions(&self, user_id: i64) -> AppResult<Vec<SessionInfo>> {
@@ -557,8 +653,9 @@ impl Store {
         let conn = self.lock();
         conn.execute("DELETE FROM sessions WHERE expires < ?1", params![now])?;
         let mut stmt = conn.prepare(
-            "SELECT token, kind, created, expires FROM sessions
-             WHERE user_id = ?1 AND expires >= ?2 ORDER BY created DESC",
+            "SELECT token, kind, created, expires, last_seen, user_agent, ip, client, revoked
+             FROM sessions WHERE user_id = ?1 AND expires >= ?2
+             ORDER BY revoked ASC, created DESC",
         )?;
         let rows = stmt
             .query_map(params![user_id, now], |r| {
@@ -567,6 +664,11 @@ impl Store {
                     kind: r.get(1)?,
                     created: r.get(2)?,
                     expires: r.get(3)?,
+                    last_seen: r.get(4)?,
+                    user_agent: r.get(5)?,
+                    ip: r.get(6)?,
+                    client: r.get(7)?,
+                    revoked: r.get::<_, i64>(8)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -574,21 +676,52 @@ impl Store {
     }
 
     /// Revoke a single session, but only if it belongs to the given user.
-    /// Returns true when a row was actually removed.
-    pub fn delete_session_for_user(&self, token: &str, user_id: i64) -> AppResult<bool> {
+    /// Token sessions are deleted; Subsonic client sessions are flagged so the
+    /// client cannot simply authenticate again.
+    pub fn revoke_session_for_user(&self, token: &str, user_id: i64) -> AppResult<bool> {
         let conn = self.lock();
-        let removed = conn.execute(
-            "DELETE FROM sessions WHERE token = ?1 AND user_id = ?2",
-            params![token, user_id],
-        )?;
-        Ok(removed > 0)
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT kind FROM sessions WHERE token = ?1 AND user_id = ?2",
+                params![token, user_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match kind.as_deref() {
+            None => Ok(false),
+            Some("subsonic") => Ok(conn.execute(
+                "UPDATE sessions SET revoked = 1 WHERE token = ?1 AND user_id = ?2",
+                params![token, user_id],
+            )? > 0),
+            Some(_) => Ok(conn.execute(
+                "DELETE FROM sessions WHERE token = ?1 AND user_id = ?2",
+                params![token, user_id],
+            )? > 0),
+        }
     }
 
-    /// Revoke every session belonging to a user. Returns the number removed.
+    /// Undo a revocation for a Subsonic client session.
+    pub fn allow_session_for_user(&self, token: &str, user_id: i64) -> AppResult<bool> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "UPDATE sessions SET revoked = 0, expires = ?1
+             WHERE token = ?2 AND user_id = ?3 AND kind = 'subsonic'",
+            params![Utc::now().timestamp() + 30 * 86400, token, user_id],
+        )? > 0)
+    }
+
+    /// Revoke every session belonging to a user. Returns the number affected.
     pub fn delete_all_sessions_for_user(&self, user_id: i64) -> AppResult<usize> {
         let conn = self.lock();
-        let removed = conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
-        Ok(removed)
+        let deleted = conn.execute(
+            "DELETE FROM sessions WHERE user_id = ?1 AND kind <> 'subsonic'",
+            params![user_id],
+        )?;
+        let flagged = conn.execute(
+            "UPDATE sessions SET revoked = 1 WHERE user_id = ?1 AND kind = 'subsonic'",
+            params![user_id],
+        )?;
+        Ok(deleted + flagged)
     }
 
     pub fn get_or_create_api_key(&self, user_id: i64) -> AppResult<String> {
@@ -4509,11 +4642,11 @@ mod tests {
         assert_eq!(store.list_sessions(bob.id).unwrap().len(), 1);
 
         // A user cannot revoke somebody else's session.
-        assert!(!store.delete_session_for_user(&bob_tok, alice.id).unwrap());
+        assert!(!store.revoke_session_for_user(&bob_tok, alice.id).unwrap());
         assert_eq!(store.list_sessions(bob.id).unwrap().len(), 1);
 
         // Revoke one of our own sessions.
-        assert!(store.delete_session_for_user(&t1, alice.id).unwrap());
+        assert!(store.revoke_session_for_user(&t1, alice.id).unwrap());
         let sessions = store.list_sessions(alice.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].token, t2);
@@ -4523,6 +4656,73 @@ mod tests {
         assert!(store.list_sessions(alice.id).unwrap().is_empty());
         // Other users are untouched.
         assert_eq!(store.list_sessions(bob.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_metadata_and_subsonic_client_revocation() {
+        let store = Store::open_memory().unwrap();
+        let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
+
+        let meta = SessionMeta {
+            user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0".to_string(),
+            ip: "203.0.113.7".to_string(),
+            client: String::new(),
+        };
+        let tok = store
+            .create_session_with_meta(alice.id, "web", 3600, &meta)
+            .unwrap();
+        let sessions = store.list_sessions(alice.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].token, tok);
+        assert_eq!(sessions[0].user_agent, meta.user_agent);
+        assert_eq!(sessions[0].ip, meta.ip);
+        assert!(sessions[0].last_seen > 0);
+
+        // Subsonic client sessions are tracked by client identity.
+        let (client_tok, revoked) = store
+            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.7")
+            .unwrap();
+        assert!(!revoked);
+        let (client_tok2, revoked2) = store
+            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.9")
+            .unwrap();
+        assert_eq!(client_tok, client_tok2);
+        assert!(!revoked2);
+
+        let sessions = store.list_sessions(alice.id).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let client = sessions.iter().find(|s| s.kind == "subsonic").unwrap();
+        assert_eq!(client.client, "Symfonium");
+        assert_eq!(client.ip, "203.0.113.9");
+        assert!(!client.revoked);
+
+        // Revoking a Subsonic session flags it instead of deleting it, so the
+        // client can't simply authenticate again.
+        assert!(store.revoke_session_for_user(&client_tok, alice.id).unwrap());
+        let (_, revoked) = store
+            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.7")
+            .unwrap();
+        assert!(revoked);
+        assert!(store
+            .list_sessions(alice.id)
+            .unwrap()
+            .iter()
+            .find(|s| s.kind == "subsonic")
+            .unwrap()
+            .revoked);
+
+        // Re-allowing clears the flag.
+        assert!(store.allow_session_for_user(&client_tok, alice.id).unwrap());
+        let (_, revoked) = store
+            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.7")
+            .unwrap();
+        assert!(!revoked);
+
+        // Revoking all deletes the web session and flags the client session.
+        assert_eq!(store.delete_all_sessions_for_user(alice.id).unwrap(), 2);
+        let sessions = store.list_sessions(alice.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].revoked);
     }
 
     #[test]

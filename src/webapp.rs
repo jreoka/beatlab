@@ -2,7 +2,8 @@ use crate::models::{
     AlbumSummary, ArtistSummary, Mood, PlayQueueState, Playlist, PublicUser, Track, User,
     UserProfile, UserTrackStats,
 };
-use crate::subsonic::AppState;
+use crate::store::SessionMeta;
+use crate::subsonic::{client_ip, user_agent, AppState};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -660,7 +661,11 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 
-pub async fn signin(State(state): State<AppState>, Json(req): Json<AuthReq>) -> Response {
+pub async fn signin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AuthReq>,
+) -> Response {
     match state
         .store
         .authenticate_or_create_user(&req.username, &req.password)
@@ -673,7 +678,15 @@ pub async fn signin(State(state): State<AppState>, Json(req): Json<AuthReq>) -> 
                     taste.prime_new_user(uid).await;
                 });
             }
-            match state.store.create_session(user.id, "web", 30 * 86400) {
+            let meta = SessionMeta {
+                user_agent: user_agent(&headers),
+                ip: client_ip(&headers),
+                ..SessionMeta::default()
+            };
+            match state
+                .store
+                .create_session_with_meta(user.id, "web", 30 * 86400, &meta)
+            {
                 Ok(token) => {
                     let api_key = state.store.get_or_create_api_key(user.id).unwrap_or_default();
                     json_res(json!({
@@ -695,7 +708,11 @@ pub async fn signin(State(state): State<AppState>, Json(req): Json<AuthReq>) -> 
     }
 }
 
-pub async fn signup(State(state): State<AppState>, Json(req): Json<AuthReq>) -> Response {
+pub async fn signup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AuthReq>,
+) -> Response {
     match state.store.create_user(&req.username, &req.password) {
         Ok(user) => {
             let taste = state.taste.clone();
@@ -703,7 +720,15 @@ pub async fn signup(State(state): State<AppState>, Json(req): Json<AuthReq>) -> 
             tokio::spawn(async move {
                 taste.prime_new_user(uid).await;
             });
-            match state.store.create_session(user.id, "web", 30 * 86400) {
+            let meta = SessionMeta {
+                user_agent: user_agent(&headers),
+                ip: client_ip(&headers),
+                ..SessionMeta::default()
+            };
+            match state
+                .store
+                .create_session_with_meta(user.id, "web", 30 * 86400, &meta)
+            {
                 Ok(token) => {
                     let api_key = state.store.get_or_create_api_key(user.id).unwrap_or_default();
                     json_res(json!({
@@ -755,6 +780,11 @@ pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
                 "kind": s.kind,
                 "created": s.created,
                 "expires": s.expires,
+                "lastSeen": s.last_seen,
+                "userAgent": s.user_agent,
+                "ip": s.ip,
+                "client": s.client,
+                "revoked": s.revoked,
                 "current": s.token == current_token,
             })
         })
@@ -774,9 +804,30 @@ pub async fn revoke_session(
     };
     let removed = state
         .store
-        .delete_session_for_user(&req.id, user.id)
+        .revoke_session_for_user(&req.id, user.id)
         .unwrap_or(false);
     if removed {
+        json_res(json!({ "ok": true }))
+    } else {
+        err_res(StatusCode::NOT_FOUND, "Session not found")
+    }
+}
+
+/// Allow a previously revoked Subsonic client session again.
+pub async fn allow_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeSessionReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let allowed = state
+        .store
+        .allow_session_for_user(&req.id, user.id)
+        .unwrap_or(false);
+    if allowed {
         json_res(json!({ "ok": true }))
     } else {
         err_res(StatusCode::NOT_FOUND, "Session not found")

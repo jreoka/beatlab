@@ -5483,10 +5483,76 @@
     }
   }
 
-  function sessionDevice(s) {
-    return s.kind === 'nd'
-      ? { label: 'Subsonic / Navidrome client', icon: SESSION_ICON_APP }
-      : { label: 'Web browser', icon: SESSION_ICON_WEB };
+  function timeAgo(ts) {
+    if (!ts) return 'unknown';
+    const diff = Date.now() - ts * 1000;
+    if (diff < 60000) return 'just now';
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+    if (diff < 2592000000) return `${Math.floor(diff / 86400000)}d ago`;
+    return formatSessionDate(ts);
+  }
+
+  function timeUntil(ts) {
+    if (!ts) return 'unknown';
+    const diff = ts * 1000 - Date.now();
+    if (diff <= 0) return 'expired';
+    const days = Math.floor(diff / 86400000);
+    if (days >= 1) return `in ${days} ${days === 1 ? 'day' : 'days'}`;
+    const hours = Math.floor(diff / 3600000);
+    if (hours >= 1) return `in ${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+    return 'soon';
+  }
+
+  function parseUserAgent(ua) {
+    if (!ua) return 'Unknown device';
+    let browser = '';
+    if (/Edg\//i.test(ua)) browser = 'Edge';
+    else if (/OPR\/|Opera/i.test(ua)) browser = 'Opera';
+    else if (/CriOS\//i.test(ua)) browser = 'Chrome';
+    else if (/FxiOS\//i.test(ua)) browser = 'Firefox';
+    else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+    else if (/Chrome\/|Chromium\//i.test(ua)) browser = 'Chrome';
+    else if (/Safari\//i.test(ua)) browser = 'Safari';
+    if (!browser) {
+      const token = ua.split(/[\s/]/)[0];
+      browser = token ? token.slice(0, 32) : 'Unknown device';
+    }
+
+    let os = '';
+    if (/Windows NT 10|Windows NT 11|Windows/i.test(ua)) os = 'Windows';
+    else if (/iPad/i.test(ua)) os = 'iPadOS';
+    else if (/iPhone|iPod/i.test(ua)) os = 'iOS';
+    else if (/Android/i.test(ua)) os = 'Android';
+    else if (/CrOS/i.test(ua)) os = 'ChromeOS';
+    else if (/Mac OS X|Macintosh/i.test(ua)) os = 'macOS';
+    else if (/Linux/i.test(ua)) os = 'Linux';
+    return os ? `${browser} on ${os}` : browser;
+  }
+
+  function sessionInfo(s) {
+    const client = (s.client || '').trim();
+    const ua = s.userAgent || '';
+    const mobile = /iPhone|iPad|Android|Mobile/i.test(ua);
+    if (s.kind === 'subsonic') {
+      return {
+        title: client || 'Subsonic client',
+        kindLabel: 'Subsonic / Navidrome client',
+        icon: SESSION_ICON_APP,
+      };
+    }
+    if (s.kind === 'nd') {
+      return {
+        title: client || parseUserAgent(ua),
+        kindLabel: 'Navidrome login',
+        icon: mobile ? SESSION_ICON_APP : SESSION_ICON_WEB,
+      };
+    }
+    return {
+      title: parseUserAgent(ua),
+      kindLabel: 'Web browser session',
+      icon: mobile ? SESSION_ICON_APP : SESSION_ICON_WEB,
+    };
   }
 
   function renderSettingsModalBody() {
@@ -5616,26 +5682,35 @@
       body.innerHTML = `
         <div class="settings-section">
           <div class="settings-section-title">Active Sessions</div>
-          <div class="settings-row-desc" style="margin-bottom:12px">Devices currently signed in to your account. Revoke any session you don't recognize &mdash; the device will be signed out immediately.</div>
+          <div class="settings-row-desc" style="margin-bottom:12px">Every device and app currently connected to your account &mdash; web logins, Navidrome sign-ins, and Subsonic clients. Revoke anything you don't recognize.</div>
           ${
             sessions.length > 0
               ? `<div class="session-list">
                   ${sessions
                     .map((s) => {
-                      const dev = sessionDevice(s);
+                      const info = sessionInfo(s);
                       const isCurrent = s.current || s.id === state.token;
+                      const revoked = !!s.revoked;
+                      const ua = s.userAgent || '';
                       return `
-                    <div class="session-card${isCurrent ? ' current' : ''}">
-                      <span class="session-icon">${dev.icon}</span>
+                    <div class="session-card${isCurrent ? ' current' : ''}${revoked ? ' revoked' : ''}">
+                      <span class="session-icon">${info.icon}</span>
                       <div class="session-meta">
                         <div class="session-title">
-                          ${esc(dev.label)}
+                          ${esc(info.title)}
                           ${isCurrent ? '<span class="session-current-pill">This device</span>' : ''}
+                          ${revoked ? '<span class="session-revoked-pill">Revoked</span>' : ''}
                         </div>
-                        <div class="session-sub">Signed in ${esc(formatSessionDate(s.created))}</div>
-                        <div class="session-sub">Expires ${esc(formatSessionDate(s.expires))}</div>
+                        <div class="session-sub">${esc(info.kindLabel)} &middot; Signed in ${esc(formatSessionDate(s.created))}</div>
+                        <div class="session-sub">Last active ${esc(timeAgo(s.lastSeen || s.created))} &middot; Expires ${esc(timeUntil(s.expires))}</div>
+                        ${s.ip ? `<div class="session-sub">IP ${esc(s.ip)}</div>` : ''}
+                        ${ua ? `<div class="session-ua" title="${esc(ua)}">${esc(ua)}</div>` : ''}
                       </div>
-                      <button class="mini-btn danger-btn session-revoke" title="Revoke this session" onclick="App.revokeSession(${esc(JSON.stringify(s.id))})">Revoke</button>
+                      ${
+                        revoked
+                          ? `<button class="mini-btn session-revoke" title="Allow this client again" onclick="App.allowSession(${esc(JSON.stringify(s.id))})">Allow</button>`
+                          : `<button class="mini-btn danger-btn session-revoke" title="Revoke this session" onclick="App.revokeSession(${esc(JSON.stringify(s.id))})">Revoke</button>`
+                      }
                     </div>`;
                     })
                     .join('')}
@@ -6931,6 +7006,17 @@
             : 'All sessions cleared'
         );
         window.App.signOut();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    allowSession: async (id) => {
+      try {
+        await api('/api/web/sessions/allow', { method: 'POST', body: JSON.stringify({ id }) });
+        const sessRes = await api('/api/web/sessions').catch(() => null);
+        if (sessRes) state.settingsData.sessions = sessRes;
+        renderSettingsModalBody();
+        showToast('Client allowed again');
       } catch (err) {
         showToast(err.message);
       }
