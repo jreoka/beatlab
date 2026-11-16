@@ -499,6 +499,65 @@ impl DeezerSource {
             .collect()
     }
 
+    /// Deezer's search/playlist endpoints omit the album genre from track objects, so every
+    /// remote candidate arrives with an empty `genre`. That makes genre-clash validation of
+    /// curated instant mixes impossible (a mis-tagged "Jrock" playlist full of rap tracks
+    /// would be trusted purely because its *title* matched). Fill the missing genre from
+    /// each distinct album's primary Deezer genre. Results are cached by `get_json`, so
+    /// repeated albums across playlists are cheap.
+    pub async fn enrich_track_genres(&self, tracks: &mut [Track]) {
+        let mut album_ids: Vec<u64> = tracks
+            .iter()
+            .filter(|t| t.source == "deezer" && t.genre.trim().is_empty())
+            .filter_map(|t| t.deezer_album_id().and_then(|id| id.parse::<u64>().ok()))
+            .filter(|&id| id > 0)
+            .collect();
+        album_ids.sort_unstable();
+        album_ids.dedup();
+        if album_ids.is_empty() {
+            return;
+        }
+        // Bound the work: a genre mix pulls a few curated batches of ~24 tracks each.
+        album_ids.truncate(64);
+
+        let lookup = async {
+            let futs = album_ids.into_iter().map(|id| async move {
+                let url = format!("https://api.deezer.com/album/{}", id);
+                let genre = self
+                    .get_json::<DzAlbumFull>(&url)
+                    .await
+                    .and_then(|a| a.genres)
+                    .and_then(|g| g.data.into_iter().next())
+                    .map(|g| g.name.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                (id, genre)
+            });
+            futures::future::join_all(futs).await
+        };
+        let by_album: HashMap<u64, String> = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, g)| g.map(|g| (id, g)))
+            .collect();
+        if by_album.is_empty() {
+            return;
+        }
+
+        for t in tracks.iter_mut() {
+            if t.source != "deezer" || !t.genre.trim().is_empty() {
+                continue;
+            }
+            if let Some(genre) = t
+                .deezer_album_id()
+                .and_then(|id| id.parse::<u64>().ok())
+                .and_then(|id| by_album.get(&id))
+            {
+                t.genre = genre.clone();
+            }
+        }
+    }
+
     pub async fn fetch_playlist_tracks(&self, playlist_id: u64, limit: usize) -> Vec<Track> {
         if playlist_id == 0 {
             return vec![];

@@ -5180,6 +5180,12 @@ impl TasteEngine {
             }
         }
 
+        if intent.is_theme_mix && !intent.genres.is_empty() {
+            for t in search_pool.iter_mut() {
+                normalize_scene_genre(t, &intent);
+            }
+        }
+
         let deduped_search = dedup_tracks_prefer_quality(search_pool);
         if deduped_search.is_empty()
             && mix_ctx.ytm_radio.is_empty()
@@ -5441,7 +5447,35 @@ impl TasteEngine {
 
             mix_pool.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             let mix_ranked: Vec<Track> = mix_pool.into_iter().map(|(_, t)| t).collect();
-            let mix_tracks = dedup_and_interleave(mix_ranked, 25, 2);
+            let mut mix_tracks = dedup_and_interleave(mix_ranked, 25, 2);
+
+            // A pure genre mix needs at least a couple of tracks whose own metadata confirms
+            // the genre. Playlist-title provenance alone is not enough: a mis-tagged
+            // "jrock" playlist full of unrelated tracks must never be labelled a J-Rock Mix.
+            let pure_genre_query = intent.is_theme_mix
+                && !intent.genres.is_empty()
+                && intent.themes.is_empty()
+                && intent.moods.is_empty()
+                && intent.year_range.is_none();
+            if pure_genre_query && !mix_tracks.is_empty() {
+                let confirmed = mix_tracks
+                    .iter()
+                    .filter(|t| {
+                        if t.source == "ytm" || t.id.starts_with("ytm:") {
+                            return true;
+                        }
+                        let ag = artist_genres
+                            .get(&primary_artist(&t.artist).to_lowercase())
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        let meta = format!("{} {}", t.genre, ag).to_lowercase();
+                        intent.genres.iter().any(|g| genre_matches_text(&meta, g))
+                    })
+                    .count();
+                if confirmed < 2 {
+                    mix_tracks.clear();
+                }
+            }
 
             let instant_mix = if mix_tracks.len() >= 2 {
                 let (title, subtitle) = build_instant_mix_title(
@@ -7211,6 +7245,36 @@ fn genre_family(g_low: &str) -> Option<u8> {
         return Some(8);
     }
     None
+}
+
+/// Deezer's genre taxonomy is coarse: an actual J-Rock or J-Pop track is tagged simply
+/// "Rock" / "Pop" on its album. When the user asks for a scene genre, treat that broad
+/// parent bucket as the requested scene so a real track is not rejected as off-genre.
+/// Other families (rap, latin, k-pop, ...) are left untouched and still clash normally.
+pub(crate) fn normalize_scene_genre(t: &mut Track, intent: &SearchIntent) {
+    if intent.genres.len() != 1 {
+        return;
+    }
+    let scene = intent.genres[0].as_str();
+    let parent_family = match scene {
+        "J-Rock" => genre_family("rock"),
+        "J-Pop" | "K-Pop" | "C-Pop" | "City Pop" => genre_family("pop"),
+        _ => return,
+    };
+    let Some(parent_family) = parent_family else {
+        return;
+    };
+    let g = t.genre.trim().to_lowercase();
+    if g.is_empty() || g == scene.to_lowercase() {
+        return;
+    }
+    if genre_family(&g) != Some(parent_family) {
+        return;
+    }
+    if has_conflicting_scene_genre(&g, &intent.genres, &intent.normalized) {
+        return;
+    }
+    t.genre = scene.to_string();
 }
 
 pub(crate) fn has_genre_clash(t: &Track, artist_genres: &str, wanted_genres: &[String]) -> bool {
@@ -9564,6 +9628,98 @@ mod tests {
     }
 
     #[test]
+    fn jrock_curated_playlist_with_unrelated_genres_is_not_labelled_a_jrock_mix() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jrock_curated_repro", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+        // After Deezer album-genre enrichment these real tracks carry genres that clash with J-Rock.
+        let mk = |id: &str, title: &str, artist: &str, genre: &str, rank: u64| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: title.into(),
+            genre: genre.into(),
+            duration: 210,
+            bitrate: 256,
+            meta: format!(r#"{{"rank":{}}}"#, rank),
+            ..Default::default()
+        };
+        let tracks = vec![
+            mk("dz:1", "Me Uste", "Sky G", "Rap", 950000),
+            mk("dz:2", "Touch the Sky", "TOMORROW X TOGETHER", "K-Pop", 940000),
+            mk("dz:3", "BANKS HOUSE", "Fatt Smack", "Hip-Hop", 930000),
+            mk("dz:4", "Love 4 Me", "Babyface Ray", "Rap", 920000),
+            mk("dz:5", "Gracias", "Poeta Callejero", "Reggaeton", 910000),
+            mk("dz:6", "Storm is...", "TOMORROW X TOGETHER", "K-Pop", 900000),
+            mk("dz:7", "Party With The Boys", "Don Toliver", "Rap", 890000),
+        ];
+        let res = taste.search_and_refine_with_context(
+            u.id,
+            "jrock",
+            tracks.clone(),
+            vec![("Jrock Mix".into(), tracks)],
+            SearchMixContext::default(),
+        );
+        let leaked = res.instant_mix.as_ref().map(|m| {
+            m.tracks.iter().map(|t| t.title.clone()).collect::<Vec<_>>()
+        });
+        assert!(
+            res.instant_mix.is_none(),
+            "unrelated curated tracks must not be labelled a J-Rock mix: {:?}",
+            leaked
+        );
+    }
+
+    #[test]
+    fn jrock_mix_keeps_real_jrock_tracks_tagged_with_broad_rock_genre() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jrock_good", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+        let mk = |id: &str, title: &str, artist: &str, rank: u64| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: title.into(),
+            genre: "Rock".into(), // Deezer's coarse album genre for real J-Rock
+            duration: 220,
+            bitrate: 256,
+            meta: format!(r#"{{"rank":{}}}"#, rank),
+            ..Default::default()
+        };
+        let tracks = vec![
+            mk("dz:j1", "Gurenge", "LiSA", 950000),
+            mk("dz:j2", "The Beginning", "ONE OK ROCK", 940000),
+            mk("dz:j3", "Ignite", "Eir Aoi", 930000),
+        ];
+        let res = taste.search_and_refine_with_context(
+            u.id,
+            "jrock",
+            tracks.clone(),
+            vec![("Top J-Rock".into(), tracks)],
+            SearchMixContext::default(),
+        );
+        let mix = res.instant_mix.expect("real J-Rock tracks should build a mix");
+        assert_eq!(mix.title, "J-Rock Mix");
+        assert!(mix.tracks.iter().all(|t| t.genre == "J-Rock"));
+    }
+
+    #[test]
     fn homonym_artists_lisa_kr_and_lisa_jp_never_cross_contaminate_mix_or_affinities() {
         let store = Store::open_memory().unwrap();
         let (u, _) = store.authenticate_or_create_user("lisa_fan", "pw").unwrap();
@@ -10254,9 +10410,10 @@ mod tests {
         let iu = mk("dz:iu", "Dear my crazy soulmate", "IU", "K-Pop", 920000);
         let weeknd_kpop = mk("dz:weeknd", "K-POP", "The Weeknd", "", 980000);
 
-        let yoasobi = mk("dz:yoasobi", "New me", "YOASOBI", "", 880000);
-        let fujii = mk("dz:fujii", "Hachiko", "Fujii Kaze", "", 870000);
-        let yonezu = mk("dz:yonezu", "Azalea", "Kenshi Yonezu", "", 860000);
+        // Real curated J-Pop tracks carry (enriched) J-Pop/Pop genre metadata.
+        let yoasobi = mk("dz:yoasobi", "New me", "YOASOBI", "J-Pop", 880000);
+        let fujii = mk("dz:fujii", "Hachiko", "Fujii Kaze", "Pop", 870000);
+        let yonezu = mk("dz:yonezu", "Azalea", "Kenshi Yonezu", "J-Pop", 860000);
         let anri = mk("dz:anri", "SHYNESS BOY", "Anri", "City Pop", 800000);
 
         store

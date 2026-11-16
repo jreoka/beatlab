@@ -1491,6 +1491,26 @@ pub async fn instant_mix(
         }
     }
 
+    // Remote (Deezer) search & playlist tracks carry no genre metadata. Without it the
+    // genre-clash checks cannot tell an actual J-Rock track from a rap track that happened
+    // to live in a playlists whose title matched "jrock". Resolve album genres before any
+    // candidate ranking so the mixer can validate tracks, not just playlist titles.
+    if intent.is_theme_mix && !intent.genres.is_empty() {
+        let dz = &state.sources.deezer;
+        dz.enrich_track_genres(&mut combined).await;
+        for (_, batch) in curated_batches.iter_mut() {
+            dz.enrich_track_genres(batch).await;
+        }
+        // Persist the resolved genres so artist/genre indexes are useful on later requests.
+        let mut enriched: Vec<Track> = combined.clone();
+        for (_, batch) in &curated_batches {
+            enriched.extend(batch.iter().cloned());
+        }
+        if !enriched.is_empty() {
+            let _ = state.store.upsert_tracks(&enriched);
+        }
+    }
+
     let base_slug = crate::models::slug(&base_query);
     let has_exact_artist = !base_slug.is_empty()
         && (dz_artists
