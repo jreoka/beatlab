@@ -3588,25 +3588,6 @@ impl TasteEngine {
         dedup_and_interleave(ranked, limit, 2)
     }
 
-    pub async fn playlist_radio_tracks_with_recent(
-        &self,
-        user_id: i64,
-        playlist_id: &str,
-        exclude_ids: &HashSet<String>,
-        client_recent: &[(String, i64)],
-        count: usize,
-    ) -> Vec<Track> {
-        self.playlist_radio_tracks_with_mode(
-            user_id,
-            playlist_id,
-            exclude_ids,
-            client_recent,
-            count,
-            RadioMode::Default,
-        )
-        .await
-    }
-
     pub async fn playlist_radio_tracks_with_mode(
         &self,
         user_id: i64,
@@ -3718,6 +3699,7 @@ impl TasteEngine {
         dedup_and_interleave(combined, count, 2)
     }
 
+    #[cfg(test)]
     pub async fn radio_next_tracks_with_exclusions_and_recent(
         &self,
         user_id: i64,

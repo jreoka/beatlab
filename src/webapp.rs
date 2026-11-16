@@ -1960,6 +1960,7 @@ fn format_instant_mix_response(
     }))
 }
 
+#[cfg(test)]
 async fn build_instant_mix_response(
     state: AppState,
     uid: i64,
