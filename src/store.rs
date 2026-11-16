@@ -248,6 +248,16 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_taste_links_user
                 ON user_taste_links(user_id, kind, updated DESC);
+
+            CREATE TABLE IF NOT EXISTS hidden_tracks (
+                user_id INTEGER NOT NULL,
+                track_id TEXT NOT NULL,
+                song_key TEXT NOT NULL DEFAULT '',
+                at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, track_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hidden_tracks_user
+                ON hidden_tracks(user_id, at DESC);
             ",
         )?;
 
@@ -270,6 +280,7 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_tracks_deezer ON tracks(deezer_id)",
             [],
         )?;
+        let _ = conn.execute("DELETE FROM kv WHERE key LIKE 'nn:user:%'", []);
 
         migrate_legacy_moods(&mut conn)?;
 
@@ -674,7 +685,9 @@ impl Store {
                         "SELECT track_id FROM ratings WHERE user_id = ?1 AND rating <= 2
                          UNION
                          SELECT track_id FROM user_track_stats
-                           WHERE user_id = ?1 AND skip_count >= play_count + 2",
+                           WHERE user_id = ?1 AND skip_count >= play_count + 2
+                         UNION
+                         SELECT track_id FROM hidden_tracks WHERE user_id = ?1",
                     )?;
                     for id in dstmt.query_map(params![user_id], |r| r.get::<_, String>(0))?.flatten() {
                         disliked_ids.insert(id);
@@ -1706,6 +1719,135 @@ impl Store {
             map.insert(item.0, item.1);
         }
         Ok(map)
+    }
+
+    pub fn hide_track(&self, user_id: i64, track_id: &str, song_key: &str) -> AppResult<()> {
+        if user_id <= 0 || track_id.trim().is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO hidden_tracks(user_id, track_id, song_key, at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, track_id) DO UPDATE SET
+               song_key = CASE WHEN excluded.song_key != '' THEN excluded.song_key ELSE hidden_tracks.song_key END,
+               at = excluded.at",
+            params![user_id, track_id, song_key, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn unhide_track(&self, user_id: i64, track_id: &str) -> AppResult<usize> {
+        if user_id <= 0 || track_id.trim().is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock();
+        let key: Option<String> = conn
+            .query_row(
+                "SELECT song_key FROM hidden_tracks WHERE user_id = ?1 AND track_id = ?2",
+                params![user_id, track_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .filter(|k: &String| !k.is_empty());
+
+        let removed = if let Some(ref sk) = key {
+            conn.execute(
+                "DELETE FROM events WHERE user_id = ?1 AND kind = 'not_interested'
+                 AND (track_id = ?2 OR track_id IN (SELECT track_id FROM hidden_tracks WHERE user_id = ?1 AND song_key = ?3))",
+                params![user_id, track_id, sk],
+            )?;
+            conn.execute(
+                "DELETE FROM hidden_tracks WHERE user_id = ?1 AND (track_id = ?2 OR song_key = ?3)",
+                params![user_id, track_id, sk],
+            )?
+        } else {
+            conn.execute(
+                "DELETE FROM events WHERE user_id = ?1 AND kind = 'not_interested' AND track_id = ?2",
+                params![user_id, track_id],
+            )?;
+            conn.execute(
+                "DELETE FROM hidden_tracks WHERE user_id = ?1 AND track_id = ?2",
+                params![user_id, track_id],
+            )?
+        };
+        Ok(removed)
+    }
+
+    pub fn reset_hidden_tracks(&self, user_id: i64) -> AppResult<usize> {
+        if user_id <= 0 {
+            return Ok(0);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM hidden_tracks WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM events WHERE user_id = ?1 AND kind = 'not_interested'",
+            params![user_id],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn hidden_track_sets(&self, user_id: i64) -> AppResult<(HashSet<String>, HashSet<String>)> {
+        let mut ids = HashSet::new();
+        let mut keys = HashSet::new();
+        if user_id <= 0 {
+            return Ok((ids, keys));
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT track_id, song_key FROM hidden_tracks WHERE user_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![user_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            ids.insert(row.0);
+            if !row.1.is_empty() {
+                keys.insert(row.1);
+            }
+        }
+        Ok((ids, keys))
+    }
+
+    pub fn hidden_tracks_list(&self, user_id: i64) -> AppResult<Vec<(Track, i64)>> {
+        if user_id <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, h.at, h.track_id
+             FROM hidden_tracks h
+             LEFT JOIN tracks t ON t.id = h.track_id
+             WHERE h.user_id = ?1
+             ORDER BY h.at DESC",
+            prefixed_track_cols("t")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                let at: i64 = r.get(21)?;
+                let raw_id: String = r.get(22)?;
+                let has_track: Option<String> = r.get(0)?;
+                let track = if has_track.is_some() {
+                    row_to_track(r)?
+                } else {
+                    Track {
+                        id: raw_id.clone(),
+                        title: raw_id,
+                        artist: "Unknown Artist".to_string(),
+                        ..Default::default()
+                    }
+                };
+                Ok((track, at))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn upsert_taste_links(&self, user_id: i64, links: &[(&str, &str, f64)]) -> AppResult<()> {

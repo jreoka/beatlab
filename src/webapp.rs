@@ -74,6 +74,23 @@ pub struct WebTrack {
     pub rating: i32,
 }
 
+fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> Vec<Track> {
+    if user_id <= 0 || tracks.is_empty() {
+        return tracks;
+    }
+    let (hidden_ids, hidden_keys) = state.store.hidden_track_sets(user_id).unwrap_or_default();
+    if hidden_ids.is_empty() && hidden_keys.is_empty() {
+        return tracks;
+    }
+    tracks
+        .into_iter()
+        .filter(|t| {
+            !hidden_ids.contains(&t.id)
+                && (hidden_keys.is_empty() || !hidden_keys.contains(&t.song_key()))
+        })
+        .collect()
+}
+
 fn to_web_tracks(state: &AppState, user_id: i64, tracks: &[Track]) -> Vec<WebTrack> {
     to_web_tracks_with_taste(state, user_id, tracks, &HashSet::new())
 }
@@ -236,8 +253,12 @@ pub struct EventReq {
     pub kind: String,
     #[serde(default = "default_one")]
     pub value: f64,
-    #[serde(default)]
-    pub query: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct NotInterestedReq {
+    #[serde(rename = "trackId")]
+    pub track_id: String,
 }
 
 fn default_one() -> f64 {
@@ -438,13 +459,17 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
         .collect();
 
     let quick_picks = state.taste.quick_picks(uid, 12);
-    let recent: Vec<Track> = state
-        .store
-        .user_recent_tracks(uid, 12, 0)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(t, _)| t)
-        .collect();
+    let recent: Vec<Track> = filter_visible_tracks(
+        &state,
+        uid,
+        state
+            .store
+            .user_recent_tracks(uid, 12, 0)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect(),
+    );
 
     let (chart_tracks, chart_albums, chart_artists) = tokio::join!(
         state.sources.deezer.fetch_chart_tracks(20),
@@ -461,11 +486,15 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
         let _ = state.store.upsert_artist_meta(ar);
     }
 
-    let trending_tracks = if !chart_tracks.is_empty() {
-        chart_tracks
-    } else {
-        state.store.newest_tracks(16, 0).unwrap_or_default()
-    };
+    let trending_tracks = filter_visible_tracks(
+        &state,
+        uid,
+        if !chart_tracks.is_empty() {
+            chart_tracks
+        } else {
+            state.store.newest_tracks(16, 0).unwrap_or_default()
+        },
+    );
     let albums = if !chart_albums.is_empty() {
         chart_albums
     } else {
@@ -560,10 +589,11 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .collect();
 
     let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
+    let visible_charts = filter_visible_tracks(&state, user.id, chart_tracks);
     json_res(json!({
         "moods": moods,
         "genres": genres,
-        "charts": to_web_tracks(&state, user.id, &chart_tracks),
+        "charts": to_web_tracks(&state, user.id, &visible_charts),
         "newAlbums": chart_albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
     }))
 }
@@ -619,9 +649,10 @@ pub async fn genre_detail(
         let _ = state.store.upsert_artist_meta(ar);
     }
     let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
+    let visible_tracks = filter_visible_tracks(&state, user.id, tracks);
     json_res(json!({
         "genre": decoded,
-        "tracks": to_web_tracks(&state, user.id, &tracks),
+        "tracks": to_web_tracks(&state, user.id, &visible_tracks),
         "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
     }))
 }
@@ -1130,7 +1161,12 @@ pub async fn get_playlist(
     } else {
         pl
     };
-    let tracks = state.store.playlist_tracks(&id).unwrap_or_default();
+    let raw_tracks = state.store.playlist_tracks(&id).unwrap_or_default();
+    let tracks = if pl.is_auto {
+        filter_visible_tracks(&state, user.id, raw_tracks)
+    } else {
+        raw_tracks
+    };
     json_res(json!({
         "playlist": playlist_summary_json(&pl),
         "isOwner": pl.user_id == user.id,
@@ -1330,7 +1366,7 @@ pub async fn toggle_star(
             } else {
                 let _ = state.store.unsave_album(user.id, &req.id);
             }
-            state.taste.record_album_save(user.id, &req.id, req.starred);
+            state.taste.mark_taste_dirty(user.id);
         }
         "artist" => {
             if req.starred {
@@ -1338,7 +1374,7 @@ pub async fn toggle_star(
             } else {
                 let _ = state.store.unfollow_artist(user.id, &req.id);
             }
-            state.taste.record_artist_follow(user.id, &req.id, req.starred);
+            state.taste.mark_taste_dirty(user.id);
         }
         _ => {
             if req.starred {
@@ -1383,13 +1419,9 @@ pub async fn record_event(
         Ok(u) => u,
         Err(r) => return r,
     };
-    state.taste.record_event_with_query(
-        user.id,
-        &req.track_id,
-        &req.kind,
-        req.value,
-        req.query.as_deref(),
-    );
+    state
+        .taste
+        .record_event(user.id, &req.track_id, &req.kind, req.value);
     if let Ok(Some(t)) = state.store.get_track(&req.track_id) {
         if req.kind == "play" {
             let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
@@ -1397,6 +1429,89 @@ pub async fn record_event(
         }
     }
     json_res(json!({ "ok": true }))
+}
+
+pub async fn mark_not_interested(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<NotInterestedReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let tid = req.track_id.trim();
+    if tid.is_empty() {
+        return err_res(StatusCode::BAD_REQUEST, "Missing trackId");
+    }
+    state.taste.mark_not_interested(user.id, tid);
+    let count = state
+        .store
+        .hidden_tracks_list(user.id)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    json_res(json!({ "ok": true, "hiddenCount": count }))
+}
+
+pub async fn list_hidden(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let items = state.store.hidden_tracks_list(user.id).unwrap_or_default();
+    let tracks: Vec<Value> = items
+        .into_iter()
+        .map(|(t, at)| {
+            json!({
+                "id": t.id,
+                "title": t.title,
+                "artist": t.artist,
+                "album": t.album,
+                "coverUrl": cover_api_url(&t.id),
+                "hiddenAt": at,
+            })
+        })
+        .collect();
+    json_res(json!({
+        "count": tracks.len(),
+        "tracks": tracks,
+    }))
+}
+
+pub async fn unhide_track(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let decoded = urlencoding::decode(&id)
+        .map(|s| s.into_owned())
+        .unwrap_or(id);
+    let removed = state.taste.unhide_track(user.id, &decoded);
+    let taste = state.taste.clone();
+    let uid = user.id;
+    let _ = tokio::task::spawn_blocking(move || taste.rebuild_auto_playlists(uid)).await;
+    let count = state
+        .store
+        .hidden_tracks_list(user.id)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    json_res(json!({ "ok": true, "removed": removed, "count": count }))
+}
+
+pub async fn reset_hidden(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let cleared = state.taste.reset_hidden_tracks(user.id);
+    let taste = state.taste.clone();
+    let uid = user.id;
+    let _ = tokio::task::spawn_blocking(move || taste.rebuild_auto_playlists(uid)).await;
+    json_res(json!({ "ok": true, "cleared": cleared, "count": 0 }))
 }
 
 pub async fn get_lyrics(
@@ -1805,12 +1920,11 @@ mod tests {
 
         let ev_res = record_event(
             State(state.clone()),
-            hdrs,
+            hdrs.clone(),
             Json(EventReq {
                 track_id: "loc:80s-1".into(),
                 kind: "search_pick".into(),
                 value: 1.0,
-                query: Some("80s".into()),
             }),
         )
         .await;
@@ -1842,6 +1956,51 @@ mod tests {
         // Ephemeral custom mix must NOT persist any playlist to SQLite
         let playlists = store.list_playlists(u.id, false).unwrap();
         assert!(playlists.is_empty(), "expected no saved playlists, found {}", playlists.len());
+
+        // Not interested hides the song across endpoints, and reset restores all hide data
+        let hide_res = mark_not_interested(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(NotInterestedReq {
+                track_id: "loc:80s-2".into(),
+            }),
+        )
+        .await;
+        assert_eq!(hide_res.status(), StatusCode::OK);
+        let hide_body: Value = serde_json::from_slice(&to_bytes(hide_res.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert_eq!(hide_body["hiddenCount"], 1);
+
+        let listed_res = list_hidden(State(state.clone()), hdrs.clone()).await;
+        let listed_body: Value = serde_json::from_slice(&to_bytes(listed_res.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert_eq!(listed_body["count"], 1);
+        assert_eq!(listed_body["tracks"][0]["id"], "loc:80s-2");
+
+        let unhide_res = unhide_track(
+            State(state.clone()),
+            Path("loc:80s-2".into()),
+            hdrs.clone(),
+        )
+        .await;
+        assert_eq!(unhide_res.status(), StatusCode::OK);
+        let unhide_body: Value = serde_json::from_slice(&to_bytes(unhide_res.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert_eq!(unhide_body["removed"], 1);
+        assert_eq!(unhide_body["count"], 0);
+
+        let _ = mark_not_interested(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(NotInterestedReq {
+                track_id: "loc:80s-2".into(),
+            }),
+        )
+        .await;
+
+        let reset_res = reset_hidden(State(state.clone()), hdrs).await;
+        assert_eq!(reset_res.status(), StatusCode::OK);
+        let reset_body: Value = serde_json::from_slice(&to_bytes(reset_res.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert_eq!(reset_body["cleared"], 1);
+        assert_eq!(reset_body["count"], 0);
+        assert!(store.hidden_tracks_list(u.id).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

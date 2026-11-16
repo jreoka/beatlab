@@ -25,6 +25,7 @@
     close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
     arrowUp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
+    eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
     nowPlaying: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="10" width="3" height="10" rx="1"/><rect x="10.5" y="4" width="3" height="16" rx="1"/><rect x="17" y="7" width="3" height="13" rx="1"/></svg>',
     volOn: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>',
     volMuted: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/>',
@@ -62,10 +63,8 @@
     compatAttemptedId: '',
     volume: parseFloat(localStorage.getItem('beatlab_vol') || '0.9'),
     muted: false,
-    isPlaying: false,
     seeking: false,
     lastScrobbleCompleteId: '',
-    rightTab: 'queue',
     fsTab: 'queue',
     fsMobileView: 'player',
     lyrics: { synced: false, plain: '', lines: [] },
@@ -81,7 +80,12 @@
     viewAbortController: null,
     libTab: 'playlists',
     searchState: null,
-    activeSearchQuery: '',
+    settingsTab: 'general',
+    settingsData: {
+      sources: null,
+      hidden: null,
+      confirmResetHidden: false,
+    },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -349,7 +353,7 @@
     state.lyrics = { synced: false, plain: '', lines: [] };
     state.activeLyricIdx = -1;
     state.searchState = null;
-    state.activeSearchQuery = '';
+    state.settingsData = { sources: null, hidden: null, confirmResetHidden: false };
     clearTimeout(state.searchTimer);
     state.searchTimer = null;
     state.searchComposing = false;
@@ -620,6 +624,7 @@
 
     wireAudioEvents();
     wireKeyboardShortcuts();
+    wireTrackGestures();
     window.addEventListener('hashchange', () => renderCurrentHash());
 
     if (state.token) {
@@ -1072,7 +1077,7 @@
 
     let html = '';
 
-    // Neural Refinement & Sub-Query Bar
+    // Search Refinement & Sub-Query Bar
     const chips = refinements?.filterChips || [];
     const suggestions = refinements?.querySuggestions || [];
     if (chips.length > 0 || suggestions.length > 0) {
@@ -1113,7 +1118,7 @@
       if (topTrack) {
         html += `<section>
           <div class="section-head"><h2>Top Result</h2></div>
-          <div class="top-result-card" onclick="App.playSearchTrack(${esc(JSON.stringify(topTrack.id))}, ${esc(JSON.stringify(query))})">
+          <div class="top-result-card" data-tid="${esc(topTrack.id)}" onclick="App.playSearchTrack(${esc(JSON.stringify(topTrack.id))})">
             <img src="${esc(topTrack.coverUrl)}" alt="" />
             <div class="top-result-title">${esc(topTrack.title)}</div>
             <div class="card-sub">${esc(topTrack.artist)} · ${esc(topTrack.album)}</div>
@@ -1121,7 +1126,7 @@
               <span class="top-result-type">SONG · ${esc(topTrack.qualityBadge)}</span>
               ${topTrack.isTasteMatch ? `<span class="taste-pill">For You</span>` : ''}
             </div>
-            <button class="card-play-fab" style="opacity:1;transform:none;" onclick="event.stopPropagation();App.playSearchTrack(${esc(JSON.stringify(topTrack.id))}, ${esc(JSON.stringify(query))})">${ICONS.play}</button>
+            <button class="card-play-fab" style="opacity:1;transform:none;" onclick="event.stopPropagation();App.playSearchTrack(${esc(JSON.stringify(topTrack.id))})">${ICONS.play}</button>
           </div>
         </section>`;
       } else {
@@ -1499,7 +1504,7 @@
   // Reusable UI Renderers
   // ---------------------------------------------------------------------------
   function renderQuickTile(t) {
-    return `<div class="qp-tile" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
+    return `<div class="qp-tile" data-tid="${esc(t.id)}" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
       <img src="${esc(t.coverUrl)}" loading="lazy" alt="" />
       <div class="qp-info">
         <div class="qp-title">${esc(t.title)}</div>
@@ -1510,7 +1515,7 @@
   }
 
   function renderTrackCard(t) {
-    return `<div class="media-card" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
+    return `<div class="media-card" data-tid="${esc(t.id)}" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
       <div class="card-art-wrap">
         <img src="${esc(t.coverUrl)}" loading="lazy" alt="" />
         <button class="card-play-fab">${ICONS.play}</button>
@@ -1581,7 +1586,7 @@
         let playClick;
         if (searchQuery) {
           playClick = singleRadio
-            ? `App.playSearchTrack(${esc(JSON.stringify(t.id))}, ${esc(JSON.stringify(searchQuery))})`
+            ? `App.playSearchTrack(${esc(JSON.stringify(t.id))})`
             : `App.playInstantMixAt(${ctxIdx})`;
         } else {
           playClick = singleRadio
@@ -1591,7 +1596,10 @@
         const editArgs = editablePlaylistId
           ? `, ${esc(JSON.stringify(editablePlaylistId))}, ${i}`
           : '';
-        return `<div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
+        const plDataAttrs = editablePlaylistId
+          ? ` data-pl-id="${esc(editablePlaylistId)}" data-pl-pos="${i}"`
+          : '';
+        return `<div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}"${plDataAttrs}>
           <div class="tr-idx" onclick="${playClick}">${isCur ? ICONS.nowPlaying : useTrackNo && t.trackNo > 0 ? t.trackNo : i + 1}</div>
           <div class="tr-main" onclick="${playClick}">
             <img class="tr-thumb" src="${esc(t.coverUrl)}" loading="lazy" alt="" />
@@ -1746,7 +1754,6 @@
   }
 
   function updatePlayButton(playing) {
-    state.isPlaying = playing;
     const svgHtml = playing
       ? '<path d="M6.5 4.5h4v15h-4zm7 0h4v15h-4z"/>'
       : '<path d="M8 4.5v15l12-7.5z"/>';
@@ -1754,26 +1761,23 @@
     if ($('fs-play-icon-svg')) $('fs-play-icon-svg').innerHTML = svgHtml;
   }
 
-  function sendTrackEvent(trackId, kind, value = 1, query = state.activeSearchQuery) {
-    const body = { trackId, kind, value };
-    if (query) body.query = query;
+  function sendTrackEvent(trackId, kind, value = 1) {
     api('/api/web/event', {
       method: 'POST',
-      body: JSON.stringify(body),
+      body: JSON.stringify({ trackId, kind, value }),
     }).catch(() => {});
   }
 
-  function playListByIds(ids, startIndex = 0, queryContext = '') {
+  function playListByIds(ids, startIndex = 0) {
     const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
     if (!tracks.length) return;
     state.radioReqToken++;
     state.radioLoading = false;
-    state.activeSearchQuery = queryContext || '';
     state.queue = tracks;
     playQueueAt(Math.max(0, Math.min(startIndex, tracks.length - 1)));
   }
 
-  function playShuffledIds(ids, queryContext = '') {
+  function playShuffledIds(ids) {
     const tracks = ids.map((id) => state.trackMap.get(id)).filter(Boolean);
     if (!tracks.length) return;
     for (let i = tracks.length - 1; i > 0; i--) {
@@ -1782,17 +1786,15 @@
     }
     state.radioReqToken++;
     state.radioLoading = false;
-    state.activeSearchQuery = queryContext || '';
     state.queue = tracks;
     playQueueAt(0);
   }
 
-  function playSingle(id, queryContext = '') {
+  function playSingle(id) {
     const t = state.trackMap.get(id);
     if (!t) return;
     state.radioReqToken++;
     state.radioLoading = !!state.autoplay;
-    state.activeSearchQuery = queryContext || '';
     state.queue = [t];
     playQueueAt(0);
     if (state.autoplay) {
@@ -1807,7 +1809,6 @@
       if (tracks.length) {
         state.radioReqToken++;
         state.radioLoading = false;
-        state.activeSearchQuery = '';
         state.queue = tracks;
         playQueueAt(0);
       }
@@ -1823,7 +1824,6 @@
       if (tracks.length) {
         state.radioReqToken++;
         state.radioLoading = false;
-        state.activeSearchQuery = '';
         state.queue = tracks;
         playQueueAt(0);
       }
@@ -1832,9 +1832,9 @@
     }
   }
 
-  function playSearchTrack(id, query) {
-    sendTrackEvent(id, 'search_pick', 1, query);
-    playSingle(id, query);
+  function playSearchTrack(id) {
+    sendTrackEvent(id, 'search_pick', 1);
+    playSingle(id);
   }
 
   function playInstantMix(shuffled = false, startIndex = 0) {
@@ -1844,11 +1844,11 @@
     const ids = mix.tracks.map((t) => t.id);
     const idx = shuffled ? 0 : Math.max(0, Math.min(startIndex, ids.length - 1));
     const pickedId = ids[idx];
-    if (pickedId) sendTrackEvent(pickedId, 'mix_play', 1, s.query);
+    if (pickedId) sendTrackEvent(pickedId, 'mix_play', 1);
     if (shuffled) {
-      playShuffledIds(ids, s.query);
+      playShuffledIds(ids);
     } else {
-      playListByIds(ids, idx, s.query);
+      playListByIds(ids, idx);
     }
   }
 
@@ -1862,7 +1862,6 @@
     if (!mix || !mix.tracks || !mix.tracks.length) return;
     const tracks = mix.tracks.map((t) => state.trackMap.get(t.id) || t);
     if (!state.queue.length) {
-      state.activeSearchQuery = s.query || '';
       state.queue = tracks;
       playQueueAt(0);
     } else {
@@ -1870,7 +1869,7 @@
       renderQueuePanel();
       saveServerQueue();
     }
-    sendTrackEvent(tracks[0].id, 'mix_play', 1, s.query);
+    sendTrackEvent(tracks[0].id, 'mix_play', 1);
     showToast(`Added ${tracks.length} tracks from "${mix.title}"`);
   }
 
@@ -2190,7 +2189,7 @@
   }
 
   function renderQItem(t, idx, active) {
-    return `<div class="q-item ${active ? 'active' : ''}" onclick="App.playQueueAt(${idx})">
+    return `<div class="q-item ${active ? 'active' : ''}" data-tid="${esc(t.id)}" onclick="App.playQueueAt(${idx})">
       <img src="${esc(t.coverUrl)}" alt="" />
       <div class="q-item-info">
         <div class="q-item-title">${esc(t.title)}</div>
@@ -2302,7 +2301,9 @@
   }
 
   function openTrackMenu(event, trackId, editablePlaylistId = null, playlistPos = -1) {
-    event.stopPropagation();
+    if (event && typeof event.stopPropagation === 'function') {
+      event.stopPropagation();
+    }
     const t = state.trackMap.get(trackId);
     if (!t) return;
     closeTrackMenu();
@@ -2337,6 +2338,11 @@
       <button class="ctx-item" onclick="App.closeTrackMenu();App.navigate('album/${encodeURIComponent(t.albumId)}')">Go to Album</button>
       <button class="ctx-item" onclick="App.closeTrackMenu();App.navigate('artist/${encodeURIComponent(t.artistId)}')">Go to Artist</button>
       <hr class="ctx-sep">
+      <button class="ctx-item ctx-item-icon danger" onclick="App.closeTrackMenu();App.markNotInterested(${tidArg})">
+        ${ICONS.eyeOff}
+        <span>Not Interested</span>
+      </button>
+      <hr class="ctx-sep">
       <button class="ctx-item" onclick="App.closeTrackMenu();App.promptAddToNewPlaylist(${tidArg})">+ New Playlist with Song</button>
       ${userPls
         .map(
@@ -2352,12 +2358,14 @@
       if (backdrop) backdrop.classList.remove('hidden');
     } else {
       if (backdrop) backdrop.classList.add('hidden');
-      const maxH = Math.min(420, window.innerHeight - 24);
+      const maxH = Math.min(440, window.innerHeight - 24);
       const rect = menu.getBoundingClientRect();
       const menuW = Math.max(220, rect.width || 220);
-      const menuH = Math.min(maxH, rect.height || 300);
-      const x = Math.min(window.innerWidth - menuW - 10, event.clientX);
-      const y = Math.min(window.innerHeight - menuH - 10, event.clientY);
+      const menuH = Math.min(maxH, rect.height || 320);
+      const cx = event && Number.isFinite(event.clientX) ? event.clientX : window.innerWidth / 2;
+      const cy = event && Number.isFinite(event.clientY) ? event.clientY : window.innerHeight / 2;
+      const x = Math.min(window.innerWidth - menuW - 10, cx);
+      const y = Math.min(window.innerHeight - menuH - 10, cy);
       menu.style.left = `${Math.max(8, x)}px`;
       menu.style.top = `${Math.max(8, y)}px`;
 
@@ -2370,8 +2378,151 @@
     }
   }
 
-  function openModal(html) {
-    $('modal-box').innerHTML = html;
+  function wireTrackGestures() {
+    let holdTimer = null;
+    let startX = 0;
+    let startY = 0;
+    let longPressFiredAt = 0;
+    let suppressNextClick = false;
+
+    const clearHold = () => {
+      if (holdTimer) {
+        clearTimeout(holdTimer);
+        holdTimer = null;
+      }
+    };
+
+    const getRowArgs = (target) => {
+      const row = target.closest('[data-tid]');
+      if (!row || target.closest('input, textarea, select')) return null;
+      const tid = row.dataset.tid;
+      if (!tid || !state.trackMap.has(tid)) return null;
+      const plId = row.dataset.plId || null;
+      const plPos = row.dataset.plPos != null ? parseInt(row.dataset.plPos, 10) : -1;
+      return { tid, plId, plPos: Number.isFinite(plPos) ? plPos : -1 };
+    };
+
+    document.addEventListener('contextmenu', (e) => {
+      const info = getRowArgs(e.target);
+      if (!info) return;
+      e.preventDefault();
+      if (Date.now() - longPressFiredAt < 700) return;
+      openTrackMenu(e, info.tid, info.plId, info.plPos);
+    });
+
+    document.addEventListener('pointerdown', (e) => {
+      if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+      if (e.target.closest('button, a, input, select, textarea, .tr-actions')) return;
+      const info = getRowArgs(e.target);
+      if (!info) return;
+      clearHold();
+      startX = e.clientX;
+      startY = e.clientY;
+      holdTimer = setTimeout(() => {
+        holdTimer = null;
+        longPressFiredAt = Date.now();
+        suppressNextClick = true;
+        if (navigator.vibrate) {
+          try {
+            navigator.vibrate(15);
+          } catch {}
+        }
+        openTrackMenu({ clientX: startX, clientY: startY }, info.tid, info.plId, info.plPos);
+      }, 480);
+    });
+
+    document.addEventListener('pointermove', (e) => {
+      if (!holdTimer) return;
+      if (Math.hypot(e.clientX - startX, e.clientY - startY) > 10) {
+        clearHold();
+      }
+    });
+
+    document.addEventListener('pointerup', clearHold);
+    document.addEventListener('pointercancel', clearHold);
+    document.addEventListener('scroll', clearHold, true);
+
+    document.addEventListener(
+      'click',
+      (e) => {
+        if (suppressNextClick) {
+          suppressNextClick = false;
+          if (Date.now() - longPressFiredAt < 1200) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        }
+      },
+      true
+    );
+  }
+
+  async function markNotInterested(trackId) {
+    if (!trackId) return;
+    try {
+      await api('/api/web/not-interested', {
+        method: 'POST',
+        body: JSON.stringify({ trackId }),
+      });
+      if (state.searchState) {
+        state.searchState.tracks = (state.searchState.tracks || []).filter((t) => t.id !== trackId);
+        if (state.searchState.instantMix && Array.isArray(state.searchState.instantMix.tracks)) {
+          state.searchState.instantMix.tracks = state.searchState.instantMix.tracks.filter(
+            (t) => t.id !== trackId
+          );
+        }
+        renderSearchView();
+      } else {
+        document.querySelectorAll('[data-tid]').forEach((el) => {
+          if (el.dataset.tid === trackId && !el.classList.contains('q-item')) {
+            el.remove();
+          }
+        });
+      }
+
+      const cur = currentTrack();
+      const wasCur = !!(cur && cur.id === trackId);
+      const oldIdx = state.queueIndex;
+      const newQueue = [];
+      let newIdx = -1;
+      state.queue.forEach((item, idx) => {
+        if (item.id === trackId) return;
+        if (idx <= oldIdx) newIdx = newQueue.length;
+        newQueue.push(item);
+      });
+
+      if (wasCur) {
+        const nextIdx = newIdx + 1;
+        state.queue = newQueue;
+        if (newQueue.length > 0 && nextIdx < newQueue.length) {
+          playQueueAt(nextIdx);
+        } else if (state.autoplay && newQueue.length > 0) {
+          state.queueIndex = newQueue.length - 1;
+          await nextTrack(false);
+        } else {
+          state.queueIndex = -1;
+          audio.pause();
+          audio.removeAttribute('src');
+          renderQueuePanel();
+          saveServerQueue();
+        }
+      } else if (newQueue.length !== state.queue.length) {
+        state.queue = newQueue;
+        state.queueIndex = newIdx;
+        renderQueuePanel();
+        saveServerQueue();
+      }
+
+      showToast('Marked as Not Interested — song hidden');
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  function openModal(html, extraClass = '') {
+    const box = $('modal-box');
+    box.className = extraClass ? `modal-box ${extraClass}` : 'modal-box';
+    box.innerHTML = html;
     $('modal-backdrop').classList.remove('hidden');
   }
 
@@ -2412,56 +2563,214 @@
     `);
   }
 
-  async function openConnectModal() {
-    let srcData = { sources: [], totalTracks: 0, cacheMb: 0, ffmpeg: false };
-    try {
-      srcData = await api('/api/web/sources');
-    } catch {}
-    openModal(`
-      <div class="modal-head">
-        <h3>Account, Clients &amp; Sources</h3>
-        <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
-      </div>
-      <div class="kv-card">
-        <div class="kv-label">SUBSONIC / NAVIDROME SERVER URL</div>
-        <div class="kv-row">
-          <span class="kv-val">${esc(location.origin)}</span>
-          <button class="mini-btn" onclick="App.copyText(${esc(JSON.stringify(location.origin))}, 'Server URL copied')">Copy</button>
+  function renderSettingsModalBody() {
+    const body = $('settings-body');
+    if (!body) return;
+    const tab = state.settingsTab || 'general';
+    const srcData = state.settingsData.sources || { sources: [], totalTracks: 0, cacheMb: 0, ffmpeg: false };
+    const hiddenData = state.settingsData.hidden || { count: 0, tracks: [] };
+    const confirmReset = !!state.settingsData.confirmResetHidden;
+
+    document.querySelectorAll('.settings-nav-btn').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.stab === tab);
+    });
+
+    if (tab === 'general') {
+      const eqActive = state.eqEnabled || state.eqGains.some((v) => v !== 0);
+      body.innerHTML = `
+        <div class="settings-section">
+          <div class="settings-section-title">Playback &amp; Audio</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Autoplay Radio</div>
+              <div class="settings-row-desc">Automatically append related songs when your queue ends</div>
+            </div>
+            <label class="switch-toggle">
+              <input type="checkbox" ${state.autoplay ? 'checked' : ''} onchange="App.toggleAutoplay(this.checked)" />
+              <span class="switch-track"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">10-Band Audio Equalizer</div>
+              <div class="settings-row-desc">${eqActive ? 'Custom EQ filter active' : 'Flat response (off)'}</div>
+            </div>
+            <button class="btn-secondary" onclick="App.openEqModal()">Configure EQ</button>
+          </div>
         </div>
-      </div>
-      <div class="kv-card">
-        <div class="kv-label">USERNAME (WORKS IN ANY SUBSONIC OR NAVIDROME CLIENT)</div>
-        <div class="kv-val">${esc(state.user.username)}</div>
-      </div>
-      <div class="kv-card">
-        <div class="kv-label">OPENSUBSONIC API KEY</div>
-        <div class="kv-row">
-          <span id="modal-apikey" class="kv-val">${esc(state.user.apiKey || '')}</span>
-          <div style="display:flex;gap:6px;flex-shrink:0">
-            <button class="mini-btn" onclick="App.copyText(document.getElementById('modal-apikey').textContent, 'API key copied')">Copy</button>
-            <button class="mini-btn" onclick="App.regenApiKey()">Regenerate</button>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Music Sources &amp; Engine</div>
+          <div class="settings-metrics">
+            <div class="settings-metric"><span>Catalog</span><strong>${srcData.totalTracks} tracks</strong></div>
+            <div class="settings-metric"><span>Audio Cache</span><strong>${srcData.cacheMb} MB</strong></div>
+            <div class="settings-metric"><span>FFmpeg</span><strong>${srcData.ffmpeg ? 'Ready' : 'Off'}</strong></div>
+          </div>
+          <div class="settings-source-list">
+            ${(srcData.sources || [])
+              .map(
+                (s) => `
+              <div class="settings-source-item">
+                <div class="settings-source-head">
+                  <span class="status-dot ${s.available ? 'on' : 'off'}"></span>
+                  <strong>${esc(s.name)}</strong>
+                </div>
+                <div class="settings-source-status">${esc(s.status)}</div>
+              </div>`
+              )
+              .join('') || '<p class="settings-empty">Loading source status...</p>'}
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    if (tab === 'hidden') {
+      const count = hiddenData.count || 0;
+      const tracks = hiddenData.tracks || [];
+      body.innerHTML = `
+        <div class="settings-section">
+          <div class="settings-section-title">Hidden Songs &amp; Not Interested</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Hide Data (${count} ${count === 1 ? 'song' : 'songs'})</div>
+              <div class="settings-row-desc">Songs marked Not Interested are excluded from mixes, recommendations, search, charts, and autoplay radio.</div>
+            </div>
+          </div>
+          ${
+            confirmReset
+              ? `<div class="settings-confirm-bar">
+                  <span>Restore all ${count} hidden ${count === 1 ? 'song' : 'songs'} and clear Not Interested history?</span>
+                  <div class="settings-confirm-actions">
+                    <button class="btn-secondary danger-btn" onclick="App.confirmResetHidden()">Confirm Reset</button>
+                    <button class="mini-btn ghost" onclick="App.cancelResetHidden()">Cancel</button>
+                  </div>
+                </div>`
+              : `<div class="settings-actions-row">
+                  <button class="btn-secondary danger-btn" ${count === 0 ? 'disabled' : ''} onclick="App.promptResetHidden()">Reset Hide Data</button>
+                </div>`
+          }
+          ${
+            tracks.length > 0
+              ? `<div class="hidden-track-list">
+                  ${tracks
+                    .map(
+                      (t) => `
+                    <div class="hidden-track-row">
+                      <img src="${esc(t.coverUrl)}" alt="" />
+                      <div class="hidden-track-meta">
+                        <div class="hidden-track-title">${esc(t.title)}</div>
+                        <div class="hidden-track-sub">${esc(t.artist)}</div>
+                      </div>
+                      <button class="mini-btn" onclick="App.unhideSong(${esc(JSON.stringify(t.id))})">Unhide</button>
+                    </div>`
+                    )
+                    .join('')}
+                </div>`
+              : `<div class="settings-empty">No hidden songs yet. Right-click or long-hold any song and select <strong>Not Interested</strong>.</div>`
+          }
+        </div>
+      `;
+      return;
+    }
+
+    if (tab === 'apps') {
+      const clients = ['Symfonium', 'Feishin', 'Supersonic', 'Tempo', 'DSub', 'Amperfy'];
+      body.innerHTML = `
+        <div class="settings-section">
+          <div class="settings-section-title">Subsonic &amp; Navidrome Connect</div>
+          <div class="kv-card">
+            <div class="kv-label">SERVER URL</div>
+            <div class="kv-row">
+              <span class="kv-val">${esc(location.origin)}</span>
+              <button class="mini-btn" onclick="App.copyText(${esc(JSON.stringify(location.origin))}, 'Server URL copied')">Copy</button>
+            </div>
+          </div>
+          <div class="kv-card">
+            <div class="kv-label">USERNAME</div>
+            <div class="kv-val">${esc(state.user.username)}</div>
+          </div>
+          <div class="kv-card">
+            <div class="kv-label">OPENSUBSONIC API KEY</div>
+            <div class="kv-row">
+              <span id="modal-apikey" class="kv-val">${esc(state.user.apiKey || '')}</span>
+              <div style="display:flex;gap:6px;flex-shrink:0">
+                <button class="mini-btn" onclick="App.copyText(document.getElementById('modal-apikey').textContent, 'API key copied')">Copy</button>
+                <button class="mini-btn" onclick="App.regenApiKey()">Regenerate</button>
+              </div>
+            </div>
+          </div>
+          <div class="settings-clients">
+            <div class="kv-label">COMPATIBLE CLIENTS</div>
+            <div class="settings-client-chips">
+              ${clients.map((c) => `<span class="settings-client-chip">${c}</span>`).join('')}
+            </div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    const initial = (state.user.username[0] || 'B').toUpperCase();
+    body.innerHTML = `
+      <div class="settings-section">
+        <div class="settings-section-title">Account Profile</div>
+        <div class="settings-profile-card">
+          <span class="avatar-dot large">${esc(initial)}</span>
+          <div>
+            <div class="settings-profile-name">${esc(state.user.username)}</div>
+            <div class="settings-row-desc">Web, OpenSubsonic &amp; Navidrome account</div>
           </div>
         </div>
       </div>
-      <div class="kv-card">
-        <div class="kv-label">CATALOG &amp; ENGINE (${srcData.totalTracks} TRACKS · ${srcData.cacheMb} MB CACHED · FFMPEG: ${srcData.ffmpeg ? 'ON' : 'OFF'})</div>
-        ${(srcData.sources || [])
-          .map(
-            (s) =>
-              `<div style="font-size:12px;margin-top:4px;color:${s.available ? 'var(--text)' : 'var(--text-dim)'}"><strong>${esc(s.name)}</strong>: ${esc(s.status)}</div>`
-          )
-          .join('')}
+      <div class="settings-section">
+        <div class="settings-section-title">Security</div>
+        <form onsubmit="App.submitPasswordChange(event)" style="display:flex;flex-direction:column;gap:8px">
+          <div class="kv-label">CHANGE PASSWORD</div>
+          <input id="pw-cur" type="password" autocomplete="current-password" placeholder="Current password" required />
+          <input id="pw-new" type="password" autocomplete="new-password" placeholder="New password" required />
+          <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;margin-top:6px">
+            <button type="submit" class="btn-secondary">Update Password</button>
+            <button type="button" class="btn-secondary danger-btn" onclick="App.signOut()">Sign out</button>
+          </div>
+        </form>
       </div>
-      <form onsubmit="App.submitPasswordChange(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:14px">
-        <div class="kv-label">CHANGE PASSWORD</div>
-        <input id="pw-cur" type="password" autocomplete="current-password" placeholder="Current password" required />
-        <input id="pw-new" type="password" autocomplete="new-password" placeholder="New password" required />
-        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;margin-top:4px">
-          <button type="submit" class="btn-secondary">Update Password</button>
-          <button type="button" class="btn-secondary" style="color:#fda4af" onclick="App.signOut()">Sign out</button>
+    `;
+  }
+
+  async function openSettingsModal(initialTab = 'general') {
+    state.settingsTab = initialTab || 'general';
+    state.settingsData.confirmResetHidden = false;
+    openModal(`
+      <div class="settings-shell">
+        <div class="modal-head settings-modal-head">
+          <h3>Settings</h3>
+          <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
         </div>
-      </form>
-    `);
+        <div class="settings-layout">
+          <nav class="settings-nav" aria-label="Settings sections">
+            <button class="settings-nav-btn" data-stab="general" onclick="App.setSettingsTab('general')">General</button>
+            <button class="settings-nav-btn" data-stab="hidden" onclick="App.setSettingsTab('hidden')">Hidden Songs</button>
+            <button class="settings-nav-btn" data-stab="apps" onclick="App.setSettingsTab('apps')">Apps &amp; API</button>
+            <button class="settings-nav-btn" data-stab="account" onclick="App.setSettingsTab('account')">Account</button>
+          </nav>
+          <div id="settings-body" class="settings-body"></div>
+        </div>
+      </div>
+    `, 'settings-modal');
+    renderSettingsModalBody();
+
+    try {
+      const [srcRes, hidRes] = await Promise.all([
+        api('/api/web/sources').catch(() => null),
+        api('/api/web/hidden').catch(() => null),
+      ]);
+      if (srcRes) state.settingsData.sources = srcRes;
+      if (hidRes) state.settingsData.hidden = hidRes;
+      if ($('settings-body')) {
+        renderSettingsModalBody();
+      }
+    } catch {}
   }
 
   function wireKeyboardShortcuts() {
@@ -2546,7 +2855,6 @@
     },
     setLibTab: (tab) => renderLibrary(tab),
     setRightTab: (tab) => {
-      state.rightTab = tab;
       $('tab-queue').classList.toggle('active', tab === 'queue');
       $('tab-lyrics').classList.toggle('active', tab === 'lyrics');
       $('rp-queue-body').classList.toggle('hidden', tab !== 'queue');
@@ -2699,6 +3007,50 @@
     },
     openTrackMenu,
     closeTrackMenu,
+    markNotInterested,
+    openSettingsModal,
+    setSettingsTab: (tab) => {
+      state.settingsTab = tab;
+      state.settingsData.confirmResetHidden = false;
+      renderSettingsModalBody();
+    },
+    promptResetHidden: () => {
+      state.settingsData.confirmResetHidden = true;
+      renderSettingsModalBody();
+    },
+    cancelResetHidden: () => {
+      state.settingsData.confirmResetHidden = false;
+      renderSettingsModalBody();
+    },
+    confirmResetHidden: async () => {
+      try {
+        const res = await api('/api/web/hidden/reset', { method: 'POST' });
+        state.settingsData.hidden = { count: 0, tracks: [] };
+        state.settingsData.confirmResetHidden = false;
+        renderSettingsModalBody();
+        showToast(
+          res.cleared > 0
+            ? `Reset hide data (${res.cleared} ${res.cleared === 1 ? 'song' : 'songs'} restored)`
+            : 'Hide data cleared'
+        );
+        renderCurrentHash();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    unhideSong: async (trackId) => {
+      try {
+        await api(`/api/web/hidden/${encodeURIComponent(trackId)}`, { method: 'DELETE' });
+        const hidRes = await api('/api/web/hidden');
+        state.settingsData.hidden = hidRes;
+        state.settingsData.confirmResetHidden = false;
+        renderSettingsModalBody();
+        showToast('Song restored');
+        renderCurrentHash();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
     copyText: async (text, label = 'Copied') => {
       try {
         if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -2883,7 +3235,6 @@
       applyEqGains();
       openEqModal();
     },
-    openConnectModal,
     regenApiKey: async () => {
       try {
         const res = await api('/api/web/account/apikey', { method: 'POST' });

@@ -1,7 +1,6 @@
 use crate::models::{
     primary_artist, slug, AlbumSummary, ArtistSummary, Mood, Track, UserTrackStats,
 };
-use crate::neural::{event_target, extract_features_ctx, FeatureContext, NeuralCache, UserNet};
 use crate::sources::{dedup_tracks_prefer_quality, SourceRegistry};
 use crate::store::{search_match_score, Store};
 use chrono::Utc;
@@ -424,12 +423,25 @@ pub struct TasteProfile {
     pub saved_albums: HashSet<String>,
     pub starred: HashSet<String>,
     pub ratings: HashMap<String, i32>,
+    pub hidden_ids: HashSet<String>,
+    pub hidden_keys: HashSet<String>,
+}
+
+#[derive(Default)]
+struct TrackAffinities {
+    artist_affinity: f64,
+    genre_affinity: f64,
+    mood_affinity: f64,
+    playlist_artist_affinity: f64,
+    playlist_genre_affinity: f64,
+    playlist_mood_affinity: f64,
+    followed_artist: bool,
+    saved_album: bool,
 }
 
 struct ScoringContext {
     prof: TasteProfile,
     stats: HashMap<String, UserTrackStats>,
-    net: UserNet,
 }
 
 #[derive(Default)]
@@ -457,8 +469,6 @@ pub struct SearchMixResult {
     pub instant_mix: Option<InstantMix>,
     pub refinements: SearchRefinements,
     pub taste_match_ids: HashSet<String>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub track_neural_scores: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -532,8 +542,6 @@ pub struct SearchIntent {
     pub moods: Vec<Mood>,
     pub genres: Vec<String>,
     pub themes: Vec<ThemeSpec>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub is_mix_query: bool,
     pub is_theme_mix: bool,
 }
 
@@ -669,7 +677,6 @@ impl ExpandedSeedBatch {
 pub struct TasteEngine {
     pub store: Store,
     pub sources: SourceRegistry,
-    pub neural: std::sync::Arc<NeuralCache>,
     expanding_users: std::sync::Arc<std::sync::Mutex<HashSet<i64>>>,
 }
 
@@ -678,7 +685,6 @@ impl TasteEngine {
         Self {
             store,
             sources,
-            neural: std::sync::Arc::new(NeuralCache::new()),
             expanding_users: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
@@ -747,37 +753,13 @@ impl TasteEngine {
     }
 
     pub fn record_event(&self, user_id: i64, track_id: &str, kind: &str, value: f64) {
-        self.record_event_with_query(user_id, track_id, kind, value, None);
-    }
-
-    pub fn record_event_with_query(
-        &self,
-        user_id: i64,
-        track_id: &str,
-        kind: &str,
-        value: f64,
-        query: Option<&str>,
-    ) {
         let safe_val = if value.is_finite() { value } else { 0.0 };
         let _ = self.store.record_event(user_id, track_id, kind, safe_val);
-        self.learn_signal_with_query(user_id, track_id, kind, safe_val, query);
+        self.learn_signal(user_id, track_id, kind, safe_val);
     }
 
-    /// Updates neural model and taste staleness for an already-persisted interaction event
-    /// (avoids writing duplicate rows into `events` after `star_track`/`set_rating`).
-    pub fn learn_signal(&self, user_id: i64, track_id: &str, kind: &str, value: f64) {
-        self.learn_signal_with_query(user_id, track_id, kind, value, None);
-    }
-
-    pub fn learn_signal_with_query(
-        &self,
-        user_id: i64,
-        track_id: &str,
-        kind: &str,
-        value: f64,
-        query: Option<&str>,
-    ) {
-        let safe_val = if value.is_finite() { value } else { 0.0 };
+    /// Marks user taste dirty after an already-persisted interaction event.
+    pub fn learn_signal(&self, user_id: i64, _track_id: &str, kind: &str, _value: f64) {
         if user_id > 0
             && matches!(
                 kind,
@@ -790,41 +772,10 @@ impl TasteEngine {
                     | "skip"
                     | "search_pick"
                     | "mix_play"
+                    | "not_interested"
             )
         {
             self.mark_taste_dirty(user_id);
-        }
-        if let Some((target, weight)) = event_target(kind, safe_val) {
-            if let Ok(Some(track)) = self.store.get_track(track_id) {
-                let prof = self.user_profile(user_id);
-                let stats = if user_id > 0 {
-                    self.store.track_stats_map(user_id).unwrap_or_default()
-                } else {
-                    HashMap::new()
-                };
-                let st = stats.get(track_id).copied().unwrap_or_default();
-                let intent = query
-                    .map(str::trim)
-                    .filter(|q| !q.is_empty())
-                    .map(parse_search_intent);
-                let fctx = build_feature_context_with_query(&track, &prof, &st, intent.as_ref(), false);
-                let feats = extract_features_ctx(&track, &fctx);
-
-                // Ensure upgraded or cold-loaded nets bootstrap from existing history before online updates.
-                if user_id > 0 && self.neural.get_or_load(&self.store, user_id).updates == 0 {
-                    let bootstrap = self.collect_bootstrap_samples(user_id, &prof, &stats);
-                    self.neural.update_and_save(&self.store, user_id, |net| {
-                        if net.updates == 0 && !bootstrap.is_empty() {
-                            net.train_batch(&bootstrap, 3);
-                        }
-                        net.train_step(&feats, target, weight);
-                    });
-                } else {
-                    self.neural.update_and_save(&self.store, user_id, |net| {
-                        net.train_step(&feats, target, weight);
-                    });
-                }
-            }
         }
     }
 
@@ -846,50 +797,43 @@ impl TasteEngine {
         }
     }
 
-    pub fn record_album_save(&self, user_id: i64, album_id: &str, saved: bool) {
-        if user_id <= 0 {
+    pub fn mark_not_interested(&self, user_id: i64, track_id: &str) {
+        if user_id <= 0 || track_id.trim().is_empty() {
             return;
         }
-        self.mark_taste_dirty(user_id);
-        let tracks = self.store.album_tracks(album_id).unwrap_or_default();
-        if tracks.is_empty() {
-            return;
-        }
-        let prof = self.user_profile(user_id);
-        let stats = self.store.track_stats_map(user_id).unwrap_or_default();
-        let target = if saved { 0.90 } else { 0.25 };
-        let weight = if saved { 1.1 } else { 0.7 };
-        self.neural.update_and_save(&self.store, user_id, |net| {
-            for t in tracks.iter().take(4) {
-                let st = stats.get(&t.id).copied().unwrap_or_default();
-                let fctx = build_feature_context(t, &prof, &st);
-                let x = extract_features_ctx(t, &fctx);
-                net.train_step(&x, target, weight);
-            }
-        });
+        let song_key = self
+            .store
+            .get_track(track_id)
+            .ok()
+            .flatten()
+            .filter(|t| {
+                !t.title.trim().is_empty()
+                    && !primary_artist(&t.artist).eq_ignore_ascii_case("Unknown Artist")
+            })
+            .map(|t| t.song_key())
+            .unwrap_or_default();
+        let _ = self.store.hide_track(user_id, track_id, &song_key);
+        self.record_event(user_id, track_id, "not_interested", 1.0);
     }
 
-    pub fn record_artist_follow(&self, user_id: i64, artist_id: &str, followed: bool) {
+    pub fn unhide_track(&self, user_id: i64, track_id: &str) -> usize {
         if user_id <= 0 {
-            return;
+            return 0;
         }
+        let removed = self.store.unhide_track(user_id, track_id).unwrap_or(0);
+        if removed > 0 {
+            self.mark_taste_dirty(user_id);
+        }
+        removed
+    }
+
+    pub fn reset_hidden_tracks(&self, user_id: i64) -> usize {
+        if user_id <= 0 {
+            return 0;
+        }
+        let removed = self.store.reset_hidden_tracks(user_id).unwrap_or(0);
         self.mark_taste_dirty(user_id);
-        let tracks = self.store.artist_tracks(artist_id).unwrap_or_default();
-        if tracks.is_empty() {
-            return;
-        }
-        let prof = self.user_profile(user_id);
-        let stats = self.store.track_stats_map(user_id).unwrap_or_default();
-        let target = if followed { 0.92 } else { 0.25 };
-        let weight = if followed { 1.25 } else { 0.75 };
-        self.neural.update_and_save(&self.store, user_id, |net| {
-            for t in tracks.iter().take(4) {
-                let st = stats.get(&t.id).copied().unwrap_or_default();
-                let fctx = build_feature_context(t, &prof, &st);
-                let x = extract_features_ctx(t, &fctx);
-                net.train_step(&x, target, weight);
-            }
-        });
+        removed
     }
 
     pub fn user_profile(&self, user_id: i64) -> TasteProfile {
@@ -932,6 +876,7 @@ impl TasteEngine {
                 "play" => 0.65,
                 "rate" => (ev.value.clamp(1.0, 5.0) - 2.75) * 1.4,
                 "skip" => -1.5,
+                "not_interested" => -1.5,
                 "unstar" => -1.6,
                 "playlist_remove" => -1.0,
                 _ => 0.15,
@@ -1000,6 +945,7 @@ impl TasteEngine {
             .store
             .user_taste_links(user_id)
             .unwrap_or_default();
+        let (hidden_ids, hidden_keys) = self.store.hidden_track_sets(user_id).unwrap_or_default();
 
         prof.related_artist_affinity = related_artists;
         prof.related_track_affinity = related_tracks;
@@ -1007,6 +953,8 @@ impl TasteEngine {
         prof.ratings = ratings;
         prof.followed_artists = followed_artists;
         prof.saved_albums = saved_albums;
+        prof.hidden_ids = hidden_ids;
+        prof.hidden_keys = hidden_keys;
         prof
     }
 
@@ -1017,59 +965,7 @@ impl TasteEngine {
         } else {
             HashMap::new()
         };
-        let mut net = if user_id > 0 {
-            self.neural.get_or_load(&self.store, user_id)
-        } else {
-            UserNet::new(0)
-        };
-
-        // Warm-start / migrate neural net from persisted history when upgrading or cold-loaded.
-        if user_id > 0 && net.updates < 4 {
-            let samples = self.collect_bootstrap_samples(user_id, &prof, &stats);
-            if !samples.is_empty() {
-                net.train_batch(&samples, 3);
-                net = self.neural.replace_and_save(&self.store, net);
-            }
-        }
-
-        ScoringContext { prof, stats, net }
-    }
-
-    fn collect_bootstrap_samples(
-        &self,
-        user_id: i64,
-        prof: &TasteProfile,
-        stats: &HashMap<String, UserTrackStats>,
-    ) -> Vec<([f64; crate::neural::INPUT_DIM], f64, f64)> {
-        let mut seed_targets: HashMap<String, (f64, f64)> = HashMap::new();
-        for ev in self.store.user_recent_events(user_id, 180).unwrap_or_default() {
-            if let Some((t, w)) = event_target(&ev.kind, ev.value) {
-                seed_targets.entry(ev.track_id).or_insert((t, w));
-            }
-        }
-        for sid in &prof.starred {
-            seed_targets.insert(sid.clone(), (0.98, 2.4));
-        }
-        for pid in &prof.manual_playlist_ids {
-            seed_targets.entry(pid.clone()).or_insert((0.92, 1.9));
-        }
-        for (rid, &rating) in &prof.ratings {
-            if let Some(pair) = event_target("rate", rating as f64) {
-                seed_targets.insert(rid.clone(), pair);
-            }
-        }
-
-        let ids: Vec<String> = seed_targets.keys().take(120).cloned().collect();
-        let tracks = self.store.get_tracks_by_ids(&ids).unwrap_or_default();
-        let mut samples = Vec::with_capacity(tracks.len());
-        for t in tracks {
-            if let Some(&(target, weight)) = seed_targets.get(&t.id) {
-                let st = stats.get(&t.id).copied().unwrap_or_default();
-                let fctx = build_feature_context(&t, prof, &st);
-                samples.push((extract_features_ctx(&t, &fctx), target, weight));
-            }
-        }
-        samples
+        ScoringContext { prof, stats }
     }
 
     pub fn for_you_tracks(&self, user_id: i64, limit: usize) -> Vec<Track> {
@@ -1087,11 +983,9 @@ impl TasteEngine {
             .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
             .map(|t| {
                 let s = score_track_core(
-                    user_id,
                     &t,
                     &sctx.prof,
                     &sctx.stats,
-                    Some(&sctx.net),
                     ScoreMode::Supermix,
                 );
                 (s, t)
@@ -1123,7 +1017,9 @@ impl TasteEngine {
             .filter(|(t, st)| {
                 let bad_rating = prof.ratings.get(&t.id).copied().unwrap_or(3) <= 2;
                 let net_positive = st.play_count > st.skip_count;
-                !bad_rating && (net_positive || prof.starred.contains(&t.id))
+                !is_hidden_track(t, &prof)
+                    && !bad_rating
+                    && (net_positive || prof.starred.contains(&t.id))
             })
             .map(|(t, st)| {
                 let age_days = ((now - st.last_played).max(0) as f64) / 86400.0;
@@ -1175,11 +1071,9 @@ impl TasteEngine {
             let aged_curated = is_curated && (st.last_played == 0 || st.last_played < cutoff);
             if aged_play || aged_curated {
                 let s = score_track_core(
-                    user_id,
                     &t,
                     &sctx.prof,
                     &sctx.stats,
-                    Some(&sctx.net),
                     ScoreMode::Supermix,
                 );
                 pool.push((s, t));
@@ -1221,15 +1115,13 @@ impl TasteEngine {
                     || sctx.prof.manual_playlist_ids.contains(&t.id)
                     || sctx.prof.manual_playlist_song_keys.contains(&key)
                     || sctx.prof.ratings.contains_key(&t.id);
-                !heard && !known_fav
+                !heard && !known_fav && !is_strongly_disliked(t, &sctx.prof, &sctx.stats)
             })
             .map(|t| {
                 let s = score_track_core(
-                    user_id,
                     &t,
                     &sctx.prof,
                     &sctx.stats,
-                    Some(&sctx.net),
                     ScoreMode::Discover,
                 );
                 (s, t)
@@ -1268,11 +1160,9 @@ impl TasteEngine {
             .map(|t| {
                 let sim = score_against_centroid(&t, &centroid);
                 let taste = score_track_core(
-                    user_id,
                     &t,
                     &sctx.prof,
                     &sctx.stats,
-                    Some(&sctx.net),
                     ScoreMode::PlaylistDna,
                 );
                 let fam_bonus = if sctx.prof.manual_playlist_ids.contains(&t.id) {
@@ -2185,11 +2075,9 @@ impl TasteEngine {
                 let meta_match = has_mood_meta_match(&combined_genre_low, mood);
 
                 let taste_s = score_track_core(
-                    user_id,
                     &t,
                     &sctx.prof,
                     &sctx.stats,
-                    Some(&sctx.net),
                     ScoreMode::Supermix,
                 );
                 let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
@@ -2286,11 +2174,9 @@ impl TasteEngine {
             .map(|t| {
                 let c_sim = score_against_centroid(&t, &centroid);
                 let u_taste = score_track_core(
-                    user_id,
                     &t,
                     &sctx.prof,
                     &sctx.stats,
-                    Some(&sctx.net),
                     ScoreMode::PlaylistDna,
                 );
                 let combined = if pl_tracks.is_empty() {
@@ -2324,8 +2210,8 @@ impl TasteEngine {
             .filter(|t| !exclude_ids.contains(&t.id) && !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
             .collect();
         familiar.sort_by(|a, b| {
-            let sa = score_track_core(user_id, a, &sctx.prof, &sctx.stats, Some(&sctx.net), ScoreMode::Supermix);
-            let sb = score_track_core(user_id, b, &sctx.prof, &sctx.stats, Some(&sctx.net), ScoreMode::Supermix);
+            let sa = score_track_core(a, &sctx.prof, &sctx.stats, ScoreMode::Supermix);
+            let sb = score_track_core(b, &sctx.prof, &sctx.stats, ScoreMode::Supermix);
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -2414,11 +2300,9 @@ impl TasteEngine {
                         // Preserve strong similarity prior while tailoring order to user taste & skips.
                         let sim_prior = ((total - idx as f64) / total) * 4.5;
                         let user_fit = score_track_core(
-                            user_id,
                             &t,
                             &sctx.prof,
                             &sctx.stats,
-                            Some(&sctx.net),
                             ScoreMode::Supermix,
                         ) * 0.45;
                         (sim_prior + user_fit, t)
@@ -2521,7 +2405,6 @@ impl TasteEngine {
         let sctx = self.build_scoring_context(user_id);
         let deduped = dedup_tracks_prefer_quality(raw_tracks.to_vec());
         let evals = evaluate_search_candidates(
-            user_id,
             &intent,
             deduped,
             &HashMap::new(),
@@ -2607,7 +2490,7 @@ impl TasteEngine {
         })
     }
 
-    /// Actively sorts and refines search results using `UserNet`, listening taste,
+    /// Actively sorts and refines search results using listening taste,
     /// lexical anchors, and query intent—and builds an ephemeral on-the-fly custom mix
     /// without persisting a playlist.
     pub fn search_and_refine(
@@ -2636,6 +2519,7 @@ impl TasteEngine {
     ) -> SearchMixResult {
         let intent = parse_search_intent(query);
         let sctx = self.build_scoring_context(user_id);
+        let has_user_taste = profile_has_taste(&sctx.prof);
 
         // Track provenance from curated playlists & intent-expanded catalog hits before dedup.
         let mut curated_prior_by_key: HashMap<String, f64> = HashMap::new();
@@ -2673,7 +2557,6 @@ impl TasteEngine {
                 instant_mix: None,
                 refinements: build_search_refinements(&intent, &[], &empty_matches, &sctx, None),
                 taste_match_ids: empty_matches,
-                track_neural_scores: HashMap::new(),
             };
         }
 
@@ -2685,7 +2568,6 @@ impl TasteEngine {
             .unwrap_or_default();
 
         let evals = evaluate_search_candidates(
-            user_id,
             &intent,
             deduped_search,
             &curated_prior_by_key,
@@ -2694,12 +2576,10 @@ impl TasteEngine {
         );
 
         let mut taste_match_ids = HashSet::new();
-        let mut track_neural_scores = HashMap::new();
         for e in &evals {
             if e.is_taste_match {
                 taste_match_ids.insert(e.track.id.clone());
             }
-            track_neural_scores.insert(e.track.id.clone(), e.net_prob);
         }
         let ranked_tracks: Vec<Track> = evals.iter().map(|e| e.track.clone()).collect();
 
@@ -2760,7 +2640,7 @@ impl TasteEngine {
                 let (title, subtitle) = build_instant_mix_title(
                     &intent,
                     &mix_tracks,
-                    &sctx.net,
+                    has_user_taste,
                     None,
                     None,
                     false,
@@ -2792,7 +2672,6 @@ impl TasteEngine {
                 instant_mix,
                 refinements,
                 taste_match_ids,
-                track_neural_scores,
             };
         }
 
@@ -3014,20 +2893,7 @@ impl TasteEngine {
                 let consensus = if entry.source_hits >= 2 { 1.4 } else { 0.0 };
 
                 let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
-                let fctx = build_feature_context(&t, &sctx.prof, &st);
-                let align = compute_taste_alignment(&t, &sctx.prof, &fctx);
-                let raw_net = if user_id > 0 && sctx.net.updates > 0 {
-                    let conf = sctx.net.confidence().max(0.25);
-                    let x = extract_features_ctx(&t, &fctx);
-                    (sctx.net.predict(&x) - 0.5) * 3.2 * conf
-                } else {
-                    0.0
-                };
-                let net_adj = if align.has_taste && !align.on_taste && raw_net > 0.0 {
-                    raw_net.min(0.6)
-                } else {
-                    raw_net
-                };
+                let fctx = build_track_affinities(&t, &sctx.prof);
 
                 let genre_coherence = if !anchor_genres.is_empty() {
                     let tg = split_genres(&t.genre);
@@ -3055,7 +2921,6 @@ impl TasteEngine {
                 let s = sim_base
                     + consensus
                     + genre_coherence
-                    + net_adj
                     + taste_nudge
                     + pop_tiebreak
                     + qual_tiebreak
@@ -3090,7 +2955,7 @@ impl TasteEngine {
                 let (title, subtitle) = build_instant_mix_title(
                     &intent,
                     &mix_tracks,
-                    &sctx.net,
+                    has_user_taste,
                     Some(anchor_art.as_str()),
                     seed_title,
                     single_artist_only,
@@ -3125,7 +2990,6 @@ impl TasteEngine {
             instant_mix,
             refinements,
             taste_match_ids,
-            track_neural_scores,
         }
     }
 }
@@ -3138,14 +3002,12 @@ struct EvaluatedSearchTrack {
     theme_match: f64,
     curated_prior: f64,
     lex: f64,
-    net_prob: f64,
     is_taste_match: bool,
     is_junk: bool,
     disliked: bool,
 }
 
 fn evaluate_search_candidates(
-    user_id: i64,
     intent: &SearchIntent,
     deduped: Vec<Track>,
     curated_prior_by_key: &HashMap<String, f64>,
@@ -3157,6 +3019,9 @@ fn evaluate_search_candidates(
     let mut evals: Vec<EvaluatedSearchTrack> = Vec::with_capacity(deduped.len());
 
     for t in deduped {
+        if is_hidden_track(&t, &sctx.prof) {
+            continue;
+        }
         let curated_prior = curated_prior_by_key
             .get(&t.song_key())
             .copied()
@@ -3172,37 +3037,24 @@ fn evaluate_search_candidates(
         let disliked = is_strongly_disliked(&t, &sctx.prof, &sctx.stats);
 
         let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
-        let fctx = build_feature_context_with_query(
-            &t,
-            &sctx.prof,
-            &st,
-            Some(intent),
-            curated_prior > 0.0,
-        );
+        let fctx = build_track_affinities(&t, &sctx.prof);
         let align = compute_taste_alignment(&t, &sctx.prof, &fctx);
-        let x = extract_features_ctx(&t, &fctx);
-        let net_prob = if user_id > 0 && sctx.net.updates > 0 {
-            sctx.net.predict(&x)
-        } else {
-            0.5
-        };
-        let conf = if user_id > 0 && sctx.net.updates > 0 {
-            sctx.net.confidence().max(0.25)
-        } else {
-            0.0
-        };
 
-        let raw_neural = (net_prob - 0.5) * 7.5 * conf;
-        let neural_delta = if align.has_taste && !align.on_taste && raw_neural > 0.0 {
-            raw_neural.min(1.0)
-        } else {
-            raw_neural
-        };
         let taste_aff = fctx.artist_affinity * 0.85
             + fctx.genre_affinity * 0.65
             + fctx.mood_affinity * 0.45
             + fctx.playlist_artist_affinity * 0.5
             + fctx.playlist_genre_affinity * 0.4
+            + if align.rel_a > 0.0 {
+                (align.rel_a / 1.8).tanh() * 1.4
+            } else {
+                0.0
+            }
+            + if align.rel_t > 0.0 {
+                (align.rel_t / 1.5).tanh() * 1.1
+            } else {
+                0.0
+            }
             + if fctx.followed_artist { 1.4 } else { 0.0 }
             + if fctx.saved_album { 0.9 } else { 0.0 }
             + if sctx.prof.starred.contains(&t.id) { 1.8 } else { 0.0 };
@@ -3221,17 +3073,15 @@ fn evaluate_search_candidates(
                 || fctx.genre_affinity >= 1.2
                 || fctx.followed_artist
                 || sctx.prof.starred.contains(&t.id)
-                || (user_id > 0
-                    && sctx.net.updates >= 3
-                    && ((align.has_taste && align.on_taste && net_prob >= 0.62)
-                        || (!align.has_taste && net_prob >= 0.72))));
+                || align.rel_a >= 1.2
+                || align.rel_t >= 1.2);
 
         let tl = t.title.to_lowercase();
         let al = primary_artist(&t.artist).to_lowercase();
         let is_exact_entity = !is_junk && (tl == lex_query_low || al == lex_query_low);
 
         // Pin exact song/artist matches at the top for entity searches while letting
-        // UserNet & taste refine broad/ambiguous queries and tie-breaks.
+        // listening taste refine broad/ambiguous queries and tie-breaks.
         let lex_anchor = if intent.is_theme_mix {
             if is_exact_entity {
                 28.0
@@ -3267,17 +3117,11 @@ fn evaluate_search_candidates(
             } else {
                 era_match * 1.5 + theme_match * 1.5 + curated_prior * 0.6 + pop_bonus * 0.55
             }
-            + neural_delta
             + taste_aff
             + quality_bonus
             - skip_penalty
             - junk_penalty;
 
-        let mix_neural = if align.has_taste && !align.on_taste {
-            ((net_prob - 0.5) * 9.0 * conf).min(0.8)
-        } else {
-            (net_prob - 0.5) * 9.0 * conf
-        };
         let mix_score = era_match * 5.2
             + theme_match * 5.5
             + curated_prior * 2.4
@@ -3286,7 +3130,6 @@ fn evaluate_search_candidates(
             } else {
                 pop_bonus * 0.55
             })
-            + mix_neural
             + taste_aff * 0.85
             + quality_bonus * 0.7
             - (st.skip_count as f64) * 1.8;
@@ -3299,7 +3142,6 @@ fn evaluate_search_candidates(
             theme_match,
             curated_prior,
             lex,
-            net_prob,
             is_taste_match,
             is_junk,
             disliked,
@@ -3345,17 +3187,7 @@ fn apply_track_affinity_delta(prof: &mut TasteProfile, t: &Track, w: f64, playli
     }
 }
 
-fn build_feature_context(t: &Track, prof: &TasteProfile, st: &UserTrackStats) -> FeatureContext {
-    build_feature_context_with_query(t, prof, st, None, false)
-}
-
-fn build_feature_context_with_query(
-    t: &Track,
-    prof: &TasteProfile,
-    st: &UserTrackStats,
-    intent: Option<&SearchIntent>,
-    curated_match: bool,
-) -> FeatureContext {
+fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
     let artist_slug = slug(&primary_artist(&t.artist));
     let artist_affinity = prof.artist_affinity.get(&artist_slug).copied().unwrap_or(0.0);
     let playlist_artist_affinity = prof
@@ -3398,26 +3230,8 @@ fn build_feature_context_with_query(
         || prof.followed_artists.contains(&format!("ar:{}", artist_slug))
         || prof.followed_artists.contains(&artist_slug);
     let saved_album = prof.saved_albums.contains(&t.album_id());
-    let popularity_prior = (parse_rank_bonus(&t.meta) / 5.0).clamp(0.0, 1.0);
 
-    let (query_active, query_lexical_fit, query_era_match, query_theme_match, query_popularity_intent) =
-        if let Some(qi) = intent {
-            let lex_q = qi.entity_query.as_deref().unwrap_or(&qi.normalized);
-            let lex = search_match_score(t, lex_q) as f64;
-            let era = compute_query_era_match(t, qi);
-            let theme = compute_query_theme_match_with_artist(t, "", qi)
-                .max(if curated_match { 0.45 } else { 0.0 });
-            let pop_intent = if qi.wants_hits || qi.wants_classic || qi.decade_label.is_some() {
-                1.0
-            } else {
-                0.35
-            };
-            (true, (lex / 500.0).clamp(0.0, 1.0), era, theme, pop_intent)
-        } else {
-            (false, 0.0, 0.0, 0.0, 0.0)
-        };
-
-    FeatureContext {
+    TrackAffinities {
         artist_affinity,
         genre_affinity,
         mood_affinity,
@@ -3426,15 +3240,6 @@ fn build_feature_context_with_query(
         playlist_mood_affinity,
         followed_artist,
         saved_album,
-        track_plays: st.play_count,
-        track_skips: st.skip_count,
-        popularity_prior,
-        hour_override: None,
-        query_active,
-        query_lexical_fit,
-        query_era_match,
-        query_theme_match,
-        query_popularity_intent,
     }
 }
 
@@ -3776,7 +3581,6 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         || wants_classic
         || wants_hits
         || explicit_mix_word;
-    let is_mix_query = has_cue && !tokens.is_empty() && (unknown_tokens == 0 || explicit_mix_word);
     let is_theme_mix =
         similarity_prefix_entity.is_none() && has_cue && !tokens.is_empty() && unknown_tokens == 0;
     if !is_theme_mix {
@@ -3841,7 +3645,6 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         moods,
         genres,
         themes,
-        is_mix_query,
         is_theme_mix,
     }
 }
@@ -4246,10 +4049,23 @@ struct TasteAlignment {
     has_direct_or_related: bool,
 }
 
+fn profile_has_taste(prof: &TasteProfile) -> bool {
+    let total_pos_artist: f64 = prof.artist_affinity.values().filter(|&&v| v > 0.0).sum();
+    let total_pos_genre: f64 = prof.genre_affinity.values().filter(|&&v| v > 0.0).sum::<f64>()
+        + prof.playlist_genre_affinity.values().filter(|&&v| v > 0.0).sum::<f64>() * 0.6;
+    total_pos_artist > 0.4
+        || total_pos_genre > 0.4
+        || !prof.starred.is_empty()
+        || !prof.manual_playlist_ids.is_empty()
+        || !prof.followed_artists.is_empty()
+        || !prof.saved_albums.is_empty()
+        || prof.ratings.values().any(|&r| r >= 4 || r <= 2)
+}
+
 fn compute_taste_alignment(
     t: &Track,
     prof: &TasteProfile,
-    fctx: &FeatureContext,
+    fctx: &TrackAffinities,
 ) -> TasteAlignment {
     let artist_slug = slug(&primary_artist(&t.artist));
     let (rel_a, rel_t) = if fctx.artist_affinity < -0.2 {
@@ -4261,19 +4077,12 @@ fn compute_taste_alignment(
         )
     };
 
-    let total_pos_artist: f64 = prof.artist_affinity.values().filter(|&&v| v > 0.0).sum();
     let total_pos_genre: f64 = prof.genre_affinity.values().filter(|&&v| v > 0.0).sum::<f64>()
         + prof.playlist_genre_affinity.values().filter(|&&v| v > 0.0).sum::<f64>() * 0.6;
     let total_pos_mood: f64 = prof.mood_affinity.values().filter(|&&v| v > 0.0).sum();
     let total_pos_pl_mood: f64 = prof.playlist_mood_affinity.values().filter(|&&v| v > 0.0).sum();
 
-    let has_taste = total_pos_artist > 0.4
-        || total_pos_genre > 0.4
-        || !prof.starred.is_empty()
-        || !prof.manual_playlist_ids.is_empty()
-        || !prof.followed_artists.is_empty()
-        || !prof.saved_albums.is_empty()
-        || prof.ratings.values().any(|&r| r >= 4 || r <= 2);
+    let has_taste = profile_has_taste(prof);
 
     let t_genres = split_genres(&t.genre);
     let has_explicit_genre = !t_genres.is_empty();
@@ -4494,7 +4303,7 @@ pub fn append_mood_slug(existing: &str, mood: Mood) -> String {
 fn build_instant_mix_title(
     intent: &SearchIntent,
     tracks: &[Track],
-    net: &UserNet,
+    has_taste: bool,
     anchor_artist_override: Option<&str>,
     seed_track_title: Option<&str>,
     single_artist_only: bool,
@@ -4531,9 +4340,10 @@ fn build_instant_mix_title(
             } else if intent.wants_hits || intent.decade_label.is_some() {
                 parts.push("Hits".to_string());
             }
-        } else if intent.genres.is_empty() && !intent.wants_classic && intent.wants_hits {
-            parts.push("Hits".to_string());
-        } else if intent.themes.len() == 1 && !intent.wants_classic && intent.genres.is_empty() {
+        } else if !intent.wants_classic
+            && intent.genres.is_empty()
+            && (intent.wants_hits || intent.themes.len() == 1)
+        {
             parts.push("Hits".to_string());
         }
 
@@ -4542,7 +4352,7 @@ fn build_instant_mix_title(
         }
         let title = format!("{} Mix", parts.join(" "));
 
-        // Describe dominant vibe & neural personalization in subtitle.
+        // Describe dominant vibe & taste personalization in subtitle.
         let mut genre_counts: HashMap<String, usize> = HashMap::new();
         for t in tracks {
             for g in split_genres(&t.genre) {
@@ -4550,14 +4360,14 @@ fn build_instant_mix_title(
             }
         }
         let mut top_genres: Vec<(String, usize)> = genre_counts.into_iter().collect();
-        top_genres.sort_by(|a, b| b.1.cmp(&a.1));
+        top_genres.sort_by_key(|a| std::cmp::Reverse(a.1));
         let vibe_hint = if !top_genres.is_empty() {
             let names: Vec<String> = top_genres.into_iter().take(2).map(|(g, _)| g).collect();
             names.join(" & ")
         } else {
             "Curated Classics & Hits".to_string()
         };
-        let subtitle = if net.updates >= 4 {
+        let subtitle = if has_taste {
             format!("On-the-fly custom mix · {} · Tuned to your taste", vibe_hint)
         } else {
             format!("On-the-fly custom mix · {}", vibe_hint)
@@ -4579,7 +4389,7 @@ fn build_instant_mix_title(
 
     if single_artist_only {
         let title = format!("{} Mix", anchor_artist);
-        let subtitle = if net.updates >= 4 {
+        let subtitle = if has_taste {
             format!("Essential tracks by {} · Tuned to your taste", anchor_artist)
         } else {
             format!("Essential tracks by {}", anchor_artist)
@@ -4588,7 +4398,7 @@ fn build_instant_mix_title(
     }
 
     let title = format!("{} & Similar Mix", anchor_artist);
-    let subtitle = match (seed_track_title, net.updates >= 4) {
+    let subtitle = match (seed_track_title, has_taste) {
         (Some(seed_t), true) => format!("Seeded from {} · Similar artists & your taste", seed_t),
         (Some(seed_t), false) => format!("Seeded from {} · Radio & similar artists", seed_t),
         (None, true) => "Artist radio & similar artists · Tuned to your taste".to_string(),
@@ -4727,7 +4537,7 @@ fn build_search_refinements(
     } else if intent.explicit_mix_word {
         "Similar Artists Mix".to_string()
     } else {
-        "Neural Ranked".to_string()
+        "Taste Ranked".to_string()
     };
 
     SearchRefinements {
@@ -4737,8 +4547,13 @@ fn build_search_refinements(
     }
 }
 
+fn is_hidden_track(t: &Track, prof: &TasteProfile) -> bool {
+    prof.hidden_ids.contains(&t.id)
+        || (!prof.hidden_keys.is_empty() && prof.hidden_keys.contains(&t.song_key()))
+}
+
 fn is_strongly_disliked(t: &Track, prof: &TasteProfile, stats: &HashMap<String, UserTrackStats>) -> bool {
-    if prof.ratings.get(&t.id).copied() == Some(1) {
+    if is_hidden_track(t, prof) || prof.ratings.get(&t.id).copied() == Some(1) {
         return true;
     }
     let st = stats.get(&t.id).copied().unwrap_or_default();
@@ -4746,15 +4561,13 @@ fn is_strongly_disliked(t: &Track, prof: &TasteProfile, stats: &HashMap<String, 
 }
 
 fn score_track_core(
-    user_id: i64,
     t: &Track,
     prof: &TasteProfile,
     stats: &HashMap<String, UserTrackStats>,
-    net: Option<&UserNet>,
     mode: ScoreMode,
 ) -> f64 {
     let st = stats.get(&t.id).copied().unwrap_or_default();
-    let fctx = build_feature_context(t, prof, &st);
+    let fctx = build_track_affinities(t, prof);
 
     let a_aff = fctx.artist_affinity;
     let g_aff = fctx.genre_affinity;
@@ -4774,21 +4587,6 @@ fn score_track_core(
     let has_explicit_genre = align.has_explicit_genre;
     let has_pos_genre_overlap = align.has_pos_genre_overlap;
     let has_direct_or_related = align.has_direct_or_related;
-
-    let raw_net = match net {
-        Some(n) if user_id > 0 && n.updates > 0 => {
-            let conf = n.confidence().max(if n.updates >= 1 { 0.2 } else { 0.0 });
-            let x = extract_features_ctx(t, &fctx);
-            (n.predict(&x) - 0.5) * 7.5 * conf
-        }
-        _ => 0.0,
-    };
-    // Prevent positive-only training history from letting novelty/pop priors lift unaligned charts.
-    let net_score = if has_taste && !on_taste && raw_net > 0.0 {
-        raw_net.min(1.0)
-    } else {
-        raw_net
-    };
 
     let artist_term = if a_aff >= 0.0 {
         (a_aff / 2.5).tanh() * 5.2
@@ -4866,8 +4664,7 @@ fn score_track_core(
     };
     let skip_penalty = (st.skip_count as f64) * 1.8;
 
-    let raw = net_score
-        + pop_bonus
+    let raw = pop_bonus
         + artist_term
         + rel_term
         + genre_term
@@ -5385,7 +5182,7 @@ mod tests {
         assert!(!pop_smoke.is_theme_mix);
 
         let daft = parse_search_intent("Daft Punk");
-        assert!(!daft.is_mix_query);
+        assert!(!daft.explicit_mix_word);
         assert!(!daft.is_theme_mix);
     }
 
@@ -5463,7 +5260,7 @@ mod tests {
     }
 
     #[test]
-    fn neural_network_reranks_search_results_while_pinning_exact_matches() {
+    fn taste_engine_reranks_search_results_while_pinning_exact_matches() {
         let store = Store::open_memory().unwrap();
         let (u, _) = store.authenticate_or_create_user("searchlearner", "pw").unwrap();
         let sources = SourceRegistry::new(
@@ -5514,10 +5311,10 @@ mod tests {
             .upsert_tracks(&[exact_track.clone(), synth_match.clone(), jazz_match.clone()])
             .unwrap();
 
-        // Train user heavily toward Electronic/Synthpop search picks and away from Jazz
+        // Learn affinity toward Electronic/Synthpop search picks and away from skipped Jazz
         for _ in 0..8 {
-            taste.record_event_with_query(u.id, &synth_match.id, "search_pick", 1.0, Some("midnight"));
-            taste.record_event_with_query(u.id, &jazz_match.id, "skip", 1.0, Some("midnight"));
+            taste.record_event(u.id, &synth_match.id, "search_pick", 1.0);
+            taste.record_event(u.id, &jazz_match.id, "skip", 1.0);
         }
 
         let ranked = taste.search_and_refine(
@@ -5532,11 +5329,86 @@ mod tests {
         let pos_synth = ids.iter().position(|&id| id == "synth").unwrap();
         let pos_jazz = ids.iter().position(|&id| id == "jazz").unwrap();
         assert!(pos_synth < pos_jazz, "ids={:?}", ids);
-        assert!(
-            ranked.track_neural_scores["synth"] > ranked.track_neural_scores["jazz"],
-            "neural scores={:?}",
-            ranked.track_neural_scores
+        assert!(ranked.taste_match_ids.contains("synth"));
+        assert!(!ranked.taste_match_ids.contains("jazz"));
+    }
+
+    #[test]
+    fn not_interested_hides_tracks_across_recommendations_and_reset_restores_them() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("hideuser", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
         );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let keep = Track {
+            id: "dz:keep".into(),
+            source: "deezer".into(),
+            title: "Starlight".into(),
+            artist: "Muse".into(),
+            genre: "Rock".into(),
+            moods: "rock_indie".into(),
+            meta: r#"{"rank":900000}"#.into(),
+            ..Default::default()
+        };
+        let hide_dz = Track {
+            id: "dz:hide".into(),
+            source: "deezer".into(),
+            title: "Skip This Song".into(),
+            artist: "Some Pop".into(),
+            genre: "Pop".into(),
+            moods: "upbeat".into(),
+            meta: r#"{"rank":950000}"#.into(),
+            ..Default::default()
+        };
+        let hide_ytm_dupe = Track {
+            id: "ytm:hide".into(),
+            source: "ytm".into(),
+            title: "Skip This Song (Official Video)".into(),
+            artist: "Some Pop".into(),
+            genre: "Pop".into(),
+            moods: "upbeat".into(),
+            ..Default::default()
+        };
+        store
+            .upsert_tracks(&[keep.clone(), hide_dz.clone(), hide_ytm_dupe.clone()])
+            .unwrap();
+
+        taste.mark_not_interested(u.id, &hide_dz.id);
+        assert_eq!(store.hidden_tracks_list(u.id).unwrap().len(), 1);
+
+        let for_you: Vec<String> = taste
+            .for_you_tracks(u.id, 10)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(for_you.contains(&keep.id), "for_you={:?}", for_you);
+        assert!(!for_you.contains(&hide_dz.id), "for_you={:?}", for_you);
+        assert!(!for_you.contains(&hide_ytm_dupe.id), "for_you={:?}", for_you);
+
+        let search = taste.search_and_refine(
+            u.id,
+            "skip this song",
+            vec![hide_dz.clone(), hide_ytm_dupe.clone(), keep.clone()],
+            vec![],
+        );
+        assert!(search.tracks.iter().all(|t| t.id != hide_dz.id && t.id != hide_ytm_dupe.id));
+
+        let cleared = taste.reset_hidden_tracks(u.id);
+        assert_eq!(cleared, 1);
+        assert!(store.hidden_tracks_list(u.id).unwrap().is_empty());
+
+        let restored: Vec<String> = taste
+            .for_you_tracks(u.id, 10)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(restored.contains(&hide_dz.id), "restored={:?}", restored);
     }
 
     #[test]
@@ -5635,7 +5507,7 @@ mod tests {
 
         store.upsert_tracks(&tracks).unwrap();
 
-        // Listen/star/complete all 20 played tracks and train UserNet without negative pop skips.
+        // Complete and play all 20 played tracks without negative pop skips.
         for a in 0..10 {
             for t in 0..2 {
                 let tid = format!("ytm:played:{}:{}", a, t);
@@ -5769,13 +5641,12 @@ mod tests {
     fn parse_search_intent_extracts_entity_mix_and_similarity_queries() {
         let m1 = parse_search_intent("9Lana mix");
         assert!(!m1.is_theme_mix);
-        assert!(m1.is_mix_query);
         assert!(m1.explicit_mix_word);
         assert_eq!(m1.entity_query.as_deref(), Some("9Lana"));
 
         let m2 = parse_search_intent("songs like dyna mind");
         assert!(!m2.is_theme_mix);
-        assert!(m2.is_mix_query);
+        assert!(m2.explicit_mix_word);
         assert_eq!(m2.entity_query.as_deref(), Some("dyna mind"));
 
         let m3 = parse_search_intent("DYNA MIND radio");
@@ -5833,7 +5704,7 @@ mod tests {
             ..Default::default()
         };
 
-        // Train user heavily on unrelated Indie Rock so UserNet has positive bias overall.
+        // Train user profile heavily on unrelated Indie Rock so artist/genre taste has positive affinity overall.
         let indie_seed = mk_dz("dz:indie", "Fluorescent Adolescent", "Arctic Monkeys", "Indie", 850000);
         let seed = mk_dz("dz:dyna", "DYNA MIND", "9Lana", "J-Pop", 550000);
 

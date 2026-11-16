@@ -1,7 +1,6 @@
 mod engine;
 mod models;
 mod navidrome;
-mod neural;
 mod sources;
 mod store;
 mod subsonic;
@@ -186,6 +185,10 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/star", post(webapp::toggle_star))
         .route("/api/web/rate", post(webapp::set_rating))
         .route("/api/web/event", post(webapp::record_event))
+        .route("/api/web/not-interested", post(webapp::mark_not_interested))
+        .route("/api/web/hidden", get(webapp::list_hidden))
+        .route("/api/web/hidden/reset", post(webapp::reset_hidden))
+        .route("/api/web/hidden/{id}", delete(webapp::unhide_track))
         .route("/api/web/lyrics/{id}", get(webapp::get_lyrics))
         .route("/api/web/radio", get(webapp::radio))
         .route(

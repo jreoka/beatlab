@@ -595,11 +595,7 @@ pub async fn dispatch(
             respond(&params, true, Some(elem))
         }
         "getAlbumInfo" | "getAlbumInfo2" => {
-            let root_name = if endpoint == "getAlbumInfo2" {
-                "albumInfo"
-            } else {
-                "albumInfo"
-            };
+            let root_name = "albumInfo";
             let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
             if let Some((alb, _)) = state.taste.get_or_hydrate_album(id).await {
                 let mut elem = XmlElem::new(root_name);
@@ -760,11 +756,11 @@ pub async fn dispatch(
             }
             for aid in multi_vals(&pairs, "albumId") {
                 let _ = state.store.save_album(uid, &aid);
-                state.taste.record_album_save(uid, &aid, true);
+                state.taste.mark_taste_dirty(uid);
             }
             for arid in multi_vals(&pairs, "artistId") {
                 let _ = state.store.follow_artist(uid, &arid);
-                state.taste.record_artist_follow(uid, &arid, true);
+                state.taste.mark_taste_dirty(uid);
             }
             respond(&params, true, None)
         }
@@ -775,11 +771,11 @@ pub async fn dispatch(
             }
             for aid in multi_vals(&pairs, "albumId") {
                 let _ = state.store.unsave_album(uid, &aid);
-                state.taste.record_album_save(uid, &aid, false);
+                state.taste.mark_taste_dirty(uid);
             }
             for arid in multi_vals(&pairs, "artistId") {
                 let _ = state.store.unfollow_artist(uid, &arid);
-                state.taste.record_artist_follow(uid, &arid, false);
+                state.taste.mark_taste_dirty(uid);
             }
             respond(&params, true, None)
         }
