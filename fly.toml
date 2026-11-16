@@ -28,9 +28,8 @@ primary_region = "ord"
 [mounts]
   source = "beatlab_data"
   destination = "/data"
-  initial_size = "10gb"
 
 [[vm]]
   cpu_kind = "shared"
-  cpus = 1
+  cpus = 2
   memory = "512mb"
