@@ -2130,6 +2130,36 @@ impl Store {
         Ok(rows)
     }
 
+    /// Returns true if any track in the catalog has a genre matching `term` (whole-word/tag).
+    pub fn has_catalog_genre(&self, term: &str) -> bool {
+        let low = term.trim().to_lowercase();
+        if low.len() < 2 {
+            return false;
+        }
+        let conn = self.lock();
+        let like = format!("%{}%", low);
+        let Ok(mut stmt) =
+            conn.prepare("SELECT genre FROM tracks WHERE genre != '' AND lower(genre) LIKE ?1 LIMIT 25")
+        else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map(params![like], |r| r.get::<_, String>(0)) else {
+            return false;
+        };
+        for g_str in rows.flatten() {
+            for part in g_str.split([',', ';', '/']) {
+                let p = part.trim().to_lowercase();
+                if p == low
+                    || p.split_whitespace().any(|w| w == low)
+                    || (low.contains(' ') && p.contains(&low))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Replaces the Transformer-distilled `neural_track` and `neural_artist` links for `user_id`
     /// without disturbing external `related_track`/`related_artist` graph links.
     pub fn replace_neural_taste_links(

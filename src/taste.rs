@@ -4011,7 +4011,21 @@ impl TasteEngine {
             });
         }
 
+        // Without an artist match, never hijack a mix onto a partial-title collision
+        // (e.g. "christian" -> "Christian's Inferno") or a catalog-genre / obscure 1-word title.
+        if !top_exact_title {
+            return None;
+        }
         let seed = top_track?;
+        if self.store.has_catalog_genre(&entity_low) {
+            return None;
+        }
+        let is_single_word = entity_low.split_whitespace().count() == 1;
+        let user_knows_seed = sctx.prof.starred.contains(&seed.id)
+            || sctx.prof.manual_playlist_ids.contains(&seed.id);
+        if is_single_word && !user_knows_seed && parse_rank_bonus(&seed.meta) < 1.2 {
+            return None;
+        }
         let artist_name = primary_artist(&seed.artist);
         if artist_name.is_empty() || artist_name.eq_ignore_ascii_case("Unknown Artist") {
             return None;
@@ -4065,9 +4079,19 @@ impl TasteEngine {
         curated_batches: Vec<(String, Vec<Track>)>,
         mix_ctx: SearchMixContext,
     ) -> SearchMixResult {
-        let intent = parse_search_intent(query);
+        let mut intent = parse_search_intent(query);
         let sctx = self.build_scoring_context(user_id);
         let has_user_taste = profile_has_taste(&sctx.prof);
+        let has_cat_genre = self.store.has_catalog_genre(&intent.normalized);
+        let promoted_topic = !intent.is_theme_mix
+            && mix_ctx.anchor_artist.is_none()
+            && (!curated_batches.is_empty() || has_cat_genre);
+        if promoted_topic {
+            intent.is_theme_mix = true;
+            if has_cat_genre && intent.genres.is_empty() && !intent.normalized.is_empty() {
+                intent.genres.push(title_case_query(&intent.normalized));
+            }
+        }
 
         // Track provenance from curated playlists & intent-expanded catalog hits before dedup.
         let mut curated_prior_by_key: HashMap<String, f64> = HashMap::new();
@@ -4172,7 +4196,11 @@ impl TasteEngine {
                     {
                         return false;
                     }
-                    if e.curated_prior == 0.0 && e.era_match <= 0.0 && e.theme_match < 0.25 {
+                    if e.curated_prior == 0.0
+                        && e.era_match <= 0.0
+                        && e.theme_match < 0.25
+                        && !(promoted_topic && e.lex >= 100.0)
+                    {
                         return false;
                     }
                     true
@@ -7448,6 +7476,73 @@ mod tests {
 
         let jp_breakfast = parse_search_intent("Japanese Breakfast");
         assert!(!jp_breakfast.is_theme_mix);
+    }
+
+    #[test]
+    fn non_hardcoded_topic_queries_avoid_false_entity_hijack() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("topicuser", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str, artist: &str, genre: &str, meta: &str| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            genre: genre.into(),
+            duration: 210,
+            meta: meta.into(),
+            ..Default::default()
+        };
+
+        // 1. "christian" should NOT hijack onto Green Day's "Christian's Inferno"
+        let gd = mk("gd1", "Christian's Inferno", "Green Day", "Punk Rock", "{\"deezer_rank\":500000}");
+        let ch1 = mk("ch1", "Oceans", "Hillsong United", "Christian", "{\"deezer_rank\":400000}");
+        let ch2 = mk("ch2", "Reckless Love", "Cory Asbury", "Christian", "{\"deezer_rank\":350000}");
+        store.upsert_tracks(&[gd.clone(), ch1.clone(), ch2.clone()]).unwrap();
+
+        assert!(
+            taste.plan_entity_mix_anchor(u.id, "christian", &[gd.clone()], &[]).is_none(),
+            "partial title match must not hijack topic query"
+        );
+        let res_ch = taste.search_and_refine_with_context(
+            u.id,
+            "christian",
+            vec![gd],
+            vec![("Christian Hits".into(), vec![ch1, ch2])],
+            SearchMixContext::default(),
+        );
+        let mix_ch = res_ch.instant_mix.expect("christian should build topic mix");
+        assert_eq!(mix_ch.title, "Christian Mix");
+        assert!(mix_ch.is_theme_mix);
+
+        // 2. "western" should NOT hijack onto obscure 1-word "Music3 - Western"
+        let w_obscure = mk("w0", "Western", "Music3", "Experimental", "");
+        let w1 = mk("w1", "Big Iron", "Marty Robbins", "Country Western", "{\"deezer_rank\":400000}");
+        let w2 = mk("w2", "Ghost Riders", "Johnny Cash", "Western", "{\"deezer_rank\":450000}");
+        store.upsert_tracks(&[w_obscure.clone(), w1.clone(), w2.clone()]).unwrap();
+
+        assert!(
+            taste.plan_entity_mix_anchor(u.id, "western", &[w_obscure.clone()], &[]).is_none(),
+            "catalog genre / obscure 1-word title must not hijack topic query"
+        );
+        let res_w = taste.search_and_refine_with_context(
+            u.id,
+            "western",
+            vec![w_obscure],
+            vec![("Country Western Classics".into(), vec![w1, w2])],
+            SearchMixContext::default(),
+        );
+        let mix_w = res_w.instant_mix.expect("western should build topic mix");
+        assert_eq!(mix_w.title, "Western Mix");
+        assert!(mix_w.is_theme_mix);
     }
 
     #[test]

@@ -1313,7 +1313,28 @@ pub async fn instant_mix(
     }
 
     let mix_ctx = if !intent.is_theme_mix {
-        expand_entity_mix_context(&state, user.id, &query, &combined, &dz_artists, &ytm_hints).await
+        let ctx =
+            expand_entity_mix_context(&state, user.id, &query, &combined, &dz_artists, &ytm_hints)
+                .await;
+        if ctx.anchor_artist.is_none() && curated_batches.is_empty() {
+            let dz_curated = tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                state.sources.deezer.fetch_curated_mix_tracks(&query, 3, 24),
+            )
+            .await
+            .unwrap_or_default();
+            if !dz_curated.is_empty() {
+                let mut extra_upsert = Vec::new();
+                for (_, batch) in &dz_curated {
+                    extra_upsert.extend(batch.iter().cloned());
+                }
+                if !extra_upsert.is_empty() {
+                    let _ = state.store.upsert_tracks(&extra_upsert);
+                }
+                curated_batches.extend(dz_curated);
+            }
+        }
+        ctx
     } else if curated_batches.is_empty() {
         // Fallback when Deezer curated playlists returned empty (e.g. rate-limited or offline):
         // expand YouTube Music radio from verified, non-spam YTM search hits matching the era.
