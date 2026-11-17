@@ -4592,13 +4592,13 @@ impl TasteEngine {
                     .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
                     .cloned()
                     .collect();
-                if !unheard_fresh.is_empty() {
-                    combined.extend(unheard_fresh);
-                } else {
-                    combined.extend(fresh);
+                let mut seen: HashSet<String> = HashSet::new();
+                for t in unheard_fresh {
+                    if seen.insert(t.id.clone()) {
+                        combined.push(t);
+                    }
                 }
                 if combined.len() < count {
-                    let mut seen: HashSet<String> = combined.iter().map(|t| t.id.clone()).collect();
                     for t in self.scoped_external_candidates(
                         user_id,
                         &sctx,
@@ -4613,7 +4613,18 @@ impl TasteEngine {
                     }
                 }
                 if combined.len() < count {
-                    combined.extend(familiar);
+                    for t in fresh {
+                        if seen.insert(t.id.clone()) {
+                            combined.push(t);
+                        }
+                    }
+                }
+                if combined.len() < count {
+                    for t in familiar {
+                        if seen.insert(t.id.clone()) {
+                            combined.push(t);
+                        }
+                    }
                 }
             }
             RadioMode::Default => {
@@ -4783,7 +4794,7 @@ impl TasteEngine {
                         .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
                         .cloned()
                         .collect();
-                    if unheard.len() < count.min(4) {
+                    if unheard.len() < count {
                         for t in self.scoped_external_candidates(
                             user_id,
                             &sctx,
@@ -4797,7 +4808,7 @@ impl TasteEngine {
                             }
                         }
                     }
-                    if unheard.len() >= count.min(4) || !unheard.is_empty() {
+                    if !unheard.is_empty() {
                         eligible = unheard;
                     }
                 }

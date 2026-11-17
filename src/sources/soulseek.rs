@@ -102,7 +102,7 @@ pub struct SoulseekSource {
     pending_transfers: Mutex<Vec<Arc<PendingTransfer>>>,
     pending_by_token: Mutex<HashMap<u32, Arc<PendingTransfer>>>,
     pending_pierce_peers: Mutex<HashMap<u32, (String, String)>>,
-    in_flight_downloads: Mutex<HashMap<String, Arc<Notify>>>,
+    in_flight_downloads: std::sync::Mutex<HashMap<String, Arc<Notify>>>,
     alt_streams: Mutex<HashMap<String, Vec<String>>>,
     next_token: Mutex<u32>,
     self_weak: OnceLock<Weak<Self>>,
@@ -137,7 +137,7 @@ impl SoulseekSource {
             pending_transfers: Mutex::new(Vec::new()),
             pending_by_token: Mutex::new(HashMap::new()),
             pending_pierce_peers: Mutex::new(HashMap::new()),
-            in_flight_downloads: Mutex::new(HashMap::new()),
+            in_flight_downloads: std::sync::Mutex::new(HashMap::new()),
             alt_streams: Mutex::new(HashMap::new()),
             next_token: Mutex::new(1000),
             self_weak: OnceLock::new(),
@@ -821,41 +821,55 @@ impl SoulseekSource {
             return Some(format!("file:{}", local_path.display()));
         }
 
-        loop {
-            let (notify, is_leader) = {
-                let mut map = self.in_flight_downloads.lock().await;
-                if let Some(existing) = map.get(stream_ref) {
-                    (Arc::clone(existing), false)
-                } else {
-                    let n = Arc::new(Notify::new());
-                    map.insert(stream_ref.to_string(), Arc::clone(&n));
-                    (n, true)
-                }
-            };
-
-            if !is_leader {
-                notify.notified().await;
-                if tokio::fs::metadata(&local_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-                    > 4096
-                {
-                    return Some(format!("file:{}", local_path.display()));
-                }
-                return None;
-            }
-
-            let res = self
-                .download_from_peer(peer, remote_path, &local_path, &base_hash)
-                .await;
-            {
-                let mut map = self.in_flight_downloads.lock().await;
-                map.remove(stream_ref);
-            }
-            notify.notify_waiters();
-            return res;
+        struct InFlightDownloadGuard<'a> {
+            map: &'a std::sync::Mutex<HashMap<String, Arc<Notify>>>,
+            key: String,
+            notify: Arc<Notify>,
         }
+
+        impl Drop for InFlightDownloadGuard<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut map) = self.map.lock() {
+                    map.remove(&self.key);
+                }
+                self.notify.notify_waiters();
+            }
+        }
+
+        let (notify, is_leader) = {
+            let mut map = self
+                .in_flight_downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = map.get(stream_ref) {
+                (Arc::clone(existing), false)
+            } else {
+                let n = Arc::new(Notify::new());
+                map.insert(stream_ref.to_string(), Arc::clone(&n));
+                (n, true)
+            }
+        };
+
+        if !is_leader {
+            notify.notified().await;
+            if tokio::fs::metadata(&local_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0)
+                > 4096
+            {
+                return Some(format!("file:{}", local_path.display()));
+            }
+            return None;
+        }
+
+        let _guard = InFlightDownloadGuard {
+            map: &self.in_flight_downloads,
+            key: stream_ref.to_string(),
+            notify,
+        };
+        self.download_from_peer(peer, remote_path, &local_path, &base_hash)
+            .await
     }
 
     async fn download_from_peer(

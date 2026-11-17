@@ -844,6 +844,8 @@
     state.queueIndex = -1;
     state.radioReqToken++;
     state.radioLoading = false;
+    state.radioInFlight = null;
+    state.radioPlaylistId = null;
     state.compatAttemptedId = '';
     state.lastScrobbleCompleteId = '';
     state.lyrics = { synced: false, plain: '', lines: [] };
@@ -4371,6 +4373,8 @@
     if (prev) recordRecentHeard(prev);
     state.radioReqToken++;
     state.radioLoading = false;
+    state.radioInFlight = null;
+    state.radioPlaylistId = null;
     const idx = setQueueWithShuffle(tracks, startIndex, false);
     playQueueAt(idx);
   }
@@ -4382,6 +4386,8 @@
     if (prev) recordRecentHeard(prev);
     state.radioReqToken++;
     state.radioLoading = false;
+    state.radioInFlight = null;
+    state.radioPlaylistId = null;
     const idx = setQueueWithShuffle(tracks, 0, true);
     playQueueAt(idx);
   }
@@ -4394,6 +4400,8 @@
     recordRecentHeard(t);
     state.radioReqToken++;
     state.radioLoading = !!state.autoplay;
+    state.radioInFlight = null;
+    state.radioPlaylistId = null;
     state.unshuffledQueue = null;
     state.queue = [t];
     playQueueAt(0);
@@ -4735,6 +4743,10 @@
         const nowCur = currentTrack();
         const curId = nowCur?.id;
         const filtered = curId ? recs.filter((r) => r.id !== curId) : recs;
+        if (!filtered.length) {
+          showToast('No matching upcoming tracks found');
+          return;
+        }
         const upcoming = state.shuffle ? shuffleArray(filtered) : filtered;
         const keepLen = nowCur ? state.queueIndex + 1 : 0;
         if (Array.isArray(state.unshuffledQueue) && nowCur) {
@@ -4972,9 +4984,9 @@
     const modeTabsHtml =
       cur || upcoming.length || state.radioLoading
         ? `<div class="upcoming-mode-tabs" role="tablist" aria-label="Upcoming mode">
-            <button type="button" class="upcoming-mode-tab ${state.upcomingMode === 'default' ? 'active' : ''}" onclick="App.setUpcomingMode('default')">Default</button>
-            <button type="button" class="upcoming-mode-tab ${state.upcomingMode === 'familiar' ? 'active' : ''}" onclick="App.setUpcomingMode('familiar')">Familiar</button>
-            <button type="button" class="upcoming-mode-tab ${state.upcomingMode === 'discover' ? 'active' : ''}" onclick="App.setUpcomingMode('discover')">Discover</button>
+            <button type="button" role="tab" aria-selected="${state.upcomingMode === 'default' ? 'true' : 'false'}" class="upcoming-mode-tab ${state.upcomingMode === 'default' ? 'active' : ''}" onclick="App.setUpcomingMode('default')">Default</button>
+            <button type="button" role="tab" aria-selected="${state.upcomingMode === 'familiar' ? 'true' : 'false'}" class="upcoming-mode-tab ${state.upcomingMode === 'familiar' ? 'active' : ''}" onclick="App.setUpcomingMode('familiar')">Familiar</button>
+            <button type="button" role="tab" aria-selected="${state.upcomingMode === 'discover' ? 'true' : 'false'}" class="upcoming-mode-tab ${state.upcomingMode === 'discover' ? 'active' : ''}" onclick="App.setUpcomingMode('discover')">Discover</button>
           </div>`
         : '';
     const upNextHtml =
