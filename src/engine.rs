@@ -185,45 +185,6 @@ impl StreamEngine {
         }
     }
 
-    /// Pulls a track back from the optional S3/R2 cool tier into the hot cache.
-    async fn rehydrate_from_remote(
-        &self,
-        remote: &crate::remote_cache::RemoteCache,
-        track_id: &str,
-        key: &str,
-    ) -> AppResult<(PathBuf, String)> {
-        let object = remote
-            .head(key)
-            .await?
-            .ok_or_else(|| err_msg("cool cache object is missing"))?;
-        if object.size <= 4096 {
-            return Err(err_msg("cool cache object is too small"));
-        }
-        let ext = if object.ext.is_empty() {
-            "m4a".to_string()
-        } else {
-            object.ext.clone()
-        };
-        let hash = sha1_hex(track_id);
-        let part = self.cache_dir.join(format!("{}.{}.r2part", hash, uuid::Uuid::new_v4().simple()));
-        let final_path = self.cache_dir.join(format!("{}.{}", hash, ext));
-        let bytes = remote.download_to(key, &part).await?;
-        if bytes <= 4096 {
-            let _ = tokio::fs::remove_file(&part).await;
-            return Err(err_msg("cool cache download was too small"));
-        }
-        tokio::fs::rename(&part, &final_path).await?;
-        self.store.upsert_cache_entry(
-            track_id,
-            &final_path.to_string_lossy(),
-            bytes as i64,
-        )?;
-        // The cool copy was just used — treat it as recently active so it is
-        // not evicted ahead of tracks that have never been rehydrated.
-        let _ = self.store.touch_remote_cache_entry(track_id);
-        Ok((final_path, ext))
-    }
-
     /// Keeps the cool tier's "never pull from a source twice" promise for audio:
     /// refresh the mirror's recency on every play, and self-heal a mirror that
     /// failed to upload the first time (or was dropped while nearly full).
@@ -328,20 +289,30 @@ impl StreamEngine {
             let _ = self.store.delete_cache_entry(&track.id);
         }
 
-        // 1b. Cool tier: if the hot copy was evicted, rehydrate it from S3/R2
-        // back into the hot cache and serve from there.
+        // 1b. Cool tier: stream the object from S3/R2 with Range support.
+        // Downloading the whole file here made hi-res tracks take 30-60s to
+        // start. The normal `cacheable` path refills the hot disk cache in
+        // the background while playback begins immediately.
         if let Some(remote) = &self.remote {
             if let Ok(Some((key, _))) = self.store.get_remote_cache_entry(&track.id) {
-                match self.rehydrate_from_remote(remote, &track.id, &key).await {
-                    Ok((path, ext)) => {
-                        let _ = self.store.prune_cache(self.max_cache_bytes);
-                        return Ok(PlayTarget::LocalFile {
-                            content_type: mime_for_audio_ext(&ext).to_string(),
-                            path,
-                        });
-                    }
-                    Err(e) => {
-                        debug!(track_id = %track.id, error = %e.to_string(), "cool cache rehydration failed");
+                if let Ok(Some(obj)) = remote.head(&key).await {
+                    if obj.size > 4096 {
+                        if let Ok((url, headers)) = remote.signed_get(&key) {
+                            let _ = self.store.touch_remote_cache_entry(&track.id);
+                            let ext = if obj.ext.is_empty() {
+                                track.format.clone()
+                            } else {
+                                obj.ext.clone()
+                            };
+                            return Ok(PlayTarget::RemoteHttp {
+                                url,
+                                headers,
+                                content_type: mime_for_audio_ext(&ext).to_string(),
+                                ext,
+                                webpage_url: String::new(),
+                                cacheable: true,
+                            });
+                        }
                     }
                 }
             }

@@ -42,7 +42,7 @@ impl HunterStats {
 
 const DEFAULT_COOLDOWN_SECS: i64 = 6 * 3600;
 const DEFAULT_INTERVAL_SECS: usize = 300;
-const DEFAULT_BATCH: usize = 12;
+const DEFAULT_BATCH: usize = 4;
 const SEARCH_TIMEOUT_MS: u64 = 5000;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 900;
 
@@ -278,7 +278,8 @@ impl QualityHunter {
         self.stats.last_tick.store(Utc::now().timestamp(), Ordering::Relaxed);
         for track in tracks {
             self.hunt_one(track).await;
-            tokio::task::yield_now().await;
+            // Leave bandwidth for actual playback between candidate downloads.
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 

@@ -8,7 +8,6 @@ use crate::models::{err_msg, AppResult};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -278,33 +277,6 @@ impl RemoteCache {
         }))
     }
 
-    /// Streams a cool object into the hot cache directory.
-    pub async fn download_to(&self, key: &str, dest: &Path) -> AppResult<u64> {
-        let resp = self
-            .send(
-                reqwest::Method::GET,
-                key,
-                EMPTY_SHA256,
-                vec![],
-                reqwest::Body::from(Vec::new()),
-            )
-            .await?;
-        if !resp.status().is_success() {
-            return Err(err_msg(format!("S3 GET returned {}", resp.status())));
-        }
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        let mut total = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| err_msg(format!("S3 download stream: {e}")))?;
-            file.write_all(&chunk).await?;
-            total += chunk.len() as u64;
-        }
-        file.flush().await?;
-        Ok(total)
-    }
-
     /// Uploads a hot-cache file with its audio extension kept as object metadata.
     pub async fn upload_from(&self, key: &str, path: &Path, ext: &str) -> AppResult<()> {
         let file = tokio::fs::File::open(path).await?;
@@ -357,6 +329,12 @@ impl RemoteCache {
             return Err(err_msg(format!("S3 PUT returned {}", resp.status())));
         }
         Ok(())
+    }
+
+    /// Builds a signed GET URL and headers so a cool object can be streamed
+    /// with HTTP Range requests instead of downloaded in full before playback.
+    pub fn signed_get(&self, key: &str) -> AppResult<(String, Vec<(String, String)>)> {
+        self.signed_request("GET", key, EMPTY_SHA256, &[])
     }
 
     /// Downloads an arbitrary cached asset into memory.

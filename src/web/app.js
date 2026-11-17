@@ -1590,10 +1590,13 @@
       if (!trimmed) {
         if (state.searchFetchingQuery || state.searchLoadingUi) {
           abortActiveViewRequest();
-          if (state.searchState) {
-            renderSearchView();
-          } else {
-            renderExplore();
+          // Clearing the box must never jump to a different tab.
+          if (isSearchHash(location.hash.replace(/^#/, ''))) {
+            if (state.searchState) {
+              renderSearchView();
+            } else {
+              renderSearch('');
+            }
           }
         }
         return;
@@ -2217,7 +2220,23 @@
   async function renderSearch(query) {
     const cleanQ = String(query || '').trim();
     if (!cleanQ) {
-      return renderExplore();
+      // An empty search stays on the Search tab with a neutral prompt instead
+      // of bouncing the user over to Explore.
+      state.searchState = null;
+      state.searchFetchingQuery = '';
+      state.searchLoadingUi = false;
+      $('main-view').innerHTML = `
+        <div class="section-head" style="margin-bottom:18px">
+          <h1 class="page-greeting" style="margin-bottom:0">Search</h1>
+        </div>
+        <div class="muted-center">
+          <div style="font-size:15px;font-weight:700;color:var(--text);margin-bottom:6px">What do you want to hear?</div>
+          <div>Search for artists, songs, albums, genres, moods, or people using the bar above.</div>
+          <div style="margin-top:16px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+            <button class="btn-secondary" onclick="App.promptInstantMix()">Create Instant Mix</button>
+          </div>
+        </div>`;
+      return;
     }
     const { reqToken, signal } = beginViewRequest();
     const personQuery = cleanQ.startsWith('@');
@@ -7286,7 +7305,11 @@
       abortActiveViewRequest();
       $('global-search').value = '';
       $('clear-search-btn').classList.add('hidden');
-      navigate('explore');
+      // Stay on the current tab. Only refresh the view when it is a search
+      // page, so clearing the box never yanks the user to Explore.
+      if (isSearchHash(location.hash.replace(/^#/, ''))) {
+        navigate('search');
+      }
     },
     signOut: async () => {
       const oldToken = state.token;
