@@ -1925,16 +1925,12 @@
   }
 
   function newReleasesSectionHtml(newReleases, unseen) {
+    if (!newReleases.length) return '';
     return `<section class="section" id="new-releases-section">
       <div class="section-head">
         <h2>New Releases${unseen > 0 ? ` <span class="new-count-pill">${unseen} new</span>` : ''}</h2>
-        <span class="section-hint">${unseen > 0 ? 'Since your last visit' : 'Fresh drops from artists you follow &amp; listen to'} &middot; <button class="mini-btn" onclick="App.refreshNewReleases()">Refresh</button></span>
       </div>
-      ${
-        newReleases.length > 0
-          ? `<div class="card-grid">${newReleases.map(renderNewReleaseCard).join('')}</div>`
-          : `<p class="muted-center">Nothing new from your artists right now. Follow more artists or listen to a wider range of music, then check back.</p>`
-      }
+      <div class="card-grid">${newReleases.map(renderNewReleaseCard).join('')}</div>
     </section>`;
   }
 
@@ -5858,6 +5854,7 @@
   }
 
   let pendingConfirmResolve = null;
+  let pendingPromptResolve = null;
 
   function settlePendingConfirm(result) {
     if (!pendingConfirmResolve) return;
@@ -5866,8 +5863,16 @@
     resolve(result);
   }
 
+  function settlePendingPrompt(value) {
+    if (!pendingPromptResolve) return;
+    const resolve = pendingPromptResolve;
+    pendingPromptResolve = null;
+    resolve(value);
+  }
+
   function openModal(html, extraClass = '') {
     settlePendingConfirm(false);
+    settlePendingPrompt(null);
     haptic('tap');
     const box = $('modal-box');
     box.className = extraClass ? `modal-box ${extraClass}` : 'modal-box';
@@ -5879,6 +5884,7 @@
     if (!event || event.target === $('modal-backdrop')) {
       $('modal-backdrop').classList.add('hidden');
       settlePendingConfirm(false);
+      settlePendingPrompt(null);
     }
   }
 
@@ -5913,6 +5919,55 @@
         closeModal();
       });
       cancelBtn?.focus();
+    });
+  }
+
+  /// In-app replacement for the browser's native prompt() — resolves with the
+  /// entered string, or null when cancelled.
+  function promptModal({
+    title = 'Enter a name',
+    message = '',
+    label = 'Name',
+    placeholder = '',
+    defaultValue = '',
+    confirmLabel = 'Save',
+  }) {
+    return new Promise((resolve) => {
+      openModal(`
+        <div class="modal-head">
+          <h3>${esc(title)}</h3>
+          <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+        </div>
+        ${message ? `<p class="confirm-modal-message">${esc(message)}</p>` : ''}
+        <form id="prompt-modal-form" style="display:flex;flex-direction:column;gap:10px">
+          <label class="kv-label" for="prompt-modal-input">${esc(label)}</label>
+          <input id="prompt-modal-input" type="text" maxlength="64" autocomplete="off"
+                 placeholder="${esc(placeholder)}" value="${esc(defaultValue)}" />
+          <div class="confirm-modal-actions">
+            <button type="button" class="btn-secondary" id="prompt-modal-cancel">Cancel</button>
+            <button type="submit" class="btn-primary">${esc(confirmLabel)}</button>
+          </div>
+        </form>
+      `);
+      pendingPromptResolve = resolve;
+      const form = $('prompt-modal-form');
+      const input = $('prompt-modal-input');
+      $('prompt-modal-cancel')?.addEventListener('click', () => {
+        settlePendingPrompt(null);
+        closeModal();
+      });
+      form?.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const value = input.value.trim();
+        if (!value) {
+          input.focus();
+          return;
+        }
+        settlePendingPrompt(value);
+        closeModal();
+      });
+      input?.focus();
+      input?.select();
     });
   }
 
@@ -6069,6 +6124,7 @@
           <div class="settings-metrics">
             <div class="settings-metric"><span>Catalog</span><strong>${srcData.totalTracks} tracks</strong></div>
             <div class="settings-metric"><span>Audio Cache</span><strong>${srcData.cacheMb} MB</strong></div>
+            <div class="settings-metric"><span>Cool Cache</span><strong>${srcData.remoteCacheEnabled ? `${Math.round(srcData.remoteCacheMb)} MB (R2)` : 'Off'}</strong></div>
             <div class="settings-metric"><span>FFmpeg</span><strong>${srcData.ffmpeg ? 'Ready' : 'Off'}</strong></div>
           </div>
         </div>
@@ -7359,19 +7415,6 @@
       renderStatsView();
     },
     refreshStats: () => renderStats(state.statsRange || 'all'),
-    refreshNewReleases: async () => {
-      haptic('tap');
-      const section = $('new-releases-section');
-      if (!section) return renderHome();
-      try {
-        const d = await api('/api/web/home/new-releases');
-        const holder = document.createElement('div');
-        holder.innerHTML = newReleasesSectionHtml(d.newReleases || [], d.newReleaseUnseen || 0);
-        section.replaceWith(holder.firstElementChild);
-      } catch (err) {
-        showToast(err.message);
-      }
-    },
     setRightTab: (tab) => {
       haptic('tap');
       $('tab-queue').classList.toggle('active', tab === 'queue');
@@ -7802,13 +7845,24 @@
         showToast('Passkeys are not supported by this browser');
         return;
       }
+      const label = await promptModal({
+        title: 'Name your passkey',
+        message: 'Pick a name you will recognise later, like “This laptop” or “My phone”.',
+        label: 'Passkey name',
+        placeholder: 'e.g. This laptop',
+        defaultValue: 'This device',
+        confirmLabel: 'Continue',
+      });
+      if (label === null) {
+        openSettingsModal('security');
+        return;
+      }
       try {
         const opts = await api('/api/web/2fa/passkey/options', { method: 'POST' });
         const credential = await navigator.credentials.create({
           publicKey: webauthnOptions(opts.publicKey, true),
         });
         if (!credential) throw new Error('Passkey registration was cancelled');
-        const label = window.prompt('Name this passkey', 'This device') || 'Passkey';
         const result = await api('/api/web/2fa/passkey/verify', {
           method: 'POST',
           body: JSON.stringify({
@@ -7822,8 +7876,10 @@
         }
         showToast('Passkey added');
         await window.App.refreshSecurityStatus();
+        openSettingsModal('security');
       } catch (err) {
         showToast(err.message);
+        openSettingsModal('security');
       }
     },
     stepUpWithPasskey: async () => {

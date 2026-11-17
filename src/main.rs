@@ -3,6 +3,7 @@ mod auth;
 mod engine;
 mod models;
 mod navidrome;
+mod remote_cache;
 mod share_page;
 mod sources;
 mod stats;
@@ -103,9 +104,16 @@ async fn main() -> models::AppResult<()> {
         info!(origin = %webauthn_origin, "Passkeys disabled: a valid public HTTPS/domain origin (BEATLAB_ORIGIN) is required");
     }
 
-    // Soft-deleted accounts and stale WebAuthn/login challenges are cleaned up
-    // once an hour; the seven-day window is enforced on restore as well.
+    // Optional S3-compatible cool cache (Cloudflare R2, AWS S3, MinIO…).
+    let remote_cache = crate::remote_cache::RemoteCache::from_env()?;
+    if let Some(ref remote) = remote_cache {
+        info!(bucket = %remote.describe(), "S3 cool cache enabled — local disk is the hot tier");
+    }
+
+    // Soft-deleted accounts, stale challenges and cool-cache quota are handled
+    // once an hour.
     let cleanup_store = store.clone();
+    let cleanup_remote = remote_cache.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         interval.tick().await;
@@ -113,6 +121,13 @@ async fn main() -> models::AppResult<()> {
             interval.tick().await;
             let _ = cleanup_store.purge_expired_deleted_users();
             let _ = cleanup_store.purge_expired_auth_challenges();
+            if let Some(ref remote) = cleanup_remote {
+                match remote.enforce_quota(&cleanup_store).await {
+                    Ok(n) if n > 0 => info!(removed = n, "pruned S3 cool cache to quota"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e.to_string(), "S3 cool cache prune failed"),
+                }
+            }
         }
     });
 
@@ -141,11 +156,12 @@ async fn main() -> models::AppResult<()> {
     }
 
     let sources = SourceRegistry::new(deezer, ytm, archive, local, soulseek);
-    let engine = Arc::new(StreamEngine::new(
+    let engine = Arc::new(StreamEngine::new_with_remote(
         store.clone(),
         sources.clone(),
         &data_dir,
         max_cache_gb,
+        remote_cache.clone().map(Arc::new),
     ));
     let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
 
@@ -214,7 +230,6 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/2fa/passkey/step-up/verify", post(webapp::passkey_stepup_verify))
         .route("/api/web/2fa/passkey/{id}", delete(webapp::passkey_delete))
         .route("/api/web/home", get(webapp::home))
-        .route("/api/web/home/new-releases", get(webapp::new_releases))
         .route("/api/web/explore", get(webapp::explore))
         .route("/api/web/explore/mix/{key}", get(webapp::explore_mix))
         .route("/api/web/mood/{slug}", get(webapp::mood_mix))
@@ -367,6 +382,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/admin/users", get(admin::users))
         .route("/api/admin/users/{id}", get(admin::user_detail))
         .route("/api/admin/events", get(admin::events))
+        .route("/api/admin/cache/backfill", post(admin::backfill_cache))
         .route("/api/admin/users/{id}/sessions/revoke", post(admin::revoke_sessions))
         .route("/api/admin/users/{id}/2fa/reset", post(admin::reset_2fa))
         .route("/api/admin/users/{id}/api-key/regenerate", post(admin::regenerate_key))

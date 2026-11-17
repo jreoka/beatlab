@@ -59,6 +59,8 @@
     .kv { display:flex; justify-content:space-between; gap:20px; padding:9px 0; border-bottom:1px solid var(--border); }
     .kv:last-child { border-bottom:0; }
     .kv span:first-child { color:var(--muted); }
+    .usage-bar { height:6px; border-radius:99px; background:var(--surface-2); overflow:hidden; margin:10px 0 4px; }
+    .usage-fill { height:100%; border-radius:99px; background:var(--accent); }
     .backdrop { position:fixed; inset:0; background:rgba(0,0,0,.7); display:flex; align-items:center; justify-content:center; padding:18px; z-index:20; }
     .modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); width:min(720px,100%); max-height:86vh; overflow:auto; padding:20px; }
     .modal h3 { margin:0 0 16px; }
@@ -110,6 +112,8 @@
 
       <section id="tab-config" class="hidden">
         <div id="config-box" class="card"></div>
+        <h2 class="section">Audio cache</h2>
+        <div id="cache-box" class="card"></div>
       </section>
     </div>
   </main>
@@ -175,6 +179,8 @@
         ['Pending deletion', o.deletedUsers, '7-day window'],
         ['Active sessions', o.sessions, o.clientSessions + ' music clients'],
         ['Tracks', o.tracks, 'in library'],
+        ['Hot cache', Math.round(o.localCacheBytes / 1048576) + ' MB', o.localCacheEntries + ' files / ' + Math.round(o.cacheMaxBytes / 1073741824) + ' GB cap'],
+        ['Cool cache', o.remoteCacheEnabled ? Math.round(o.remoteCacheBytes / 1048576) + ' MB' : 'Off', o.remoteCacheEnabled ? o.remoteCacheObjects + ' objects' : 'configure S3/R2 to enable'],
         ['2FA users', o.totpUsers, o.passkeys + ' passkeys'],
         ['Recovery codes', o.recoveryCodes, 'unused'],
         ['Playlists', o.playlists, 'across accounts'],
@@ -273,6 +279,39 @@
       ['overview','users','events','config'].forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
     };
 
+    window.backfillCache = async () => {
+      if (!confirm('Upload all locally cached tracks to the cool cache now?')) return;
+      try {
+        await api('/api/admin/cache/backfill', { method: 'POST' });
+        toast('Backfill started in the background');
+      } catch (e) { toast(e.message); }
+    };
+
+    function renderCache(o) {
+      const mb = (n) => (n / 1024 / 1024).toFixed(1) + ' MB';
+      const kv = (k, v) => '<div class="kv"><span>' + k + '</span><span>' + esc(v) + '</span></div>';
+      const bar = (used, max) => {
+        const pct = max > 0 ? Math.min(100, (used / max) * 100) : 0;
+        return '<div class="usage-bar"><div class="usage-fill" style="width:' + pct.toFixed(1) + '%"></div></div>';
+      };
+      let html = '<h3 style="margin:0 0 6px;font-size:13px">Hot cache · local disk</h3>';
+      html += kv('Size', mb(o.localCacheBytes) + ' / ' + mb(o.cacheMaxBytes));
+      html += bar(o.localCacheBytes, o.cacheMaxBytes);
+      html += kv('Cached tracks', o.localCacheEntries);
+      html += '<h3 style="margin:16px 0 6px;font-size:13px">Cool cache · S3/R2</h3>';
+      if (o.remoteCacheEnabled) {
+        html += kv('Bucket / prefix', o.remoteCacheTarget);
+        html += kv('Objects', o.remoteCacheObjects);
+        html += kv('Size', mb(o.remoteCacheBytes) + ' / ' + mb(o.remoteCacheMaxBytes));
+        html += bar(o.remoteCacheBytes, o.remoteCacheMaxBytes);
+        html += '<button class="mini" style="margin-top:12px" onclick="backfillCache()">Backfill from local cache</button>';
+      } else {
+        html += kv('Status', 'Not configured');
+        html += '<p class="muted" style="margin:8px 0 0">Set BEATLAB_S3_BUCKET and credentials to enable a larger cool tier.</p>';
+      }
+      $('cache-box').innerHTML = html;
+    }
+
     async function load() {
       try {
         const data = await api('/api/admin/overview');
@@ -285,6 +324,7 @@
         state.users = users.users || [];
         state.events = events.events || [];
         renderOverview();
+        renderCache(data);
         renderUsers();
         $('all-events').innerHTML = state.events.length ? state.events.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
         $('config-box').innerHTML = Object.entries(config).map(([k,v]) => {

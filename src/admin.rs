@@ -157,6 +157,14 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "playlists": o.playlists,
             "securityEvents": o.security_events,
             "admins": admin_names(),
+            "localCacheBytes": state.store.cache_total_bytes().unwrap_or(0),
+            "localCacheEntries": state.store.cache_entry_count().unwrap_or(0),
+            "cacheMaxBytes": state.engine.max_cache_bytes,
+            "remoteCacheEnabled": state.engine.remote.is_some(),
+            "remoteCacheObjects": state.store.remote_cache_count().unwrap_or(0),
+            "remoteCacheBytes": state.store.remote_cache_total_bytes().unwrap_or(0),
+            "remoteCacheMaxBytes": state.engine.remote.as_ref().map(|r| r.max_bytes).unwrap_or(0),
+            "remoteCacheTarget": state.engine.remote.as_ref().map(|r| r.describe()).unwrap_or_default(),
         })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -421,6 +429,45 @@ pub async fn restore_user(
         }
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// Backfills the cool cache from everything currently on local disk.
+pub async fn backfill_cache(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let Some(remote) = state.engine.remote.clone() else {
+        return err_res(StatusCode::BAD_REQUEST, "No S3/R2 cool cache is configured");
+    };
+    let store = state.store.clone();
+    tokio::spawn(async move {
+        let entries = store.list_cache_entries().unwrap_or_default();
+        let mut uploaded = 0usize;
+        for (track_id, path, bytes) in entries {
+            let p = std::path::PathBuf::from(&path);
+            if !p.exists() {
+                continue;
+            }
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("m4a")
+                .to_string();
+            let key = remote.object_key(&track_id);
+            if remote.upload_from(&key, &p, &ext).await.is_ok() {
+                let _ = store.upsert_remote_cache_entry(&track_id, &key, bytes);
+                uploaded += 1;
+            }
+        }
+        store.record_security_event(
+            admin.id,
+            "admin_cache_backfill",
+            &format!("Backfilled {uploaded} tracks to the cool cache"),
+            "",
+        );
+    });
+    json_res(json!({ "ok": true, "started": true }))
 }
 
 pub async fn purge_user(

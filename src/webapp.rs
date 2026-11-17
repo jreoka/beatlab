@@ -1798,14 +1798,12 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
     albums
 }
 
-/// Builds the new-releases shelf. `advance` controls whether viewing it marks
-/// the current albums as seen — the Home view advances the marker, while an
-/// explicit refresh only re-checks without consuming the "NEW" badges.
+/// Builds the new-releases shelf and advances the per-account "seen" marker so
+/// the NEW badge only highlights arrivals since the last Home visit.
 async fn build_new_releases(
     state: &AppState,
     uid: i64,
     saved: &HashSet<String>,
-    advance: bool,
 ) -> (Vec<Value>, usize, i64) {
     let new_releases = collect_new_releases(state, uid, 12).await;
     for a in &new_releases {
@@ -1840,40 +1838,22 @@ async fn build_new_releases(
         })
         .collect();
 
-    if advance {
-        let mut known = previous_ids.unwrap_or_default();
-        let mut known_set: HashSet<String> = known.iter().cloned().collect();
-        for a in &new_releases {
-            if known_set.insert(a.id.clone()) {
-                known.push(a.id.clone());
-            }
+    let mut known = previous_ids.unwrap_or_default();
+    let mut known_set: HashSet<String> = known.iter().cloned().collect();
+    for a in &new_releases {
+        if known_set.insert(a.id.clone()) {
+            known.push(a.id.clone());
         }
-        if known.len() > 1000 {
-            known = known.split_off(known.len() - 1000);
-        }
-        state.store.kv_set(
-            &seen_key,
-            &serde_json::to_string(&known).unwrap_or_else(|_| "[]".to_string()),
-        );
     }
+    if known.len() > 1000 {
+        known = known.split_off(known.len() - 1000);
+    }
+    state.store.kv_set(
+        &seen_key,
+        &serde_json::to_string(&known).unwrap_or_else(|_| "[]".to_string()),
+    );
 
     (items, unseen.len(), Utc::now().timestamp())
-}
-
-/// Lightweight re-check used by the Home section's Refresh button. It never
-/// advances the "seen" marker, so NEW badges stay until the next Home visit.
-pub async fn new_releases(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let user = match require_web_user(&state, &headers) {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-    let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
-    let (items, unseen, checked_at) = build_new_releases(&state, user.id, &saved, false).await;
-    json_res(json!({
-        "newReleases": items,
-        "newReleaseUnseen": unseen,
-        "newReleaseCheckedAt": checked_at,
-    }))
 }
 
 pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1957,7 +1937,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
 
     let (new_releases_json, new_release_unseen, new_release_checked_at) =
-        build_new_releases(&state, uid, &saved, true).await;
+        build_new_releases(&state, uid, &saved).await;
 
     let moods: Vec<Value> = Mood::ALL
         .iter()
@@ -4149,6 +4129,9 @@ pub async fn sources_info(State(state): State<AppState>, headers: HeaderMap) -> 
         "sources": state.sources.sources_info(),
         "totalTracks": state.store.count_tracks().unwrap_or(0),
         "cacheMb": (cache_mb * 10.0).round() / 10.0,
+        "remoteCacheEnabled": state.engine.remote.is_some(),
+        "remoteCacheMb": (state.store.remote_cache_total_bytes().unwrap_or(0) as f64)
+            / (1024.0 * 1024.0),
         "ffmpeg": state.engine.ffmpeg_available,
     }))
 }

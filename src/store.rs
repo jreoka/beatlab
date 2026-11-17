@@ -399,6 +399,15 @@ impl Store {
                 last_accessed INTEGER NOT NULL
             );
 
+            -- Registry of objects uploaded to the optional S3/R2 cool cache.
+            CREATE TABLE IF NOT EXISTS remote_cache_entries (
+                track_id TEXT PRIMARY KEY,
+                object_key TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                created INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_remote_cache_created ON remote_cache_entries(created ASC);
+
             CREATE TABLE IF NOT EXISTS kv (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -4732,6 +4741,76 @@ impl Store {
         Ok(())
     }
 
+    // -- Optional S3/R2 cool cache registry ----------------------------------
+
+    pub fn upsert_remote_cache_entry(
+        &self,
+        track_id: &str,
+        object_key: &str,
+        bytes: i64,
+    ) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO remote_cache_entries(track_id, object_key, bytes, created)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(track_id) DO UPDATE SET
+                 object_key = excluded.object_key, bytes = excluded.bytes,
+                 created = excluded.created",
+            params![track_id, object_key, bytes, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_remote_cache_entry(&self, track_id: &str) -> AppResult<Option<(String, i64)>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT object_key, bytes FROM remote_cache_entries WHERE track_id = ?1",
+                params![track_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn remote_cache_total_bytes(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM remote_cache_entries",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn remote_cache_count(&self) -> AppResult<usize> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM remote_cache_entries",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n as usize),
+        )?)
+    }
+
+    /// Oldest entries first, for cool-cache quota eviction.
+    pub fn remote_cache_eviction_candidates(&self, limit: usize) -> AppResult<Vec<(String, String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT track_id, object_key, bytes FROM remote_cache_entries ORDER BY created ASC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_remote_cache_entry(&self, track_id: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM remote_cache_entries WHERE track_id = ?1",
+            params![track_id],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_cache_entry(&self, track_id: &str, path: &str, bytes: i64) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();
@@ -4741,6 +4820,17 @@ impl Store {
             params![track_id, path, bytes, now],
         )?;
         Ok(())
+    }
+
+    pub fn list_cache_entries(&self) -> AppResult<Vec<(String, String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT track_id, path, bytes FROM cache_entries ORDER BY last_accessed DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn get_cache_entry(&self, track_id: &str) -> AppResult<Option<CacheEntry>> {
@@ -4772,6 +4862,15 @@ impl Store {
             params![track_id],
         )?;
         Ok(())
+    }
+
+    pub fn cache_entry_count(&self) -> AppResult<usize> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM cache_entries",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n as usize),
+        )?)
     }
 
     pub fn cache_total_bytes(&self) -> AppResult<i64> {

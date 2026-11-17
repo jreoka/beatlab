@@ -86,6 +86,8 @@ pub struct StreamEngine {
     pub embed_dir: PathBuf,
     pub max_cache_bytes: i64,
     pub ffmpeg_available: bool,
+    /// Optional S3/R2 "cool" cache; local disk stays the hot tier.
+    pub remote: Option<Arc<crate::remote_cache::RemoteCache>>,
     resolved_cache: Arc<RwLock<HashMap<String, CachedResolved>>>,
     in_flight_resolutions: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     in_flight_downloads: Arc<StdMutex<HashSet<String>>>,
@@ -98,11 +100,22 @@ pub struct StreamEngine {
 }
 
 impl StreamEngine {
+    #[cfg(test)]
     pub fn new(
         store: Store,
         sources: SourceRegistry,
         data_dir: &Path,
         max_cache_gb: f64,
+    ) -> Self {
+        Self::new_with_remote(store, sources, data_dir, max_cache_gb, None)
+    }
+
+    pub fn new_with_remote(
+        store: Store,
+        sources: SourceRegistry,
+        data_dir: &Path,
+        max_cache_gb: f64,
+        remote: Option<Arc<crate::remote_cache::RemoteCache>>,
     ) -> Self {
         let cache_dir = data_dir.join("cache").join("audio");
         let cover_dir = data_dir.join("cache").join("covers");
@@ -149,6 +162,7 @@ impl StreamEngine {
             embed_dir,
             max_cache_bytes: ((max_cache_gb.max(0.5)) * 1024.0 * 1024.0 * 1024.0) as i64,
             ffmpeg_available,
+            remote,
             resolved_cache: Arc::new(RwLock::new(HashMap::new())),
             in_flight_resolutions: Arc::new(StdMutex::new(HashMap::new())),
             in_flight_downloads: Arc::new(StdMutex::new(HashSet::new())),
@@ -159,6 +173,42 @@ impl StreamEngine {
             stream_proc_sem: Arc::new(Semaphore::new(8)),
             embed_sem: Arc::new(Semaphore::new(2)),
         }
+    }
+
+    /// Pulls a track back from the optional S3/R2 cool tier into the hot cache.
+    async fn rehydrate_from_remote(
+        &self,
+        remote: &crate::remote_cache::RemoteCache,
+        track_id: &str,
+        key: &str,
+    ) -> AppResult<(PathBuf, String)> {
+        let object = remote
+            .head(key)
+            .await?
+            .ok_or_else(|| err_msg("cool cache object is missing"))?;
+        if object.size <= 4096 {
+            return Err(err_msg("cool cache object is too small"));
+        }
+        let ext = if object.ext.is_empty() {
+            "m4a".to_string()
+        } else {
+            object.ext.clone()
+        };
+        let hash = sha1_hex(track_id);
+        let part = self.cache_dir.join(format!("{}.{}.r2part", hash, uuid::Uuid::new_v4().simple()));
+        let final_path = self.cache_dir.join(format!("{}.{}", hash, ext));
+        let bytes = remote.download_to(key, &part).await?;
+        if bytes <= 4096 {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(err_msg("cool cache download was too small"));
+        }
+        tokio::fs::rename(&part, &final_path).await?;
+        self.store.upsert_cache_entry(
+            track_id,
+            &final_path.to_string_lossy(),
+            bytes as i64,
+        )?;
+        Ok((final_path, ext))
     }
 
     pub async fn resolve_target(&self, track: &Track) -> AppResult<PlayTarget> {
@@ -177,6 +227,25 @@ impl StreamEngine {
                 });
             }
             let _ = self.store.delete_cache_entry(&track.id);
+        }
+
+        // 1b. Cool tier: if the hot copy was evicted, rehydrate it from S3/R2
+        // back into the hot cache and serve from there.
+        if let Some(remote) = &self.remote {
+            if let Ok(Some((key, _))) = self.store.get_remote_cache_entry(&track.id) {
+                match self.rehydrate_from_remote(remote, &track.id, &key).await {
+                    Ok((path, ext)) => {
+                        let _ = self.store.prune_cache(self.max_cache_bytes);
+                        return Ok(PlayTarget::LocalFile {
+                            content_type: mime_for_audio_ext(&ext).to_string(),
+                            path,
+                        });
+                    }
+                    Err(e) => {
+                        debug!(track_id = %track.id, error = %e.to_string(), "cool cache rehydration failed");
+                    }
+                }
+            }
         }
 
         // 2. Local filesystem source.
@@ -1032,6 +1101,22 @@ impl StreamEngine {
         self.store
             .upsert_cache_entry(track_id, &final_path.to_string_lossy(), final_bytes)?;
         let _ = self.store.prune_cache(self.max_cache_bytes);
+
+        // Mirror the hot copy into the optional cool tier. A failure here is
+        // non-fatal: the local cache is already usable.
+        if let Some(remote) = &self.remote {
+            let key = remote.object_key(track_id);
+            match remote.upload_from(&key, &final_path, final_ext).await {
+                Ok(()) => {
+                    let _ = self.store.upsert_remote_cache_entry(track_id, &key, final_bytes);
+                    debug!(track_id = %track_id, "mirrored track to cool cache");
+                }
+                Err(e) => {
+                    debug!(track_id = %track_id, error = %e.to_string(), "cool cache upload failed");
+                }
+            }
+        }
+
         debug!(track_id = %track_id, bytes = final_bytes, "cached track to disk");
         Ok(())
     }
@@ -1912,7 +1997,7 @@ pub fn mime_for_audio_ext(ext: &str) -> &'static str {
     }
 }
 
-fn sha1_hex(s: &str) -> String {
+pub(crate) fn sha1_hex(s: &str) -> String {
     let mut h = Sha1::new();
     h.update(s.as_bytes());
     hex::encode(h.finalize())
