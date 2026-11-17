@@ -87,6 +87,7 @@
     repeat: 'off', // off | all | one
     autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
     hapticsEnabled: localStorage.getItem('beatlab_haptics') !== 'false',
+    theme: localStorage.getItem('beatlab_theme') === 'light' ? 'light' : 'dark',
     radioReqToken: 0,
     radioLoading: false,
     radioInFlight: null,
@@ -160,6 +161,15 @@
     })(),
     radioPlaylistId: null,
   };
+
+  function applyTheme(theme) {
+    const next = theme === 'light' ? 'light' : 'dark';
+    state.theme = next;
+    document.documentElement.setAttribute('data-theme', next);
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', next === 'light' ? '#f8f9fb' : '#090a0d');
+  }
+  applyTheme(state.theme);
 
   const RECENT_HEARD_TTL_MS = 2 * 60 * 60 * 1000;
   const RECENT_HEARD_MAX = 50;
@@ -5699,6 +5709,20 @@
               : `<span class="settings-row-desc" style="text-align:right;max-width:220px">Available via browser menu</span>`;
       body.innerHTML = `
         <div class="settings-section">
+          <div class="settings-section-title">Appearance</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Theme</div>
+              <div class="settings-row-desc">Switch between flat dark mode and clean light mode</div>
+            </div>
+            <div class="theme-toggle-group" role="group" aria-label="Color theme">
+              <button type="button" class="theme-toggle-opt${state.theme !== 'light' ? ' active' : ''}" onclick="App.setTheme('dark')">Dark</button>
+              <button type="button" class="theme-toggle-opt${state.theme === 'light' ? ' active' : ''}" onclick="App.setTheme('light')">Light</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
           <div class="settings-section-title">App &amp; Installation</div>
           <div class="settings-row">
             <div class="settings-row-info">
@@ -6850,6 +6874,16 @@
       state.hapticsEnabled = !!v;
       localStorage.setItem('beatlab_haptics', state.hapticsEnabled ? 'true' : 'false');
       if (state.hapticsEnabled) haptic('success');
+    },
+    setTheme: (mode) => {
+      haptic('select');
+      const next = mode === 'light' ? 'light' : 'dark';
+      localStorage.setItem('beatlab_theme', next);
+      applyTheme(next);
+      renderSettingsModalBody();
+    },
+    toggleTheme: (isLight) => {
+      window.App.setTheme(isLight ? 'light' : 'dark');
     },
     removeFromQueue: (idx) => {
       if (idx > state.queueIndex && idx < state.queue.length) {
