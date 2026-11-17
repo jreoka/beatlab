@@ -1,3 +1,4 @@
+mod admin;
 mod auth;
 mod engine;
 mod models;
@@ -85,6 +86,8 @@ async fn main() -> models::AppResult<()> {
         .map(AllowedUrl::parse)
         .transpose()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    admin::init_admins(&std::env::var("ADMIN_USERNAME").unwrap_or_default());
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Store::open(&data_dir.join("beatlab.db"))?;
@@ -211,6 +214,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/2fa/passkey/step-up/verify", post(webapp::passkey_stepup_verify))
         .route("/api/web/2fa/passkey/{id}", delete(webapp::passkey_delete))
         .route("/api/web/home", get(webapp::home))
+        .route("/api/web/home/new-releases", get(webapp::new_releases))
         .route("/api/web/explore", get(webapp::explore))
         .route("/api/web/explore/mix/{key}", get(webapp::explore_mix))
         .route("/api/web/mood/{slug}", get(webapp::mood_mix))
@@ -355,6 +359,20 @@ async fn main() -> models::AppResult<()> {
         .route("/api/user", get(navidrome::list_users))
         .route("/api/user/{id}", put(navidrome::update_user))
         .route("/api/keepalive/keepalive", get(navidrome::keepalive))
+        // Administrator panel (gated by ADMIN_USERNAME at the API layer).
+        .route("/admin", get(admin::serve_admin))
+        .route("/api/admin/session", get(admin::session))
+        .route("/api/admin/overview", get(admin::overview))
+        .route("/api/admin/config", get(admin::config))
+        .route("/api/admin/users", get(admin::users))
+        .route("/api/admin/users/{id}", get(admin::user_detail))
+        .route("/api/admin/events", get(admin::events))
+        .route("/api/admin/users/{id}/sessions/revoke", post(admin::revoke_sessions))
+        .route("/api/admin/users/{id}/2fa/reset", post(admin::reset_2fa))
+        .route("/api/admin/users/{id}/api-key/regenerate", post(admin::regenerate_key))
+        .route("/api/admin/users/{id}/delete", post(admin::delete_user))
+        .route("/api/admin/users/{id}/restore", post(admin::restore_user))
+        .route("/api/admin/users/{id}/purge", post(admin::purge_user))
         .layer(cors)
         .with_state(state);
 

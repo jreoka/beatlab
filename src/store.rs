@@ -85,6 +85,50 @@ pub struct PasskeyInfo {
     pub last_used: i64,
 }
 
+/// Admin-facing summary of one account (no credentials exposed).
+#[derive(Debug, Clone)]
+pub struct AdminUserSummary {
+    pub id: i64,
+    pub username: String,
+    pub created: i64,
+    pub deleted_at: i64,
+    pub totp_enabled: bool,
+    pub passkeys: usize,
+    pub recovery_left: usize,
+    pub sessions: usize,
+    pub playlists: usize,
+    pub stars: usize,
+    pub events: usize,
+    pub listens: usize,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdminOverview {
+    pub total_users: usize,
+    pub active_users: usize,
+    pub deleted_users: usize,
+    pub sessions: usize,
+    pub client_sessions: usize,
+    pub tracks: usize,
+    pub passkeys: usize,
+    pub totp_users: usize,
+    pub recovery_codes: usize,
+    pub playlists: usize,
+    pub security_events: usize,
+}
+
+/// A security event with the account it belongs to (global admin feed).
+#[derive(Debug, Clone)]
+pub struct AdminEvent {
+    pub user_id: i64,
+    pub username: String,
+    pub kind: String,
+    pub detail: String,
+    pub ip: String,
+    pub created: i64,
+}
+
 /// One line in the account's security audit trail.
 #[derive(Debug, Clone)]
 pub struct SecurityEvent {
@@ -527,8 +571,33 @@ impl Store {
         })
     }
 
-    /// Authenticate an existing user or automatically create a new user account if
-    /// the username does not exist yet. Returns `(User, created_new_account)`.
+    /// Strict credential check used by the web sign-in form: never creates an
+    /// account. Unknown usernames must go through the sign-up flow instead.
+    pub fn authenticate_user(&self, username: &str, password: &str) -> AppResult<User> {
+        let uname = validate_credentials(username, password).map_err(err_msg)?;
+        let conn = self.lock();
+        let existing: Option<(User, i64)> = conn
+            .query_row(
+                "SELECT id, username, password, created, deleted_at FROM users WHERE lower(username) = lower(?1)",
+                params![uname],
+                |r| Ok((row_to_user(r)?, r.get::<_, i64>(4)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((user, deleted_at)) if constant_time_eq(&user.password, password) => {
+                if deleted_at > 0 {
+                    Err(err_msg(crate::models::ERR_RESTORE_REQUIRED))
+                } else {
+                    Ok(user)
+                }
+            }
+            _ => Err(err_msg("Invalid username or password")),
+        }
+    }
+
+    /// Test convenience helper: authenticate or create a user in one call.
+    /// Production sign-in must use the strict `authenticate_user` instead.
+    #[cfg(test)]
     pub fn authenticate_or_create_user(
         &self,
         username: &str,
@@ -1239,6 +1308,98 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // -------------------------------------------------------------------------
+    // Administration (gated by ADMIN_USERNAME at the HTTP layer)
+    // -------------------------------------------------------------------------
+
+    pub fn admin_overview(&self) -> AppResult<AdminOverview> {
+        let conn = self.lock();
+        let count = |sql: &str| -> AppResult<usize> {
+            Ok(conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0) as usize)
+        };
+        Ok(AdminOverview {
+            total_users: count("SELECT COUNT(*) FROM users")?,
+            active_users: count("SELECT COUNT(*) FROM users WHERE deleted_at = 0")?,
+            deleted_users: count("SELECT COUNT(*) FROM users WHERE deleted_at > 0")?,
+            sessions: count("SELECT COUNT(*) FROM sessions WHERE revoked = 0")?,
+            client_sessions: count("SELECT COUNT(*) FROM sessions WHERE kind = 'subsonic' AND revoked = 0")?,
+            tracks: count("SELECT COUNT(*) FROM tracks")?,
+            passkeys: count("SELECT COUNT(*) FROM passkeys")?,
+            totp_users: count("SELECT COUNT(*) FROM totp_secrets WHERE enabled = 1")?,
+            recovery_codes: count("SELECT COUNT(*) FROM recovery_codes WHERE used = 0")?,
+            playlists: count("SELECT COUNT(*) FROM playlists")?,
+            security_events: count("SELECT COUNT(*) FROM security_events")?,
+        })
+    }
+
+    pub fn admin_list_users(&self) -> AppResult<Vec<AdminUserSummary>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.username, u.created, u.deleted_at,
+                    COALESCE(t.enabled, 0),
+                    (SELECT COUNT(*) FROM passkeys p WHERE p.user_id = u.id),
+                    (SELECT COUNT(*) FROM recovery_codes r WHERE r.user_id = u.id AND r.used = 0),
+                    (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.revoked = 0),
+                    (SELECT COUNT(*) FROM playlists p WHERE p.user_id = u.id),
+                    (SELECT COUNT(*) FROM stars st WHERE st.user_id = u.id),
+                    (SELECT COUNT(*) FROM security_events e WHERE e.user_id = u.id),
+                    (SELECT COUNT(*) FROM user_track_stats uts WHERE uts.user_id = u.id),
+                    COALESCE((SELECT MAX(last_seen) FROM sessions s WHERE s.user_id = u.id), 0)
+             FROM users u LEFT JOIN totp_secrets t ON t.user_id = u.id
+             ORDER BY u.id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AdminUserSummary {
+                    id: r.get(0)?,
+                    username: r.get(1)?,
+                    created: r.get(2)?,
+                    deleted_at: r.get(3)?,
+                    totp_enabled: r.get::<_, i64>(4)? != 0,
+                    passkeys: r.get::<_, i64>(5)? as usize,
+                    recovery_left: r.get::<_, i64>(6)? as usize,
+                    sessions: r.get::<_, i64>(7)? as usize,
+                    playlists: r.get::<_, i64>(8)? as usize,
+                    stars: r.get::<_, i64>(9)? as usize,
+                    events: r.get::<_, i64>(10)? as usize,
+                    listens: r.get::<_, i64>(11)? as usize,
+                    last_seen: r.get(12)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn admin_global_events(&self, limit: usize) -> AppResult<Vec<AdminEvent>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.user_id, u.username, e.kind, e.detail, e.ip, e.created
+             FROM security_events e JOIN users u ON u.id = e.user_id
+             ORDER BY e.created DESC, e.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(AdminEvent {
+                    user_id: r.get(0)?,
+                    username: r.get(1)?,
+                    kind: r.get(2)?,
+                    detail: r.get(3)?,
+                    ip: r.get(4)?,
+                    created: r.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Permanently removes an account. Only for admin use after the recovery
+    /// window has been skipped explicitly.
+    pub fn hard_delete_user(&self, user_id: i64) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
+        Ok(())
     }
 
     // -------------------------------------------------------------------------

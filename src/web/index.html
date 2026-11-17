@@ -39,7 +39,12 @@
         </div>
       </div>
 
-      <p class="auth-desc">
+      <div class="auth-tabs" role="tablist" aria-label="Sign in or sign up">
+        <button id="auth-tab-signin" type="button" class="auth-tab active" role="tab" aria-selected="true" onclick="App.setAuthMode('signin')">Sign in</button>
+        <button id="auth-tab-signup" type="button" class="auth-tab" role="tab" aria-selected="false" onclick="App.setAuthMode('signup')">Sign up</button>
+      </div>
+
+      <p id="auth-desc" class="auth-desc">
         Sign in with your username &amp; password, or with a passkey. For <strong>Subsonic</strong> &amp; <strong>Navidrome</strong> apps, use the API key from <strong>Settings &rarr; Apps &amp; API</strong> as the password &mdash; account passwords no longer work in music clients.
       </p>
 
@@ -52,8 +57,12 @@
           <span>Password</span>
           <input id="auth-password" type="password" autocomplete="current-password" placeholder="Choose or enter password" required maxlength="256" />
         </label>
+        <label id="auth-confirm-row" class="hidden">
+          <span>Confirm password</span>
+          <input id="auth-confirm" type="password" autocomplete="new-password" placeholder="Enter your password again" required maxlength="256" />
+        </label>
         <div id="auth-error" class="auth-error hidden"></div>
-        <button id="auth-submit" type="submit" class="btn-primary btn-full">Continue to Beatlab</button>
+        <button id="auth-submit" type="submit" class="btn-primary btn-full">Sign in</button>
       </form>
       <button id="auth-passkey-btn" type="button" class="btn-secondary btn-full auth-alt-btn" onclick="App.signInWithPasskey()">Sign in with a passkey</button>
 

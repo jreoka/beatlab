@@ -151,7 +151,9 @@
       confirmRevokeAll: false,
       confirmDisable2fa: false,
       confirmDelete: false,
+      showPasswordForm: false,
     },
+    authMode: 'signin',
     authChallenge: '',
     authFactor: 'totp',
     restoreChallenge: '',
@@ -870,6 +872,39 @@
   // ---------------------------------------------------------------------------
   // Authentication & Session Bootstrap
   // ---------------------------------------------------------------------------
+  const AUTH_DESC_SIGNIN = 'Sign in with your username &amp; password, or with a passkey. For <strong>Subsonic</strong> &amp; <strong>Navidrome</strong> apps, use the API key from <strong>Settings &rarr; Apps &amp; API</strong> as the password &mdash; account passwords no longer work in music clients.';
+  const AUTH_DESC_SIGNUP = 'Create your Beatlab account with a username and password. Enter the password twice to confirm it.';
+
+  function setAuthMode(mode) {
+    const signup = mode === 'signup';
+    state.authMode = signup ? 'signup' : 'signin';
+    const signinTab = $('auth-tab-signin');
+    const signupTab = $('auth-tab-signup');
+    if (signinTab) {
+      signinTab.classList.toggle('active', !signup);
+      signinTab.setAttribute('aria-selected', signup ? 'false' : 'true');
+    }
+    if (signupTab) {
+      signupTab.classList.toggle('active', signup);
+      signupTab.setAttribute('aria-selected', signup ? 'true' : 'false');
+    }
+    const confirmRow = $('auth-confirm-row');
+    if (confirmRow) confirmRow.classList.toggle('hidden', !signup);
+    const confirmInput = $('auth-confirm');
+    if (confirmInput) {
+      confirmInput.required = signup;
+      if (!signup) confirmInput.value = '';
+    }
+    const passwordInput = $('auth-password');
+    if (passwordInput) passwordInput.autocomplete = signup ? 'new-password' : 'current-password';
+    const submit = $('auth-submit');
+    if (submit) submit.textContent = signup ? 'Create account' : 'Sign in';
+    const desc = $('auth-desc');
+    if (desc) desc.innerHTML = signup ? AUTH_DESC_SIGNUP : AUTH_DESC_SIGNIN;
+    const passkeyBtn = $('auth-passkey-btn');
+    if (passkeyBtn) passkeyBtn.classList.toggle('hidden', signup);
+  }
+
   function resetAuthForm() {
     const form = $('auth-form');
     if (form) {
@@ -878,6 +913,7 @@
     }
     const passkeyBtn = $('auth-passkey-btn');
     if (passkeyBtn) passkeyBtn.classList.remove('hidden');
+    setAuthMode('signin');
     const mfa = $('auth-mfa');
     if (mfa) mfa.classList.add('hidden');
     const mfaForm = $('mfa-form');
@@ -894,7 +930,7 @@
       errBox.textContent = '';
       errBox.classList.add('hidden');
     }
-    for (const id of ['auth-username', 'auth-password']) {
+    for (const id of ['auth-username', 'auth-password', 'auth-confirm']) {
       const el = $(id);
       if (!el) continue;
       if (document.activeElement === el) el.blur();
@@ -944,6 +980,7 @@
       confirmRevokeAll: false,
       confirmDisable2fa: false,
       confirmDelete: false,
+      showPasswordForm: false,
     };
     clearTimeout(state.searchTimer);
     state.searchTimer = null;
@@ -1042,7 +1079,13 @@
   }
 
   function webauthnOptions(src, creating = false) {
-    const out = Object.assign({}, src);
+    // webauthn-rs wraps options in its own `publicKey` field; accept either
+    // shape so an older server build still works during rolling deploys.
+    let options = src || {};
+    if (!options.challenge && options.publicKey && options.publicKey.challenge) {
+      options = options.publicKey;
+    }
+    const out = Object.assign({}, options);
     out.challenge = base64urlToBytes(src.challenge);
     if (creating && out.user) {
       out.user = Object.assign({}, out.user, { id: base64urlToBytes(out.user.id) });
@@ -1457,10 +1500,21 @@
       errBox.classList.add('hidden');
       const username = $('auth-username').value.trim();
       const password = $('auth-password').value;
+      const signup = state.authMode === 'signup';
+      const confirmPassword = signup ? $('auth-confirm').value : '';
+      if (signup && password !== confirmPassword) {
+        errBox.textContent = 'Passwords do not match';
+        errBox.classList.remove('hidden');
+        return;
+      }
       try {
-        const res = await api('/api/web/auth/signin', {
+        const res = await api(signup ? '/api/web/auth/signup' : '/api/web/auth/signin', {
           method: 'POST',
-          body: JSON.stringify({ username, password }),
+          body: JSON.stringify(
+            signup
+              ? { username, password, confirmPassword }
+              : { username, password }
+          ),
         });
         if (res.mfaRequired) {
           state.authChallenge = res.challenge;
@@ -1870,6 +1924,20 @@
     `;
   }
 
+  function newReleasesSectionHtml(newReleases, unseen) {
+    return `<section class="section" id="new-releases-section">
+      <div class="section-head">
+        <h2>New Releases${unseen > 0 ? ` <span class="new-count-pill">${unseen} new</span>` : ''}</h2>
+        <span class="section-hint">${unseen > 0 ? 'Since your last visit' : 'Fresh drops from artists you follow &amp; listen to'} &middot; <button class="mini-btn" onclick="App.refreshNewReleases()">Refresh</button></span>
+      </div>
+      ${
+        newReleases.length > 0
+          ? `<div class="card-grid">${newReleases.map(renderNewReleaseCard).join('')}</div>`
+          : `<p class="muted-center">Nothing new from your artists right now. Follow more artists or listen to a wider range of music, then check back.</p>`
+      }
+    </section>`;
+  }
+
   async function renderHome() {
     const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading...');
@@ -1906,15 +1974,7 @@
         </section>`;
       }
 
-      if (newReleases.length > 0) {
-        html += `<section class="section">
-          <div class="section-head">
-            <h2>New Releases</h2>
-            <span class="section-hint">Fresh drops from artists you follow &amp; listen to</span>
-          </div>
-          <div class="card-grid">${newReleases.map(renderNewReleaseCard).join('')}</div>
-        </section>`;
-      }
+      html += newReleasesSectionHtml(newReleases, d.newReleaseUnseen || 0);
 
       if (mixes.length > 0) {
         html += `<section class="section">
@@ -4169,7 +4229,7 @@
     return `<div class="media-card new-release-card" data-share-kind="album" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
-        <span class="new-release-badge">NEW</span>
+        ${a.isNew ? '<span class="new-release-badge">NEW</span>' : ''}
         <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(a.name)}</div>
@@ -6237,6 +6297,29 @@
           }
         </div>
 
+        <div class="settings-section">
+          <div class="settings-section-title">Password</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Account password</div>
+              <div class="settings-row-desc">Used to sign in to the web player. Music clients use your API key instead.${sec.twoFactorEnabled ? ' Your 2FA code is required to change it.' : ''}</div>
+            </div>
+          </div>
+          ${
+            state.settingsData.showPasswordForm
+              ? `<form onsubmit="App.submitPasswordChange(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+                  <input id="pw-cur" type="password" autocomplete="current-password" placeholder="Current password" required />
+                  <input id="pw-new" type="password" autocomplete="new-password" placeholder="New password" required />
+                  ${sec.twoFactorEnabled ? '<input id="pw-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code" required />' : ''}
+                  <div class="settings-confirm-actions" style="justify-content:flex-start;margin-top:6px">
+                    <button type="submit" class="btn-secondary">Update password</button>
+                    <button type="button" class="mini-btn ghost" onclick="App.cancelPasswordChange()">Cancel</button>
+                  </div>
+                </form>`
+              : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.showPasswordForm()">Change password</button></div>`
+          }
+        </div>
+
         ${
           sec.twoFactorEnabled
             ? `<div class="settings-section">
@@ -6303,8 +6386,9 @@
             confirmDelete
               ? `<div class="settings-confirm-bar">
                   <div style="display:flex;flex-direction:column;gap:8px;width:100%">
-                    <span>Type your password to confirm deletion.</span>
+                    <span>Type your password${sec.twoFactorEnabled ? ' and a 2FA or recovery code' : ''} to confirm deletion.</span>
                     <input id="delete-password" type="password" autocomplete="current-password" placeholder="Account password" />
+                    ${sec.twoFactorEnabled ? '<input id="delete-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code" />' : ''}
                     <div class="settings-confirm-actions">
                       <button class="btn-secondary danger-btn" onclick="App.confirmDeleteAccount()">Delete my account</button>
                       <button class="mini-btn ghost" onclick="App.cancelDeleteAccount()">Cancel</button>
@@ -6336,18 +6420,11 @@
         <button class="btn-secondary" style="margin-top:12px;width:100%" onclick="App.closeModal();App.openMyProfile()">View my public profile →</button>
       </div>
       <div class="settings-section">
-        <div class="settings-section-title">Security</div>
-        <form onsubmit="App.submitPasswordChange(event)" style="display:flex;flex-direction:column;gap:8px">
-          <div class="kv-label">CHANGE PASSWORD</div>
-          <input id="pw-cur" type="password" autocomplete="current-password" placeholder="Current password" required />
-          <input id="pw-new" type="password" autocomplete="new-password" placeholder="New password" required />
-          ${state.user && state.user.twoFactorEnabled ? '<input id="pw-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code" required />' : ''}
-          <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;margin-top:6px">
-            <button type="submit" class="btn-secondary">Update Password</button>
-            <button type="button" class="btn-secondary danger-btn" onclick="App.signOut()">Sign out</button>
-          </div>
-        </form>
-        <button class="btn-secondary" style="margin-top:10px;width:100%" onclick="App.setSettingsTab('sessions')">Manage active sessions &rarr;</button>
+        <div class="settings-section-title">Account Actions</div>
+        <button class="btn-secondary" style="width:100%;margin-bottom:8px" onclick="App.setSettingsTab('security')">Security &amp; two-factor authentication &rarr;</button>
+        <button class="btn-secondary" style="width:100%;margin-bottom:8px" onclick="App.setSettingsTab('sessions')">Manage active sessions &rarr;</button>
+        ${state.user && state.user.isAdmin ? '<button class="btn-secondary" style="width:100%;margin-bottom:8px" onclick="window.location.href=\'/admin\'">Open admin panel &rarr;</button>' : ''}
+        <button type="button" class="btn-secondary danger-btn" style="width:100%" onclick="App.signOut()">Sign out</button>
       </div>
     `;
   }
@@ -6356,6 +6433,7 @@
     state.settingsTab = initialTab || 'general';
     state.settingsData.confirmResetHidden = false;
     state.settingsData.confirmRevokeAll = false;
+    state.settingsData.showPasswordForm = false;
     openModal(`
       <div class="settings-shell">
         <div class="modal-head settings-modal-head">
@@ -7196,6 +7274,7 @@
         }).catch(() => {});
       }
     },
+    setAuthMode,
     backToSignIn: () => {
       resetAuthForm();
     },
@@ -7280,6 +7359,19 @@
       renderStatsView();
     },
     refreshStats: () => renderStats(state.statsRange || 'all'),
+    refreshNewReleases: async () => {
+      haptic('tap');
+      const section = $('new-releases-section');
+      if (!section) return renderHome();
+      try {
+        const d = await api('/api/web/home/new-releases');
+        const holder = document.createElement('div');
+        holder.innerHTML = newReleasesSectionHtml(d.newReleases || [], d.newReleaseUnseen || 0);
+        section.replaceWith(holder.firstElementChild);
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
     setRightTab: (tab) => {
       haptic('tap');
       $('tab-queue').classList.toggle('active', tab === 'queue');
@@ -7557,6 +7649,7 @@
       state.settingsData.confirmRevokeAll = false;
       state.settingsData.confirmDisable2fa = false;
       state.settingsData.confirmDelete = false;
+      state.settingsData.showPasswordForm = false;
       if (tab === 'security') {
         api('/api/web/2fa/status').then((res) => {
           state.settingsData.security = res;
@@ -7807,12 +7900,17 @@
         showToast('Enter your password to confirm');
         return;
       }
+      const codeInput = $('delete-code');
+      if (codeInput && !codeInput.value.trim()) {
+        showToast('Enter a 2FA or recovery code to confirm');
+        return;
+      }
       try {
         const res = await api('/api/web/account/delete', {
           method: 'POST',
           body: JSON.stringify({
             password: passwordInput.value,
-            code: securityCodeValue() || undefined,
+            code: codeInput ? codeInput.value : undefined,
           }),
         });
         state.settingsData.confirmDelete = false;
@@ -8160,6 +8258,16 @@
         showToast(err.message);
       }
     },
+    showPasswordForm: () => {
+      state.settingsData.showPasswordForm = true;
+      renderSettingsModalBody();
+      const first = $('pw-cur');
+      if (first) first.focus();
+    },
+    cancelPasswordChange: () => {
+      state.settingsData.showPasswordForm = false;
+      renderSettingsModalBody();
+    },
     submitPasswordChange: async (e) => {
       e.preventDefault();
       try {
@@ -8171,8 +8279,9 @@
             code: $('pw-code') ? $('pw-code').value : undefined,
           }),
         });
+        state.settingsData.showPasswordForm = false;
         showToast('Password updated');
-        closeModal();
+        renderSettingsModalBody();
       } catch (err) {
         showToast(err.message);
       }

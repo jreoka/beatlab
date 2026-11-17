@@ -603,6 +603,35 @@ fn require_sensitive_auth(
     Ok((user, token))
 }
 
+/// Stricter gate for the two most destructive account operations: a TOTP code
+/// or an unused recovery code must be supplied every time 2FA is enabled, even
+/// when the session was recently verified by another factor.
+fn require_explicit_code(
+    state: &AppState,
+    headers: &HeaderMap,
+    code: Option<&str>,
+) -> Result<(User, String), Response> {
+    let (user, token) = require_web_user_with_token(state, headers)?;
+    if !state.store.is_2fa_enabled(user.id).unwrap_or(false) {
+        return Ok((user, token));
+    }
+    let supplied = code.map(str::trim).filter(|s| !s.is_empty());
+    if supplied.is_none() {
+        return Err(err_res(
+            StatusCode::FORBIDDEN,
+            "A two-factor or recovery code is required",
+        ));
+    }
+    if !second_factor_ok(state, &user, supplied)? {
+        return Err(err_res(
+            StatusCode::FORBIDDEN,
+            "Invalid two-factor or recovery code",
+        ));
+    }
+    let _ = state.store.mark_session_mfa(&token);
+    Ok((user, token))
+}
+
 fn issue_session(state: &AppState, user: &User, headers: &HeaderMap, kind: &str) -> Result<String, Response> {
     let meta = SessionMeta {
         user_agent: user_agent(headers),
@@ -626,6 +655,7 @@ fn user_json(state: &AppState, user: &User) -> Value {
         "created": user.created,
         "avatarUrl": self_avatar_url(state, user.id),
         "twoFactorEnabled": two_factor_enabled,
+        "isAdmin": crate::admin::is_admin_username(&user.username),
         "totpEnabled": state.store.get_totp(user.id).ok().flatten().map(|t| t.enabled).unwrap_or(false),
         "passkeys": state.store.passkey_count(user.id).unwrap_or(0),
         "recoveryCodesLeft": recovery_total.saturating_sub(recovery_used),
@@ -636,6 +666,14 @@ fn user_json(state: &AppState, user: &User) -> Value {
 pub struct AuthReq {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Deserialize)]
+pub struct SignupReq {
+    pub username: String,
+    pub password: String,
+    #[serde(rename = "confirmPassword")]
+    pub confirm_password: String,
 }
 
 #[derive(Deserialize)]
@@ -773,18 +811,8 @@ pub async fn signin(
     headers: HeaderMap,
     Json(req): Json<AuthReq>,
 ) -> Response {
-    match state
-        .store
-        .authenticate_or_create_user(&req.username, &req.password)
-    {
-        Ok((user, created)) => {
-            if created {
-                let taste = state.taste.clone();
-                let uid = user.id;
-                tokio::spawn(async move {
-                    taste.prime_new_user(uid).await;
-                });
-            }
+    match state.store.authenticate_user(&req.username, &req.password) {
+        Ok(user) => {
             if state.store.is_2fa_enabled(user.id).unwrap_or(false) {
                 return match state.store.create_auth_challenge(user.id, "mfa_login", "") {
                     Ok(challenge) => json_res(json!({
@@ -799,7 +827,7 @@ pub async fn signin(
             match issue_session(&state, &user, &headers, "web") {
                 Ok(token) => json_res(json!({
                     "token": token,
-                    "created": created,
+                    "created": false,
                     "user": user_json(&state, &user),
                 })),
                 Err(r) => r,
@@ -837,8 +865,11 @@ pub async fn signin(
 pub async fn signup(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<AuthReq>,
+    Json(req): Json<SignupReq>,
 ) -> Response {
+    if req.password != req.confirm_password {
+        return err_res(StatusCode::BAD_REQUEST, "Passwords do not match");
+    }
     match state.store.create_user(&req.username, &req.password) {
         Ok(user) => {
             let taste = state.taste.clone();
@@ -996,7 +1027,7 @@ pub async fn change_password(
     headers: HeaderMap,
     Json(req): Json<PasswordChangeReq>,
 ) -> Response {
-    let (user, _) = match require_sensitive_auth(&state, &headers, req.code.as_deref()) {
+    let (user, _) = match require_explicit_code(&state, &headers, req.code.as_deref()) {
         Ok(value) => value,
         Err(r) => return r,
     };
@@ -1112,7 +1143,7 @@ pub async fn passkey_login_options(
         .store
         .create_auth_challenge(user.id, "passkey_login", &serialised)
     {
-        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": challenge_response })),
+        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": challenge_response.public_key })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -1252,7 +1283,7 @@ pub async fn account_delete(
     headers: HeaderMap,
     Json(req): Json<DeleteAccountReq>,
 ) -> Response {
-    let (user, _) = match require_sensitive_auth(&state, &headers, req.code.as_deref()) {
+    let (user, _) = match require_explicit_code(&state, &headers, req.code.as_deref()) {
         Ok(value) => value,
         Err(r) => return r,
     };
@@ -1479,7 +1510,7 @@ pub async fn passkey_register_options(
         .store
         .create_auth_challenge(user.id, "passkey_register", &serialised)
     {
-        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": creation })),
+        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": creation.public_key })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -1615,7 +1646,7 @@ pub async fn passkey_stepup_options(
         .store
         .create_auth_challenge(user.id, "passkey_stepup", &serialised)
     {
-        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": challenge_response })),
+        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": challenge_response.public_key })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -1767,6 +1798,84 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
     albums
 }
 
+/// Builds the new-releases shelf. `advance` controls whether viewing it marks
+/// the current albums as seen — the Home view advances the marker, while an
+/// explicit refresh only re-checks without consuming the "NEW" badges.
+async fn build_new_releases(
+    state: &AppState,
+    uid: i64,
+    saved: &HashSet<String>,
+    advance: bool,
+) -> (Vec<Value>, usize, i64) {
+    let new_releases = collect_new_releases(state, uid, 12).await;
+    for a in &new_releases {
+        let _ = state.store.upsert_album_meta(a);
+    }
+
+    let seen_key = format!("newrel:seen:{uid}");
+    let previous_ids: Option<Vec<String>> = state
+        .store
+        .kv_get(&seen_key)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok());
+    let previous_set: Option<HashSet<String>> = previous_ids
+        .as_ref()
+        .map(|ids| ids.iter().cloned().collect());
+    let unseen: HashSet<String> = match &previous_set {
+        Some(prev) => new_releases
+            .iter()
+            .filter(|a| !prev.contains(&a.id))
+            .map(|a| a.id.clone())
+            .collect(),
+        // First visit: everything is "already seen" so we don't claim 12 new drops.
+        None => HashSet::new(),
+    };
+    let items: Vec<Value> = new_releases
+        .iter()
+        .map(|a| {
+            let mut value = album_json(a, saved.contains(&a.id));
+            if let Value::Object(map) = &mut value {
+                map.insert("isNew".to_string(), json!(unseen.contains(&a.id)));
+            }
+            value
+        })
+        .collect();
+
+    if advance {
+        let mut known = previous_ids.unwrap_or_default();
+        let mut known_set: HashSet<String> = known.iter().cloned().collect();
+        for a in &new_releases {
+            if known_set.insert(a.id.clone()) {
+                known.push(a.id.clone());
+            }
+        }
+        if known.len() > 1000 {
+            known = known.split_off(known.len() - 1000);
+        }
+        state.store.kv_set(
+            &seen_key,
+            &serde_json::to_string(&known).unwrap_or_else(|_| "[]".to_string()),
+        );
+    }
+
+    (items, unseen.len(), Utc::now().timestamp())
+}
+
+/// Lightweight re-check used by the Home section's Refresh button. It never
+/// advances the "seen" marker, so NEW badges stay until the next Home visit.
+pub async fn new_releases(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
+    let (items, unseen, checked_at) = build_new_releases(&state, user.id, &saved, false).await;
+    json_res(json!({
+        "newReleases": items,
+        "newReleaseUnseen": unseen,
+        "newReleaseCheckedAt": checked_at,
+    }))
+}
+
 pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
@@ -1847,10 +1956,8 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
 
-    let new_releases = collect_new_releases(&state, uid, 12).await;
-    for a in &new_releases {
-        let _ = state.store.upsert_album_meta(a);
-    }
+    let (new_releases_json, new_release_unseen, new_release_checked_at) =
+        build_new_releases(&state, uid, &saved, true).await;
 
     let moods: Vec<Value> = Mood::ALL
         .iter()
@@ -1874,7 +1981,9 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
 
     json_res(json!({
         "quickPicks": to_web_tracks(&state, uid, &quick_picks),
-        "newReleases": new_releases.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
+        "newReleases": new_releases_json,
+        "newReleaseUnseen": new_release_unseen,
+        "newReleaseCheckedAt": new_release_checked_at,
         "recent": to_web_tracks(&state, uid, &recent),
         "mixedForYou": json!(state.taste.mixed_for_you_cards(uid)),
         "madeForYou": auto_mixes,

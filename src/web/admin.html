@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Beatlab Admin</title>
+  <link rel="icon" type="image/svg+xml" href="/web/favicon.svg" />
+  <style>
+    :root {
+      --bg:#090a0d; --surface:#12141a; --surface-2:#1a1d26; --border:#272b36;
+      --text:#eef1f6; --muted:#9aa3b2; --dim:#666f80; --accent:#1ed760; --danger:#f43f5e;
+      --radius:10px; --radius-sm:7px;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    a { color:var(--accent); text-decoration:none; }
+    button { font:inherit; cursor:pointer; }
+    .hidden { display:none !important; }
+    header { display:flex; align-items:center; gap:14px; padding:14px 22px; border-bottom:1px solid var(--border); background:var(--surface); position:sticky; top:0; z-index:5; }
+    .brand { display:flex; align-items:center; gap:9px; font-weight:800; font-size:17px; }
+    .dot { width:11px; height:11px; border-radius:50%; background:var(--accent); display:inline-block; box-shadow:0 0 12px rgba(30,215,96,.6); }
+    .badge { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--accent); border:1px solid rgba(30,215,96,.35); background:rgba(30,215,96,.1); border-radius:99px; padding:3px 9px; }
+    .head-spacer { flex:1; }
+    .head-user { color:var(--muted); font-size:13px; }
+    main { max-width:1200px; margin:0 auto; padding:24px 20px 60px; }
+    .notice { padding:18px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); margin-bottom:18px; }
+    .notice h2 { margin:0 0 8px; font-size:18px; }
+    .tabs { display:flex; gap:6px; margin-bottom:22px; border-bottom:1px solid var(--border); }
+    .tab { border:0; background:none; color:var(--muted); padding:10px 15px; font-weight:600; border-bottom:2px solid transparent; }
+    .tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(165px,1fr)); gap:12px; margin-bottom:24px; }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:16px; }
+    .card .k { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+    .card .v { font-size:26px; font-weight:800; margin-top:6px; }
+    h2.section { font-size:15px; margin:26px 0 12px; }
+    table { width:100%; border-collapse:collapse; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+    th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); font-size:13px; vertical-align:middle; }
+    th { color:var(--muted); font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; background:var(--surface-2); }
+    tr:last-child td { border-bottom:0; }
+    tr:hover td { background:rgba(255,255,255,.02); }
+    .pill { font-size:11px; font-weight:700; padding:2px 7px; border-radius:99px; border:1px solid var(--border); color:var(--muted); white-space:nowrap; }
+    .pill.on { color:var(--accent); border-color:rgba(30,215,96,.35); background:rgba(30,215,96,.1); }
+    .pill.off { color:var(--dim); }
+    .pill.del { color:var(--danger); border-color:rgba(244,63,94,.35); background:rgba(244,63,94,.1); }
+    .actions { display:flex; gap:5px; flex-wrap:wrap; }
+    .mini { border:1px solid var(--border); background:var(--surface-2); color:var(--text); border-radius:6px; padding:5px 8px; font-size:11.5px; font-weight:600; }
+    .mini:hover { border-color:var(--accent); color:var(--accent); }
+    .mini.danger { color:var(--danger); border-color:rgba(244,63,94,.4); }
+    .mini.danger:hover { background:rgba(244,63,94,.12); }
+    .mini:disabled { opacity:.4; cursor:not-allowed; }
+    input[type=search] { width:100%; max-width:340px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:9px 12px; color:var(--text); outline:none; margin-bottom:14px; }
+    input[type=search]:focus { border-color:var(--accent); }
+    .event { display:flex; gap:12px; padding:10px 12px; border-bottom:1px solid var(--border); background:var(--surface); }
+    .event:first-child { border-radius:var(--radius) var(--radius) 0 0; }
+    .event:last-child { border-radius:0 0 var(--radius) var(--radius); border-bottom:0; }
+    .event .who { min-width:130px; font-weight:700; color:var(--accent); }
+    .event .what { flex:1; }
+    .event .when { color:var(--dim); font-size:12px; white-space:nowrap; }
+    .kv { display:flex; justify-content:space-between; gap:20px; padding:9px 0; border-bottom:1px solid var(--border); }
+    .kv:last-child { border-bottom:0; }
+    .kv span:first-child { color:var(--muted); }
+    .backdrop { position:fixed; inset:0; background:rgba(0,0,0,.7); display:flex; align-items:center; justify-content:center; padding:18px; z-index:20; }
+    .modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); width:min(720px,100%); max-height:86vh; overflow:auto; padding:20px; }
+    .modal h3 { margin:0 0 16px; }
+    .modal-head { display:flex; align-items:center; justify-content:space-between; }
+    .close { background:none; border:0; color:var(--muted); font-size:20px; }
+    .muted { color:var(--muted); }
+    #toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius); padding:10px 16px; z-index:40; }
+    @media (max-width:700px) { .actions { max-width:130px; } th:nth-child(n+5), td:nth-child(n+5) { display:none; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="dot"></span> Beatlab <span class="badge">Admin</span></div>
+    <div class="head-spacer"></div>
+    <span id="head-user" class="head-user"></span>
+    <a href="/">Back to app</a>
+    <button class="mini" onclick="signOut()">Sign out</button>
+  </header>
+
+  <main>
+    <div id="gate" class="notice hidden">
+      <h2 id="gate-title">Sign in required</h2>
+      <p id="gate-text" class="muted"></p>
+      <a href="/">Open the Beatlab player to sign in →</a>
+    </div>
+
+    <div id="panel" class="hidden">
+      <div class="tabs">
+        <button class="tab active" data-tab="overview" onclick="showTab('overview')">Overview</button>
+        <button class="tab" data-tab="users" onclick="showTab('users')">Users</button>
+        <button class="tab" data-tab="events" onclick="showTab('events')">Security Events</button>
+        <button class="tab" data-tab="config" onclick="showTab('config')">Configuration</button>
+      </div>
+
+      <section id="tab-overview">
+        <div id="overview-cards" class="cards"></div>
+        <h2 class="section">Recent activity</h2>
+        <div id="overview-events"></div>
+      </section>
+
+      <section id="tab-users" class="hidden">
+        <input id="user-search" type="search" placeholder="Search users…" oninput="renderUsers()" />
+        <div id="users-wrap"></div>
+      </section>
+
+      <section id="tab-events" class="hidden">
+        <div id="all-events"></div>
+      </section>
+
+      <section id="tab-config" class="hidden">
+        <div id="config-box" class="card"></div>
+      </section>
+    </div>
+  </main>
+
+  <div id="modal" class="backdrop hidden" onclick="if(event.target===this)closeModal()">
+    <div class="modal">
+      <div class="modal-head"><h3 id="modal-title">User details</h3><button class="close" onclick="closeModal()">✕</button></div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+  <div id="toast" class="hidden"></div>
+
+  <script>
+  (() => {
+    const $ = (id) => document.getElementById(id);
+    const state = { token: localStorage.getItem('beatlab_token') || '', users: [], overview: null, events: [], tab: 'overview' };
+    window.state = state;
+
+    const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const ago = (ts) => {
+      if (!ts) return 'never';
+      const s = Math.max(0, Math.floor(Date.now()/1000) - ts);
+      if (s < 60) return s + 's ago';
+      if (s < 3600) return Math.floor(s/60) + 'm ago';
+      if (s < 86400) return Math.floor(s/3600) + 'h ago';
+      return Math.floor(s/86400) + 'd ago';
+    };
+    const date = (ts) => ts ? new Date(ts*1000).toLocaleString() : '—';
+    function toast(msg) {
+      const el = $('toast'); el.textContent = msg; el.classList.remove('hidden');
+      clearTimeout(el._t); el._t = setTimeout(() => el.classList.add('hidden'), 3000);
+    }
+    async function api(path, opts = {}) {
+      const headers = Object.assign({ 'Content-Type':'application/json' }, opts.headers || {});
+      if (state.token) headers.Authorization = 'Bearer ' + state.token;
+      const r = await fetch(path, Object.assign({}, opts, { headers }));
+      const text = await r.text();
+      let data = {}; try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+      if (!r.ok) {
+        if (r.status === 401) gate('Sign in required', 'Your session is missing or expired.');
+        if (r.status === 403) gate('Administrator only', 'This account is not listed in ADMIN_USERNAME.');
+        throw new Error(data.error || ('Request failed (' + r.status + ')'));
+      }
+      return data;
+    }
+    function gate(title, text) {
+      $('panel').classList.add('hidden'); $('gate').classList.remove('hidden');
+      $('gate-title').textContent = title; $('gate-text').textContent = text;
+    }
+    window.api = api; window.toast = toast; window.esc = esc; window.ago = ago; window.date = date; window.gate = gate;
+
+    function eventRow(e) {
+      return '<div class="event"><span class="who">' + esc(e.username || e.detail) +
+        '</span><span class="what">' + esc(e.detail) +
+        (e.ip ? ' <span class="muted">· ' + esc(e.ip) + '</span>' : '') +
+        '</span><span class="when">' + esc(ago(e.created)) + '</span></div>';
+    }
+    window.eventRow = eventRow;
+
+    function cardsHtml(o) {
+      const items = [
+        ['Users', o.activeUsers, 'of ' + o.totalUsers + ' total'],
+        ['Pending deletion', o.deletedUsers, '7-day window'],
+        ['Active sessions', o.sessions, o.clientSessions + ' music clients'],
+        ['Tracks', o.tracks, 'in library'],
+        ['2FA users', o.totpUsers, o.passkeys + ' passkeys'],
+        ['Recovery codes', o.recoveryCodes, 'unused'],
+        ['Playlists', o.playlists, 'across accounts'],
+        ['Security events', o.securityEvents, 'recorded'],
+      ];
+      return items.map(([k,v,s]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="muted" style="font-size:11px">' + esc(s) + '</div></div>').join('');
+    }
+
+    window.renderOverview = () => {
+      const o = state.overview; if (!o) return;
+      $('overview-cards').innerHTML = cardsHtml(o);
+      const recent = (state.events || []).slice(0, 12);
+      $('overview-events').innerHTML = recent.length ? recent.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
+    };
+
+    window.renderUsers = () => {
+      const q = ($('user-search').value || '').toLowerCase().trim();
+      const rows = state.users.filter((u) => !q || u.username.toLowerCase().includes(q));
+      if (!rows.length) { $('users-wrap').innerHTML = '<p class="muted">No matching users.</p>'; return; }
+      let html = '<table><thead><tr><th>ID</th><th>User</th><th>Joined</th><th>Status</th><th>2FA</th><th>Activity</th><th style="width:320px">Actions</th></tr></thead><tbody>';
+      for (const u of rows) {
+        const status = u.deletedAt ? '<span class="pill del">Pending deletion</span>' : '<span class="pill on">Active</span>';
+        const twofa = [
+          u.totpEnabled ? '<span class="pill on">App</span>' : '',
+          u.passkeys ? '<span class="pill on">' + u.passkeys + ' key' + (u.passkeys>1?'s':'') + '</span>' : '',
+        ].filter(Boolean).join(' ') || '<span class="pill off">Off</span>';
+        const self = u.username.toLowerCase() === (state.username || '').toLowerCase();
+        const actions = [
+          '<button class="mini" onclick="userDetail(' + u.id + ')">Details</button>',
+          '<button class="mini" onclick="userAction(' + u.id + ',\'sessions\')">Sign out</button>',
+          '<button class="mini" onclick="userAction(' + u.id + ',\'2fa\')">Reset 2FA</button>',
+          '<button class="mini" onclick="userAction(' + u.id + ',\'key\')">Rotate key</button>',
+          u.deletedAt
+            ? '<button class="mini" onclick="userAction(' + u.id + ',\'restore\')">Restore</button><button class="mini danger" onclick="userAction(' + u.id + ',\'purge\')">Purge</button>'
+            : '<button class="mini danger" onclick="userAction(' + u.id + ',\'delete\')">Delete</button>',
+        ].join('');
+        html += '<tr><td>' + u.id + '</td><td><strong>' + esc(u.username) + '</strong>' + (u.isAdmin ? ' <span class="pill on">Admin</span>' : '') + '</td>' +
+          '<td>' + esc(date(u.created)) + '</td><td>' + status + '</td><td>' + twofa + '</td>' +
+          '<td>' + u.sessions + ' sessions<br><span class="muted">' + u.listens + ' tracks · ' + u.playlists + ' lists</span><br><span class="muted">Seen ' + esc(ago(u.lastSeen)) + '</span></td>' +
+          '<td><div class="actions">' + (self ? '<span class="muted">Your account</span>' : actions) + '</div></td></tr>';
+      }
+      $('users-wrap').innerHTML = html + '</table>';
+    };
+
+    window.userAction = async (id, action) => {
+      const labels = {
+        sessions: 'Sign out all sessions of this user?',
+        '2fa': 'Remove this user\'s authenticator, passkeys and recovery codes?',
+        key: 'Rotate this user\'s API key? Their music clients will need the new key.',
+        delete: 'Schedule this account for deletion? It can be restored for 7 days.',
+        restore: 'Restore this account now?',
+        purge: 'PERMANENTLY delete this account and all its data? This cannot be undone.',
+      };
+      if (!confirm(labels[action] || 'Continue?')) return;
+      const routes = {
+        sessions: '/sessions/revoke', '2fa': '/2fa/reset', key: '/api-key/regenerate',
+        delete: '/delete', restore: '/restore', purge: '/purge',
+      };
+      try {
+        const res = await api('/api/admin/users/' + id + routes[action], { method:'POST' });
+        if (res.apiKey) toast('New API key: ' + res.apiKey);
+        else toast('Done');
+        if (action === 'purge') state.users = state.users.filter((u) => u.id !== id);
+        await load();
+      } catch (e) { toast(e.message); }
+    };
+
+    window.closeModal = () => $('modal').classList.add('hidden');
+    window.userDetail = async (id) => {
+      try {
+        const d = await api('/api/admin/users/' + id);
+        const u = d.user;
+        const profile = d.profile || {};
+        $('modal-title').textContent = 'User: ' + u.username;
+        let html = '<div class="card" style="margin-bottom:16px">';
+        const kv = (k,v) => '<div class="kv"><span>' + k + '</span><span>' + esc(v) + '</span></div>';
+        html += kv('ID', u.id) + kv('Joined', date(u.created)) + kv('Last seen', ago(u.lastSeen));
+        html += kv('Status', u.deletedAt ? 'Pending deletion' : 'Active') + kv('Admin', u.isAdmin ? 'Yes' : 'No');
+        html += kv('2FA', [u.totpEnabled ? 'Authenticator' : '', u.passkeys ? u.passkeys + ' passkey(s)' : ''].filter(Boolean).join(' + ') || 'Off');
+        html += kv('Recovery codes left', u.recoveryLeft) + kv('Playlists', u.playlists) + kv('Starred tracks', u.stars);
+        html += kv('Tracks with history', u.listens) + kv('Active sessions', u.sessions);
+        html += kv('Display name', profile.displayName || '—') + kv('Location', profile.location || '—');
+        html += kv('Followers / following', (profile.followers || 0) + ' / ' + (profile.following || 0));
+        html += '</div><h2 class="section">Sessions</h2>';
+        html += d.sessions.length ? d.sessions.map((s) => '<div class="kv"><span>' + esc(s.kind) + ' · ' + esc(s.client || s.userAgent || 'unknown') + ' · ' + esc(s.ip || 'no IP') + '</span><span>' + esc(ago(s.lastSeen)) + (s.revoked ? ' · revoked' : '') + '</span></div>').join('') : '<p class="muted">No sessions.</p>';
+        html += '<h2 class="section">Security history</h2>';
+        html += d.events.length ? d.events.map(eventRow).join('') : '<p class="muted">No events.</p>';
+        $('modal-body').innerHTML = html;
+        $('modal').classList.remove('hidden');
+      } catch (e) { toast(e.message); }
+    };
+
+    window.showTab = (tab) => {
+      state.tab = tab;
+      document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+      ['overview','users','events','config'].forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
+    };
+
+    async function load() {
+      try {
+        const data = await api('/api/admin/overview');
+        state.overview = data;
+        $('head-user').textContent = 'Signed in as ' + (state.username || 'admin');
+        $('panel').classList.remove('hidden'); $('gate').classList.add('hidden');
+        const [users, events, config] = await Promise.all([
+          api('/api/admin/users'), api('/api/admin/events'), api('/api/admin/config'),
+        ]);
+        state.users = users.users || [];
+        state.events = events.events || [];
+        renderOverview();
+        renderUsers();
+        $('all-events').innerHTML = state.events.length ? state.events.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
+        $('config-box').innerHTML = Object.entries(config).map(([k,v]) => {
+          const label = k.replace(/([A-Z])/g,' $1').replace(/^./, (c) => c.toUpperCase());
+          return '<div class="kv"><span>' + esc(label) + '</span><span>' + esc(Array.isArray(v) ? v.join(', ') || '—' : v) + '</span></div>';
+        }).join('');
+      } catch (e) { toast(e.message); }
+    }
+
+    async function boot() {
+      if (!state.token) { gate('Sign in required', 'Sign in to the Beatlab player first, then open this page.'); return; }
+      try {
+        const s = await api('/api/admin/session');
+        if (!s.admin) { gate('Administrator only', 'This account is not listed in ADMIN_USERNAME.'); return; }
+        state.username = s.username;
+        await load();
+      } catch (e) { /* gate() already shown by api() */ }
+    }
+    window.signOut = () => {
+      localStorage.removeItem('beatlab_token');
+      state.token = '';
+      gate('Signed out', 'Sign in to the Beatlab player, then reopen this page.');
+    };
+    boot();
+  })();
+  </script>
+</body>
+</html>

@@ -912,7 +912,7 @@ pub fn render_share_html(
         <h3 id="auth-modal-title">Sign In or Sign Up</h3>
         <button class="icon-btn" onclick="ShareApp.closeAuth()">✕</button>
       </div>
-      <p style="font-size:13px;color:var(--text-muted)">Enter any username &amp; password to sign in or automatically create a brand-new Beatlab account.</p>
+      <p id="sa-desc" style="font-size:13px;color:var(--text-muted)">Sign in with your Beatlab username and password.</p>
       <form class="auth-form" onsubmit="ShareApp.submitAuth(event)">
         <label>
           <span>Username</span>
@@ -922,8 +922,12 @@ pub fn render_share_html(
           <span>Password</span>
           <input id="sa-pass" type="password" autocomplete="current-password" placeholder="Choose or enter password" required maxlength="256" />
         </label>
+        <label id="sa-confirm-row" class="hidden">
+          <span>Confirm password</span>
+          <input id="sa-confirm" type="password" autocomplete="new-password" placeholder="Enter your password again" required maxlength="256" />
+        </label>
         <div id="sa-err" class="auth-err hidden"></div>
-        <button type="submit" class="btn-primary" style="width:100%">Continue to Beatlab</button>
+        <button id="sa-submit" type="submit" class="btn-primary" style="width:100%">Sign in</button>
       </form>
     </div>
   </div>
@@ -957,6 +961,7 @@ pub fn render_share_html(
       lyricsReqToken: 0,
       token: localStorage.getItem('beatlab_token') || '',
       user: null,
+      authMode: 'signin',
     }};
 
     let audioCtx = null;
@@ -1446,7 +1451,16 @@ pub fn render_share_html(
         }}
       }},
       openAuth: (mode) => {{
-        $('auth-modal-title').textContent = mode === 'signup' ? 'Create Free Beatlab Account' : 'Sign In to Beatlab';
+        state.authMode = mode === 'signup' ? 'signup' : 'signin';
+        const signup = state.authMode === 'signup';
+        $('auth-modal-title').textContent = signup ? 'Create Free Beatlab Account' : 'Sign In to Beatlab';
+        $('sa-desc').textContent = signup
+          ? 'Pick a username and password, then enter the password again to confirm.'
+          : 'Sign in with your Beatlab username and password.';
+        $('sa-confirm-row').classList.toggle('hidden', !signup);
+        $('sa-confirm').required = signup;
+        if (!signup) $('sa-confirm').value = '';
+        $('sa-submit').textContent = signup ? 'Create account' : 'Sign in';
         $('sa-err').classList.add('hidden');
         $('auth-modal').classList.remove('hidden');
         setTimeout(() => $('sa-user')?.focus(), 50);
@@ -1456,11 +1470,20 @@ pub fn render_share_html(
         e.preventDefault();
         const err = $('sa-err');
         err.classList.add('hidden');
+        const signup = state.authMode === 'signup';
+        const username = $('sa-user').value.trim();
+        const password = $('sa-pass').value;
+        const confirmPassword = signup ? $('sa-confirm').value : '';
+        if (signup && password !== confirmPassword) {{
+          err.textContent = 'Passwords do not match';
+          err.classList.remove('hidden');
+          return;
+        }}
         try {{
-          const r = await fetch('/api/web/auth/signin', {{
+          const r = await fetch(signup ? '/api/web/auth/signup' : '/api/web/auth/signin', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ username: $('sa-user').value.trim(), password: $('sa-pass').value }}),
+            body: JSON.stringify(signup ? {{ username, password, confirmPassword }} : {{ username, password }}),
           }});
           const res = await r.json();
           if (!r.ok) throw new Error(res.error || 'Authentication failed');
