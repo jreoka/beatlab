@@ -2815,6 +2815,17 @@ impl TasteEngine {
         }
     }
 
+    /// Build a verified mix on demand for the first request of a query, so the
+    /// user never sees a "come back later" placeholder. Bounded by the caller.
+    pub async fn build_verified_mix(&self, query: &str) -> Option<crate::llm::VerifiedMix> {
+        let mut pool = self.deezer_genre_tracks_for_query(query).await;
+        if pool.len() < 8 {
+            return None;
+        }
+        dedup_tracks_by_id(&mut pool);
+        self.llm.curate_verified_mix(query, &pool).await
+    }
+
     /// Let the assistant rename/add/retire Moods & Vibes in the background.
     /// The built-in classifier stays intact — this only changes what the UI
     /// shows and which mood slugs get curated.
@@ -2989,7 +3000,7 @@ impl TasteEngine {
     /// Resolve a theme to Deezer's own genre taxonomy and pull its editorial
     /// chart. This is the only source that reliably returns real anime/J-pop
     /// tracks instead of uploads that merely say "anime" in the title.
-    async fn deezer_genre_tracks_for_query(&self, query: &str) -> Vec<Track> {
+    pub async fn deezer_genre_tracks_for_query(&self, query: &str) -> Vec<Track> {
         let q = query.trim().to_ascii_lowercase();
         if q.is_empty() {
             return Vec::new();

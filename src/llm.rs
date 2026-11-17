@@ -447,8 +447,19 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(store: Store) -> Self {
         let config = Arc::new(LlmConfig::from_env());
+        // Ask for plain responses explicitly: some OpenAI-compatible proxies
+        // send broken Content-Encoding headers, which makes reqwest's decoder
+        // fail with "error decoding response body" before we see any JSON.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
+            .default_headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                h.insert(
+                    reqwest::header::ACCEPT_ENCODING,
+                    reqwest::header::HeaderValue::from_static("identity"),
+                );
+                h
+            })
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let stats = store
@@ -464,6 +475,14 @@ impl LlmClient {
         }
         let research_http = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.research_timeout_ms))
+            .default_headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                h.insert(
+                    reqwest::header::ACCEPT_ENCODING,
+                    reqwest::header::HeaderValue::from_static("identity"),
+                );
+                h
+            })
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {

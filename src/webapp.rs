@@ -2488,14 +2488,26 @@ pub async fn instant_mix(
     let llm_query = query.clone();
     tokio::spawn(async move { llm_queue.queue_query(&llm_query); });
 
-    // Ground-up theme mix path: the assistant builds a verified mix from
-    // editorial sources in the background. The live request only reads that
-    // cached result — no keyword search, no YTM, no junk to re-rank.
+    // Theme mixes are built from editorial sources with AI verification —
+    // never from keyword search. On the first request we build it on demand
+    // (bounded); later requests just read the cache. No "come back later".
     let use_verified = !force_entity
         && (intent.is_theme_mix
             || (intent.entity_query.is_none() && query.split_whitespace().count() <= 3));
     if use_verified {
-        if let Some(verified) = state.taste.llm.cached_verified_mix(&query) {
+        let verified = match state.taste.llm.cached_verified_mix(&query) {
+            Some(v) => Some(v),
+            None => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    state.taste.build_verified_mix(&query),
+                )
+                .await
+                .ok()
+                .flatten()
+            }
+        };
+        if let Some(verified) = verified {
             let tracks = state
                 .store
                 .get_tracks_by_ids(&verified.track_ids)
@@ -2528,13 +2540,8 @@ pub async fn instant_mix(
                 }));
             }
         }
-        // Nothing verified yet — say so instead of shipping keyword-search junk.
-        return json_res(json!({
-            "query": query,
-            "instantMix": Value::Null,
-            "status": "curating",
-            "refinements": { "detectedIntent": "Building a verified mix from curated sources…" },
-        }));
+        // AI build failed — fall through to the deterministic path rather than
+        // showing a "building" placeholder.
     }
 
     let mix_future = async {
