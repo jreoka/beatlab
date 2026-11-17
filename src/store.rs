@@ -3531,6 +3531,32 @@ impl Store {
         Ok(rows)
     }
 
+    /// Slug-based variant used for AI-invented moods that have no enum value.
+    pub fn tracks_by_mood_slug(
+        &self,
+        slug: &str,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<Track>> {
+        let conn = self.lock();
+        let pat = format!("%,{},%", slug.trim().to_ascii_lowercase());
+        let sql = format!(
+            "SELECT {} FROM tracks
+             WHERE (',' || lower(moods) || ',') LIKE ?1
+             ORDER BY
+               (CASE WHEN trim(genre) != '' THEN 2 ELSE 0 END)
+               + (CASE WHEN source = 'local' THEN 2 WHEN deezer_id != '' THEN 1 ELSE 0 END) DESC,
+               created DESC
+             LIMIT ?2 OFFSET ?3",
+            TRACK_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![pat, limit as i64, offset as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Returns up to `limit` distinct tracks from a user's listening history that are missing
     /// `genre` or `year`, ordered by most recently played so stats enrichment can hydrate them.
     pub fn user_tracks_missing_metadata(&self, user_id: i64, limit: usize) -> AppResult<Vec<Track>> {
@@ -4391,7 +4417,7 @@ impl Store {
         for (id, kind) in rows {
             let part = kind.split(':').nth(2).unwrap_or("");
             let name = if part == "supermix" {
-                "Daily Mix Supermix".to_string()
+                "Daily Supermix".to_string()
             } else {
                 format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
             };
@@ -5105,6 +5131,29 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         );
+    }
+
+    pub fn load_mood_catalog(&self) -> Vec<crate::models::MoodDef> {
+        if let Some(raw) = self.kv_get("moods:catalog:v1") {
+            if let Ok(defs) = serde_json::from_str::<Vec<crate::models::MoodDef>>(&raw) {
+                if !defs.is_empty() {
+                    return defs;
+                }
+            }
+        }
+        let defs: Vec<crate::models::MoodDef> = Mood::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, m)| crate::models::MoodDef::from_builtin(*m, i))
+            .collect();
+        self.save_mood_catalog(&defs);
+        defs
+    }
+
+    pub fn save_mood_catalog(&self, defs: &[crate::models::MoodDef]) {
+        if let Ok(raw) = serde_json::to_string(defs) {
+            self.kv_set("moods:catalog:v1", &raw);
+        }
     }
 
     // -------------------------------------------------------------------------

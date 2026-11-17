@@ -33,6 +33,7 @@ const MIX_CACHE_PREFIX: &str = "llm:mix:v2:";
 const META_CACHE_PREFIX: &str = "llm:meta:v1:";
 const POOL_CACHE_PREFIX: &str = "llm:pool:v1:";
 const QUERY_EXP_PREFIX: &str = "llm:qexp:v1:";
+const SEARCH_ANSWER_PREFIX: &str = "llm:answer:v1:";
 const MIX_CACHE_TTL_SECS: i64 = 14 * 24 * 3600;
 const PLAN_CACHE_PREFIX: &str = "llm:plan:v1:";
 const PLAN_PENDING_KV_KEY: &str = "llm:pending_plans:v1";
@@ -307,6 +308,42 @@ pub struct MetaSuggestion {
     pub genre: String,
     pub year: i32,
     pub moods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MoodCatalogChange {
+    pub renames: HashMap<String, String>,
+    pub subtitles: HashMap<String, String>,
+    pub remove: Vec<String>,
+    pub add: Vec<MoodSuggestion>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MoodSuggestion {
+    pub slug: String,
+    pub label: String,
+    pub subtitle: String,
+    pub c1: String,
+    pub c2: String,
+}
+
+/// LLM resolution of a descriptive/lyrical search query into concrete
+/// song and artist names. Cached so live search only reads SQLite.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SearchAnswer {
+    pub tracks: Vec<SearchTrackRef>,
+    pub artists: Vec<String>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SearchTrackRef {
+    pub title: String,
+    pub artist: String,
 }
 
 /// A short result from the optional background web-research tool.
@@ -898,10 +935,12 @@ impl LlmClient {
             return Some(ids);
         }
         let listing = track_lines(tracks, 36);
-        let system = "You curate a music mix. Return ONLY a JSON object with key \"trackIds\": \
-            an array of ids chosen ONLY from the supplied list, best first (at least 8, at most 40). \
-            Add \"title\" and \"subtitle\" for the mix. Reject covers, karaoke, slowed/reverb and \
-            title-word collisions. Never invent an id.";
+        let system = "You curate a music mix with high precision. Return ONLY a JSON object with \
+            key \"trackIds\": an array of ids chosen ONLY from the supplied list, best first. \
+            Prefer 8-20 genuinely on-theme ids — return fewer rather than padding with weak matches. \
+            Add \"title\" and \"subtitle\" for the mix. Reject covers, karaoke, slowed/reverb, \
+            phonk/novelty edits, tracks with unrelated foreign-language titles when the theme is \
+            specific, and anything whose genre or scene does not match the theme. Never invent an id.";
         let user = format!("Mix theme: {query}\n\nCandidates:\n{listing}\n\nJSON:");
         let value = self.chat_json("pool", system, &user).await?;
         let allowed: HashSet<&str> = tracks.iter().map(|t| t.id.as_str()).collect();
@@ -959,6 +998,183 @@ impl LlmClient {
         self.cache_set(&key, &queries);
         self.bump_cache_writes();
         queries
+    }
+
+    /// Background-only: propose renames, new moods and removals for the
+    /// Moods & Vibes catalog. Results are cached for a week so the catalog
+    /// doesn't churn on every curator tick.
+    pub async fn curate_mood_catalog(
+        &self,
+        current: &[crate::models::MoodDef],
+    ) -> Option<MoodCatalogChange> {
+        if !self.enabled() || current.is_empty() {
+            return None;
+        }
+        let key = "llm:mood_catalog:v1";
+        if let Some(cached) = self.cache_get::<MoodCatalogChange>(key, 7 * 24 * 3600) {
+            return Some(cached);
+        }
+        let catalog_json = serde_json::to_string(current).unwrap_or_default();
+        let system = "You design the Moods & Vibes sections of a music app. Review the current \
+            catalog and propose improvements: clearer labels/subtitles, up to 3 genuinely new \
+            moods the library could support (with hex colors), and moods that are redundant or \
+            useless. Keep at least 5 moods total and at most 16. Return ONLY a JSON object with \
+            keys: renames (object slug -> new label), subtitles (object slug -> new subtitle), \
+            remove (array of slugs), add (array of {slug,label,subtitle,c1,c2}). Slugs must be \
+            lowercase ascii letters/digits/underscore, max 24 chars. Only use slugs that exist \
+            in the catalog for renames/subtitles/remove.";
+        let user = format!("Current catalog:\n{catalog_json}\n\nJSON:");
+        let value = self.chat_json("mood_catalog", system, &user).await?;
+        let strings = |key: &str| -> HashMap<String, String> {
+            value
+                .get(key)
+                .and_then(Value::as_object)
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| {
+                            let text = truncate(v.as_str().unwrap_or("").trim(), 80);
+                            (!text.is_empty()).then(|| (k.clone(), text))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let valid_slug = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 24
+                && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        let change = MoodCatalogChange {
+            renames: strings("renames"),
+            subtitles: strings("subtitles"),
+            remove: value
+                .get("remove")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .filter(|s| valid_slug(s))
+                        .take(4)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            add: value
+                .get("add")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|item| {
+                            let slug = item.get("slug").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                            if !valid_slug(&slug) {
+                                return None;
+                            }
+                            let label = truncate(item.get("label").and_then(Value::as_str).unwrap_or("").trim(), 50);
+                            if label.is_empty() {
+                                return None;
+                            }
+                            let hex = |k: &str| {
+                                let v = item.get(k).and_then(Value::as_str).unwrap_or("").trim();
+                                if v.len() == 7 && v.starts_with('#') && v[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+                                    v.to_string()
+                                } else {
+                                    "#6366f1".to_string()
+                                }
+                            };
+                            Some(MoodSuggestion {
+                                slug,
+                                label,
+                                subtitle: truncate(item.get("subtitle").and_then(Value::as_str).unwrap_or("").trim(), 120),
+                                c1: hex("c1"),
+                                c2: hex("c2"),
+                            })
+                        })
+                        .take(3)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        self.cache_set(key, &change);
+        self.bump_cache_writes();
+        Some(change)
+    }
+
+    pub fn cached_search_answer(&self, query: &str) -> Option<SearchAnswer> {
+        if !self.enabled() {
+            return None;
+        }
+        self.cache_get(
+            &format!("{}{}", SEARCH_ANSWER_PREFIX, slug(query)),
+            30 * 24 * 3600,
+        )
+    }
+
+    /// Background-only: turn a descriptive search ("that Queen song about the
+    /// poor boy from a poor family") into concrete song/artist names.
+    pub async fn resolve_search_intent(&self, query: &str) -> Option<SearchAnswer> {
+        if !self.enabled() || query.trim().is_empty() {
+            return None;
+        }
+        let key = format!("{}{}", SEARCH_ANSWER_PREFIX, slug(query));
+        if let Some(cached) = self.cache_get::<SearchAnswer>(&key, 30 * 24 * 3600) {
+            return Some(cached);
+        }
+        let system = "You resolve music searches. The listener may describe a song by its lyrics, \
+            story, mood or scene instead of its title. Work out the exact song(s) and artist(s) \
+            they mean. Return ONLY a JSON object with keys: tracks (array of {title, artist}, at \
+            most 3), artists (array of at most 3 exact artist names), note (one short sentence \
+            explaining the match). Example: 'queen song poor boy from poor family' -> \
+            Bohemian Rhapsody by Queen. Use research if genuinely unsure.";
+        let user = format!("Search request: {query}\n\nJSON:");
+        let Some(mut value) = self.chat_json("search_intent", system, &user).await else {
+            return None;
+        };
+        if let Some(researched) = self
+            .research_followup(&value, system, &user, "search_intent_research")
+            .await
+        {
+            value = researched;
+        }
+        let tracks: Vec<SearchTrackRef> = value
+            .get("tracks")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|item| {
+                        let title = truncate(item.get("title").and_then(Value::as_str).unwrap_or("").trim(), 100);
+                        let artist = truncate(item.get("artist").and_then(Value::as_str).unwrap_or("").trim(), 100);
+                        (!title.is_empty() && !artist.is_empty()).then(|| SearchTrackRef { title, artist })
+                    })
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let artists: Vec<String> = value
+            .get("artists")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| truncate(s.trim(), 100))
+                    .filter(|s| !s.is_empty())
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if tracks.is_empty() && artists.is_empty() {
+            return None;
+        }
+        let answer = SearchAnswer {
+            tracks,
+            artists,
+            note: truncate(
+                value.get("note").and_then(Value::as_str).unwrap_or("").trim(),
+                160,
+            ),
+        };
+        self.cache_set(&key, &answer);
+        self.bump_cache_writes();
+        Some(answer)
     }
 
     /// Background-only: name real artists/songs that genuinely fit a theme.

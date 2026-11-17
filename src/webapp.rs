@@ -1862,6 +1862,38 @@ async fn build_new_releases(
     (items, unseen.len(), Utc::now().timestamp())
 }
 
+/// Moods & Vibes tiles come from the AI-curated catalog, not the hardcoded
+/// enum, so renames/new moods/removals show up everywhere immediately.
+fn mood_catalog_tiles(state: &AppState, uid: i64) -> Vec<Value> {
+    let mut catalog: Vec<crate::models::MoodDef> = state
+        .store
+        .load_mood_catalog()
+        .into_iter()
+        .filter(|d| d.enabled)
+        .collect();
+    catalog.sort_by_key(|d| d.order);
+    catalog
+        .into_iter()
+        .map(|d| {
+            let (track_count, covers) = state.taste.curated_mood_preview_for_slug(&d.slug);
+            let mood_subtitle = state
+                .taste
+                .llm_plan_text("mood", &format!("{}:{}", uid, d.slug))
+                .and_then(|(_, s)| (!s.trim().is_empty()).then(|| s.trim().to_string()))
+                .unwrap_or_else(|| d.subtitle.clone());
+            json!({
+                "slug": d.slug,
+                "label": d.label,
+                "subtitle": mood_subtitle,
+                "c1": d.c1,
+                "c2": d.c2,
+                "trackCount": track_count,
+                "covers": covers,
+            })
+        })
+        .collect()
+}
+
 pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
@@ -1949,27 +1981,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     let (new_releases_json, new_release_unseen, new_release_checked_at) =
         build_new_releases(&state, uid, &saved).await;
 
-    let moods: Vec<Value> = Mood::ALL
-        .iter()
-        .map(|m| {
-            let (c1, c2) = m.gradient();
-            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
-            let mood_subtitle = state
-                .taste
-                .llm_plan_text("mood", &format!("{}:{}", uid, m.slug()))
-                .and_then(|(_, s)| (!s.trim().is_empty()).then(|| s.trim().to_string()))
-                .unwrap_or_else(|| m.subtitle().to_string());
-            json!({
-                "slug": m.slug(),
-                "label": m.label(),
-                "subtitle": mood_subtitle,
-                "c1": c1,
-                "c2": c2,
-                "trackCount": track_count,
-                "covers": covers,
-            })
-        })
-        .collect();
+    let moods = mood_catalog_tiles(&state, uid);
 
     let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
     let recommended_artists = state.taste.recommended_artists_for_user(uid, 12);
@@ -2014,27 +2026,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         let _ = state.store.upsert_artist_meta(ar);
     }
 
-    let moods: Vec<Value> = Mood::ALL
-        .iter()
-        .map(|m| {
-            let (c1, c2) = m.gradient();
-            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
-            let mood_subtitle = state
-                .taste
-                .llm_plan_text("mood", &format!("{}:{}", uid, m.slug()))
-                .and_then(|(_, s)| (!s.trim().is_empty()).then(|| s.trim().to_string()))
-                .unwrap_or_else(|| m.subtitle().to_string());
-            json!({
-                "slug": m.slug(),
-                "label": m.label(),
-                "subtitle": mood_subtitle,
-                "c1": c1,
-                "c2": c2,
-                "trackCount": track_count,
-                "covers": covers,
-            })
-        })
-        .collect();
+    let moods = mood_catalog_tiles(&state, uid);
 
     let mut decades: Vec<Value> = Vec::new();
     for spec in crate::taste::EXPLORE_MIX_SPECS {
@@ -2239,19 +2231,27 @@ pub async fn mood_mix(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some(mood) = Mood::from_slug(&slug_str) else {
+    let def = state
+        .store
+        .load_mood_catalog()
+        .into_iter()
+        .find(|d| d.enabled && d.slug == slug_str.to_ascii_lowercase().replace('-', "_"));
+    let Some(def) = def else {
         return err_res(StatusCode::NOT_FOUND, "Mood not found");
     };
-    let tracks = state.taste.mood_mix_tracks(user.id, mood, 35).await;
-    let (c1, c2) = mood.gradient();
+    let tracks = if let Some(builtin) = Mood::from_slug(&def.slug) {
+        state.taste.mood_mix_tracks(user.id, builtin, 35).await
+    } else {
+        state.taste.mood_mix_tracks_by_slug(user.id, &def.slug, 35).await
+    };
     let match_ids = personal_match_ids(&state, user.id);
     json_res(json!({
         "mood": {
-            "slug": mood.slug(),
-            "label": mood.label(),
-            "subtitle": mood.subtitle(),
-            "c1": c1,
-            "c2": c2,
+            "slug": def.slug,
+            "label": def.label,
+            "subtitle": def.subtitle,
+            "c1": def.c1,
+            "c2": def.c2,
         },
         "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
     }))
@@ -2962,6 +2962,13 @@ async fn build_search_response_with_options(
     refined.tracks = state
         .taste
         .llm_rank_cached("search", &query, std::mem::take(&mut refined.tracks));
+    // If the assistant resolved a descriptive/lyrical query to a concrete
+    // song or artist, pin those matches at the top (cached read only).
+    if let Some(answer) = state.taste.llm.cached_search_answer(&query) {
+        refined.tracks = state
+            .taste
+            .apply_search_answer(&answer, std::mem::take(&mut refined.tracks));
+    }
     // The assistant also writes the search UI copy — suggestions are the
     // alternate queries it produced while warming this search in background.
     if let Some(plan) = state.taste.llm.cached_plan("search", &query) {
@@ -3304,6 +3311,26 @@ fn format_instant_mix_response(
 /// kicks off a background task to compute it for the next request. This keeps
 /// the response path free of model latency while still letting the assistant
 /// drive instant mixes once it has had a moment to work.
+/// The exact candidate set used to BUILD a mix plan must also be used to APPLY
+/// it. If those differ, the plan's track ids won't match and it does nothing —
+/// which is why an "AI-curated" mix could look identical to the old one.
+fn llm_mix_candidates(state: &AppState, query: &str, mix_tracks: &[Track]) -> Vec<Track> {
+    let normalized = crate::models::slug(query);
+    let mut candidates: Vec<Track> = state
+        .taste
+        .load_curated_query_tracks(&normalized)
+        .into_iter()
+        .chain(state.store.search_tracks(query, 40, 0).unwrap_or_default())
+        .collect();
+    for t in mix_tracks {
+        if !candidates.iter().any(|existing| existing.id == t.id) {
+            candidates.push(t.clone());
+        }
+    }
+    candidates.truncate(48);
+    candidates
+}
+
 fn maybe_apply_llm_mix(
     state: &AppState,
     query: &str,
@@ -3313,17 +3340,28 @@ fn maybe_apply_llm_mix(
     if !llm.enabled() {
         return;
     }
+    let Some(mix) = refined.instant_mix.as_mut() else {
+        return;
+    };
+    let candidates = llm_mix_candidates(state, query, &mix.tracks);
+    if candidates.len() < 4 {
+        return;
+    }
     if let Some(plan) = llm.cached_mix(query) {
-        if let Some(mix) = refined.instant_mix.as_mut() {
-            if !plan.title.trim().is_empty() {
-                mix.title = plan.title.trim().to_string();
-            }
-            if !plan.subtitle.trim().is_empty() {
-                mix.subtitle = plan.subtitle.trim().to_string();
-            }
-            let tracks = crate::llm::apply_mix_plan(&plan, std::mem::take(&mut mix.tracks));
-            mix.total_duration = tracks.iter().map(|t| t.duration.max(0)).sum();
-            mix.tracks = tracks;
+        let before: Vec<String> = mix.tracks.iter().map(|t| t.id.clone()).collect();
+        let tracks = crate::llm::apply_mix_plan(&plan, candidates);
+        let after: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+        let changed = before != after;
+        if !plan.title.trim().is_empty() {
+            mix.title = plan.title.trim().to_string();
+        }
+        if !plan.subtitle.trim().is_empty() {
+            mix.subtitle = plan.subtitle.trim().to_string();
+        }
+        mix.total_duration = tracks.iter().map(|t| t.duration.max(0)).sum();
+        mix.tracks = tracks;
+        // Only claim AI curation when the plan actually changed the selection.
+        if changed {
             mix.subtitle = format!("✦ AI-curated · {}", mix.subtitle);
         }
         for extra in plan.extra_queries {
@@ -3331,34 +3369,11 @@ fn maybe_apply_llm_mix(
         }
         return;
     }
-    if let Some(mix) = refined.instant_mix.as_ref() {
-        if mix.tracks.len() >= 4 {
-            // Give the model a much wider pool than the deterministic mix:
-            // locally indexed matches plus whatever the background curator
-            // already prepared for this query. Otherwise it can only shuffle
-            // the same handful of mediocre candidates.
-            let normalized = crate::models::slug(query);
-            let mut candidates: Vec<Track> = state
-                .taste
-                .load_curated_query_tracks(&normalized)
-                .into_iter()
-                .chain(state.store.search_tracks(query, 40, 0).unwrap_or_default())
-                .collect();
-            // The model only sees the first 32 candidates — put the AI-curated
-            // pool first or the good tracks are hidden behind playlist noise.
-            for t in &mix.tracks {
-                if !candidates.iter().any(|existing| existing.id == t.id) {
-                    candidates.push(t.clone());
-                }
-            }
-            candidates.truncate(48);
-            let llm = llm.clone();
-            let q = query.to_string();
-            tokio::spawn(async move {
-                let _ = llm.enhance_mix(&q, &candidates).await;
-            });
-        }
-    }
+    let llm = llm.clone();
+    let q = query.to_string();
+    tokio::spawn(async move {
+        let _ = llm.enhance_mix(&q, &candidates).await;
+    });
 }
 
 #[cfg(test)]

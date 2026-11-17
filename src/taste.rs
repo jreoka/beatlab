@@ -696,7 +696,11 @@ pub fn find_explore_mix_spec(key: &str) -> Option<&'static ExploreMixSpec> {
 }
 
 fn mood_cache_key(mood: Mood) -> String {
-    format!("curated:mood:v2:{}", mood.slug())
+    mood_cache_key_slug(mood.slug())
+}
+
+fn mood_cache_key_slug(slug: &str) -> String {
+    format!("curated:mood:v2:{}", slug)
 }
 
 fn mood_user_cache_key(user_id: i64, mood: Mood) -> String {
@@ -2024,7 +2028,7 @@ impl TasteEngine {
         let _ = self.store.upsert_auto_playlist(
             &Self::mixed_for_you_playlist_id(user_id, slug, "supermix"),
             user_id,
-            "Daily Mix Supermix",
+            "Daily Supermix",
             "The best of your Daily Mixes, refreshed once a day by the background curator",
             &Self::mixed_for_you_kind(slug, "supermix"),
             &super_ids,
@@ -2121,7 +2125,7 @@ impl TasteEngine {
             // playlist name — older rows still say "Party Mix 1" until the
             // next daily rebuild, but the card must show Daily Mix now.
             let display_title = if is_super {
-                "Daily Mix Supermix".to_string()
+                "Daily Supermix".to_string()
             } else {
                 format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
             };
@@ -2129,7 +2133,7 @@ impl TasteEngine {
                 id: p.id,
                 title: display_title,
                 art_title: if is_super {
-                    "Daily Mix Supermix".to_string()
+                    "Daily Supermix".to_string()
                 } else {
                     "Daily Mix".to_string()
                 },
@@ -2507,6 +2511,18 @@ impl TasteEngine {
         (tracks.len(), covers)
     }
 
+    /// Preview for any catalog mood slug, including AI-invented ones.
+    pub fn curated_mood_preview_for_slug(&self, slug: &str) -> (usize, Vec<String>) {
+        let ids = self.load_curated_pool_ids(&mood_cache_key_slug(slug), 24 * 3600);
+        let tracks = if !ids.is_empty() {
+            self.store.get_tracks_by_ids(&ids).unwrap_or_default()
+        } else {
+            self.store.tracks_by_mood_slug(slug, 30, 0).unwrap_or_default()
+        };
+        Self::preview_from_tracks(&tracks)
+    }
+
+    #[allow(dead_code)]
     pub fn curated_mood_preview(&self, mood: Mood) -> (usize, Vec<String>) {
         let ids = self.load_curated_pool_ids(&mood_cache_key(mood), 24 * 3600);
         let tracks = if !ids.is_empty() {
@@ -2517,6 +2533,7 @@ impl TasteEngine {
         Self::preview_from_tracks(&tracks)
     }
 
+    #[allow(dead_code)]
     pub fn curated_mood_preview_for_user(&self, user_id: i64, mood: Mood) -> (usize, Vec<String>) {
         if user_id > 0 {
             let user_ids = self.load_curated_pool_ids(&mood_user_cache_key(user_id, mood), 12 * 3600);
@@ -2615,17 +2632,19 @@ impl TasteEngine {
             .kv_get("curator:last_tick_at")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
-        let ready_moods = Mood::ALL
+        let catalog = self.store.load_mood_catalog();
+        let ready_moods = catalog
             .iter()
-            .filter(|&&m| {
-                !self
-                    .load_curated_pool_ids(&mood_cache_key(m), 24 * 3600)
-                    .is_empty()
-                    || !self
-                        .store
-                        .tracks_by_mood(m, 1, 0)
-                        .unwrap_or_default()
+            .filter(|d| {
+                d.enabled
+                    && (!self
+                        .load_curated_pool_ids(&mood_cache_key_slug(&d.slug), 24 * 3600)
                         .is_empty()
+                        || !self
+                            .store
+                            .tracks_by_mood_slug(&d.slug, 1, 0)
+                            .unwrap_or_default()
+                            .is_empty())
             })
             .count();
         let ready_mixes = EXPLORE_MIX_SPECS
@@ -2637,7 +2656,7 @@ impl TasteEngine {
             "lastRunAt": last_run,
             "catalogTracks": self.store.count_tracks().unwrap_or(0),
             "readyMoods": ready_moods,
-            "totalMoods": Mood::ALL.len(),
+            "totalMoods": catalog.len(),
             "readyMixes": ready_mixes,
             "totalMixes": EXPLORE_MIX_SPECS.len(),
             "transformer": self.neural.status_snapshot(),
@@ -2664,6 +2683,9 @@ impl TasteEngine {
         }
         if tick % 8 == 0 {
             self.llm_retag_rotation(tick).await;
+        }
+        if tick % 16 == 0 {
+            self.llm_apply_mood_catalog().await;
         }
         self.llm_curate_one_pool(tick).await;
         self.llm_warm_search_pools().await;
@@ -2696,7 +2718,8 @@ impl TasteEngine {
             return;
         }
         let by_id: HashMap<String, &Track> = tracks.iter().map(|t| (t.id.clone(), t)).collect();
-        let valid_moods: HashSet<&str> = Mood::ALL.iter().map(|m| m.slug()).collect();
+        let catalog = self.store.load_mood_catalog();
+        let valid_moods: HashSet<&str> = catalog.iter().map(|d| d.slug.as_str()).collect();
         let mut updated = Vec::new();
         for suggestion in suggestions {
             let Some(base) = by_id.get(&suggestion.track_id) else {
@@ -2754,7 +2777,8 @@ impl TasteEngine {
             .iter()
             .map(|t| (t.id.clone(), t))
             .collect();
-        let valid_moods: HashSet<&str> = Mood::ALL.iter().map(|m| m.slug()).collect();
+        let catalog = self.store.load_mood_catalog();
+        let valid_moods: HashSet<&str> = catalog.iter().map(|d| d.slug.as_str()).collect();
         let mut updated = Vec::new();
         for s in suggestions {
             let Some(base) = by_id.get(&s.track_id) else {
@@ -2791,19 +2815,88 @@ impl TasteEngine {
         }
     }
 
+    /// Let the assistant rename/add/retire Moods & Vibes in the background.
+    /// The built-in classifier stays intact — this only changes what the UI
+    /// shows and which mood slugs get curated.
+    async fn llm_apply_mood_catalog(&self) {
+        let mut catalog = self.store.load_mood_catalog();
+        let Some(change) = self.llm.curate_mood_catalog(&catalog).await else {
+            return;
+        };
+        let existing: HashMap<String, usize> = catalog
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.slug.clone(), i))
+            .collect();
+        for (slug, label) in change.renames {
+            if let Some(&idx) = existing.get(&slug) {
+                catalog[idx].label = label;
+            }
+        }
+        for (slug, subtitle) in change.subtitles {
+            if let Some(&idx) = existing.get(&slug) {
+                catalog[idx].subtitle = subtitle;
+            }
+        }
+        let removed: HashSet<&str> = change.remove.iter().map(String::as_str).collect();
+        if catalog.len() > 5 {
+            catalog.retain(|d| !removed.contains(d.slug.as_str()));
+        }
+        for suggestion in change.add {
+            if existing.contains_key(&suggestion.slug)
+                || catalog.iter().any(|d| d.slug == suggestion.slug)
+                || catalog.len() >= 16
+            {
+                continue;
+            }
+            catalog.push(crate::models::MoodDef {
+                slug: suggestion.slug,
+                label: suggestion.label,
+                subtitle: suggestion.subtitle,
+                c1: suggestion.c1,
+                c2: suggestion.c2,
+                built_in: None,
+                enabled: true,
+                order: catalog.len(),
+            });
+        }
+        if catalog.len() < 5 {
+            return;
+        }
+        self.store.save_mood_catalog(&catalog);
+        info!(moods = catalog.len(), "AI curator refreshed the Moods & Vibes catalog");
+    }
+
     /// Let the model re-rank one mood or Explore pool per tick, replacing the
     /// deterministic curated IDs only when it returns a healthy selection.
     async fn llm_curate_one_pool(&self, tick: usize) {
         let (cache_key, label, query, mut candidates) = if tick % 2 == 0 {
-            let mood = Mood::ALL[(tick / 2) % Mood::ALL.len()];
-            let cache_key = mood_cache_key(mood);
+            let catalog: Vec<crate::models::MoodDef> = self
+                .store
+                .load_mood_catalog()
+                .into_iter()
+                .filter(|d| d.enabled)
+                .collect();
+            if catalog.is_empty() {
+                return;
+            }
+            let def = &catalog[(tick / 2) % catalog.len()];
+            let cache_key = mood_cache_key_slug(&def.slug);
             let cached = self.load_curated_pool_ids(&cache_key, 0);
             let mut tracks = self.store.get_tracks_by_ids(&cached).unwrap_or_default();
-            tracks.extend(self.store.tracks_by_mood(mood, 40, 0).unwrap_or_default());
+            tracks.extend(
+                self.store
+                    .tracks_by_mood_slug(&def.slug, 40, 0)
+                    .unwrap_or_default(),
+            );
             (
                 cache_key,
-                format!("mood:{}", mood.slug()),
-                format!("{} music", mood.label()),
+                format!("mood:{}", def.slug),
+                if def.subtitle.trim().is_empty() {
+                    format!("{} music", def.label)
+                } else {
+                    def.subtitle.clone()
+                },
                 tracks,
             )
         } else {
@@ -2840,7 +2933,14 @@ impl TasteEngine {
         }
         for query in queries {
             let expansions = self.llm.query_expansions(&query).await;
-            let seeds = self.llm.discover_seed_artists(&query).await;
+            let mut seed_names = self.llm.discover_seed_artists(&query).await;
+            let answer = self.llm.resolve_search_intent(&query).await;
+            if let Some(ref answer) = answer {
+                for track in &answer.tracks {
+                    seed_names.push(format!("{} {}", track.title, track.artist));
+                }
+                seed_names.extend(answer.artists.iter().cloned());
+            }
             let mut search_queries = vec![query.clone()];
             search_queries.extend(expansions);
             let mut pool = self.load_curated_query_tracks(&query);
@@ -2859,9 +2959,9 @@ impl TasteEngine {
             // art on unrelated tracks. Fetch the actual artists/songs the
             // assistant named so the pool contains genuinely on-theme music.
             let mut seed_tracks: Vec<Track> = Vec::new();
-            if !seeds.is_empty() {
+            if !seed_names.is_empty() {
                 use crate::sources::MusicSource;
-                let lookups = futures::future::join_all(seeds.iter().take(8).map(|name| async {
+                let lookups = futures::future::join_all(seed_names.iter().take(8).map(|name| async {
                     let dz = tokio::time::timeout(
                         std::time::Duration::from_secs(8),
                         self.sources.deezer.search_tracks(name, 12),
@@ -2986,6 +3086,56 @@ impl TasteEngine {
 
     pub fn llm_plan_text(&self, scope: &str, context: &str) -> Option<(String, String)> {
         self.llm.plan_text(scope, context)
+    }
+
+    /// Move tracks the assistant identified for a descriptive query (or the
+    /// artist it named) to the top of the search results. Zero model latency.
+    pub fn apply_search_answer(
+        &self,
+        answer: &crate::llm::SearchAnswer,
+        tracks: Vec<Track>,
+    ) -> Vec<Track> {
+        if answer.tracks.is_empty() && answer.artists.is_empty() {
+            return tracks;
+        }
+        let track_norm: Vec<(String, String)> = answer
+            .tracks
+            .iter()
+            .map(|r| (slug(&r.title), slug(&r.artist)))
+            .collect();
+        let artist_norm: HashSet<String> = answer
+            .artists
+            .iter()
+            .map(|a| slug(a))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut matches: Vec<Track> = Vec::new();
+        let mut rest = Vec::new();
+        for t in tracks {
+            let title = slug(&t.title);
+            let artist = slug(&primary_artist(&t.artist));
+            let is_match = track_norm
+                .iter()
+                .any(|(tt, ta)| !tt.is_empty() && *tt == title && (ta.is_empty() || *ta == artist))
+                || artist_norm.contains(&artist);
+            if is_match {
+                matches.push(t);
+            } else {
+                rest.push(t);
+            }
+        }
+        let mut ordered: Vec<Track> = Vec::with_capacity(matches.len());
+        for (title, artist) in &track_norm {
+            if let Some(pos) = matches
+                .iter()
+                .position(|t| slug(&t.title) == *title && (artist.is_empty() || slug(&primary_artist(&t.artist)) == *artist))
+            {
+                ordered.push(matches.remove(pos));
+            }
+        }
+        ordered.extend(matches);
+        ordered.extend(rest);
+        ordered
     }
 
     /// AI-curated "similar artists" for an artist page: a wider candidate set
@@ -5056,6 +5206,31 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
 
     /// Collects stored candidates for a Moods & Vibes category and ranks/curates them against
     /// verified mood rules, genre compatibility, clutter filtering, and user taste.
+    /// Mix for an AI-invented mood slug (no enum value available).
+    pub async fn mood_mix_tracks_by_slug(
+        &self,
+        user_id: i64,
+        slug: &str,
+        count: usize,
+    ) -> Vec<Track> {
+        let mut candidates = self.store.tracks_by_mood_slug(slug, 140, 0).unwrap_or_default();
+        let cached = self.load_curated_pool_ids(&mood_cache_key_slug(slug), 24 * 3600);
+        candidates.extend(self.store.get_tracks_by_ids(&cached).unwrap_or_default());
+        if user_id > 0 {
+            candidates.extend(
+                self.store
+                    .candidate_tracks_for_user(user_id, 400)
+                    .unwrap_or_default(),
+            );
+        }
+        dedup_tracks_by_id(&mut candidates);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let ranked = self.llm_rank_tracks("mood", &format!("{}:{}", user_id, slug), candidates);
+        dedup_and_interleave(ranked, count, 2)
+    }
+
     pub async fn mood_mix_tracks(&self, user_id: i64, mood: Mood, count: usize) -> Vec<Track> {
         let cached_curated_ids = self.load_curated_pool_ids(&mood_cache_key(mood), 12 * 3600);
         let cached_curated_tracks = if !cached_curated_ids.is_empty() {
@@ -11884,7 +12059,7 @@ mod tests {
         assert_eq!(cards.len(), 4, "cards: {:?}", cards.iter().map(|c| &c.title).collect::<Vec<_>>());
         assert_eq!(cards[0].title, "Daily Mix 1");
         assert_eq!(cards[0].number, "01");
-        assert_eq!(cards[3].title, "Daily Mix Supermix");
+        assert_eq!(cards[3].title, "Daily Supermix");
         assert!(cards[3].is_super);
         assert!(cards[3].number.is_empty());
         assert_eq!(cards[0].covers.len(), 4);

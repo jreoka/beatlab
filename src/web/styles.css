@@ -913,7 +913,7 @@ a {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 8px 36px 8px 38px;
+  padding: 8px 62px 8px 12px;
   font-size: 13.5px;
   outline: none;
   transition: border-color 0.14s, background 0.14s;
@@ -936,9 +936,17 @@ a {
   background: var(--surface-2);
 }
 
-#clear-search-btn {
+#submit-search-btn {
   position: absolute;
   right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 28px;
+}
+#clear-search-btn {
+  position: absolute;
+  right: 32px;
   top: 50%;
   transform: translateY(-50%);
   width: 28px;
@@ -4174,7 +4182,7 @@ a {
   }
   .search-box input {
     font-size: 16px;
-    padding: 9px 38px;
+    padding: 9px 62px 9px 12px;
     border-radius: 8px;
   }
 
