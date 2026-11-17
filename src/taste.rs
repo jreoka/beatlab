@@ -624,6 +624,10 @@ fn mood_cache_key(mood: Mood) -> String {
     format!("curated:mood:{}", mood.slug())
 }
 
+fn mood_user_cache_key(user_id: i64, mood: Mood) -> String {
+    format!("curated:mood_user:{}:{}", user_id, mood.slug())
+}
+
 fn explore_cache_key(key: &str) -> String {
     format!("curated:explore:{}", key)
 }
@@ -2330,15 +2334,9 @@ impl TasteEngine {
         }
     }
 
-    pub fn curated_mood_preview(&self, mood: Mood) -> (usize, Vec<String>) {
-        let ids = self.load_curated_pool_ids(&mood_cache_key(mood), 24 * 3600);
-        let tracks = if !ids.is_empty() {
-            self.store.get_tracks_by_ids(&ids).unwrap_or_default()
-        } else {
-            self.store.tracks_by_mood(mood, 30, 0).unwrap_or_default()
-        };
+    fn preview_from_tracks(tracks: &[Track]) -> (usize, Vec<String>) {
         let mut covers = Vec::new();
-        for t in &tracks {
+        for t in tracks {
             if !t.cover_url.is_empty() && !covers.contains(&t.cover_url) {
                 covers.push(t.cover_url.clone());
                 if covers.len() >= 4 {
@@ -2349,22 +2347,36 @@ impl TasteEngine {
         (tracks.len(), covers)
     }
 
+    pub fn curated_mood_preview(&self, mood: Mood) -> (usize, Vec<String>) {
+        let ids = self.load_curated_pool_ids(&mood_cache_key(mood), 24 * 3600);
+        let tracks = if !ids.is_empty() {
+            self.store.get_tracks_by_ids(&ids).unwrap_or_default()
+        } else {
+            self.store.tracks_by_mood(mood, 30, 0).unwrap_or_default()
+        };
+        Self::preview_from_tracks(&tracks)
+    }
+
+    pub fn curated_mood_preview_for_user(&self, user_id: i64, mood: Mood) -> (usize, Vec<String>) {
+        if user_id > 0 {
+            let user_ids = self.load_curated_pool_ids(&mood_user_cache_key(user_id, mood), 12 * 3600);
+            if !user_ids.is_empty() {
+                let tracks = self.store.get_tracks_by_ids(&user_ids).unwrap_or_default();
+                if !tracks.is_empty() {
+                    return Self::preview_from_tracks(&tracks);
+                }
+            }
+        }
+        self.curated_mood_preview(mood)
+    }
+
     pub fn curated_explore_preview(&self, spec: &ExploreMixSpec) -> (usize, Vec<String>) {
         let ids = self.load_curated_pool_ids(&explore_cache_key(spec.key), 24 * 3600);
         if ids.is_empty() {
             return (0, Vec::new());
         }
         let tracks = self.store.get_tracks_by_ids(&ids).unwrap_or_default();
-        let mut covers = Vec::new();
-        for t in &tracks {
-            if !t.cover_url.is_empty() && !covers.contains(&t.cover_url) {
-                covers.push(t.cover_url.clone());
-                if covers.len() >= 4 {
-                    break;
-                }
-            }
-        }
-        (tracks.len(), covers)
+        Self::preview_from_tracks(&tracks)
     }
 
     pub fn curator_status_snapshot(&self) -> serde_json::Value {
@@ -3730,6 +3742,22 @@ impl TasteEngine {
 
         // Preserve any previously verified local/catalog matches if remote returned sparse results,
         // and only persist the curated pool when we have a solid verified set.
+        if curated_tracks.len() < 6 {
+            for t in self.store.tracks_by_mood(mood, 60, 0).unwrap_or_default() {
+                if is_mood_clutter_track(&t)
+                    || track_matches_topic(&t, "christmas")
+                    || track_matches_topic(&t, "halloween")
+                {
+                    continue;
+                }
+                if seen_ids.insert(t.id.clone()) {
+                    curated_tracks.push(t);
+                    if curated_tracks.len() >= 35 {
+                        break;
+                    }
+                }
+            }
+        }
         if curated_tracks.len() >= 6 {
             let ids: Vec<String> = curated_tracks.iter().map(|t| t.id.clone()).collect();
             self.save_curated_pool(&mood_cache_key(mood), &ids);
@@ -3771,59 +3799,64 @@ impl TasteEngine {
 
         let mut curated_ids: HashSet<String> = cached_curated_ids.into_iter().collect();
         let initial = self.rank_mood_mix(user_id, mood, candidates.clone(), &curated_ids, count);
-        if initial.len() >= count.min(18) && !curated_ids.is_empty() {
-            return initial;
-        }
-
-        // Replenish sparse or uncurated mood categories from curated playlists and genre charts.
-        let fresh = self.curate_mood_pool(mood).await;
-        for t in fresh {
-            curated_ids.insert(t.id.clone());
-            if seen_ids.insert(t.id.clone()) {
-                candidates.push(t);
-            }
-        }
-
-        let mut ranked = self.rank_mood_mix(user_id, mood, candidates, &curated_ids, count);
-        // Never collapse to a 1-song mix if compatible user/catalog tracks exist.
-        if ranked.len() < count.min(12) && user_id > 0 {
-            let sctx = self.build_scoring_context(user_id);
-            let mut have_keys: HashSet<String> = ranked.iter().map(Track::song_key).collect();
-            let mut have_ids: HashSet<String> = ranked.iter().map(|t| t.id.clone()).collect();
-            let extra_pool: Vec<Track> = user_pool
-                .into_iter()
-                .chain(self.for_you_tracks(user_id, count * 2))
-                .collect();
-            let extra_artists: Vec<String> = extra_pool.iter().map(|t| t.artist.clone()).collect();
-            let artist_genres = self
-                .store
-                .known_artist_genres_for(&extra_artists)
-                .unwrap_or_default();
-            for t in extra_pool {
-                if ranked.len() >= count {
-                    break;
-                }
-                if have_ids.contains(&t.id)
-                    || have_keys.contains(&t.song_key())
-                    || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
-                    || is_mood_clutter_track(&t)
-                {
-                    continue;
-                }
-                let ag = artist_genres
-                    .get(&primary_artist(&t.artist).to_lowercase())
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if is_track_compatible_with_mood(&t, ag, mood)
-                    && !is_mood_title_trap(&t, mood)
-                    && !track_matches_topic(&t, "christmas")
-                    && !track_matches_topic(&t, "halloween")
-                {
-                    have_ids.insert(t.id.clone());
-                    have_keys.insert(t.song_key());
-                    ranked.push(t);
+        let ranked = if initial.len() >= count.min(18) && !curated_ids.is_empty() {
+            initial
+        } else {
+            // Replenish sparse or uncurated mood categories from curated playlists and genre charts.
+            let fresh = self.curate_mood_pool(mood).await;
+            for t in fresh {
+                curated_ids.insert(t.id.clone());
+                if seen_ids.insert(t.id.clone()) {
+                    candidates.push(t);
                 }
             }
+
+            let mut ranked = self.rank_mood_mix(user_id, mood, candidates, &curated_ids, count);
+            // Never collapse to a 1-song mix if compatible user/catalog tracks exist.
+            if ranked.len() < count.min(12) && user_id > 0 {
+                let sctx = self.build_scoring_context(user_id);
+                let mut have_keys: HashSet<String> = ranked.iter().map(Track::song_key).collect();
+                let mut have_ids: HashSet<String> = ranked.iter().map(|t| t.id.clone()).collect();
+                let extra_pool: Vec<Track> = user_pool
+                    .into_iter()
+                    .chain(self.for_you_tracks(user_id, count * 2))
+                    .collect();
+                let extra_artists: Vec<String> = extra_pool.iter().map(|t| t.artist.clone()).collect();
+                let artist_genres = self
+                    .store
+                    .known_artist_genres_for(&extra_artists)
+                    .unwrap_or_default();
+                for t in extra_pool {
+                    if ranked.len() >= count {
+                        break;
+                    }
+                    if have_ids.contains(&t.id)
+                        || have_keys.contains(&t.song_key())
+                        || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                        || is_mood_clutter_track(&t)
+                    {
+                        continue;
+                    }
+                    let ag = artist_genres
+                        .get(&primary_artist(&t.artist).to_lowercase())
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if is_track_compatible_with_mood(&t, ag, mood)
+                        && !is_mood_title_trap(&t, mood)
+                        && !track_matches_topic(&t, "christmas")
+                        && !track_matches_topic(&t, "halloween")
+                    {
+                        have_ids.insert(t.id.clone());
+                        have_keys.insert(t.song_key());
+                        ranked.push(t);
+                    }
+                }
+            }
+            ranked
+        };
+        if user_id > 0 && !ranked.is_empty() {
+            let ids: Vec<String> = ranked.iter().map(|t| t.id.clone()).collect();
+            self.save_curated_pool(&mood_user_cache_key(user_id, mood), &ids);
         }
         ranked
     }
@@ -10175,6 +10208,55 @@ mod tests {
         assert_eq!(snap["active"], true);
         assert_eq!(snap["readyMoods"], 1);
         assert_eq!(snap["totalMoods"], 10);
+    }
+
+    #[tokio::test]
+    async fn curated_mood_preview_for_user_updates_after_mood_mix_tracks() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("moodfan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(
+                store.clone(),
+                vec![],
+            )),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mut tracks = Vec::new();
+        for i in 0..14 {
+            tracks.push(Track {
+                id: format!("dz:ln{i}"),
+                source: "deezer".into(),
+                title: format!("Midnight Drive {i}"),
+                artist: format!("Night Artist {i}"),
+                album: "After Hours".into(),
+                genre: "Electronic".into(),
+                moods: if i == 0 { "late-night".into() } else { String::new() },
+                cover_url: format!("https://example.com/ln{i}.jpg"),
+                duration: 210,
+                bitrate: 320,
+                stream_url: format!("dz:ln{i}"),
+                ..Default::default()
+            });
+        }
+        store.upsert_tracks(&tracks).unwrap();
+        for t in &tracks {
+            let _ = store.record_event(u.id, &t.id, "play", 1.0);
+        }
+
+        let (before_cnt, _) = taste.curated_mood_preview_for_user(u.id, Mood::LateNight);
+        assert_eq!(before_cnt, 1);
+
+        let mix = taste.mood_mix_tracks(u.id, Mood::LateNight, 35).await;
+        assert!(mix.len() >= 14);
+
+        let (after_cnt, after_covers) = taste.curated_mood_preview_for_user(u.id, Mood::LateNight);
+        assert_eq!(after_cnt, mix.len());
+        assert_eq!(after_covers.len(), 4);
     }
 
     #[tokio::test]

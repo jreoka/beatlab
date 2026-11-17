@@ -1021,12 +1021,15 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
         .iter()
         .map(|m| {
             let (c1, c2) = m.gradient();
+            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
             json!({
                 "slug": m.slug(),
                 "label": m.label(),
                 "subtitle": m.subtitle(),
                 "c1": c1,
                 "c2": c2,
+                "trackCount": track_count,
+                "covers": covers,
             })
         })
         .collect();
@@ -1076,7 +1079,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .iter()
         .map(|m| {
             let (c1, c2) = m.gradient();
-            let (track_count, covers) = state.taste.curated_mood_preview(*m);
+            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
             json!({
                 "slug": m.slug(),
                 "label": m.label(),

@@ -2561,7 +2561,7 @@
         <div class="hero-info">
           <div class="hero-kicker" style="color:#fff">MOOD MIX</div>
           <h1 class="hero-title">${esc(m.label)}</h1>
-          <div class="hero-sub" style="color:rgba(255,255,255,0.88)">${esc(m.subtitle)} · ${tracks.length} tracks</div>
+          <div class="hero-sub" style="color:rgba(255,255,255,0.88)">${esc(m.subtitle)} · ${tracks.length} track${tracks.length === 1 ? '' : 's'}</div>
           <div class="hero-actions">
             ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Mix</button>` : `<button class="btn-primary" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">Refresh Mix</button>`}
             ${tracks.length ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}
@@ -3883,7 +3883,7 @@
     const thumbs = covers.length
       ? `<div class="mood-tile-thumbs">${covers.map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`
       : '';
-    const countTag = m.trackCount > 0 ? `<span class="mood-tile-count">${m.trackCount} tracks</span>` : '';
+    const countTag = m.trackCount > 0 ? `<span class="mood-tile-count">${m.trackCount} track${m.trackCount === 1 ? '' : 's'}</span>` : '';
     return `<div class="mood-tile" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)}" onclick="App.navigate('mood/${encodeURIComponent(m.slug)}')">
       <div class="mood-tile-top">
         <h3>${esc(m.label)}</h3>
