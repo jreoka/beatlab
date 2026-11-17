@@ -141,7 +141,6 @@
     },
     settingsTab: 'general',
     settingsData: {
-      sources: null,
       hidden: null,
       sessions: null,
       security: null,
@@ -970,7 +969,6 @@
     state.currentGenreShare = null;
     state.currentShareUrl = '';
     state.settingsData = {
-      sources: null,
       hidden: null,
       sessions: null,
       security: null,
@@ -6050,7 +6048,6 @@
     const body = $('settings-body');
     if (!body) return;
     const tab = state.settingsTab || 'general';
-    const srcData = state.settingsData.sources || { sources: [], totalTracks: 0, cacheMb: 0, ffmpeg: false };
     const hiddenData = state.settingsData.hidden || { count: 0, tracks: [] };
     const confirmReset = !!state.settingsData.confirmResetHidden;
 
@@ -6099,16 +6096,6 @@
           <div class="settings-section-title">Playback &amp; Audio</div>
           <div class="settings-row">
             <div class="settings-row-info">
-              <div class="settings-row-label">Autoplay Radio</div>
-              <div class="settings-row-desc">Automatically append related songs when your queue ends</div>
-            </div>
-            <label class="switch-toggle">
-              <input type="checkbox" ${state.autoplay ? 'checked' : ''} onchange="App.toggleAutoplay(this.checked)" />
-              <span class="switch-track"></span>
-            </label>
-          </div>
-          <div class="settings-row">
-            <div class="settings-row-info">
               <div class="settings-row-label">Haptic Feedback</div>
               <div class="settings-row-desc">Subtle tactile vibrations on mobile taps, swipes, and controls (when supported by device)</div>
             </div>
@@ -6116,16 +6103,6 @@
               <input type="checkbox" ${state.hapticsEnabled ? 'checked' : ''} onchange="App.toggleHaptics(this.checked)" />
               <span class="switch-track"></span>
             </label>
-          </div>
-        </div>
-
-        <div class="settings-section">
-          <div class="settings-section-title">Music Sources &amp; Engine</div>
-          <div class="settings-metrics">
-            <div class="settings-metric"><span>Catalog</span><strong>${srcData.totalTracks} tracks</strong></div>
-            <div class="settings-metric"><span>Audio Cache</span><strong>${srcData.cacheMb} MB</strong></div>
-            <div class="settings-metric"><span>Cool Cache</span><strong>${srcData.remoteCacheEnabled ? `${Math.round(srcData.remoteCacheMb)} MB (R2)` : 'Off'}</strong></div>
-            <div class="settings-metric"><span>FFmpeg</span><strong>${srcData.ffmpeg ? 'Ready' : 'Off'}</strong></div>
           </div>
         </div>
       `;
@@ -6512,13 +6489,11 @@
     renderSettingsModalBody();
 
     try {
-      const [srcRes, hidRes, sessRes, secRes] = await Promise.all([
-        api('/api/web/sources').catch(() => null),
+      const [hidRes, sessRes, secRes] = await Promise.all([
         api('/api/web/hidden').catch(() => null),
         api('/api/web/sessions').catch(() => null),
         api('/api/web/2fa/status').catch(() => null),
       ]);
-      if (srcRes) state.settingsData.sources = srcRes;
       if (hidRes) state.settingsData.hidden = hidRes;
       if (sessRes) state.settingsData.sessions = sessRes;
       if (secRes) state.settingsData.security = secRes;
@@ -7470,11 +7445,6 @@
         $('panel-backdrop').classList.toggle('hidden', window.innerWidth > 1060);
       }
       window.App.setRightTab(tab);
-    },
-    toggleAutoplay: (v) => {
-      haptic('select');
-      state.autoplay = !!v;
-      localStorage.setItem('beatlab_autoplay', state.autoplay ? 'true' : 'false');
     },
     toggleHaptics: (v) => {
       state.hapticsEnabled = !!v;

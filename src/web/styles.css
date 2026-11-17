@@ -2792,29 +2792,6 @@ a {
   transform: translateX(18px);
   background: #06120b;
 }
-.settings-metrics {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-.settings-metric {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.settings-metric span {
-  font-size: 11px;
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.settings-metric strong {
-  font-size: 14px;
-}
 .settings-actions-row {
   margin: 8px 0 14px;
 }
@@ -4961,9 +4938,6 @@ a {
   }
   .settings-body {
     padding: 16px;
-  }
-  .settings-metrics {
-    grid-template-columns: 1fr;
   }
   .modal-box input,
   .modal-box select,

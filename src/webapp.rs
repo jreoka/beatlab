@@ -4892,6 +4892,16 @@ pub async fn social_set_avatar(
     };
     match state.store.set_avatar(user.id, &body, mime) {
         Ok(()) => {
+            // Profile pictures live in the DB, but the durable cool tier keeps
+            // a copy alongside every other cached asset.
+            state.engine.mirror_asset(
+                "avatar",
+                &user.id.to_string(),
+                body.to_vec(),
+                "img",
+                mime,
+                "",
+            );
             let public = state.store.get_public_user(user.id, user.id).ok().flatten();
             json_res(json!({
                 "ok": true,
@@ -4909,6 +4919,13 @@ pub async fn social_clear_avatar(State(state): State<AppState>, headers: HeaderM
     };
     match state.store.clear_avatar(user.id) {
         Ok(()) => {
+            // Drop the durable copy too, so a cleared picture stays cleared.
+            if let Some(remote) = state.engine.remote.clone() {
+                let id = user.id.to_string();
+                let key = remote.asset_object_key("avatar", &id);
+                let _ = remote.delete(&key).await;
+                let _ = state.store.delete_asset_cache_entry("avatar", &id);
+            }
             let public = state.store.get_public_user(user.id, user.id).ok().flatten();
             json_res(json!({
                 "ok": true,

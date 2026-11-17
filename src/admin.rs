@@ -431,7 +431,8 @@ pub async fn restore_user(
     }
 }
 
-/// Backfills the cool cache from everything currently on local disk.
+/// Backfills the cool cache with audio tracks currently in the local hot cache.
+/// Covers, embeds and avatars are mirrored as they are created.
 pub async fn backfill_cache(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let admin = match require_admin(&state, &headers) {
         Ok(a) => a,

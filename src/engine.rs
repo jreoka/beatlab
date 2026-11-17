@@ -208,7 +208,94 @@ impl StreamEngine {
             &final_path.to_string_lossy(),
             bytes as i64,
         )?;
+        // The cool copy was just used — treat it as recently active so it is
+        // not evicted ahead of tracks that have never been rehydrated.
+        let _ = self.store.touch_remote_cache_entry(track_id);
         Ok((final_path, ext))
+    }
+
+    /// Keeps the cool tier's "never pull from a source twice" promise for audio:
+    /// refresh the mirror's recency on every play, and self-heal a mirror that
+    /// failed to upload the first time (or was dropped while nearly full).
+    fn note_audio_access(&self, track_id: &str, path: &Path, ext: &str) {
+        let Some(remote) = self.remote.clone() else {
+            return;
+        };
+        match self.store.get_remote_cache_entry(track_id) {
+            Ok(Some(_)) => {
+                let _ = self.store.touch_remote_cache_entry(track_id);
+            }
+            Ok(None) => {
+                let key = remote.object_key(track_id);
+                let store = self.store.clone();
+                let path = path.to_path_buf();
+                let ext = ext.to_string();
+                let tid = track_id.to_string();
+                tokio::spawn(async move {
+                    if remote.upload_from(&key, &path, &ext).await.is_ok() {
+                        let bytes = tokio::fs::metadata(&path)
+                            .await
+                            .map(|m| m.len() as i64)
+                            .unwrap_or(0);
+                        let _ = store.upsert_remote_cache_entry(&tid, &key, bytes);
+                    }
+                });
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Mirrors an arbitrary cached asset (cover, embed, avatar) to the cool tier.
+    pub fn mirror_asset(
+        &self,
+        kind: &'static str,
+        asset_id: &str,
+        bytes: Vec<u8>,
+        ext: &str,
+        mime: &str,
+        src: &str,
+    ) {
+        let Some(remote) = self.remote.clone() else {
+            return;
+        };
+        let id = asset_id.to_string();
+        let key = remote.asset_object_key(kind, &id);
+        let store = self.store.clone();
+        let len = bytes.len() as i64;
+        let ext = ext.to_string();
+        let mime = mime.to_string();
+        let src = src.to_string();
+        tokio::spawn(async move {
+            match remote.upload_bytes(&key, bytes, &ext, &mime, &src).await {
+                Ok(()) => {
+                    let _ = store.upsert_asset_cache_entry(kind, &id, &key, len);
+                }
+                Err(e) => {
+                    debug!(asset_id = %id, error = %e.to_string(), "cool asset upload failed");
+                }
+            }
+        });
+    }
+
+    /// Restores a cached asset from the cool tier instead of re-fetching or
+    /// re-generating it locally.
+    async fn rehydrate_asset(
+        &self,
+        kind: &str,
+        asset_id: &str,
+    ) -> Option<(Vec<u8>, String, String)> {
+        let remote = self.remote.as_ref()?;
+        let (key, _) = self.store.get_asset_cache_entry(kind, asset_id).ok().flatten()?;
+        let object = remote.head(&key).await.ok().flatten()?;
+        if object.size <= 0 {
+            return None;
+        }
+        let bytes = remote.download_bytes(&key).await.ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let _ = self.store.touch_asset_cache_entry(kind, asset_id);
+        Some((bytes, object.mime, object.src))
     }
 
     pub async fn resolve_target(&self, track: &Track) -> AppResult<PlayTarget> {
@@ -220,9 +307,11 @@ impl StreamEngine {
                 let ext = p
                     .extension()
                     .and_then(|e| e.to_str())
-                    .unwrap_or(&track.format);
+                    .unwrap_or(&track.format)
+                    .to_string();
+                self.note_audio_access(&track.id, &p, &ext);
                 return Ok(PlayTarget::LocalFile {
-                    content_type: mime_for_audio_ext(ext).to_string(),
+                    content_type: mime_for_audio_ext(&ext).to_string(),
                     path: p,
                 });
             }
@@ -279,9 +368,11 @@ impl StreamEngine {
                         let ext = local_path
                             .extension()
                             .and_then(|e| e.to_str())
-                            .unwrap_or(&track.format);
+                            .unwrap_or(&track.format)
+                            .to_string();
+                        self.note_audio_access(&track.id, &local_path, &ext);
                         return Ok(PlayTarget::LocalFile {
-                            content_type: mime_for_audio_ext(ext).to_string(),
+                            content_type: mime_for_audio_ext(&ext).to_string(),
                             path: local_path,
                         });
                     }
@@ -1153,11 +1244,26 @@ impl StreamEngine {
                         .await
                         .unwrap_or_else(|_| "image/jpeg".to_string());
                     if !is_low_res_cover(&bytes) {
+                        let _ = self.store.touch_asset_cache_entry("cover", lookup_id);
                         return image_response(bytes, &mime);
                     }
                     stale_cached = Some((bytes, mime));
                 }
             }
+        } else if let Some((bytes, mime, src)) = self.rehydrate_asset("cover", lookup_id).await {
+            // Hot copy evicted: restore the artwork from the cool tier instead
+            // of hitting the image host (or re-extracting it) again.
+            let mime = if mime.is_empty() {
+                "image/jpeg".to_string()
+            } else {
+                mime
+            };
+            let _ = tokio::fs::write(&cache_file, &bytes).await;
+            let _ = tokio::fs::write(&meta_file, &mime).await;
+            if !src.is_empty() {
+                let _ = tokio::fs::write(&src_file, &src).await;
+            }
+            return image_response(bytes, &mime);
         }
 
         // 1. Check playlist or auto-mix -> first track cover
@@ -1226,6 +1332,7 @@ impl StreamEngine {
             if let Some((bytes, mime)) = extract_embedded_cover(&path) {
                 let _ = tokio::fs::write(&cache_file, &bytes).await;
                 let _ = tokio::fs::write(&meta_file, &mime).await;
+                self.mirror_asset("cover", lookup_id, bytes.clone(), "img", &mime, "");
                 return image_response(bytes, &mime);
             }
         }
@@ -1242,6 +1349,14 @@ impl StreamEngine {
                         if !is_low_res_cover(&bytes) || bytes.len() > stale_bytes.len() {
                             let _ = tokio::fs::write(&cache_file, &bytes).await;
                             let _ = tokio::fs::write(&meta_file, &mime).await;
+                            self.mirror_asset(
+                                "cover",
+                                lookup_id,
+                                bytes.clone(),
+                                "img",
+                                &mime,
+                                &upgraded_url,
+                            );
                             return image_response(bytes, &mime);
                         }
                     }
@@ -1260,6 +1375,14 @@ impl StreamEngine {
                 let _ = tokio::fs::write(&cache_file, &bytes).await;
                 let _ = tokio::fs::write(&meta_file, &mime).await;
                 let _ = tokio::fs::write(&src_file, &upgraded_url).await;
+                self.mirror_asset(
+                    "cover",
+                    lookup_id,
+                    bytes.clone(),
+                    "img",
+                    &mime,
+                    &upgraded_url,
+                );
                 return image_response(bytes, &mime);
             }
         }
@@ -1353,7 +1476,22 @@ impl StreamEngine {
             .map(|m| m.len() > 4096)
             .unwrap_or(false)
         {
+            let _ = self.store.touch_asset_cache_entry("embed", &track.id);
             return Some(out_path);
+        }
+
+        // Hot copy gone: restore the pre-rendered embed from the cool tier
+        // instead of running ffmpeg and re-pulling the audio all over again.
+        if let Some((bytes, _, _)) = self.rehydrate_asset("embed", &track.id).await {
+            if bytes.len() > 4096 {
+                let part = self.embed_dir.join(format!("{}.r2part.mp4", sha1_hex(&track.id)));
+                if tokio::fs::write(&part, &bytes).await.is_ok()
+                    && tokio::fs::rename(&part, &out_path).await.is_ok()
+                {
+                    return Some(out_path);
+                }
+                let _ = tokio::fs::remove_file(&part).await;
+            }
         }
 
         let (notify, is_leader) = {
@@ -1511,6 +1649,9 @@ impl StreamEngine {
         {
             let renamed = tokio::fs::rename(&part_path, out_path).await.is_ok();
             if renamed {
+                if let Ok(bytes) = tokio::fs::read(out_path).await {
+                    self.mirror_asset("embed", &track.id, bytes, "mp4", "video/mp4", "");
+                }
                 return true;
             }
         }

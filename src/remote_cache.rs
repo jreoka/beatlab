@@ -27,6 +27,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 pub struct RemoteObject {
     pub size: i64,
     pub ext: String,
+    /// Audio extension is stored in `x-amz-meta-ext`; covers use these two for
+    /// their MIME type and source URL.
+    pub mime: String,
+    pub src: String,
 }
 
 #[derive(Clone)]
@@ -40,6 +44,8 @@ pub struct RemoteCache {
     secret_key: String,
     prefix: String,
     pub max_bytes: i64,
+    /// Eviction starts here, leaving headroom so the tier is never caught full.
+    pub high_water_bytes: i64,
 }
 
 impl RemoteCache {
@@ -79,6 +85,14 @@ impl RemoteCache {
         let max_gb: f64 = env_nonempty("BEATLAB_S3_MAX_GB")
             .and_then(|s| s.parse().ok())
             .unwrap_or(100.0);
+        let max_bytes = (max_gb.max(1.0) * 1024.0 * 1024.0 * 1024.0) as i64;
+        // Start evicting when the bucket is this full (default 90%), so there is
+        // always headroom for new assets and no surprise source re-pulls.
+        let high_water_pct: f64 = env_nonempty("BEATLAB_S3_HIGH_WATER_PCT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(90.0f64)
+            .clamp(1.0f64, 100.0f64);
+        let high_water_bytes = (max_bytes as f64 * high_water_pct / 100.0) as i64;
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .read_timeout(std::time::Duration::from_secs(60))
@@ -94,12 +108,27 @@ impl RemoteCache {
             access_key,
             secret_key,
             prefix,
-            max_bytes: (max_gb.max(1.0) * 1024.0 * 1024.0 * 1024.0) as i64,
+            max_bytes,
+            high_water_bytes,
         }))
     }
 
+    /// Legacy audio key layout, kept so existing uploaded objects still resolve.
     pub fn object_key(&self, track_id: &str) -> String {
         format!("{}{}", self.prefix, crate::engine::sha1_hex(track_id))
+    }
+
+    /// Namespaced key for non-audio cached assets (covers, embeds, avatars).
+    pub fn asset_object_key(&self, kind: &str, asset_id: &str) -> String {
+        if kind == "audio" {
+            return self.object_key(asset_id);
+        }
+        format!(
+            "{}{}/{}",
+            self.prefix,
+            kind,
+            crate::engine::sha1_hex(asset_id)
+        )
     }
 
     pub fn describe(&self) -> String {
@@ -223,16 +252,30 @@ impl RemoteCache {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let ext = resp
-            .headers()
-            .get("x-amz-meta-ext")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("m4a")
-            .trim()
-            .chars()
-            .take(12)
-            .collect();
-        Ok(Some(RemoteObject { size, ext }))
+        let meta = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let ext = {
+            let raw = meta("x-amz-meta-ext");
+            if raw.is_empty() {
+                "m4a".to_string()
+            } else {
+                raw.chars().take(12).collect()
+            }
+        };
+        let mime = meta("x-amz-meta-mime").chars().take(64).collect();
+        let src = meta("x-amz-meta-src").chars().take(1024).collect();
+        Ok(Some(RemoteObject {
+            size,
+            ext,
+            mime,
+            src,
+        }))
     }
 
     /// Streams a cool object into the hot cache directory.
@@ -286,19 +329,71 @@ impl RemoteCache {
         Ok(())
     }
 
-    /// Deletes the oldest cool objects until the configured quota is met.
+    /// Uploads an arbitrary cached asset (cover, avatar, …) with its metadata.
+    pub async fn upload_bytes(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ext: &str,
+        mime: &str,
+        src: &str,
+    ) -> AppResult<()> {
+        let extra = vec![
+            ("content-length", bytes.len().to_string()),
+            ("x-amz-meta-ext", ext.chars().take(12).collect()),
+            ("x-amz-meta-mime", mime.chars().take(64).collect()),
+            ("x-amz-meta-src", src.chars().take(1024).collect()),
+        ];
+        let resp = self
+            .send(
+                reqwest::Method::PUT,
+                key,
+                UNSIGNED_PAYLOAD,
+                extra,
+                reqwest::Body::from(bytes),
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(err_msg(format!("S3 PUT returned {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Downloads an arbitrary cached asset into memory.
+    pub async fn download_bytes(&self, key: &str) -> AppResult<Vec<u8>> {
+        let resp = self
+            .send(
+                reqwest::Method::GET,
+                key,
+                EMPTY_SHA256,
+                vec![],
+                reqwest::Body::from(Vec::new()),
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(err_msg(format!("S3 GET returned {}", resp.status())));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| err_msg(format!("S3 download: {e}")))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Evicts the least recently used assets once the bucket reaches its
+    /// high-water mark, leaving headroom so the cool tier is never caught full.
     pub async fn enforce_quota(&self, store: &crate::store::Store) -> AppResult<usize> {
         let mut total = store.remote_cache_total_bytes()?;
-        if total <= self.max_bytes {
+        if total <= self.high_water_bytes {
             return Ok(0);
         }
         let mut removed = 0usize;
-        for (track_id, key, bytes) in store.remote_cache_eviction_candidates(200)? {
-            if total <= self.max_bytes {
+        for (kind, asset_id, key, bytes) in store.remote_cache_eviction_candidates(500)? {
+            if total <= self.high_water_bytes {
                 break;
             }
             self.delete(&key).await?;
-            let _ = store.delete_remote_cache_entry(&track_id);
+            let _ = store.delete_asset_cache_entry(&kind, &asset_id);
             total -= bytes;
             removed += 1;
         }
@@ -360,6 +455,7 @@ mod tests {
             secret_key: "secret".into(),
             prefix: "beatlab/audio/".into(),
             max_bytes: 1024,
+            high_water_bytes: 900,
         };
         let (_, first) = c
             .signed_request("GET", "beatlab/audio/abc", EMPTY_SHA256, &[])
@@ -390,6 +486,7 @@ mod tests {
             secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
             prefix: "".into(),
             max_bytes: 1,
+            high_water_bytes: 1,
         };
         let now = chrono::DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
             .unwrap()
@@ -420,6 +517,7 @@ mod tests {
             secret_key: "s".into(),
             prefix: "beatlab/audio/".into(),
             max_bytes: 1,
+            high_water_bytes: 1,
         };
         let key = c.object_key("track:1");
         assert!(key.starts_with("beatlab/audio/"));

@@ -400,13 +400,22 @@ impl Store {
             );
 
             -- Registry of objects uploaded to the optional S3/R2 cool cache.
+            -- `kind` namespaces audio / covers / embeds / avatars so every cached
+            -- asset can live in one durable tier. last_accessed is the recency
+            -- signal for eviction: the cool tier keeps everything until it is
+            -- nearly full, then drops the least recently used asset rather than
+            -- the least recently uploaded one.
             CREATE TABLE IF NOT EXISTS remote_cache_entries (
                 track_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'audio',
                 object_key TEXT NOT NULL,
                 bytes INTEGER NOT NULL,
-                created INTEGER NOT NULL
+                created INTEGER NOT NULL,
+                last_accessed INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_remote_cache_created ON remote_cache_entries(created ASC);
+            -- The recency index is created after migrations add its columns.
+            CREATE INDEX IF NOT EXISTS idx_remote_cache_created
+                ON remote_cache_entries(created ASC);
 
             CREATE TABLE IF NOT EXISTS kv (
                 key TEXT PRIMARY KEY,
@@ -526,6 +535,30 @@ impl Store {
         ensure_column(&conn, "sessions", "mfa_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "deleted_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "restore_hash", "TEXT NOT NULL DEFAULT ''")?;
+        // Cool cache: namespace entries by asset type and track real usage so
+        // eviction only happens once the bucket is nearly full.
+        ensure_column(
+            &conn,
+            "remote_cache_entries",
+            "kind",
+            "TEXT NOT NULL DEFAULT 'audio'",
+        )?;
+        ensure_column(
+            &conn,
+            "remote_cache_entries",
+            "last_accessed",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        conn.execute(
+            "UPDATE remote_cache_entries SET last_accessed = created WHERE last_accessed = 0",
+            [],
+        )?;
+        let _ = conn.execute("DROP INDEX IF EXISTS idx_remote_cache_created", []);
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_remote_cache_recency
+             ON remote_cache_entries(kind ASC, last_accessed ASC)",
+            [],
+        )?;
         // Sessions used to expire after 30 days; normalise old rows so the
         // stored value matches the now-persistent behaviour.
         conn.execute(
@@ -4743,33 +4776,87 @@ impl Store {
 
     // -- Optional S3/R2 cool cache registry ----------------------------------
 
+    /// Audio rows keep their legacy bare track id; other asset kinds are
+    /// prefixed so an embed/avatar sharing a track's id cannot overwrite it.
+    fn cool_registry_id(kind: &str, asset_id: &str) -> String {
+        if kind == "audio" {
+            asset_id.to_string()
+        } else {
+            format!("{}:{}", kind, asset_id)
+        }
+    }
+
+    /// Registers (or refreshes) any asset in the cool tier. `kind` namespaces
+    /// audio / cover / embed / avatar objects so one durable tier can hold
+    /// everything the app has cached.
+    pub fn upsert_asset_cache_entry(
+        &self,
+        kind: &str,
+        asset_id: &str,
+        object_key: &str,
+        bytes: i64,
+    ) -> AppResult<()> {
+        let conn = self.lock();
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO remote_cache_entries(track_id, kind, object_key, bytes, created, last_accessed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(track_id) DO UPDATE SET
+                 kind = excluded.kind, object_key = excluded.object_key,
+                 bytes = excluded.bytes, created = excluded.created,
+                 last_accessed = excluded.last_accessed",
+            params![Self::cool_registry_id(kind, asset_id), kind, object_key, bytes, now],
+        )?;
+        Ok(())
+    }
+
+    /// Backwards-compatible audio wrapper.
     pub fn upsert_remote_cache_entry(
         &self,
         track_id: &str,
         object_key: &str,
         bytes: i64,
     ) -> AppResult<()> {
+        self.upsert_asset_cache_entry("audio", track_id, object_key, bytes)
+    }
+
+    pub fn get_asset_cache_entry(
+        &self,
+        kind: &str,
+        asset_id: &str,
+    ) -> AppResult<Option<(String, i64)>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT object_key, bytes FROM remote_cache_entries WHERE kind = ?1 AND track_id = ?2",
+                params![kind, Self::cool_registry_id(kind, asset_id)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Backwards-compatible audio wrapper.
+    pub fn get_remote_cache_entry(&self, track_id: &str) -> AppResult<Option<(String, i64)>> {
+        self.get_asset_cache_entry("audio", track_id)
+    }
+
+    /// Refreshes the recency signal so frequently used assets survive eviction.
+    pub fn touch_asset_cache_entry(&self, kind: &str, asset_id: &str) -> AppResult<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO remote_cache_entries(track_id, object_key, bytes, created)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(track_id) DO UPDATE SET
-                 object_key = excluded.object_key, bytes = excluded.bytes,
-                 created = excluded.created",
-            params![track_id, object_key, bytes, Utc::now().timestamp()],
+            "UPDATE remote_cache_entries SET last_accessed = ?1 WHERE kind = ?2 AND track_id = ?3",
+            params![
+                Utc::now().timestamp(),
+                kind,
+                Self::cool_registry_id(kind, asset_id)
+            ],
         )?;
         Ok(())
     }
 
-    pub fn get_remote_cache_entry(&self, track_id: &str) -> AppResult<Option<(String, i64)>> {
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT object_key, bytes FROM remote_cache_entries WHERE track_id = ?1",
-                params![track_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
+    /// Backwards-compatible audio wrapper.
+    pub fn touch_remote_cache_entry(&self, track_id: &str) -> AppResult<()> {
+        self.touch_asset_cache_entry("audio", track_id)
     }
 
     pub fn remote_cache_total_bytes(&self) -> AppResult<i64> {
@@ -4790,23 +4877,33 @@ impl Store {
         )?)
     }
 
-    /// Oldest entries first, for cool-cache quota eviction.
-    pub fn remote_cache_eviction_candidates(&self, limit: usize) -> AppResult<Vec<(String, String, i64)>> {
+    /// Least-recently-used first, for cool-cache quota eviction. Returns
+    /// (kind, asset_id, object_key, bytes) so any asset kind can be evicted.
+    pub fn remote_cache_eviction_candidates(
+        &self,
+        limit: usize,
+    ) -> AppResult<Vec<(String, String, String, i64)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT track_id, object_key, bytes FROM remote_cache_entries ORDER BY created ASC LIMIT ?1",
+            "SELECT kind,
+                    CASE WHEN kind = 'audio' THEN track_id
+                         ELSE substr(track_id, length(kind) + 2) END AS asset_id,
+                    object_key, bytes
+             FROM remote_cache_entries ORDER BY last_accessed ASC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map(params![limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    pub fn delete_remote_cache_entry(&self, track_id: &str) -> AppResult<()> {
+    pub fn delete_asset_cache_entry(&self, kind: &str, asset_id: &str) -> AppResult<()> {
         let conn = self.lock();
         conn.execute(
-            "DELETE FROM remote_cache_entries WHERE track_id = ?1",
-            params![track_id],
+            "DELETE FROM remote_cache_entries WHERE kind = ?1 AND track_id = ?2",
+            params![kind, Self::cool_registry_id(kind, asset_id)],
         )?;
         Ok(())
     }
@@ -6864,5 +6961,84 @@ mod tests {
         assert!(be_summary.is_some());
         assert_eq!(be_summary.unwrap().id, "ar:dz:5482289");
         assert_eq!(store.artist_tracks("ar:ytm:UC_BLUE_ENC").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cool_cache_registry_namespaces_asset_kinds_without_collisions() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .upsert_remote_cache_entry("track:1", "prefix/audio", 1000)
+            .unwrap();
+        store
+            .upsert_asset_cache_entry("embed", "track:1", "prefix/embed/track1", 2000)
+            .unwrap();
+        store
+            .upsert_asset_cache_entry("cover", "al:1", "prefix/cover/al1", 3000)
+            .unwrap();
+
+        // The embed shares its track id with the audio entry but must not
+        // overwrite it.
+        assert_eq!(
+            store.get_remote_cache_entry("track:1").unwrap().unwrap().0,
+            "prefix/audio"
+        );
+        assert_eq!(
+            store
+                .get_asset_cache_entry("embed", "track:1")
+                .unwrap()
+                .unwrap()
+                .0,
+            "prefix/embed/track1"
+        );
+        assert_eq!(store.remote_cache_count().unwrap(), 3);
+        assert_eq!(store.remote_cache_total_bytes().unwrap(), 6000);
+
+        let candidates = store.remote_cache_eviction_candidates(10).unwrap();
+        assert!(candidates
+            .iter()
+            .any(|(kind, id, key, _)| kind == "audio" && id == "track:1" && key == "prefix/audio"));
+        assert!(candidates.iter().any(|(kind, id, key, _)| kind == "embed"
+            && id == "track:1"
+            && key == "prefix/embed/track1"));
+
+        store.delete_asset_cache_entry("embed", "track:1").unwrap();
+        assert!(store.get_asset_cache_entry("embed", "track:1").unwrap().is_none());
+        assert!(store.get_remote_cache_entry("track:1").unwrap().is_some());
+    }
+
+    #[test]
+    fn cool_cache_legacy_schema_migrates_and_keeps_audio_entries() {
+        let dir = std::env::temp_dir().join(format!("beatlab_cool_mig_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("beatlab.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE remote_cache_entries (
+                    track_id TEXT PRIMARY KEY,
+                    object_key TEXT NOT NULL,
+                    bytes INTEGER NOT NULL,
+                    created INTEGER NOT NULL
+                 );
+                 CREATE INDEX idx_remote_cache_created ON remote_cache_entries(created ASC);
+                 INSERT INTO remote_cache_entries(track_id, object_key, bytes, created)
+                 VALUES ('track:old', 'legacy/key', 4096, 1234567890);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_remote_cache_entry("track:old").unwrap().unwrap().0,
+            "legacy/key"
+        );
+        let candidates = store.remote_cache_eviction_candidates(10).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "audio");
+        assert_eq!(candidates[0].1, "track:old");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
