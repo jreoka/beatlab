@@ -2554,6 +2554,12 @@ pub async fn instant_mix(
             curated_batches.insert(0, (query.clone(), pre_curated));
         }
     }
+    // Drop YouTube/clickbait spam before any scoring sees it.
+    let q_low = query.to_ascii_lowercase();
+    combined.retain(|t| !crate::taste::is_mix_clutter_track(t, &q_low));
+    for (_, batch) in curated_batches.iter_mut() {
+        batch.retain(|t| !crate::taste::is_mix_clutter_track(t, &q_low));
+    }
 
     // Remote (Deezer) search & playlist tracks carry no genre metadata. Without it the
     // genre-clash checks cannot tell an actual J-Rock track from a rap track that happened
@@ -3271,6 +3277,13 @@ fn format_instant_mix_response(
     mut refined: crate::taste::SearchMixResult,
 ) -> Response {
     maybe_apply_llm_mix(state, query, &mut refined);
+    if let Some(mix) = refined.instant_mix.as_mut() {
+        // A tight mix beats a padded one — never ship 40+ filler tracks.
+        if mix.tracks.len() > 24 {
+            mix.tracks.truncate(24);
+            mix.total_duration = mix.tracks.iter().map(|t| t.duration.max(0)).sum();
+        }
+    }
     if let Some(ref mix) = refined.instant_mix {
         if mix.is_theme_mix && curated_len > 0 && mix.tracks.len() >= 8 {
             state
@@ -3316,15 +3329,22 @@ fn format_instant_mix_response(
 /// which is why an "AI-curated" mix could look identical to the old one.
 fn llm_mix_candidates(state: &AppState, query: &str, mix_tracks: &[Track]) -> Vec<Track> {
     let normalized = crate::models::slug(query);
+    let q_low = query.to_ascii_lowercase();
+    let spam_free: Vec<Track> = mix_tracks
+        .iter()
+        .filter(|t| !crate::taste::is_mix_clutter_track(t, &q_low))
+        .cloned()
+        .collect();
     let mut candidates: Vec<Track> = state
         .taste
         .load_curated_query_tracks(&normalized)
         .into_iter()
         .chain(state.store.search_tracks(query, 40, 0).unwrap_or_default())
+        .filter(|t| !crate::taste::is_mix_clutter_track(t, &q_low))
         .collect();
-    for t in mix_tracks {
+    for t in spam_free {
         if !candidates.iter().any(|existing| existing.id == t.id) {
-            candidates.push(t.clone());
+            candidates.push(t);
         }
     }
     candidates.truncate(48);

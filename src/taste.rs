@@ -2952,7 +2952,11 @@ impl TasteEngine {
                 .await
                 .unwrap_or_default();
                 for (_, batch) in batches {
-                    pool.extend(batch);
+                    pool.extend(
+                        batch
+                            .into_iter()
+                            .filter(|t| !is_mix_clutter_track(t, &query.to_ascii_lowercase())),
+                    );
                 }
             }
             // Generic playlist search is easily fooled by anime-style cover
@@ -2978,8 +2982,14 @@ impl TasteEngine {
                 }))
                 .await;
                 for (dz, ytm) in lookups {
-                    seed_tracks.extend(dz);
-                    seed_tracks.extend(ytm);
+                    seed_tracks.extend(dz.into_iter().filter(|t| {
+                        !is_mix_clutter_track(t, &query.to_ascii_lowercase())
+                            && seed_names.iter().any(|n| seed_name_matches(n, t))
+                    }));
+                    seed_tracks.extend(ytm.into_iter().filter(|t| {
+                        !is_mix_clutter_track(t, &query.to_ascii_lowercase())
+                            && seed_names.iter().any(|n| seed_name_matches(n, t))
+                    }));
                 }
             }
             // Seed-derived tracks are the only ones guaranteed to be on-theme,
@@ -3018,6 +3028,23 @@ impl TasteEngine {
                 .await;
         }
     }
+}
+
+/// A search result only counts as a seed match if the seed name actually
+/// appears in its title or artist. Broad searches return tracks that merely
+/// contain the theme word ("Anime Bae", "Anime Funk"), which are not matches.
+fn seed_name_matches(name: &str, track: &Track) -> bool {
+    let norm = |s: &str| slug(s);
+    let needle = norm(name);
+    if needle.len() < 3 {
+        return false;
+    }
+    let title = norm(&track.title);
+    let artist = norm(&primary_artist(&track.artist));
+    title.contains(&needle)
+        || artist.contains(&needle)
+        || (artist.len() > 2 && needle.contains(&artist))
+        || (title.len() > 3 && needle.contains(&title))
 }
 
 fn dedup_tracks_by_id(tracks: &mut Vec<Track>) {
@@ -8387,7 +8414,71 @@ fn is_junk_track_for_query(t: &Track, query_low: &str) -> bool {
     false
 }
 
-fn is_mix_clutter_track(t: &Track, query_low: &str) -> bool {
+/// YouTube/Deezer search spam that has no place in a curated mix: clickbait
+/// motivation uploads, "sleep music" compilations, reuploads and fake "funk"
+/// edits that merely stuff the theme word in the title.
+fn is_youtube_spam_track(t: &Track) -> bool {
+    let title = t.title.to_lowercase();
+    let hay = format!("{} {} {}", t.title, t.artist, t.album).to_lowercase();
+    for phrase in [
+        "listen to this",
+        "before you give up",
+        "life lessons",
+        "life lesson",
+        "motivation",
+        "motivational",
+        "reupload",
+        "(reupload)",
+        "sleep music",
+        "soothing lullabies",
+        "lullabies for",
+        "study music",
+        "relaxing music",
+        "top 10",
+        "top 5",
+        "facts about",
+        "what they don't",
+        "billionaire mindset",
+        "success secrets",
+        "hardstyle rage",
+        "anime rage",
+        "anime funk",
+        "anime baddie",
+        "anime bae",
+        "anime dziefczynka",
+        "anime abc cut",
+        "cut 60",
+        "audio cut",
+    ] {
+        if hay.contains(phrase) {
+            return true;
+        }
+    }
+    if title.contains('|') && title.len() > 40 {
+        return true;
+    }
+    if title.chars().filter(|c| c.is_uppercase()).count() >= 8 && title.len() > 24 {
+        return true;
+    }
+    let artist = t.artist.to_lowercase();
+    if artist.ends_with("-sama")
+        || artist.contains("visualizer")
+        || artist.contains("official video")
+    {
+        return true;
+    }
+    // Only treat channel-style suffixes as spam on YouTube imports — real
+    // artists like "Bethel Music" are legitimate elsewhere.
+    if t.source == "ytm" && (artist.ends_with(" music") || artist.ends_with(" tv")) {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn is_mix_clutter_track(t: &Track, query_low: &str) -> bool {
+    if is_youtube_spam_track(t) {
+        return true;
+    }
     if is_junk_track_for_query(t, query_low) {
         return true;
     }

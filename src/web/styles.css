@@ -1970,6 +1970,8 @@ a {
   display: flex;
   align-items: center;
   gap: 4px;
+  height: 60px;
+  box-sizing: border-box;
   padding: 10px 12px;
   border-bottom: 1px solid var(--border);
 }
@@ -5711,7 +5713,7 @@ html, body {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 7px 34px 7px 36px;
+  padding: 7px 62px 7px 12px;
   font-size: 13px;
   transition: border-color 0.12s, background 0.12s;
 }
@@ -5924,7 +5926,9 @@ html, body {
   border-left: 1px solid var(--border);
 }
 .rp-tabs {
-  padding: 9px 12px;
+  height: 56px;
+  box-sizing: border-box;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border);
 }
 .rp-tab {
