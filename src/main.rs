@@ -1,3 +1,4 @@
+mod auth;
 mod engine;
 mod models;
 mod navidrome;
@@ -88,6 +89,30 @@ async fn main() -> models::AppResult<()> {
     std::fs::create_dir_all(&data_dir)?;
     let store = Store::open(&data_dir.join("beatlab.db"))?;
 
+    // Passkeys are bound to the public origin. `BEATLAB_ORIGIN` wins over `URL`
+    // so deployments behind a proxy can configure the exact browser origin.
+    let webauthn_origin = std::env::var("BEATLAB_ORIGIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| allowed_url_raw.clone())
+        .unwrap_or_else(|| "http://localhost:4533".to_string());
+    if !auth::init_webauthn(&webauthn_origin) {
+        info!(origin = %webauthn_origin, "Passkeys disabled: a valid public HTTPS/domain origin (BEATLAB_ORIGIN) is required");
+    }
+
+    // Soft-deleted accounts and stale WebAuthn/login challenges are cleaned up
+    // once an hour; the seven-day window is enforced on restore as well.
+    let cleanup_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = cleanup_store.purge_expired_deleted_users();
+            let _ = cleanup_store.purge_expired_auth_challenges();
+        }
+    });
+
     let deezer = DeezerSource::new();
     let ytm = YtmSource::new(ytdlp_override);
     let archive = ArchiveSource::new();
@@ -169,6 +194,22 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/sessions/revoke-all", post(webapp::revoke_all_sessions))
         .route("/api/web/account/apikey", post(webapp::regenerate_api_key))
         .route("/api/web/account/password", post(webapp::change_password))
+        .route("/api/web/account/delete", post(webapp::account_delete))
+        .route("/api/web/account/restore", post(webapp::account_restore))
+        // Two-factor authentication, recovery codes & passkeys
+        .route("/api/web/auth/mfa/verify", post(webapp::mfa_verify))
+        .route("/api/web/auth/passkey/options", post(webapp::passkey_login_options))
+        .route("/api/web/auth/passkey/verify", post(webapp::passkey_login_verify))
+        .route("/api/web/2fa/status", get(webapp::twofa_status))
+        .route("/api/web/2fa/totp/start", post(webapp::totp_start))
+        .route("/api/web/2fa/totp/enable", post(webapp::totp_enable))
+        .route("/api/web/2fa/recovery", post(webapp::recovery_regenerate))
+        .route("/api/web/2fa/disable", post(webapp::twofa_disable))
+        .route("/api/web/2fa/passkey/options", post(webapp::passkey_register_options))
+        .route("/api/web/2fa/passkey/verify", post(webapp::passkey_register_verify))
+        .route("/api/web/2fa/passkey/step-up/options", post(webapp::passkey_stepup_options))
+        .route("/api/web/2fa/passkey/step-up/verify", post(webapp::passkey_stepup_verify))
+        .route("/api/web/2fa/passkey/{id}", delete(webapp::passkey_delete))
         .route("/api/web/home", get(webapp::home))
         .route("/api/web/explore", get(webapp::explore))
         .route("/api/web/explore/mix/{key}", get(webapp::explore_mix))

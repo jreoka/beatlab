@@ -22,6 +22,10 @@ pub fn err_msg(msg: impl Into<String>) -> AppError {
     AppError(msg.into())
 }
 
+/// Sentinel returned by credential checks when the account exists but has been
+/// soft-deleted and is still inside its seven-day recovery window.
+pub const ERR_RESTORE_REQUIRED: &str = "__beatlab_restore_required__";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: i64,

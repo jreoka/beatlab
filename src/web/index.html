@@ -40,7 +40,7 @@
       </div>
 
       <p class="auth-desc">
-        Enter any username &amp; password to sign in or automatically create a brand-new account. Your account also works directly in <strong>Subsonic</strong> &amp; <strong>Navidrome</strong> apps.
+        Sign in with your username &amp; password, or with a passkey. For <strong>Subsonic</strong> &amp; <strong>Navidrome</strong> apps, use the API key from <strong>Settings &rarr; Apps &amp; API</strong> as the password &mdash; account passwords no longer work in music clients.
       </p>
 
       <form id="auth-form" class="auth-form">
@@ -55,6 +55,30 @@
         <div id="auth-error" class="auth-error hidden"></div>
         <button id="auth-submit" type="submit" class="btn-primary btn-full">Continue to Beatlab</button>
       </form>
+      <button id="auth-passkey-btn" type="button" class="btn-secondary btn-full auth-alt-btn" onclick="App.signInWithPasskey()">Sign in with a passkey</button>
+
+      <div id="auth-mfa" class="auth-extra hidden">
+        <div class="auth-section-title">Two-factor authentication</div>
+        <p id="auth-mfa-hint" class="auth-hint">Enter the 6-digit code from your authenticator app.</p>
+        <form id="mfa-form" class="auth-form">
+          <label>
+            <span id="mfa-code-label">Authentication code</span>
+            <input id="mfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" maxlength="32" required />
+          </label>
+          <div id="mfa-error" class="auth-error hidden"></div>
+          <button type="submit" class="btn-primary btn-full">Verify &amp; continue</button>
+        </form>
+        <button id="mfa-passkey-btn" type="button" class="btn-secondary btn-full auth-alt-btn hidden" onclick="App.signInWithPasskey()">Use a passkey instead</button>
+        <button type="button" class="link-btn" onclick="App.backToSignIn()">Back to sign in</button>
+      </div>
+
+      <div id="auth-restore" class="auth-extra hidden">
+        <div class="auth-section-title">Account scheduled for deletion</div>
+        <p class="auth-hint">Your account and library are still here, but your sessions were signed out. Restore it to keep everything &mdash; signing in again will not create a duplicate account.</p>
+        <div id="restore-error" class="auth-error hidden"></div>
+        <button type="button" class="btn-primary btn-full" onclick="App.restoreAccount()">Restore my account</button>
+        <button type="button" class="link-btn" onclick="App.backToSignIn()">Use a different account</button>
+      </div>
     </div>
   </div>
 

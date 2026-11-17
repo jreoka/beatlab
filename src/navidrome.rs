@@ -16,6 +16,10 @@ use uuid::Uuid;
 pub struct LoginReq {
     pub username: String,
     pub password: String,
+    /// Preferred explicit field. Many Navidrome clients only expose a password
+    /// box, so the API key may also be supplied there.
+    #[serde(default, rename = "apiKey")]
+    pub api_key: String,
     /// Client-supplied name (Navidrome sends `name`, some clients send
     /// `client` or Subsonic's `c`). Used to label the session in Settings.
     #[serde(default)]
@@ -147,10 +151,10 @@ pub fn require_nd_user(state: &AppState, headers: &HeaderMap) -> Result<User, Re
 
 fn build_login_response(state: &AppState, user: &User, token: &str) -> Value {
     let salt = Uuid::new_v4().simple().to_string()[..10].to_string();
-    let mut h = Md5::new();
-    h.update(format!("{}{}", user.password, salt).as_bytes());
-    let subsonic_token = hex::encode(h.finalize());
     let api_key = state.store.get_or_create_api_key(user.id).unwrap_or_default();
+    let mut h = Md5::new();
+    h.update(format!("{}{}", api_key, salt).as_bytes());
+    let subsonic_token = hex::encode(h.finalize());
 
     json!({
         "id": user.id.to_string(),
@@ -164,64 +168,58 @@ fn build_login_response(state: &AppState, user: &User, token: &str) -> Value {
     })
 }
 
+/// Navidrome-compatible clients must authenticate with the account's API key,
+/// never with a username/password pair. Most clients let the key be pasted into
+/// the password field; an explicit `apiKey` field is accepted as well.
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Response {
-    match state.store.authenticate_or_create_user(&req.username, &req.password) {
-        Ok((user, created)) => {
-            if created {
-                let taste = state.taste.clone();
-                let uid = user.id;
-                tokio::spawn(async move {
-                    taste.prime_new_user(uid).await;
-                });
-            }
-            let meta = SessionMeta {
-                user_agent: user_agent(&headers),
-                ip: client_ip(&headers),
-                client: req.client_name(),
-            };
-            match state
-                .store
-                .create_session_with_meta(user.id, "nd", &meta)
-            {
-                Ok(token) => json_ok(build_login_response(&state, &user, &token), None),
-                Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-            }
-        }
-        Err(e) => json_err(StatusCode::UNAUTHORIZED, &e.to_string()),
+    let explicit_key = req.api_key.trim();
+    let key = if explicit_key.is_empty() {
+        req.password.trim()
+    } else {
+        explicit_key
+    };
+    if key.is_empty() {
+        return json_err(
+            StatusCode::UNAUTHORIZED,
+            "API key required. Find it in Beatlab → Settings → Apps & API.",
+        );
+    }
+    let Some(user) = state.store.get_user_by_api_key(key).ok().flatten() else {
+        return json_err(StatusCode::UNAUTHORIZED, "Invalid API key");
+    };
+    let supplied_name = req.username.trim();
+    if !supplied_name.is_empty() && !supplied_name.eq_ignore_ascii_case(&user.username) {
+        return json_err(StatusCode::UNAUTHORIZED, "API key does not match that username");
+    }
+    let meta = SessionMeta {
+        user_agent: user_agent(&headers),
+        ip: client_ip(&headers),
+        client: req.client_name(),
+    };
+    match state
+        .store
+        .create_session_with_meta(user.id, "nd", &meta)
+    {
+        Ok(token) => json_ok(build_login_response(&state, &user, &token), None),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
+/// Client-side account creation is no longer allowed: accounts are created in
+/// the Beatlab web player where the user can also configure 2FA.
 pub async fn signup(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<LoginReq>,
+    State(_state): State<AppState>,
+    _headers: HeaderMap,
+    _req: Json<LoginReq>,
 ) -> Response {
-    match state.store.create_user(&req.username, &req.password) {
-        Ok(user) => {
-            let taste = state.taste.clone();
-            let uid = user.id;
-            tokio::spawn(async move {
-                taste.prime_new_user(uid).await;
-            });
-            let meta = SessionMeta {
-                user_agent: user_agent(&headers),
-                ip: client_ip(&headers),
-                client: req.client_name(),
-            };
-            match state
-                .store
-                .create_session_with_meta(user.id, "nd", &meta)
-            {
-                Ok(token) => json_ok(build_login_response(&state, &user, &token), None),
-                Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-            }
-        }
-        Err(e) => json_err(StatusCode::CONFLICT, &e.to_string()),
-    }
+    json_err(
+        StatusCode::FORBIDDEN,
+        "Create an account in the Beatlab web player, then use its API key in your music client.",
+    )
 }
 
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1128,12 +1126,15 @@ mod tests {
     #[tokio::test]
     async fn navidrome_login_auto_creates_user_and_playlist_crud_works() {
         let st = nd_test_state();
+        // Clients authenticate with the API key, never with the account password.
+        let user = st.store.create_user("maya", "password123").unwrap();
+        let api_key = st.store.get_or_create_api_key(user.id).unwrap();
         let resp = login(
             State(st.clone()),
             HeaderMap::new(),
             Json(LoginReq {
                 username: "maya".into(),
-                password: "password123".into(),
+                password: api_key,
                 ..Default::default()
             }),
         )

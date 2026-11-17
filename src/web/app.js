@@ -144,9 +144,18 @@
       sources: null,
       hidden: null,
       sessions: null,
+      security: null,
+      totpSetup: null,
+      recoveryCodes: null,
       confirmResetHidden: false,
       confirmRevokeAll: false,
+      confirmDisable2fa: false,
+      confirmDelete: false,
     },
+    authChallenge: '',
+    authFactor: 'totp',
+    restoreChallenge: '',
+    pendingPasskeyOptions: null,
     deferredInstallPrompt: null,
     isStandalone: false,
     hasViewNetworkError: false,
@@ -583,7 +592,15 @@
     if (state.networkMode !== 'online' || state.wasDisconnected) {
       handleConnectivityRestored();
     }
-    if (resp.status === 401 && path !== '/api/web/auth/signin' && path !== '/api/web/auth/signup') {
+    const inlineAuthPaths = [
+      '/api/web/auth/signin',
+      '/api/web/auth/signup',
+      '/api/web/auth/mfa/verify',
+      '/api/web/auth/passkey/options',
+      '/api/web/auth/passkey/verify',
+      '/api/web/account/restore',
+    ];
+    if (resp.status === 401 && !inlineAuthPaths.includes(path)) {
       showAuthScreen();
       throw new Error('Unauthorized');
     }
@@ -846,7 +863,23 @@
   // ---------------------------------------------------------------------------
   function resetAuthForm() {
     const form = $('auth-form');
-    if (form) form.reset();
+    if (form) {
+      form.reset();
+      form.classList.remove('hidden');
+    }
+    const passkeyBtn = $('auth-passkey-btn');
+    if (passkeyBtn) passkeyBtn.classList.remove('hidden');
+    const mfa = $('auth-mfa');
+    if (mfa) mfa.classList.add('hidden');
+    const mfaForm = $('mfa-form');
+    if (mfaForm) mfaForm.classList.remove('hidden');
+    const mfaPasskey = $('mfa-passkey-btn');
+    if (mfaPasskey) mfaPasskey.classList.add('hidden');
+    const restore = $('auth-restore');
+    if (restore) restore.classList.add('hidden');
+    state.authChallenge = '';
+    state.restoreChallenge = '';
+    state.pendingPasskeyOptions = null;
     const errBox = $('auth-error');
     if (errBox) {
       errBox.textContent = '';
@@ -891,7 +924,18 @@
     state.currentMoodShare = null;
     state.currentGenreShare = null;
     state.currentShareUrl = '';
-    state.settingsData = { sources: null, hidden: null, confirmResetHidden: false };
+    state.settingsData = {
+      sources: null,
+      hidden: null,
+      sessions: null,
+      security: null,
+      totpSetup: null,
+      recoveryCodes: null,
+      confirmResetHidden: false,
+      confirmRevokeAll: false,
+      confirmDisable2fa: false,
+      confirmDelete: false,
+    };
     clearTimeout(state.searchTimer);
     state.searchTimer = null;
     state.searchComposing = false;
@@ -968,6 +1012,61 @@
     $('app-shell').classList.remove('hidden');
     $('player-bar').classList.remove('hidden');
     syncResponsiveLayout();
+  }
+
+  // WebAuthn's JavaScript API uses ArrayBuffers while the server speaks
+  // base64url strings, so both directions need a small conversion layer.
+  function base64urlToBytes(value) {
+    let raw = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (raw.length % 4) raw += '=';
+    const bin = atob(raw);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function bytesToBase64url(buffer) {
+    const bytes = new Uint8Array(buffer || []);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function webauthnOptions(src, creating = false) {
+    const out = Object.assign({}, src);
+    out.challenge = base64urlToBytes(src.challenge);
+    if (creating && out.user) {
+      out.user = Object.assign({}, out.user, { id: base64urlToBytes(out.user.id) });
+    }
+    const listKey = creating ? 'excludeCredentials' : 'allowCredentials';
+    if (Array.isArray(out[listKey])) {
+      out[listKey] = out[listKey].map((c) => Object.assign({}, c, { id: base64urlToBytes(c.id) }));
+    }
+    return out;
+  }
+
+  function webauthnCredentialToJson(cred) {
+    const response = cred.response || {};
+    const encoded = {};
+    for (const key of ['authenticatorData', 'clientDataJSON', 'signature', 'userHandle', 'attestationObject']) {
+      if (response[key] != null) encoded[key] = bytesToBase64url(response[key]);
+    }
+    return {
+      id: cred.id,
+      rawId: bytesToBase64url(cred.rawId),
+      type: cred.type || 'public-key',
+      response: encoded,
+      clientExtensionResults: typeof cred.getClientExtensionResults === 'function' ? cred.getClientExtensionResults() : {},
+    };
+  }
+
+  function passkeySupported() {
+    return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.create);
+  }
+
+  function securityCodeValue() {
+    const input = $('sec-code');
+    return input ? input.value.trim() : '';
   }
 
   function wirePlayerBarToggle() {
@@ -1344,6 +1443,29 @@
           method: 'POST',
           body: JSON.stringify({ username, password }),
         });
+        if (res.mfaRequired) {
+          state.authChallenge = res.challenge;
+          state.authFactor = res.totp ? 'totp' : 'passkey';
+          $('auth-form').classList.add('hidden');
+          $('auth-passkey-btn').classList.add('hidden');
+          $('auth-mfa').classList.remove('hidden');
+          $('auth-mfa-hint').textContent = res.totp
+            ? 'Enter the 6-digit code from your authenticator app, or one of your recovery codes.'
+            : 'This account signs in with passkeys. Verify one to continue.';
+          const mfaForm = $('mfa-form');
+          const passkeyBtn = $('mfa-passkey-btn');
+          if (mfaForm) mfaForm.classList.toggle('hidden', !res.totp);
+          if (passkeyBtn) passkeyBtn.classList.toggle('hidden', !!res.totp);
+          if (res.totp) $('mfa-code').focus();
+          return;
+        }
+        if (res.restoreRequired) {
+          state.restoreChallenge = res.challenge;
+          $('auth-form').classList.add('hidden');
+          $('auth-passkey-btn').classList.add('hidden');
+          $('auth-restore').classList.remove('hidden');
+          return;
+        }
         state.token = res.token;
         state.user = res.user;
         localStorage.setItem('beatlab_token', res.token);
@@ -1354,6 +1476,30 @@
         errBox.classList.remove('hidden');
       }
     });
+
+    const mfaForm = $('mfa-form');
+    if (mfaForm) {
+      mfaForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const errBox = $('mfa-error');
+        errBox.classList.add('hidden');
+        try {
+          const res = await api('/api/web/auth/mfa/verify', {
+            method: 'POST',
+            body: JSON.stringify({ challenge: state.authChallenge, code: $('mfa-code').value }),
+          });
+          state.token = res.token;
+          state.user = res.user;
+          state.authChallenge = '';
+          localStorage.setItem('beatlab_token', res.token);
+          showToast(`Welcome back, ${res.user.username}`);
+          await onSignedIn();
+        } catch (err) {
+          errBox.textContent = err.message;
+          errBox.classList.remove('hidden');
+        }
+      });
+    }
 
     const globalSearch = $('global-search');
     const triggerSearchFromInput = (rawVal) => {
@@ -5962,8 +6108,9 @@
             <div class="kv-label">USERNAME</div>
             <div class="kv-val">${esc(state.user.username)}</div>
           </div>
+          <div class="settings-row-desc" style="margin-bottom:12px">Music clients can no longer sign in with your account password. When your client asks for a password, paste the API key below instead &mdash; or use its <code>apiKey</code> field. Regenerating the key signs every connected client out until you update it.</div>
           <div class="kv-card">
-            <div class="kv-label">OPENSUBSONIC API KEY</div>
+            <div class="kv-label">OPENSUBSONIC / NAVIDROME API KEY</div>
             <div class="kv-row">
               <span id="modal-apikey" class="kv-val">${esc(state.user.apiKey || '')}</span>
               <div style="display:flex;gap:6px;flex-shrink:0">
@@ -5971,6 +6118,7 @@
                 <button class="mini-btn" onclick="App.regenApiKey()">Regenerate</button>
               </div>
             </div>
+            ${state.user && state.user.twoFactorEnabled ? '<input id="apikey-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code to regenerate" style="width:100%;margin-top:8px" />' : ''}
           </div>
           <div class="settings-clients">
             <div class="kv-label">COMPATIBLE CLIENTS</div>
@@ -5978,6 +6126,147 @@
               ${clients.map((c) => `<span class="settings-client-chip">${c}</span>`).join('')}
             </div>
           </div>
+        </div>
+      `;
+      return;
+    }
+
+    if (tab === 'security') {
+      const sec = state.settingsData.security || {
+        twoFactorEnabled: false, totpEnabled: false, passkeys: [], events: [],
+        recoveryTotal: 0, recoveryUsed: 0, passkeysAvailable: false,
+      };
+      const setup = state.settingsData.totpSetup;
+      const codes = state.settingsData.recoveryCodes;
+      const confirmDisable = !!state.settingsData.confirmDisable2fa;
+      const confirmDelete = !!state.settingsData.confirmDelete;
+      const methods = [
+        sec.totpEnabled ? 'Authenticator app' : '',
+        sec.passkeys.length ? 'Passkeys' : '',
+      ].filter(Boolean).join(' + ') || 'None';
+      const passkeyRows = sec.passkeys.length
+        ? sec.passkeys.map((p) => `
+            <div class="hidden-track-row">
+              <span class="session-icon">${ICONS.key || ICONS.lock || ''}</span>
+              <div class="hidden-track-meta">
+                <div class="hidden-track-title">${esc(p.label || 'Passkey')}</div>
+                <div class="hidden-track-sub">Added ${esc(timeAgo(p.created))}${p.lastUsed ? ` &middot; Last used ${esc(timeAgo(p.lastUsed))}` : ''}</div>
+              </div>
+              <button class="mini-btn danger-btn" onclick="App.removePasskey(${esc(JSON.stringify(p.id))})">Remove</button>
+            </div>`).join('')
+        : `<div class="settings-empty">No passkeys registered yet.</div>`;
+      const eventRows = sec.events.length
+        ? sec.events.map((e) => `
+            <div class="hidden-track-row">
+              <div class="hidden-track-meta">
+                <div class="hidden-track-title">${esc(e.detail || e.kind)}</div>
+                <div class="hidden-track-sub">${esc(timeAgo(e.created))}${e.ip ? ` &middot; ${esc(e.ip)}` : ''}</div>
+              </div>
+            </div>`).join('')
+        : `<div class="settings-empty">No security events recorded yet.</div>`;
+      body.innerHTML = `
+        <div class="settings-section">
+          <div class="settings-section-title">Two-Factor Authentication</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Account protection</div>
+              <div class="settings-row-desc">${sec.twoFactorEnabled ? `Active: ${esc(methods)}` : 'Add an authenticator app or passkey to protect your account'}</div>
+            </div>
+            <span class="pwa-status-pill">${sec.twoFactorEnabled ? 'Enabled' : 'Off'}</span>
+          </div>
+          ${
+            sec.totpEnabled
+              ? `<div class="settings-row"><div class="settings-row-info"><div class="settings-row-label">Authenticator app</div><div class="settings-row-desc">Codes are verified with your app. Recovery codes can also sign you in.</div></div><span class="pwa-status-pill">Enabled</span></div>`
+              : setup
+                ? `<div class="totp-setup-card">
+                    <div class="kv-label">1. SCAN THIS QR CODE</div>
+                    <div class="totp-qr">${setup.qrSvg || ''}</div>
+                    <div class="kv-label">OR ENTER THIS KEY MANUALLY</div>
+                    <div class="kv-row"><span id="totp-secret" class="kv-val totp-secret">${esc(setup.secret)}</span><button class="mini-btn" onclick="App.copyText(document.getElementById('totp-secret').textContent, 'Secret copied')">Copy</button></div>
+                    <div class="kv-label" style="margin-top:12px">2. ENTER THE 6-DIGIT CODE TO CONFIRM</div>
+                    <form onsubmit="App.enableTotp(event)" style="display:flex;gap:8px;flex-wrap:wrap">
+                      <input id="totp-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="000000" maxlength="6" required style="flex:1;min-width:140px" />
+                      <button type="submit" class="btn-secondary">Enable 2FA</button>
+                      <button type="button" class="mini-btn ghost" onclick="App.cancelTotpSetup()">Cancel</button>
+                    </form>
+                  </div>`
+                : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.startTotpSetup()">Set up authenticator app</button></div>`
+          }
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Recovery Codes</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">${Math.max(0, sec.recoveryTotal - sec.recoveryUsed)} of ${sec.recoveryTotal} codes left</div>
+              <div class="settings-row-desc">Single-use codes that work when you lose your authenticator. Store them somewhere safe.</div>
+            </div>
+          </div>
+          ${
+            codes
+              ? `<div class="recovery-codes-card">
+                  <div class="kv-label">SAVE THESE NOW — THEY WILL NOT BE SHOWN AGAIN</div>
+                  <div class="recovery-codes-grid">${codes.map((c) => `<code>${esc(c)}</code>`).join('')}</div>
+                  <button class="btn-secondary" style="margin-top:10px" onclick="App.dismissRecoveryCodes()">I've saved them</button>
+                </div>`
+              : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.generateRecoveryCodes()">Generate new recovery codes</button></div>`
+          }
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Passkeys</div>
+          <div class="settings-row-desc" style="margin-bottom:12px">Passkeys let you sign in with Face ID, Windows Hello, a hardware key or a synced password key. ${!sec.passkeysAvailable ? 'Passkeys are not configured on this server (set BEATLAB_ORIGIN to your public HTTPS URL).' : ''}</div>
+          <div class="hidden-track-list">${passkeyRows}</div>
+          <div class="settings-actions-row">
+            <button class="btn-secondary" ${!sec.passkeysAvailable || !passkeySupported() ? 'disabled' : ''} onclick="App.addPasskey()">Add a passkey</button>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Sensitive Actions</div>
+          <div class="settings-row-desc" style="margin-bottom:10px">${sec.twoFactorEnabled ? 'Enter an authenticator code, a recovery code, or authenticate with a passkey in this session.' : '2FA is off, so no code is required yet.'}</div>
+          <input id="sec-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="${sec.twoFactorEnabled ? '2FA or recovery code' : '2FA code (not required)'}" style="width:100%;margin-bottom:8px" />
+          ${sec.passkeys.length && sec.passkeysAvailable ? '<button class="mini-btn" style="margin-bottom:12px" onclick="App.stepUpWithPasskey()">Verify with a passkey instead</button>' : ''}
+          ${
+            confirmDisable
+              ? `<div class="settings-confirm-bar">
+                  <span>Disable all two-factor authentication? This removes your authenticator, passkeys and recovery codes.</span>
+                  <div class="settings-confirm-actions">
+                    <button class="btn-secondary danger-btn" onclick="App.confirmDisable2fa()">Yes, disable 2FA</button>
+                    <button class="mini-btn ghost" onclick="App.cancelDisable2fa()">Cancel</button>
+                  </div>
+                </div>`
+              : `<div class="settings-actions-row"><button class="btn-secondary danger-btn" ${!sec.twoFactorEnabled ? 'disabled' : ''} onclick="App.promptDisable2fa()">Disable two-factor authentication</button></div>`
+          }
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Delete Account</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Delete my account</div>
+              <div class="settings-row-desc">Signs you out of every device and music app immediately. You have 7 days to restore it by signing back in — after that it is permanently removed.</div>
+            </div>
+          </div>
+          ${
+            confirmDelete
+              ? `<div class="settings-confirm-bar">
+                  <div style="display:flex;flex-direction:column;gap:8px;width:100%">
+                    <span>Type your password to confirm deletion.</span>
+                    <input id="delete-password" type="password" autocomplete="current-password" placeholder="Account password" />
+                    <div class="settings-confirm-actions">
+                      <button class="btn-secondary danger-btn" onclick="App.confirmDeleteAccount()">Delete my account</button>
+                      <button class="mini-btn ghost" onclick="App.cancelDeleteAccount()">Cancel</button>
+                    </div>
+                  </div>
+                </div>`
+              : `<div class="settings-actions-row"><button class="btn-secondary danger-btn" onclick="App.promptDeleteAccount()">Delete account</button></div>`
+          }
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Security History</div>
+          <div class="hidden-track-list">${eventRows}</div>
         </div>
       `;
       return;
@@ -6001,6 +6290,7 @@
           <div class="kv-label">CHANGE PASSWORD</div>
           <input id="pw-cur" type="password" autocomplete="current-password" placeholder="Current password" required />
           <input id="pw-new" type="password" autocomplete="new-password" placeholder="New password" required />
+          ${state.user && state.user.twoFactorEnabled ? '<input id="pw-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code" required />' : ''}
           <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:space-between;align-items:center;margin-top:6px">
             <button type="submit" class="btn-secondary">Update Password</button>
             <button type="button" class="btn-secondary danger-btn" onclick="App.signOut()">Sign out</button>
@@ -6026,6 +6316,7 @@
             <button class="settings-nav-btn" data-stab="general" onclick="App.setSettingsTab('general')">General</button>
             <button class="settings-nav-btn" data-stab="hidden" onclick="App.setSettingsTab('hidden')">Hidden Songs</button>
             <button class="settings-nav-btn" data-stab="sessions" onclick="App.setSettingsTab('sessions')">Sessions</button>
+            <button class="settings-nav-btn" data-stab="security" onclick="App.setSettingsTab('security')">Security &amp; 2FA</button>
             <button class="settings-nav-btn" data-stab="apps" onclick="App.setSettingsTab('apps')">Apps &amp; API</button>
             <button class="settings-nav-btn" data-stab="account" onclick="App.setSettingsTab('account')">Account</button>
           </nav>
@@ -6036,14 +6327,16 @@
     renderSettingsModalBody();
 
     try {
-      const [srcRes, hidRes, sessRes] = await Promise.all([
+      const [srcRes, hidRes, sessRes, secRes] = await Promise.all([
         api('/api/web/sources').catch(() => null),
         api('/api/web/hidden').catch(() => null),
         api('/api/web/sessions').catch(() => null),
+        api('/api/web/2fa/status').catch(() => null),
       ]);
       if (srcRes) state.settingsData.sources = srcRes;
       if (hidRes) state.settingsData.hidden = hidRes;
       if (sessRes) state.settingsData.sessions = sessRes;
+      if (secRes) state.settingsData.security = secRes;
       if ($('settings-body')) {
         renderSettingsModalBody();
       }
@@ -6852,6 +7145,75 @@
         }).catch(() => {});
       }
     },
+    backToSignIn: () => {
+      resetAuthForm();
+    },
+    restoreAccount: async () => {
+      const errBox = $('restore-error');
+      if (errBox) errBox.classList.add('hidden');
+      try {
+        const res = await api('/api/web/account/restore', {
+          method: 'POST',
+          body: JSON.stringify({ challenge: state.restoreChallenge }),
+        });
+        state.token = res.token;
+        state.user = res.user;
+        state.restoreChallenge = '';
+        localStorage.setItem('beatlab_token', res.token);
+        showToast('Account restored — welcome back!');
+        await onSignedIn();
+      } catch (err) {
+        if (errBox) {
+          errBox.textContent = err.message;
+          errBox.classList.remove('hidden');
+        }
+      }
+    },
+    signInWithPasskey: async () => {
+      if (!passkeySupported()) {
+        showToast('Passkeys are not supported by this browser');
+        return;
+      }
+      const username = ($('auth-username') && $('auth-username').value || '').trim();
+      if (!username) {
+        const box = $('auth-error');
+        if (box) {
+          box.textContent = 'Enter your username first, then sign in with a passkey.';
+          box.classList.remove('hidden');
+        }
+        return;
+      }
+      try {
+        const opts = await api('/api/web/auth/passkey/options', {
+          method: 'POST',
+          body: JSON.stringify({ username }),
+        });
+        state.authChallenge = opts.challenge;
+        const credential = await navigator.credentials.get({
+          publicKey: webauthnOptions(opts.publicKey, false),
+        });
+        if (!credential) throw new Error('Passkey sign-in was cancelled');
+        const res = await api('/api/web/auth/passkey/verify', {
+          method: 'POST',
+          body: JSON.stringify({
+            challenge: opts.challenge,
+            credential: webauthnCredentialToJson(credential),
+          }),
+        });
+        state.token = res.token;
+        state.user = res.user;
+        state.authChallenge = '';
+        localStorage.setItem('beatlab_token', res.token);
+        showToast(`Welcome back, ${res.user.username}`);
+        await onSignedIn();
+      } catch (err) {
+        const box = $('auth-mfa') && !$('auth-mfa').classList.contains('hidden') ? $('mfa-error') : $('auth-error');
+        if (box) {
+          box.textContent = err.message;
+          box.classList.remove('hidden');
+        }
+      }
+    },
     setLibTab: (tab) => {
       haptic('tap');
       return renderLibrary(tab);
@@ -7142,6 +7504,14 @@
       state.settingsTab = tab;
       state.settingsData.confirmResetHidden = false;
       state.settingsData.confirmRevokeAll = false;
+      state.settingsData.confirmDisable2fa = false;
+      state.settingsData.confirmDelete = false;
+      if (tab === 'security') {
+        api('/api/web/2fa/status').then((res) => {
+          state.settingsData.security = res;
+          if ($('settings-body') && state.settingsTab === 'security') renderSettingsModalBody();
+        }).catch(() => {});
+      }
       renderSettingsModalBody();
     },
     promptResetHidden: () => {
@@ -7228,6 +7598,171 @@
         if (sessRes) state.settingsData.sessions = sessRes;
         renderSettingsModalBody();
         showToast('Client allowed again');
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    refreshSecurityStatus: async () => {
+      try {
+        state.settingsData.security = await api('/api/web/2fa/status');
+      } catch {}
+      if ($('settings-body') && state.settingsTab === 'security') renderSettingsModalBody();
+    },
+    startTotpSetup: async () => {
+      try {
+        state.settingsData.totpSetup = await api('/api/web/2fa/totp/start', { method: 'POST' });
+        renderSettingsModalBody();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    cancelTotpSetup: () => {
+      state.settingsData.totpSetup = null;
+      renderSettingsModalBody();
+    },
+    enableTotp: async (e) => {
+      if (e) e.preventDefault();
+      try {
+        const res = await api('/api/web/2fa/totp/enable', {
+          method: 'POST',
+          body: JSON.stringify({ code: $('totp-code').value }),
+        });
+        state.settingsData.totpSetup = null;
+        state.settingsData.recoveryCodes = res.recoveryCodes;
+        if (state.user) state.user.twoFactorEnabled = true;
+        showToast('Two-factor authentication enabled');
+        await window.App.refreshSecurityStatus();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    generateRecoveryCodes: async () => {
+      try {
+        const res = await api('/api/web/2fa/recovery', {
+          method: 'POST',
+          body: JSON.stringify({ code: securityCodeValue() || undefined }),
+        });
+        state.settingsData.recoveryCodes = res.recoveryCodes;
+        renderSettingsModalBody();
+        showToast('New recovery codes generated');
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    dismissRecoveryCodes: async () => {
+      state.settingsData.recoveryCodes = null;
+      await window.App.refreshSecurityStatus();
+    },
+    addPasskey: async () => {
+      if (!passkeySupported()) {
+        showToast('Passkeys are not supported by this browser');
+        return;
+      }
+      try {
+        const opts = await api('/api/web/2fa/passkey/options', { method: 'POST' });
+        const credential = await navigator.credentials.create({
+          publicKey: webauthnOptions(opts.publicKey, true),
+        });
+        if (!credential) throw new Error('Passkey registration was cancelled');
+        const label = window.prompt('Name this passkey', 'This device') || 'Passkey';
+        await api('/api/web/2fa/passkey/verify', {
+          method: 'POST',
+          body: JSON.stringify({
+            challenge: opts.challenge,
+            credential: webauthnCredentialToJson(credential),
+            label,
+          }),
+        });
+        showToast('Passkey added');
+        await window.App.refreshSecurityStatus();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    stepUpWithPasskey: async () => {
+      if (!passkeySupported()) {
+        showToast('Passkeys are not supported by this browser');
+        return;
+      }
+      try {
+        const opts = await api('/api/web/2fa/passkey/step-up/options', { method: 'POST' });
+        const credential = await navigator.credentials.get({
+          publicKey: webauthnOptions(opts.publicKey, false),
+        });
+        if (!credential) throw new Error('Passkey verification was cancelled');
+        await api('/api/web/2fa/passkey/step-up/verify', {
+          method: 'POST',
+          body: JSON.stringify({ challenge: opts.challenge, credential: webauthnCredentialToJson(credential) }),
+        });
+        showToast('Verified with your passkey');
+        const input = $('sec-code');
+        if (input) input.value = '';
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    removePasskey: async (id) => {
+      try {
+        const code = securityCodeValue();
+        const query = code ? `?code=${encodeURIComponent(code)}` : '';
+        await api(`/api/web/2fa/passkey/${encodeURIComponent(id)}${query}`, { method: 'DELETE' });
+        showToast('Passkey removed');
+        await window.App.refreshSecurityStatus();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    promptDisable2fa: () => {
+      state.settingsData.confirmDisable2fa = true;
+      renderSettingsModalBody();
+    },
+    cancelDisable2fa: () => {
+      state.settingsData.confirmDisable2fa = false;
+      renderSettingsModalBody();
+    },
+    confirmDisable2fa: async () => {
+      try {
+        await api('/api/web/2fa/disable', {
+          method: 'POST',
+          body: JSON.stringify({ code: securityCodeValue() || undefined }),
+        });
+        if (state.user) {
+          state.user.twoFactorEnabled = false;
+          state.user.totpEnabled = false;
+          state.user.passkeys = 0;
+        }
+        state.settingsData.confirmDisable2fa = false;
+        showToast('Two-factor authentication disabled');
+        await window.App.refreshSecurityStatus();
+      } catch (err) {
+        showToast(err.message);
+      }
+    },
+    promptDeleteAccount: () => {
+      state.settingsData.confirmDelete = true;
+      renderSettingsModalBody();
+    },
+    cancelDeleteAccount: () => {
+      state.settingsData.confirmDelete = false;
+      renderSettingsModalBody();
+    },
+    confirmDeleteAccount: async () => {
+      const passwordInput = $('delete-password');
+      if (!passwordInput || !passwordInput.value) {
+        showToast('Enter your password to confirm');
+        return;
+      }
+      try {
+        const res = await api('/api/web/account/delete', {
+          method: 'POST',
+          body: JSON.stringify({
+            password: passwordInput.value,
+            code: securityCodeValue() || undefined,
+          }),
+        });
+        state.settingsData.confirmDelete = false;
+        showToast('Account scheduled for deletion. Sign in within 7 days to restore it.');
+        await window.App.signOut();
       } catch (err) {
         showToast(err.message);
       }
@@ -7557,7 +8092,11 @@
     installPwa,
     regenApiKey: async () => {
       try {
-        const res = await api('/api/web/account/apikey', { method: 'POST' });
+        const codeInput = $('apikey-code');
+        const res = await api('/api/web/account/apikey', {
+          method: 'POST',
+          body: JSON.stringify({ code: codeInput ? codeInput.value : undefined }),
+        });
         state.user.apiKey = res.apiKey;
         const el = $('modal-apikey');
         if (el) el.textContent = res.apiKey;
@@ -7574,6 +8113,7 @@
           body: JSON.stringify({
             currentPassword: $('pw-cur').value,
             newPassword: $('pw-new').value,
+            code: $('pw-code') ? $('pw-code').value : undefined,
           }),
         });
         showToast('Password updated');

@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1
 
 FROM rust:1-bookworm AS builder
+# WebAuthn passkey verification needs OpenSSL development headers at build time.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 # Pre-compile dependencies first to maximize Docker layer caching
@@ -19,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         ffmpeg \
+        libssl3 \
         nodejs \
         python3 \
     && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \

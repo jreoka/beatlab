@@ -1,3 +1,4 @@
+use crate::auth::{hash_recovery_code, RESTORE_WINDOW_SECS};
 use crate::models::{
     constant_time_eq, err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
     ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, PublicUser, RadioStation,
@@ -66,6 +67,34 @@ pub struct SessionMeta {
     pub client: String,
 }
 
+/// Server-side state of a user's TOTP enrolment.
+#[derive(Debug, Clone)]
+pub struct TotpState {
+    pub secret: String,
+    pub enabled: bool,
+    pub created: i64,
+    pub last_step: i64,
+}
+
+/// A registered passkey, safe to show in settings (never exposes key material).
+#[derive(Debug, Clone)]
+pub struct PasskeyInfo {
+    pub credential_id: String,
+    pub label: String,
+    pub created: i64,
+    pub last_used: i64,
+}
+
+/// One line in the account's security audit trail.
+#[derive(Debug, Clone)]
+pub struct SecurityEvent {
+    pub id: i64,
+    pub kind: String,
+    pub detail: String,
+    pub ip: String,
+    pub created: i64,
+}
+
 impl Store {
     pub fn open(path: &Path) -> AppResult<Self> {
         if let Some(parent) = path.parent() {
@@ -126,6 +155,58 @@ impl Store {
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+
+            -- Two-factor authentication (TOTP secret + single-use recovery codes)
+            CREATE TABLE IF NOT EXISTS totp_secrets (
+                user_id INTEGER PRIMARY KEY,
+                secret TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                created INTEGER NOT NULL,
+                last_step INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS recovery_codes (
+                code_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                created INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes(user_id);
+
+            -- WebAuthn passkeys and the in-flight challenges that pair each
+            -- browser ceremony with its server-side state.
+            CREATE TABLE IF NOT EXISTS passkeys (
+                credential_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                label TEXT NOT NULL DEFAULT 'Passkey',
+                passkey_json TEXT NOT NULL,
+                created INTEGER NOT NULL,
+                last_used INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys(user_id);
+            CREATE TABLE IF NOT EXISTS auth_challenges (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_auth_challenges_created ON auth_challenges(created);
+
+            -- Security audit trail and soft-deletion / 7-day account recovery.
+            CREATE TABLE IF NOT EXISTS security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                ip TEXT NOT NULL DEFAULT '',
+                created INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_security_events_user ON security_events(user_id, created DESC);
 
             CREATE TABLE IF NOT EXISTS tracks (
                 id TEXT PRIMARY KEY,
@@ -389,6 +470,9 @@ impl Store {
         ensure_column(&conn, "sessions", "client", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "sessions", "last_seen", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "sessions", "revoked", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "sessions", "mfa_at", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "users", "deleted_at", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "users", "restore_hash", "TEXT NOT NULL DEFAULT ''")?;
         // Sessions used to expire after 30 days; normalise old rows so the
         // stored value matches the now-persistent behaviour.
         conn.execute(
@@ -452,18 +536,21 @@ impl Store {
     ) -> AppResult<(User, bool)> {
         let uname = validate_credentials(username, password).map_err(|e| err_msg(e))?;
         let conn = self.lock();
-        let existing = conn
+        let existing: Option<(User, i64)> = conn
             .query_row(
-                "SELECT id, username, password, created FROM users WHERE lower(username) = lower(?1)",
+                "SELECT id, username, password, created, deleted_at FROM users WHERE lower(username) = lower(?1)",
                 params![uname],
-                row_to_user,
+                |r| Ok((row_to_user(r)?, r.get::<_, i64>(4)?)),
             )
             .optional()?;
-        if let Some(u) = existing {
-            if constant_time_eq(&u.password, password) {
-                return Ok((u, false));
+        if let Some((u, deleted_at)) = existing {
+            if !constant_time_eq(&u.password, password) {
+                return Err(err_msg("Invalid username or password"));
             }
-            return Err(err_msg("Invalid username or password"));
+            if deleted_at > 0 {
+                return Err(err_msg(crate::models::ERR_RESTORE_REQUIRED));
+            }
+            return Ok((u, false));
         }
 
         let now = Utc::now().timestamp();
@@ -508,6 +595,17 @@ impl Store {
             .query_row(
                 "SELECT id, username, password, created FROM users WHERE lower(username) = lower(?1)",
                 params![name.trim()],
+                row_to_user,
+            )
+            .optional()?)
+    }
+
+    pub fn get_user_by_id(&self, id: i64) -> AppResult<Option<User>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, username, password, created FROM users WHERE id = ?1 AND deleted_at = 0",
+                params![id],
                 row_to_user,
             )
             .optional()?)
@@ -573,7 +671,7 @@ impl Store {
             .query_row(
                 "SELECT u.id, u.username, u.password, u.created
                  FROM sessions s JOIN users u ON u.id = s.user_id
-                 WHERE s.token = ?1 AND s.revoked = 0",
+                 WHERE s.token = ?1 AND s.revoked = 0 AND u.deleted_at = 0",
                 params![token.trim()],
                 row_to_user,
             )
@@ -761,11 +859,386 @@ impl Store {
             .query_row(
                 "SELECT u.id, u.username, u.password, u.created
                  FROM api_keys k JOIN users u ON u.id = k.user_id
-                 WHERE k.key = ?1",
+                 WHERE k.key = ?1 AND u.deleted_at = 0",
                 params![key.trim()],
                 row_to_user,
             )
             .optional()?)
+    }
+
+    // -------------------------------------------------------------------------
+    // Two-factor authentication, passkeys & seven-day account recovery
+    // -------------------------------------------------------------------------
+
+    pub fn get_totp(&self, user_id: i64) -> AppResult<Option<TotpState>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT secret, enabled, created, last_step FROM totp_secrets WHERE user_id = ?1",
+                params![user_id],
+                |r| {
+                    Ok(TotpState {
+                        secret: r.get(0)?,
+                        enabled: r.get::<_, i64>(1)? != 0,
+                        created: r.get(2)?,
+                        last_step: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Creates or replaces a pending/enabled TOTP enrolment. Re-enrolling always
+    /// resets the replay counter and invalidates previously issued codes.
+    pub fn save_totp(&self, user_id: i64, secret: &str, enabled: bool) -> AppResult<()> {
+        let conn = self.lock();
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO totp_secrets(user_id, secret, enabled, created, last_step)
+             VALUES (?1, ?2, ?3, ?4, 0)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 secret = excluded.secret, enabled = excluded.enabled,
+                 created = excluded.created, last_step = 0",
+            params![user_id, secret, if enabled { 1 } else { 0 }, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_totp_enabled(&self, user_id: i64, enabled: bool) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE totp_secrets SET enabled = ?1 WHERE user_id = ?2",
+            params![if enabled { 1 } else { 0 }, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_totp_step(&self, user_id: i64, step: i64) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE totp_secrets SET last_step = ?1 WHERE user_id = ?2",
+            params![step, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn passkey_count(&self, user_id: i64) -> AppResult<usize> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM passkeys WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get::<_, i64>(0).map(|n| n as usize),
+        )?)
+    }
+
+    /// A user has 2FA when TOTP is enabled or at least one passkey is enrolled.
+    pub fn is_2fa_enabled(&self, user_id: i64) -> AppResult<bool> {
+        if let Some(state) = self.get_totp(user_id)? {
+            if state.enabled {
+                return Ok(true);
+            }
+        }
+        Ok(self.passkey_count(user_id)? > 0)
+    }
+
+    /// List the credentials registered for an account (public data only).
+    pub fn list_passkeys(&self, user_id: i64) -> AppResult<Vec<PasskeyInfo>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT credential_id, label, created, last_used FROM passkeys
+             WHERE user_id = ?1 ORDER BY created DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                Ok(PasskeyInfo {
+                    credential_id: r.get(0)?,
+                    label: r.get(1)?,
+                    created: r.get(2)?,
+                    last_used: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Serialised passkeys used to build a WebAuthn assertion challenge.
+    pub fn get_passkeys_json(&self, user_id: i64) -> AppResult<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT passkey_json FROM passkeys WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map(params![user_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_passkey_by_id(&self, credential_id: &str) -> AppResult<Option<(i64, String)>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT user_id, passkey_json FROM passkeys WHERE credential_id = ?1",
+                params![credential_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn save_passkey(
+        &self,
+        user_id: i64,
+        credential_id: &str,
+        label: &str,
+        passkey_json: &str,
+    ) -> AppResult<()> {
+        let conn = self.lock();
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO passkeys(credential_id, user_id, label, passkey_json, created)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(credential_id) DO UPDATE SET
+                 user_id = excluded.user_id, label = excluded.label,
+                 passkey_json = excluded.passkey_json, created = excluded.created",
+            params![credential_id, user_id, label, passkey_json, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_passkey(&self, user_id: i64, credential_id: &str) -> AppResult<bool> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "DELETE FROM passkeys WHERE user_id = ?1 AND credential_id = ?2",
+            params![user_id, credential_id],
+        )? > 0)
+    }
+
+    pub fn delete_all_passkeys(&self, user_id: i64) -> AppResult<usize> {
+        let conn = self.lock();
+        Ok(conn.execute("DELETE FROM passkeys WHERE user_id = ?1", params![user_id])?)
+    }
+
+    pub fn touch_passkey(&self, credential_id: &str, passkey_json: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE passkeys SET passkey_json = ?1, last_used = ?2 WHERE credential_id = ?3",
+            params![passkey_json, Utc::now().timestamp(), credential_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stores a short-lived challenge (login, restore, WebAuthn ceremony) and
+    /// returns the opaque id handed to the browser.
+    pub fn create_auth_challenge(&self, user_id: i64, kind: &str, payload: &str) -> AppResult<String> {
+        let id = crate::auth::random_token();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO auth_challenges(id, user_id, kind, payload, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, user_id, kind, payload, Utc::now().timestamp()],
+        )?;
+        Ok(id)
+    }
+
+    /// Atomically reads and removes a challenge. Expired challenges are dropped.
+    pub fn take_auth_challenge(&self, id: &str, kind: &str) -> AppResult<Option<(i64, String)>> {
+        let conn = self.lock();
+        let row: Option<(i64, String, i64)> = conn
+            .query_row(
+                "SELECT user_id, payload, created FROM auth_challenges WHERE id = ?1 AND kind = ?2",
+                params![id, kind],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)?)),
+            )
+            .optional()?;
+        conn.execute("DELETE FROM auth_challenges WHERE id = ?1", params![id])?;
+        let Some((user_id, payload, created)) = row else {
+            return Ok(None);
+        };
+        let ttl = if kind.starts_with("passkey") {
+            crate::auth::WEBAUTHN_CHALLENGE_TTL
+        } else {
+            crate::auth::LOGIN_CHALLENGE_TTL
+        };
+        if Utc::now().timestamp() - created > ttl {
+            return Ok(None);
+        }
+        Ok(Some((user_id, payload)))
+    }
+
+    pub fn purge_expired_auth_challenges(&self) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM auth_challenges WHERE created < ?1",
+            params![Utc::now().timestamp() - 3600],
+        )?;
+        Ok(())
+    }
+
+    /// Replace all recovery codes with freshly generated one-time codes (stored
+    /// only as SHA-256 hashes).
+    pub fn replace_recovery_codes(&self, user_id: i64, codes: &[String]) -> AppResult<()> {
+        let mut conn = self.lock();
+        let now = Utc::now().timestamp();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user_id])?;
+        for code in codes {
+            tx.execute(
+                "INSERT INTO recovery_codes(code_hash, user_id, created) VALUES (?1, ?2, ?3)",
+                params![hash_recovery_code(code), user_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically consume a recovery code. Returns true only on first use.
+    pub fn consume_recovery_code(&self, user_id: i64, code: &str) -> AppResult<bool> {
+        let hash = hash_recovery_code(code);
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let found: Option<String> = tx
+            .query_row(
+                "SELECT code_hash FROM recovery_codes
+                 WHERE user_id = ?1 AND code_hash = ?2 AND used = 0",
+                params![user_id, hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(code_hash) = found {
+            tx.execute(
+                "UPDATE recovery_codes SET used = 1 WHERE code_hash = ?1",
+                params![code_hash],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns (total, used) recovery codes, so the UI can show what is left.
+    pub fn recovery_code_stats(&self, user_id: i64) -> AppResult<(usize, usize)> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(used), 0) FROM recovery_codes WHERE user_id = ?1",
+            params![user_id],
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+        )?)
+    }
+
+    // -- Session step-up state -------------------------------------------------
+
+    /// (user_id, mfa_at) for a session token.
+    pub fn session_auth_state(&self, token: &str) -> AppResult<Option<(i64, i64)>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT user_id, mfa_at FROM sessions WHERE token = ?1 AND revoked = 0",
+                params![token.trim()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn mark_session_mfa(&self, token: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE sessions SET mfa_at = ?1 WHERE token = ?2",
+            params![Utc::now().timestamp(), token.trim()],
+        )?;
+        Ok(())
+    }
+
+    // -- Soft deletion & recovery ---------------------------------------------
+
+    pub fn user_deleted_at(&self, user_id: i64) -> AppResult<Option<i64>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT deleted_at FROM users WHERE id = ?1",
+                params![user_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Soft-delete an account: all sessions and API keys are destroyed so no
+    /// client stays signed in, while library data and 2FA settings are kept for
+    /// the seven-day recovery window.
+    pub fn soft_delete_user(&self, user_id: i64, restore_hash: &str) -> AppResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE users SET deleted_at = ?1, restore_hash = ?2 WHERE id = ?3",
+            params![Utc::now().timestamp(), restore_hash, user_id],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        tx.execute("DELETE FROM api_keys WHERE user_id = ?1", params![user_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn restore_hash(&self, user_id: i64) -> AppResult<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT restore_hash FROM users WHERE id = ?1 AND deleted_at > 0",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Ways a user may still be inside the recovery window.
+    pub fn deletion_expires_at(&self, user_id: i64) -> AppResult<Option<i64>> {
+        Ok(self
+            .user_deleted_at(user_id)?
+            .map(|at| at + RESTORE_WINDOW_SECS))
+    }
+
+    pub fn restore_user(&self, user_id: i64) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE users SET deleted_at = 0, restore_hash = '' WHERE id = ?1",
+            params![user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Hard-deletes accounts whose recovery window has expired. Cascading
+    /// foreign keys remove their library, playlists, social graph and 2FA data.
+    pub fn purge_expired_deleted_users(&self) -> AppResult<usize> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "DELETE FROM users WHERE deleted_at > 0 AND deleted_at < ?1",
+            params![Utc::now().timestamp() - RESTORE_WINDOW_SECS],
+        )?)
+    }
+
+    // -- Security audit trail --------------------------------------------------
+
+    pub fn record_security_event(&self, user_id: i64, kind: &str, detail: &str, ip: &str) {
+        let conn = self.lock();
+        let _ = conn.execute(
+            "INSERT INTO security_events(user_id, kind, detail, ip, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user_id, kind, detail, ip, Utc::now().timestamp()],
+        );
+    }
+
+    pub fn list_security_events(&self, user_id: i64, limit: usize) -> AppResult<Vec<SecurityEvent>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, detail, ip, created FROM security_events
+             WHERE user_id = ?1 ORDER BY created DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, limit as i64], |r| {
+                Ok(SecurityEvent {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    detail: r.get(2)?,
+                    ip: r.get(3)?,
+                    created: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // -------------------------------------------------------------------------
@@ -5035,6 +5508,78 @@ mod tests {
         let key2 = store.regenerate_api_key(alice.id).unwrap();
         assert_ne!(key1, key2);
         assert!(store.get_user_by_api_key(&key1).unwrap().is_none());
+    }
+
+    #[test]
+    fn totp_recovery_codes_and_session_mfa_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
+        assert!(!store.is_2fa_enabled(alice.id).unwrap());
+
+        let secret = crate::auth::generate_totp_secret();
+        store.save_totp(alice.id, &secret, false).unwrap();
+        assert!(!store.is_2fa_enabled(alice.id).unwrap());
+        let step = Utc::now().timestamp() / crate::auth::TOTP_PERIOD;
+        let code = crate::auth::totp_code(&secret, step).unwrap();
+        assert_eq!(crate::auth::verify_totp(&secret, &code, step - 1).unwrap(), Some(step));
+        assert_eq!(crate::auth::verify_totp(&secret, &code, step).unwrap(), None);
+        store.mark_totp_step(alice.id, step).unwrap();
+        store.set_totp_enabled(alice.id, true).unwrap();
+        assert!(store.is_2fa_enabled(alice.id).unwrap());
+
+        let codes = crate::auth::generate_recovery_codes(crate::auth::RECOVERY_CODE_COUNT);
+        store.replace_recovery_codes(alice.id, &codes).unwrap();
+        assert_eq!(store.recovery_code_stats(alice.id).unwrap(), (10, 0));
+        assert!(store.consume_recovery_code(alice.id, &codes[0]).unwrap());
+        assert!(!store.consume_recovery_code(alice.id, &codes[0]).unwrap());
+        assert_eq!(store.recovery_code_stats(alice.id).unwrap(), (10, 1));
+
+        let token = store.create_session(alice.id, "web").unwrap();
+        assert_eq!(store.session_auth_state(&token).unwrap().unwrap().1, 0);
+        store.mark_session_mfa(&token).unwrap();
+        assert!(store.session_auth_state(&token).unwrap().unwrap().1 > 0);
+
+        store.record_security_event(alice.id, "test", "detail", "1.2.3.4");
+        assert_eq!(store.list_security_events(alice.id, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn soft_delete_signs_out_everywhere_and_allows_restore() {
+        let store = Store::open_memory().unwrap();
+        let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
+        let key = store.get_or_create_api_key(alice.id).unwrap();
+        let token = store.create_session(alice.id, "web").unwrap();
+
+        store
+            .soft_delete_user(alice.id, &crate::auth::hash_token("restore-secret"))
+            .unwrap();
+        assert!(store.get_session_user(&token).unwrap().is_none());
+        assert!(store.get_user_by_api_key(&key).unwrap().is_none());
+        assert!(store.get_user_by_id(alice.id).unwrap().is_none());
+        assert_eq!(
+            store.authenticate_or_create_user("alice", "secret123").unwrap_err().0,
+            crate::models::ERR_RESTORE_REQUIRED
+        );
+        assert!(store.restore_hash(alice.id).unwrap().is_some());
+        assert!(store.deletion_expires_at(alice.id).unwrap().unwrap() > Utc::now().timestamp());
+
+        store.restore_user(alice.id).unwrap();
+        assert!(store.authenticate_or_create_user("alice", "secret123").is_ok());
+        assert_ne!(store.get_or_create_api_key(alice.id).unwrap(), key);
+
+        // Accounts past the seven-day window are removed permanently.
+        let (bob, _) = store.authenticate_or_create_user("bob", "secret123").unwrap();
+        store.soft_delete_user(bob.id, "hash").unwrap();
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE users SET deleted_at = 1 WHERE id = ?1",
+                params![bob.id],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.purge_expired_deleted_users().unwrap(), 1);
+        assert!(store.get_user_by_id(bob.id).unwrap().is_none());
     }
 
     #[test]

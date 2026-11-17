@@ -7,11 +7,9 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use md5::{Digest, Md5};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tracing::info;
 
 const API_VERSION: &str = "1.16.1";
 const SERVER_TYPE: &str = "beatlab";
@@ -375,7 +373,7 @@ fn authenticate_subsonic_credentials(
     state: &AppState,
     params: &HashMap<String, String>,
 ) -> Result<User, (i32, &'static str)> {
-    // 1. OpenSubsonic apiKey authentication
+    // OpenSubsonic's dedicated apiKey parameter is preferred.
     if let Some(key) = params.get("apiKey").filter(|k| !k.trim().is_empty()) {
         return state
             .store
@@ -385,52 +383,35 @@ fn authenticate_subsonic_credentials(
             .ok_or((40, "Invalid API key"));
     }
 
-    let Some(username) = params.get("u").map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-        return Err((10, "Missing username parameter 'u'"));
-    };
-
-    // 2. Password or hex-encoded password -> auto-create account if unknown!
-    if let Some(raw_p) = params.get("p") {
-        let plain = decode_subsonic_password(raw_p)?;
-        match state.store.authenticate_or_create_user(username, &plain) {
-            Ok((user, created)) => {
-                if created {
-                    info!(username = %user.username, "auto-created user account via Subsonic client");
-                    let taste = state.taste.clone();
-                    let uid = user.id;
-                    tokio::spawn(async move {
-                        taste.prime_new_user(uid).await;
-                    });
-                }
-                return Ok(user);
-            }
-            Err(_) => return Err((40, "Wrong username or password")),
-        }
-    }
-
-    // 3. Salted MD5 token auth (u + t + s)
-    if let (Some(token), Some(salt)) = (params.get("t"), params.get("s")) {
-        match state.store.get_user_by_name(username).ok().flatten() {
-            Some(user) => {
-                let mut h = Md5::new();
-                h.update(format!("{}{}", user.password, salt).as_bytes());
-                let expected = hex::encode(h.finalize());
-                if crate::models::constant_time_eq(&expected.to_lowercase(), &token.to_lowercase()) {
-                    return Ok(user);
-                }
-                return Err((40, "Wrong username or password"));
-            }
-            None => {
-                // Subsonic Error 41 triggers client automatic fallback to password/enc auth so the user account gets created!
-                return Err((
-                    41,
-                    "Account does not exist yet; retry using password authentication to create it",
-                ));
+    // Most Subsonic clients only offer a password field. That field must now
+    // contain the account's API key from Settings → Apps & API.
+    if let Some(raw_key) = params.get("p").filter(|k| !k.trim().is_empty()) {
+        let key = decode_subsonic_password(raw_key).map_err(|_| (40, "Malformed API key"))?;
+        let user = state
+            .store
+            .get_user_by_api_key(&key)
+            .ok()
+            .flatten()
+            .ok_or((40, "Invalid API key"))?;
+        if let Some(name) = params.get("u").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !name.eq_ignore_ascii_case(&user.username) {
+                return Err((40, "API key does not match that username"));
             }
         }
+        return Ok(user);
     }
 
-    Err((10, "Missing authentication credentials"))
+    if params.contains_key("t") || params.contains_key("s") {
+        return Err((
+            40,
+            "Password/token sign-in is disabled. Use the API key from Settings → Apps & API as the password.",
+        ));
+    }
+
+    Err((
+        10,
+        "Missing API key. Use the apiKey parameter, or paste the API key into the password field.",
+    ))
 }
 
 fn decode_subsonic_password(p: &str) -> Result<String, (i32, &'static str)> {
@@ -1739,12 +1720,21 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn api_key_for(st: &AppState, username: &str, password: &str) -> String {
+        let user = st
+            .store
+            .get_user_by_name(username)
+            .unwrap()
+            .unwrap_or_else(|| st.store.create_user(username, password).unwrap());
+        st.store.get_or_create_api_key(user.id).unwrap()
+    }
+
     #[tokio::test]
-    async fn subsonic_auto_creates_account_on_first_login_and_returns_41_for_unknown_token() {
+    async fn subsonic_requires_api_key_and_rejects_password_auth() {
         let st = test_state();
 
-        // Unknown user with token auth triggers Subsonic code 41 (fallback prompt)
-        let resp41 = dispatch(
+        // Salted token auth is no longer accepted at all.
+        let rejected = dispatch(
             State(st.clone()),
             Path("ping.view".into()),
             RawQuery(Some("u=newlistener&t=deadbeef&s=1234&f=json".into())),
@@ -1752,33 +1742,36 @@ mod tests {
             String::new(),
         )
         .await;
-        let bytes41 = to_bytes(resp41.into_body(), 1024 * 1024).await.unwrap();
-        let body41: Value = serde_json::from_slice(&bytes41).unwrap();
-        assert_eq!(body41["subsonic-response"]["error"]["code"], 41);
+        let bytes = to_bytes(rejected.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["subsonic-response"]["error"]["code"], 40);
 
-        // Plain/enc auth immediately creates account with non-admin role!
-        let ok = call_subsonic(st.clone(), "newlistener", "enc:736563726574", "ping.view", &[]).await;
+        // Account passwords (plain or enc:) never authenticate or auto-create.
+        let bad = call_subsonic(st.clone(), "newlistener", "enc:736563726574", "ping.view", &[]).await;
+        assert_eq!(bad["subsonic-response"]["error"]["code"], 40);
+        assert!(st.store.get_user_by_name("newlistener").unwrap().is_none());
+
+        // The API key from Settings works in the password field.
+        let user = st.store.create_user("newlistener", "secret").unwrap();
+        let key = st.store.get_or_create_api_key(user.id).unwrap();
+        let ok = call_subsonic(st.clone(), "newlistener", &key, "ping.view", &[]).await;
         assert_eq!(ok["subsonic-response"]["status"], "ok");
-        assert!(st.store.get_user_by_name("newlistener").unwrap().is_some());
 
-        let uinfo = call_subsonic(st.clone(), "newlistener", "secret", "getUser.view", &[]).await;
-        assert_eq!(uinfo["subsonic-response"]["user"]["adminRole"], false);
-
-        // Subsequent salted token auth now succeeds!
-        let mut h = Md5::new();
-        h.update(b"secretsalt99");
-        let tok = hex::encode(h.finalize());
-        let ok_tok = dispatch(
-            State(st),
+        // And via OpenSubsonic's dedicated apiKey parameter.
+        let explicit = dispatch(
+            State(st.clone()),
             Path("ping.view".into()),
-            RawQuery(Some(format!("u=newlistener&t={}&s=salt99&f=json", tok))),
+            RawQuery(Some(format!("u=newlistener&apiKey={}&f=json", key))),
             HeaderMap::new(),
             String::new(),
         )
         .await;
-        let bytes_tok = to_bytes(ok_tok.into_body(), 1024 * 1024).await.unwrap();
-        let body_tok: Value = serde_json::from_slice(&bytes_tok).unwrap();
-        assert_eq!(body_tok["subsonic-response"]["status"], "ok");
+        let bytes = to_bytes(explicit.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["subsonic-response"]["status"], "ok");
+
+        let uinfo = call_subsonic(st, "newlistener", &key, "getUser.view", &[]).await;
+        assert_eq!(uinfo["subsonic-response"]["user"]["adminRole"], false);
     }
 
     #[tokio::test]
@@ -1798,10 +1791,12 @@ mod tests {
             }])
             .unwrap();
 
+        let alice_key = api_key_for(&st, "alice", "pass1");
+        let bob_key = api_key_for(&st, "bob", "pass2");
         let created = call_subsonic(
             st.clone(),
             "alice",
-            "pass1",
+            &alice_key,
             "createPlaylist.view",
             &[("name", "Roadtrip"), ("songId", "t1")],
         )
@@ -1814,7 +1809,7 @@ mod tests {
         let _ = call_subsonic(
             st.clone(),
             "alice",
-            "pass1",
+            &alice_key,
             "updatePlaylist.view",
             &[
                 ("playlistId", &pid),
@@ -1823,7 +1818,7 @@ mod tests {
             ],
         )
         .await;
-        let fetched = call_subsonic(st.clone(), "alice", "pass1", "getPlaylist.view", &[("id", &pid)]).await;
+        let fetched = call_subsonic(st.clone(), "alice", &alice_key, "getPlaylist.view", &[("id", &pid)]).await;
         let entries = fetched["subsonic-response"]["playlist"]["entry"]
             .as_array()
             .unwrap();
@@ -1834,7 +1829,7 @@ mod tests {
         let hijack = call_subsonic(
             st,
             "bob",
-            "pass2",
+            &bob_key,
             "updatePlaylist.view",
             &[("playlistId", &pid), ("name", "Hijack")],
         )

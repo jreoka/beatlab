@@ -228,6 +228,83 @@ a {
   font-size: 13px;
 }
 
+/* ---------------- Two-factor / account recovery UI ---------------- */
+.auth-alt-btn {
+  margin-top: 12px;
+}
+.auth-extra {
+  border-top: 1px solid var(--border);
+  margin-top: 20px;
+  padding-top: 18px;
+}
+.auth-section-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.auth-hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 14px;
+}
+.link-btn {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 12px 0 0;
+  cursor: pointer;
+}
+.link-btn:hover {
+  text-decoration: underline;
+}
+.totp-setup-card, .recovery-codes-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-top: 12px;
+}
+.totp-qr {
+  background: #fff;
+  border-radius: 10px;
+  padding: 10px;
+  width: 200px;
+  height: 200px;
+  margin: 10px auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.totp-qr svg {
+  width: 100%;
+  height: 100%;
+}
+.totp-secret {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 1px;
+  word-break: break-all;
+}
+.recovery-codes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.recovery-codes-grid code {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 13px;
+  letter-spacing: 1px;
+  text-align: center;
+}
+
 /* ---------------- Buttons & Pills ---------------- */
 .btn-primary {
   background: var(--accent);
