@@ -2127,7 +2127,7 @@ impl TasteEngine {
         for &mood in Mood::ALL.iter() {
             if self.load_curated_pool_ids(&mood_cache_key(mood), 6 * 3600).len() < 12 {
                 let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(7),
+                    std::time::Duration::from_secs(14),
                     self.curate_mood_pool(mood),
                 )
                 .await;
@@ -2203,7 +2203,7 @@ impl TasteEngine {
         mood_order.sort_by_key(|(ts, _)| *ts);
         for (_, mood) in mood_order.into_iter().take(2) {
             let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(8),
+                std::time::Duration::from_secs(14),
                 self.curate_mood_pool(mood),
             )
             .await;
@@ -2367,7 +2367,77 @@ impl TasteEngine {
                 }
             }
         }
-        self.curated_mood_preview(mood)
+        let base = self.curated_mood_preview(mood);
+        if base.0 >= 12 || user_id <= 0 {
+            return base;
+        }
+
+        let cached_curated_ids = self.load_curated_pool_ids(&mood_cache_key(mood), 24 * 3600);
+        let cached_curated_tracks = if !cached_curated_ids.is_empty() {
+            self.store
+                .get_tracks_by_ids(&cached_curated_ids)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let local_mood = self.store.tracks_by_mood(mood, 60, 0).unwrap_or_default();
+        let user_pool = self
+            .store
+            .candidate_tracks_for_user(user_id, 400)
+            .unwrap_or_default();
+        let mut candidates = Vec::new();
+        let mut seen_ids = HashSet::new();
+        for t in cached_curated_tracks
+            .into_iter()
+            .chain(local_mood)
+            .chain(user_pool.clone())
+        {
+            if seen_ids.insert(t.id.clone()) {
+                candidates.push(t);
+            }
+        }
+        let curated_ids: HashSet<String> = cached_curated_ids.into_iter().collect();
+        let mut ranked = self.rank_mood_mix(user_id, mood, candidates, &curated_ids, 35);
+        if ranked.len() < 12 {
+            let sctx = self.build_scoring_context(user_id);
+            let mut have_keys: HashSet<String> = ranked.iter().map(Track::song_key).collect();
+            let mut have_ids: HashSet<String> = ranked.iter().map(|t| t.id.clone()).collect();
+            let extra_artists: Vec<String> = user_pool.iter().map(|t| t.artist.clone()).collect();
+            let artist_genres = self
+                .store
+                .known_artist_genres_for(&extra_artists)
+                .unwrap_or_default();
+            for t in user_pool {
+                if ranked.len() >= 35 {
+                    break;
+                }
+                if have_ids.contains(&t.id)
+                    || have_keys.contains(&t.song_key())
+                    || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                    || is_mood_clutter_track(&t)
+                {
+                    continue;
+                }
+                let ag = artist_genres
+                    .get(&primary_artist(&t.artist).to_lowercase())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if is_track_compatible_with_mood(&t, ag, mood)
+                    && !is_mood_title_trap(&t, mood)
+                    && !track_matches_topic(&t, "christmas")
+                    && !track_matches_topic(&t, "halloween")
+                {
+                    have_ids.insert(t.id.clone());
+                    have_keys.insert(t.song_key());
+                    ranked.push(t);
+                }
+            }
+        }
+        if ranked.len() > base.0 {
+            Self::preview_from_tracks(&ranked)
+        } else {
+            base
+        }
     }
 
     pub fn curated_explore_preview(&self, spec: &ExploreMixSpec) -> (usize, Vec<String>) {
@@ -10249,7 +10319,7 @@ mod tests {
         }
 
         let (before_cnt, _) = taste.curated_mood_preview_for_user(u.id, Mood::LateNight);
-        assert_eq!(before_cnt, 1);
+        assert_eq!(before_cnt, 14);
 
         let mix = taste.mood_mix_tracks(u.id, Mood::LateNight, 35).await;
         assert!(mix.len() >= 14);

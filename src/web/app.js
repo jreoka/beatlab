@@ -3,6 +3,12 @@
 
   const audio = document.getElementById('audio-el');
   let rafVisualizer = null;
+  let vizCtx = null;
+  let vizAnalyser = null;
+  let vizSource = null;
+  let vizData = null;
+  let vizStream = null;
+  let vizUnavailable = false;
 
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
@@ -697,6 +703,54 @@
     icon.innerHTML = state.muted || state.volume === 0 ? ICONS.volMuted : ICONS.volOn;
   }
 
+  function ensureVisualizerAnalyser() {
+    if (vizUnavailable || vizAnalyser) {
+      if (vizCtx && vizCtx.state === 'suspended' && audio && !audio.paused) {
+        vizCtx.resume().catch(() => {});
+      }
+      return;
+    }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const capture =
+      audio && typeof audio.captureStream === 'function'
+        ? () => audio.captureStream()
+        : audio && typeof audio.mozCaptureStream === 'function'
+          ? () => audio.mozCaptureStream()
+          : null;
+    if (!AC || !capture) {
+      vizUnavailable = true;
+      return;
+    }
+    try {
+      if (!vizStream) {
+        vizStream = capture();
+      }
+      if (!vizStream || vizStream.getAudioTracks().length === 0) {
+        return;
+      }
+      if (!vizCtx) {
+        vizCtx = new AC();
+      }
+      if (vizCtx.state === 'suspended') {
+        vizCtx.resume().catch(() => {});
+      }
+      vizSource = vizCtx.createMediaStreamSource(vizStream);
+      vizAnalyser = vizCtx.createAnalyser();
+      vizAnalyser.fftSize = 256;
+      vizAnalyser.smoothingTimeConstant = 0.78;
+      vizData = new Uint8Array(vizAnalyser.frequencyBinCount);
+      // Route into a 0-gain node so Chromium pulls the analyser graph without
+      // duplicating or hijacking native <audio> background/lock-screen output.
+      const silentGain = vizCtx.createGain();
+      silentGain.gain.value = 0;
+      vizSource.connect(vizAnalyser);
+      vizAnalyser.connect(silentGain);
+      silentGain.connect(vizCtx.destination);
+    } catch {
+      vizUnavailable = true;
+    }
+  }
+
   function drawVisualizer() {
     const fs = $('fullscreen-player');
     if (!fs.classList.contains('open')) {
@@ -710,17 +764,42 @@
       const bw = canvas.width / bars;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = '#1ed760';
-      // Lightweight synthetic animation that reflects play state. Keeping this
-      // independent of the Web Audio API lets the <audio> element play natively,
-      // which is required for background / lock-screen playback on mobile.
-      const t = (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000;
       const playing = !!audio && !audio.paused && !audio.ended;
-      for (let i = 0; i < bars; i++) {
-        const wave = playing
-          ? 0.18 + 0.45 * Math.abs(Math.sin(t * 2.1 + i * 0.42)) + 0.25 * Math.abs(Math.sin(t * 3.6 - i * 0.27))
-          : 0.08;
-        const h = Math.min(canvas.height, Math.max(3, wave * canvas.height * 0.9));
-        ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
+      if (playing && audio.readyState >= 2) {
+        ensureVisualizerAnalyser();
+      }
+      let hasSignal = false;
+      if (playing && vizAnalyser && vizData) {
+        vizAnalyser.getByteFrequencyData(vizData);
+        for (let k = 0; k < vizData.length; k++) {
+          if (vizData[k] > 0) {
+            hasSignal = true;
+            break;
+          }
+        }
+      }
+      if (hasSignal) {
+        const usableBins = Math.max(1, Math.floor(vizData.length * 0.65));
+        for (let i = 0; i < bars; i++) {
+          const bin = Math.min(
+            vizData.length - 1,
+            Math.floor(Math.pow(i / bars, 1.35) * usableBins)
+          );
+          const amp = vizData[bin] / 255;
+          const h = Math.min(canvas.height, Math.max(3, (0.06 + amp * 0.9) * canvas.height));
+          ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
+        }
+      } else {
+        // Fallback synthetic animation when captureStream is unavailable (e.g. iOS Safari)
+        // or before audio frames arrive.
+        const t = (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000;
+        for (let i = 0; i < bars; i++) {
+          const wave = playing
+            ? 0.18 + 0.45 * Math.abs(Math.sin(t * 2.1 + i * 0.42)) + 0.25 * Math.abs(Math.sin(t * 3.6 - i * 0.27))
+            : 0.08;
+          const h = Math.min(canvas.height, Math.max(3, wave * canvas.height * 0.9));
+          ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
+        }
       }
     }
     rafVisualizer = requestAnimationFrame(drawVisualizer);
