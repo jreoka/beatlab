@@ -1899,27 +1899,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Updates only the fields describing the audio bytes when a better file
-    /// is installed under an existing track ID: all metadata (title, artist,
-    /// artwork, ids, moods, …) stays untouched.
-    pub fn update_track_audio_quality(
-        &self,
-        track_id: &str,
-        format: &str,
-        bitrate: i32,
-        sample_rate: i32,
-        bit_depth: i32,
-        size: i64,
-    ) -> AppResult<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE tracks SET format = ?1, bitrate = ?2, sample_rate = ?3,
-                    bit_depth = ?4, size = ?5 WHERE id = ?6",
-            params![format, bitrate, sample_rate, bit_depth, size, track_id],
-        )?;
-        Ok(())
-    }
-
     /// Returns user-affinity tracks (starred, manual playlists, played, rated, expanded radio links,
     /// same-artist/local/same-genre catalog matches) unioned with recent catalog tracks so personalized
     /// mixes never lose taste candidates past recent-insert offset limits.
