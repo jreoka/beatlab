@@ -163,6 +163,7 @@
     wasDisconnected: false,
     backOnlineTimer: null,
     reconnectTimer: null,
+    marqueeTimer: null,
     healthHeartbeatTimer: null,
     healthCheckInFlight: null,
     recentHeard: loadRecentHeard(),
@@ -676,6 +677,14 @@
     if (next && !rafVisualizer) {
       drawVisualizer();
     }
+    if (next) {
+      const cur = currentTrack();
+      if (cur) {
+        setMarqueeText($('fs-title'), cur.title);
+        const fsNow = $('fs-queue-now-playing');
+        if (fsNow) setMarqueeText(fsNow.querySelector('.q-item.active .q-item-title'), cur.title);
+      }
+    }
   }
 
   function setFsMobileView(view, silent = false) {
@@ -944,7 +953,7 @@
     state.fsMobileView = 'player';
 
     $('pb-cover').src = '/api/web/cover/default';
-    $('pb-title').textContent = 'Ready to play';
+    setMarqueeText($('pb-title'), 'Ready to play');
     $('pb-artist').textContent = 'Select any track';
     $('pb-like').classList.remove('active');
     $('pb-quality').classList.add('hidden');
@@ -954,7 +963,7 @@
     if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = '0%';
 
     $('fs-cover').src = '/api/web/cover/default';
-    $('fs-title').textContent = 'Ready';
+    setMarqueeText($('fs-title'), 'Ready');
     $('fs-artist').textContent = 'Beatlab';
     $('fs-bg').style.backgroundImage = '';
     if ($('fs-like')) $('fs-like').classList.remove('active');
@@ -1421,6 +1430,16 @@
     syncResponsiveLayout();
     window.matchMedia('(max-width: 1060px)').addEventListener('change', syncResponsiveLayout);
     window.matchMedia('(max-width: 780px)').addEventListener('change', syncResponsiveLayout);
+    window.addEventListener('resize', () => {
+      clearTimeout(state.marqueeTimer);
+      state.marqueeTimer = setTimeout(() => {
+        const cur = currentTrack();
+        if (!cur) return;
+        setMarqueeText($('pb-title'), cur.title);
+        const nowTitle = $('queue-now-playing').querySelector('.q-item.active .q-item-title');
+        setMarqueeText(nowTitle, cur.title);
+      }, 220);
+    });
     window.addEventListener('pageshow', (e) => {
       if (e.persisted && !state.user) {
         resetAuthForm();
@@ -4531,6 +4550,23 @@
     }
   }
 
+  // Only long, clipped titles scroll. A duplicated copy makes the loop seamless,
+  // and the duration scales with length so every title moves at the same slow pace.
+  function setMarqueeText(el, text) {
+    if (!el) return;
+    const value = String(text || '');
+    el.classList.remove('is-marquee');
+    el.style.removeProperty('--marquee-duration');
+    el.removeAttribute('title');
+    el.textContent = value;
+    if (value.length < 10 || el.scrollWidth <= el.clientWidth + 1 || !el.clientWidth) return;
+    el.title = value;
+    const safe = esc(value);
+    el.innerHTML = `<span class="marquee-inner"><span>${safe}</span><span aria-hidden="true">${safe}</span></span>`;
+    el.style.setProperty('--marquee-duration', `${Math.min(34, Math.max(12, value.length * 0.55)).toFixed(1)}s`);
+    el.classList.add('is-marquee');
+  }
+
   function updateNowPlayingUI(track, active, skipHeavy = false) {
     if (!track) return;
     if (!skipHeavy) {
@@ -4538,7 +4574,7 @@
       $('fs-cover').src = track.coverUrl;
       $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
     }
-    $('pb-title').textContent = track.title;
+    setMarqueeText($('pb-title'), track.title);
     $('pb-artist').textContent = track.artist;
     $('pb-like').classList.toggle('active', !!track.isStarred);
     $('pb-quality').textContent = track.qualityBadge;
@@ -4549,7 +4585,7 @@
     $('pb-seek').value = '0';
     if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = '0%';
 
-    $('fs-title').textContent = track.title;
+    setMarqueeText($('fs-title'), track.title);
     $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(track.artist)}</span>${track.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(track.album)}</span>` : ''}`;
     if ($('fs-like')) $('fs-like').classList.toggle('active', !!track.isStarred);
     if ($('fs-quality')) {
@@ -5216,6 +5252,13 @@
     $('queue-up-next').innerHTML = upNextHtml;
     if ($('fs-queue-now-playing')) $('fs-queue-now-playing').innerHTML = nowHtml;
     if ($('fs-queue-up-next')) $('fs-queue-up-next').innerHTML = upNextHtml;
+    if (cur) {
+      setMarqueeText($('queue-now-playing').querySelector('.q-item.active .q-item-title'), cur.title);
+      const fsNow = $('fs-queue-now-playing');
+      if (fsNow && fsNow.offsetParent) {
+        setMarqueeText(fsNow.querySelector('.q-item.active .q-item-title'), cur.title);
+      }
+    }
   }
 
   function renderQItem(t, idx, active) {
@@ -6194,24 +6237,28 @@
           }
         </div>
 
-        <div class="settings-section">
-          <div class="settings-section-title">Recovery Codes</div>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <div class="settings-row-label">${Math.max(0, sec.recoveryTotal - sec.recoveryUsed)} of ${sec.recoveryTotal} codes left</div>
-              <div class="settings-row-desc">Single-use codes that work when you lose your authenticator. Store them somewhere safe.</div>
-            </div>
-          </div>
-          ${
-            codes
-              ? `<div class="recovery-codes-card">
-                  <div class="kv-label">SAVE THESE NOW — THEY WILL NOT BE SHOWN AGAIN</div>
-                  <div class="recovery-codes-grid">${codes.map((c) => `<code>${esc(c)}</code>`).join('')}</div>
-                  <button class="btn-secondary" style="margin-top:10px" onclick="App.dismissRecoveryCodes()">I've saved them</button>
-                </div>`
-              : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.generateRecoveryCodes()">Generate new recovery codes</button></div>`
-          }
-        </div>
+        ${
+          sec.twoFactorEnabled
+            ? `<div class="settings-section">
+                <div class="settings-section-title">Recovery Codes</div>
+                <div class="settings-row">
+                  <div class="settings-row-info">
+                    <div class="settings-row-label">${Math.max(0, sec.recoveryTotal - sec.recoveryUsed)} of ${sec.recoveryTotal} codes left</div>
+                    <div class="settings-row-desc">Single-use backup codes for your second factor. Use one if you lose access to your authenticator or passkey. Store them somewhere safe.</div>
+                  </div>
+                </div>
+                ${
+                  codes
+                    ? `<div class="recovery-codes-card">
+                        <div class="kv-label">SAVE THESE NOW — THEY WILL NOT BE SHOWN AGAIN</div>
+                        <div class="recovery-codes-grid">${codes.map((c) => `<code>${esc(c)}</code>`).join('')}</div>
+                        <button class="btn-secondary" style="margin-top:10px" onclick="App.dismissRecoveryCodes()">I've saved them</button>
+                      </div>`
+                    : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.generateRecoveryCodes()">Generate new recovery codes</button></div>`
+                }
+              </div>`
+            : ''
+        }
 
         <div class="settings-section">
           <div class="settings-section-title">Passkeys</div>
@@ -6222,23 +6269,27 @@
           </div>
         </div>
 
-        <div class="settings-section">
-          <div class="settings-section-title">Sensitive Actions</div>
-          <div class="settings-row-desc" style="margin-bottom:10px">${sec.twoFactorEnabled ? 'Enter an authenticator code, a recovery code, or authenticate with a passkey in this session.' : '2FA is off, so no code is required yet.'}</div>
-          <input id="sec-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="${sec.twoFactorEnabled ? '2FA or recovery code' : '2FA code (not required)'}" style="width:100%;margin-bottom:8px" />
-          ${sec.passkeys.length && sec.passkeysAvailable ? '<button class="mini-btn" style="margin-bottom:12px" onclick="App.stepUpWithPasskey()">Verify with a passkey instead</button>' : ''}
-          ${
-            confirmDisable
-              ? `<div class="settings-confirm-bar">
-                  <span>Disable all two-factor authentication? This removes your authenticator, passkeys and recovery codes.</span>
-                  <div class="settings-confirm-actions">
-                    <button class="btn-secondary danger-btn" onclick="App.confirmDisable2fa()">Yes, disable 2FA</button>
-                    <button class="mini-btn ghost" onclick="App.cancelDisable2fa()">Cancel</button>
-                  </div>
-                </div>`
-              : `<div class="settings-actions-row"><button class="btn-secondary danger-btn" ${!sec.twoFactorEnabled ? 'disabled' : ''} onclick="App.promptDisable2fa()">Disable two-factor authentication</button></div>`
-          }
-        </div>
+        ${
+          sec.twoFactorEnabled
+            ? `<div class="settings-section">
+                <div class="settings-section-title">Two-Factor Verification</div>
+                <div class="settings-row-desc" style="margin-bottom:10px">Confirm with an authenticator code, a recovery code, or a passkey before changing security settings.</div>
+                <input id="sec-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code" style="width:100%;margin-bottom:8px" />
+                ${sec.passkeys.length && sec.passkeysAvailable ? '<button class="mini-btn" style="margin-bottom:12px" onclick="App.stepUpWithPasskey()">Verify with a passkey instead</button>' : ''}
+                ${
+                  confirmDisable
+                    ? `<div class="settings-confirm-bar">
+                        <span>Disable all two-factor authentication? This removes your authenticator, passkeys and recovery codes.</span>
+                        <div class="settings-confirm-actions">
+                          <button class="btn-secondary danger-btn" onclick="App.confirmDisable2fa()">Yes, disable 2FA</button>
+                          <button class="mini-btn ghost" onclick="App.cancelDisable2fa()">Cancel</button>
+                        </div>
+                      </div>`
+                    : `<div class="settings-actions-row"><button class="btn-secondary danger-btn" onclick="App.promptDisable2fa()">Disable two-factor authentication</button></div>`
+                }
+              </div>`
+            : ''
+        }
 
         <div class="settings-section">
           <div class="settings-section-title">Delete Account</div>
@@ -7665,7 +7716,7 @@
         });
         if (!credential) throw new Error('Passkey registration was cancelled');
         const label = window.prompt('Name this passkey', 'This device') || 'Passkey';
-        await api('/api/web/2fa/passkey/verify', {
+        const result = await api('/api/web/2fa/passkey/verify', {
           method: 'POST',
           body: JSON.stringify({
             challenge: opts.challenge,
@@ -7673,6 +7724,9 @@
             label,
           }),
         });
+        if (result.recoveryCodes && result.recoveryCodes.length) {
+          state.settingsData.recoveryCodes = result.recoveryCodes;
+        }
         showToast('Passkey added');
         await window.App.refreshSecurityStatus();
       } catch (err) {
@@ -7732,6 +7786,7 @@
           state.user.passkeys = 0;
         }
         state.settingsData.confirmDisable2fa = false;
+        state.settingsData.recoveryCodes = null;
         showToast('Two-factor authentication disabled');
         await window.App.refreshSecurityStatus();
       } catch (err) {

@@ -1401,6 +1401,14 @@ pub async fn recovery_regenerate(
         Ok(v) => v,
         Err(r) => return r,
     };
+    // Recovery codes are a backup for a second factor, not a standalone
+    // account feature — refuse to hand them out until 2FA is actually enabled.
+    if !state.store.is_2fa_enabled(user.id).unwrap_or(false) {
+        return err_res(
+            StatusCode::CONFLICT,
+            "Set up two-factor authentication before generating recovery codes",
+        );
+    }
     let codes = generate_recovery_codes(RECOVERY_CODE_COUNT);
     if let Err(e) = state.store.replace_recovery_codes(user.id, &codes) {
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
@@ -1549,7 +1557,28 @@ pub async fn passkey_register_verify(
         &format!("Passkey registered: {label}"),
         &client_ip(&headers),
     );
-    json_res(json!({ "ok": true, "credentialId": credential_id, "label": label }))
+    // The first passkey may be the account's only second factor. Give that
+    // user the same one-time backup codes an authenticator-app user gets.
+    let mut recovery_codes: Vec<String> = Vec::new();
+    let totp_enabled = state
+        .store
+        .get_totp(user.id)
+        .ok()
+        .flatten()
+        .map(|t| t.enabled)
+        .unwrap_or(false);
+    if !totp_enabled && state.store.recovery_code_stats(user.id).unwrap_or((0, 0)).0 == 0 {
+        recovery_codes = generate_recovery_codes(RECOVERY_CODE_COUNT);
+        if let Err(e) = state.store.replace_recovery_codes(user.id, &recovery_codes) {
+            return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+    }
+    json_res(json!({
+        "ok": true,
+        "credentialId": credential_id,
+        "label": label,
+        "recoveryCodes": recovery_codes,
+    }))
 }
 
 /// Re-verifies the current session with a passkey (needed when an account has

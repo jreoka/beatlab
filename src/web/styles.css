@@ -232,6 +232,32 @@ a {
 .auth-alt-btn {
   margin-top: 12px;
 }
+
+/* ---------------- Slow marquee for overflowing titles ---------------- */
+.is-marquee {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.marquee-inner {
+  display: inline-flex;
+  white-space: nowrap;
+  will-change: transform;
+  animation: marquee-slide var(--marquee-duration, 16s) ease-in-out infinite;
+}
+.marquee-inner > span {
+  flex: none;
+  padding-right: 3em;
+}
+@keyframes marquee-slide {
+  0%, 7% { transform: translateX(0); }
+  50%, 57% { transform: translateX(-50%); }
+  100% { transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .marquee-inner { animation: none; }
+  .is-marquee .marquee-inner > span:last-child { display: none; }
+}
 .auth-extra {
   border-top: 1px solid var(--border);
   margin-top: 20px;
