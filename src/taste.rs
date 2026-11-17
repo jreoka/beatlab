@@ -2117,9 +2117,17 @@ impl TasteEngine {
                 .and_then(|(_, subtitle)| {
                     (!subtitle.trim().is_empty()).then(|| subtitle.trim().to_string())
                 });
+            // Derive the display name from the mix kind instead of the stored
+            // playlist name — older rows still say "Party Mix 1" until the
+            // next daily rebuild, but the card must show Daily Mix now.
+            let display_title = if is_super {
+                "Daily Mix Supermix".to_string()
+            } else {
+                format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
+            };
             cards.push(MixedForYouCard {
                 id: p.id,
-                title: p.name,
+                title: display_title,
                 art_title: if is_super {
                     "Daily Mix Supermix".to_string()
                 } else {
@@ -2850,6 +2858,7 @@ impl TasteEngine {
             // Generic playlist search is easily fooled by anime-style cover
             // art on unrelated tracks. Fetch the actual artists/songs the
             // assistant named so the pool contains genuinely on-theme music.
+            let mut seed_tracks: Vec<Track> = Vec::new();
             if !seeds.is_empty() {
                 use crate::sources::MusicSource;
                 let lookups = futures::future::join_all(seeds.iter().take(8).map(|name| async {
@@ -2869,10 +2878,15 @@ impl TasteEngine {
                 }))
                 .await;
                 for (dz, ytm) in lookups {
-                    pool.extend(dz);
-                    pool.extend(ytm);
+                    seed_tracks.extend(dz);
+                    seed_tracks.extend(ytm);
                 }
             }
+            // Seed-derived tracks are the only ones guaranteed to be on-theme,
+            // so they go first — the model sees a capped number of candidates.
+            let mut ordered_pool = seed_tracks;
+            ordered_pool.extend(pool);
+            pool = ordered_pool;
             dedup_tracks_by_id(&mut pool);
             if pool.len() < 8 {
                 continue;
@@ -4677,13 +4691,11 @@ impl TasteEngine {
                 None => {
                     let artists = self.sources.deezer.search_artists(&pa, 5).await;
                     let exact = artists.iter().find(|a| a.name == pa);
-                    let matched = if !is_ytm_seed {
-                        exact
-                            .or_else(|| artists.iter().find(|a| slug(&a.name) == pa_slug))
-                            .or_else(|| artists.first())
-                    } else {
-                        exact.or_else(|| artists.iter().find(|a| slug(&a.name) == pa_slug))
-                    };
+                    // Never fall back to an arbitrary first result: for
+                    // niche/anime artists that resolves to an unrelated act
+                    // and poisons the whole radio with their tracks.
+                    let matched = exact
+                        .or_else(|| artists.iter().find(|a| slug(&a.name) == pa_slug));
                     matched
                         .map(|a| a.deezer_id.clone())
                         .filter(|id| !id.is_empty())
@@ -4743,10 +4755,10 @@ impl TasteEngine {
         let seed_moods: HashSet<Mood> = seed.mood_list().into_iter().collect();
         let seed_genres: HashSet<String> = split_genres(&seed.genre).into_iter().collect();
         let pa_slug = slug(&primary_artist(&seed.artist));
-        let require_affinity = !out.is_empty();
+        let has_identity = !pa_slug.is_empty() || !seed_genres.is_empty() || !seed_moods.is_empty();
         let all = self.store.all_tracks(500, 0).unwrap_or_default();
 
-        let mut scored: Vec<(i32, Track)> = all
+        let scored: Vec<(i32, i32, Track)> = all
             .into_iter()
             .filter(|t| !seen_keys.contains(&t.song_key()))
             .filter_map(|t| {
@@ -4778,14 +4790,26 @@ impl TasteEngine {
                         && t.moods == "upbeat,chill";
                     aff += shared_m * if legacy_fallback_collision { 4 } else { 22 };
                 }
-                if require_affinity && aff == 0 {
-                    return None;
-                }
-                Some((aff + t.quality_score() / 50, t))
+                let total = aff + t.quality_score() / 50;
+                Some((aff, total, t))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        for (_, t) in scored {
+        // When the seed has an identifiable artist/genre/mood, prefer only
+        // catalog tracks with real affinity (not merely high quality). If
+        // nothing matches, fall back to the highest-quality tracks so an
+        // obscure seed never produces an empty radio.
+        let coherent: Vec<(i32, i32, Track)> = scored
+            .iter()
+            .filter(|(aff, _, _)| *aff > 0)
+            .cloned()
+            .collect();
+        let mut scored = if has_identity && !coherent.is_empty() {
+            coherent
+        } else {
+            scored
+        };
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        for (_, _, t) in scored {
             if out.len() >= count * 2 {
                 break;
             }
@@ -5332,7 +5356,7 @@ struct RadioScope {
 }
 
 impl RadioScope {
-    fn from_seed(seed: &Track, sims: &[Track]) -> Self {
+    fn from_seed(seed: &Track, artist_genres: &[String]) -> Self {
         let mut scope = Self::default();
         let pa = slug(&primary_artist(&seed.artist));
         if !pa.is_empty() {
@@ -5340,29 +5364,14 @@ impl RadioScope {
         }
 
         let seed_text = format!("{} {} {} {}", seed.title, seed.album, seed.genre, seed.moods);
-        scope.topic_key = strict_topic_for_text(&seed_text).or_else(|| {
-            ["christmas", "halloween"].into_iter().find(|topic| {
-                let hits = sims.iter().filter(|t| track_matches_topic(t, topic)).count();
-                hits >= 3 && hits * 2 >= sims.len().max(1)
-            })
-        });
+        scope.topic_key = strict_topic_for_text(&seed_text);
 
+        // Use the seed's own tags, then genres already known for this artist.
+        // Inferring genres from `sims` is circular: when radio returns junk,
+        // that junk would define the "scope" and then be accepted as on-topic.
         let mut genres = split_genres(&seed.genre);
         if genres.is_empty() {
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            for t in sims {
-                for g in split_genres(&t.genre) {
-                    *counts.entry(g).or_insert(0) += 1;
-                }
-            }
-            let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            genres = ranked
-                .into_iter()
-                .filter(|(_, c)| *c >= 2)
-                .take(2)
-                .map(|(g, _)| g)
-                .collect();
+            genres = artist_genres.to_vec();
         }
         scope.genres = genres;
         scope
@@ -5825,7 +5834,16 @@ impl TasteEngine {
 
         if let Some(s) = seed {
             let sims = self.similar_songs_async(s, (count * 2).max(20)).await;
-            let scope = RadioScope::from_seed(s, &sims);
+            let seed_artist = primary_artist(&s.artist).to_string();
+            let known_genres = self
+                .store
+                .known_artist_genres_for(&[seed_artist.clone()])
+                .unwrap_or_default();
+            let artist_genres = known_genres
+                .get(&seed_artist.to_lowercase())
+                .map(|g| split_genres(g))
+                .unwrap_or_default();
+            let scope = RadioScope::from_seed(s, &artist_genres);
             let mut filtered: Vec<Track> = Vec::new();
             let mut seen_ids: HashSet<String> = exclude_ids.clone();
             seen_ids.insert(s.id.clone());
@@ -5843,6 +5861,24 @@ impl TasteEngine {
                     .collect();
                 if scope.topic_key.is_some() || !on_scope.is_empty() {
                     filtered = on_scope;
+                }
+            }
+            // Anime/game artists often have no genre tags at all. Without any
+            // scope signal, require at least an artist or mood connection so
+            // arbitrary radio results don't survive by default.
+            if scope.topic_key.is_none() && scope.genres.is_empty() {
+                let seed_slug = slug(&seed_artist);
+                let seed_moods: HashSet<Mood> = s.mood_list().into_iter().collect();
+                let coherent: Vec<Track> = filtered
+                    .iter()
+                    .filter(|t| {
+                        slug(&primary_artist(&t.artist)) == seed_slug
+                            || t.mood_list().iter().any(|m| seed_moods.contains(m))
+                    })
+                    .cloned()
+                    .collect();
+                if coherent.len() >= count.min(4) {
+                    filtered = coherent;
                 }
             }
 

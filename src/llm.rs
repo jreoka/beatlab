@@ -256,7 +256,9 @@ pub fn apply_mix_plan(plan: &MixPlan, tracks: Vec<Track>) -> Vec<Track> {
         .iter()
         .map(String::as_str)
         .collect();
-    let floor = (tracks.len() * 3 / 5).max(6).min(tracks.len());
+    // Quality over quantity: allow the model to cut a mix down to 8 tracks
+    // rather than forcing it to fill slots with off-theme leftovers.
+    let floor = 8.min(tracks.len());
     let mut filtered: Vec<Track> = tracks
         .iter()
         .filter(|t| !rejects.contains(t.id.as_str()))
@@ -1757,8 +1759,8 @@ mod tests {
             ..Default::default()
         };
         let result = apply_mix_plan(&plan, tracks);
-        // 10 tracks * 60% = 6 track floor, so only 4 rejections survive.
-        assert!(result.len() >= 6);
+        // Floor is 8 tracks, so at most 2 of the 8 rejections survive.
+        assert_eq!(result.len(), 8);
         assert_eq!(result[0].id, "t9");
         assert_eq!(result[1].id, "t8");
     }

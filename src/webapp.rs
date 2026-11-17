@@ -2546,10 +2546,12 @@ pub async fn instant_mix(
         let _ = state.store.upsert_artist_meta(ar);
     }
 
-    if intent.is_theme_mix && curated_batches.is_empty() {
+    if intent.is_theme_mix {
+        // The background AI pool is the highest-quality evidence we have —
+        // always include it, ahead of generic playlist-search batches.
         let pre_curated = state.taste.load_curated_query_tracks(&intent.normalized);
         if pre_curated.len() >= 5 {
-            curated_batches.push((query.clone(), pre_curated));
+            curated_batches.insert(0, (query.clone(), pre_curated));
         }
     }
 
@@ -3335,16 +3337,18 @@ fn maybe_apply_llm_mix(
             // locally indexed matches plus whatever the background curator
             // already prepared for this query. Otherwise it can only shuffle
             // the same handful of mediocre candidates.
-            let mut candidates: Vec<Track> = mix.tracks.iter().take(32).cloned().collect();
             let normalized = crate::models::slug(query);
-            for t in state
+            let mut candidates: Vec<Track> = state
                 .taste
                 .load_curated_query_tracks(&normalized)
                 .into_iter()
                 .chain(state.store.search_tracks(query, 40, 0).unwrap_or_default())
-            {
+                .collect();
+            // The model only sees the first 32 candidates — put the AI-curated
+            // pool first or the good tracks are hidden behind playlist noise.
+            for t in &mix.tracks {
                 if !candidates.iter().any(|existing| existing.id == t.id) {
-                    candidates.push(t);
+                    candidates.push(t.clone());
                 }
             }
             candidates.truncate(48);

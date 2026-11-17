@@ -4375,6 +4375,40 @@ impl Store {
         Ok(())
     }
 
+    /// One-time cleanup for Daily Mix playlists created before the rename:
+    /// their stored names still used the old mood-based branding.
+    pub fn normalize_daily_mix_names(&self) -> usize {
+        let conn = self.lock();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT id, kind FROM playlists WHERE kind LIKE 'mixed_for_you:%'")
+            .and_then(|mut stmt| {
+                stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        let mut changed = 0usize;
+        for (id, kind) in rows {
+            let part = kind.split(':').nth(2).unwrap_or("");
+            let name = if part == "supermix" {
+                "Daily Mix Supermix".to_string()
+            } else {
+                format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
+            };
+            if conn
+                .execute(
+                    "UPDATE playlists SET name = ?1 WHERE id = ?2 AND name <> ?1",
+                    params![name, id],
+                )
+                .unwrap_or(0)
+                > 0
+            {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     pub fn get_playlist(&self, id: &str) -> AppResult<Option<Playlist>> {
         let conn = self.lock();
         Ok(conn
