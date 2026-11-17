@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 const STATS_KV_KEY: &str = "llm:stats:v1";
 const PENDING_Q_KV_KEY: &str = "llm:pending_queries:v1";
-const MIX_CACHE_PREFIX: &str = "llm:mix:v4:";
+const MIX_CACHE_PREFIX: &str = "llm:mix:v5:";
 const META_CACHE_PREFIX: &str = "llm:meta:v1:";
 const POOL_CACHE_PREFIX: &str = "llm:pool:v1:";
 const QUERY_EXP_PREFIX: &str = "llm:qexp:v1:";
@@ -811,7 +811,7 @@ impl LlmClient {
         }
         // One attempt per query per 10 minutes — request-driven mix building
         // must never turn into a stream of model calls for an unresponsive API.
-        let attempt_key = format!("llm:mix_attempt:v4:{}", slug(query));
+        let attempt_key = format!("llm:mix_attempt:v5:{}", slug(query));
         if let Some(raw) = self.store.kv_get(&attempt_key) {
             if let Ok(ts) = raw.trim().parse::<i64>() {
                 if Utc::now().timestamp().saturating_sub(ts) < 600 {

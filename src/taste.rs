@@ -2923,6 +2923,54 @@ impl TasteEngine {
         }
     }
 
+    /// Resolve a theme to Deezer's own genre taxonomy and pull its editorial
+    /// chart. This is the only source that reliably returns real anime/J-pop
+    /// tracks instead of uploads that merely say "anime" in the title.
+    async fn deezer_genre_tracks_for_query(&self, query: &str) -> Vec<Track> {
+        let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let synonyms: Vec<String> = match q.as_str() {
+            "anime" | "anime mix" => ["anime", "j-pop", "jpop", "j-rock", "jrock", "ost"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "jpop" | "j-pop" | "j rock" | "j-rock" => {
+                ["j-pop", "jpop", "j-rock", "jrock", "anime"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+            _ => vec![q.clone()],
+        };
+        let genres = self.sources.deezer.fetch_genres().await;
+        let mut matched: Vec<(u64, String)> = Vec::new();
+        for genre in genres {
+            let name = genre.name.to_ascii_lowercase();
+            if synonyms.iter().any(|s| name == *s || name.contains(s)) {
+                matched.push((genre.id, genre.name.clone()));
+                if matched.len() >= 3 {
+                    break;
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (id, name) in matched {
+            let tracks = self
+                .sources
+                .deezer
+                .fetch_genre_chart_tracks(id, &name, 40)
+                .await;
+            out.extend(
+                tracks
+                    .into_iter()
+                    .filter(|t| !is_mix_clutter_track(t, &q)),
+            );
+        }
+        out
+    }
+
     /// Turn search queries people actually typed into warm, LLM-ranked pools.
     /// Live search only reads the resulting SQLite rows — no model call is ever
     /// made on the request path.
@@ -2943,63 +2991,59 @@ impl TasteEngine {
                 }
                 seed_names.extend(answer.artists.iter().cloned());
             }
-            let mut search_queries = vec![query.clone()];
-            search_queries.extend(expansions);
-            let mut pool = self.load_curated_query_tracks(&query);
-            for sq in search_queries.into_iter().take(3) {
-                let batches = tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    self.sources.deezer.fetch_curated_mix_tracks(&sq, 2, 20),
-                )
-                .await
-                .unwrap_or_default();
-                for (_, batch) in batches {
-                    pool.extend(
-                        batch
-                            .into_iter()
-                            .filter(|t| !is_mix_clutter_track(t, &query.to_ascii_lowercase())),
-                    );
-                }
-            }
-            // Generic playlist search is easily fooled by anime-style cover
-            // art on unrelated tracks. Fetch the actual artists/songs the
-            // assistant named so the pool contains genuinely on-theme music.
-            let mut seed_tracks: Vec<Track> = Vec::new();
-            if !seed_names.is_empty() {
-                use crate::sources::MusicSource;
-                let lookups = futures::future::join_all(seed_names.iter().take(8).map(|name| async {
-                    let dz = tokio::time::timeout(
-                        std::time::Duration::from_secs(8),
-                        self.sources.deezer.search_tracks(name, 12),
-                    )
-                    .await
-                    .unwrap_or_default();
-                    let ytm = tokio::time::timeout(
-                        std::time::Duration::from_secs(8),
-                        self.sources.ytm.search(name, 6),
-                    )
-                    .await
-                    .unwrap_or_default();
-                    (dz, ytm)
-                }))
-                .await;
-                for (dz, ytm) in lookups {
-                    seed_tracks.extend(dz.into_iter().filter(|t| {
-                        !is_mix_clutter_track(t, &query.to_ascii_lowercase())
-                            && seed_names.iter().any(|n| seed_name_matches(n, t))
-                    }));
-                    seed_tracks.extend(ytm.into_iter().filter(|t| {
-                        !is_mix_clutter_track(t, &query.to_ascii_lowercase())
-                            && seed_names.iter().any(|n| seed_name_matches(n, t))
-                    }));
-                }
-            }
-            // Seed-derived tracks are the only ones guaranteed to be on-theme,
-            // so they go first — the model sees a capped number of candidates.
-            let mut ordered_pool = seed_tracks;
-            ordered_pool.extend(pool);
-            pool = ordered_pool;
+            // Editorial Deezer genre charts are the primary source: unlike
+            // keyword search they can't be poisoned by junk uploads whose
+            // titles merely contain the theme word.
+            let mut pool: Vec<Track> = self.deezer_genre_tracks_for_query(&query).await;
+            pool.extend(self.load_curated_query_tracks(&query));
             dedup_tracks_by_id(&mut pool);
+
+            // Only fall back to keyword/seed search if genre charts yielded
+            // too little material for a mix.
+            if pool.len() < 8 {
+                let mut search_queries = vec![query.clone()];
+                search_queries.extend(expansions);
+                let q_low = query.to_ascii_lowercase();
+                for sq in search_queries.into_iter().take(3) {
+                    let batches = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        self.sources.deezer.fetch_curated_mix_tracks(&sq, 2, 20),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    for (_, batch) in batches {
+                        pool.extend(
+                            batch
+                                .into_iter()
+                                .filter(|t| !is_mix_clutter_track(t, &q_low)),
+                        );
+                    }
+                }
+                let mut seed_tracks: Vec<Track> = Vec::new();
+                if !seed_names.is_empty() {
+                    // Deezer only: YouTube search is the main source of
+                    // title-stuffed uploads with anime-style thumbnails.
+                    let lookups = futures::future::join_all(seed_names.iter().take(8).map(|name| async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(8),
+                            self.sources.deezer.search_tracks(name, 12),
+                        )
+                        .await
+                        .unwrap_or_default()
+                    }))
+                    .await;
+                    for found in lookups {
+                        seed_tracks.extend(found.into_iter().filter(|t| {
+                            !is_mix_clutter_track(t, &q_low)
+                                && seed_names.iter().any(|n| seed_name_matches(n, t))
+                        }));
+                    }
+                }
+                let mut ordered_pool = seed_tracks;
+                ordered_pool.extend(pool);
+                pool = ordered_pool;
+                dedup_tracks_by_id(&mut pool);
+            }
             if pool.len() < 8 {
                 continue;
             }
