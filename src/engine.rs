@@ -85,6 +85,9 @@ pub struct StreamEngine {
     pub cover_dir: PathBuf,
     pub embed_dir: PathBuf,
     pub max_cache_bytes: i64,
+    /// Per-track disk cache ceiling. Large hi-res FLACs can exceed the old
+    /// 250 MB limit, which made them re-fetch from the source on every play.
+    pub max_track_bytes: i64,
     pub ffmpeg_available: bool,
     /// Optional S3/R2 "cool" cache; local disk stays the hot tier.
     pub remote: Option<Arc<crate::remote_cache::RemoteCache>>,
@@ -161,6 +164,13 @@ impl StreamEngine {
             cover_dir,
             embed_dir,
             max_cache_bytes: ((max_cache_gb.max(0.5)) * 1024.0 * 1024.0 * 1024.0) as i64,
+            max_track_bytes: (std::env::var("BEATLAB_CACHE_MAX_TRACK_MB")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(2048.0)
+                * 1024.0
+                * 1024.0) as i64,
             ffmpeg_available,
             remote,
             resolved_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1053,9 +1063,6 @@ impl StreamEngine {
                 return;
             }
         }
-        let Ok(permit) = self.cache_sem.clone().try_acquire_owned() else {
-            return;
-        };
         {
             let mut set = self
                 .in_flight_downloads
@@ -1072,12 +1079,30 @@ impl StreamEngine {
         let hdrs = headers.to_vec();
         let ext_s = if ext.is_empty() { "m4a" } else { ext }.to_string();
 
+        // Awaiting a permit instead of dropping the request when all slots are
+        // busy is essential: previously a busy cache semaphore silently skipped
+        // caching, so the track was re-fetched from the source on every play.
         tokio::spawn(async move {
-            let _permit = permit;
             let _guard = InFlightSetGuard {
                 set: Arc::clone(&this.in_flight_downloads),
                 key: tid.clone(),
             };
+            let permit = match tokio::time::timeout(
+                Duration::from_secs(600),
+                this.cache_sem.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                _ => return,
+            };
+            // Another path may have cached the track while we waited.
+            if let Ok(Some(entry)) = this.store.get_cache_entry(&tid) {
+                if Path::new(&entry.path).exists() {
+                    return;
+                }
+            }
+            let _permit = permit;
             let _ = this.download_to_disk_cache(&tid, &u, &hdrs, &ext_s).await;
         });
     }
@@ -1124,10 +1149,13 @@ impl StreamEngine {
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
             total_written += bytes.len() as i64;
-            if total_written > 250 * 1024 * 1024 {
+            if total_written > self.max_track_bytes {
                 drop(file);
                 let _ = tokio::fs::remove_file(&part_path).await;
-                return Err(err_msg("Track exceeded 250MB cache cap"));
+                return Err(err_msg(format!(
+                    "Track exceeded {}MB cache cap",
+                    self.max_track_bytes / (1024 * 1024)
+                )));
             }
             file.write_all(&bytes).await?;
         }
@@ -1209,6 +1237,86 @@ impl StreamEngine {
         }
 
         debug!(track_id = %track_id, bytes = final_bytes, "cached track to disk");
+        Ok(())
+    }
+
+    /// Installs a higher-quality file under an existing track ID. Only the
+    /// audio bytes and their technical fields change; the track row's artwork,
+    /// metadata and source URL stay intact, so every existing playlist and
+    /// queue entry immediately plays the better file.
+    pub async fn install_quality_upgrade(
+        &self,
+        track_id: &str,
+        source_path: &Path,
+        upgraded: &Track,
+    ) -> AppResult<()> {
+        let bytes = tokio::fs::metadata(source_path).await?.len() as i64;
+        if bytes <= 4096 {
+            return Err(err_msg("Quality upgrade file is too small"));
+        }
+        let ext: String = upgraded
+            .format
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        let ext = if ext.is_empty() { "flac".to_string() } else { ext };
+
+        let old_path = self
+            .store
+            .get_cache_entry(track_id)
+            .ok()
+            .flatten()
+            .map(|e| PathBuf::from(e.path));
+
+        let hash = sha1_hex(track_id);
+        let final_path = self.cache_dir.join(format!("{}.{}", hash, ext));
+        let part_path = self
+            .cache_dir
+            .join(format!("{}.{}.upgrade.part", hash, uuid::Uuid::new_v4().simple()));
+        tokio::fs::copy(source_path, &part_path).await?;
+        if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(e.into());
+        }
+
+        self.store
+            .upsert_cache_entry(track_id, &final_path.to_string_lossy(), bytes)?;
+        self.store.update_track_audio_quality(
+            track_id,
+            &upgraded.format,
+            upgraded.bitrate,
+            upgraded.sample_rate,
+            upgraded.bit_depth,
+            bytes,
+        )?;
+
+        // Drop the superseded file, but only after the new entry is registered.
+        if let Some(old) = old_path {
+            if old != final_path {
+                let _ = tokio::fs::remove_file(&old).await;
+            }
+        }
+
+        // Re-mirror unconditionally: the object key is unchanged, so the cool
+        // tier must be overwritten with the new bytes, not just have its
+        // recency stamp refreshed.
+        if let Some(remote) = &self.remote {
+            let key = remote.object_key(track_id);
+            match remote.upload_from(&key, &final_path, &ext).await {
+                Ok(()) => {
+                    let _ = self.store.upsert_remote_cache_entry(track_id, &key, bytes);
+                    debug!(track_id = %track_id, "mirrored quality upgrade to cool cache");
+                }
+                Err(e) => {
+                    debug!(track_id = %track_id, error = %e.to_string(), "quality upgrade cool mirror failed");
+                }
+            }
+        }
+
+        let _ = self.store.prune_cache(self.max_cache_bytes);
+        debug!(track_id = %track_id, format = %ext, bytes, "installed higher-quality version");
         Ok(())
     }
 

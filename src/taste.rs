@@ -820,6 +820,10 @@ impl SearchIntent {
             }
         } else if !self.themes.is_empty() {
             out.push(format!("{} hits", self.themes[0].search_boost));
+        } else if !self.genres.is_empty() {
+            // Genre-only mixes (e.g. "classic rock") previously produced no
+            // direct track search at all, leaving only coarse genre charts.
+            out.push(format!("{} hits", self.normalized));
         }
         out.retain(|q| q != &self.normalized);
         out.truncate(1);
@@ -835,6 +839,7 @@ impl SearchIntent {
             let mapped: &[&str] = match g.as_str() {
                 "Pop" => &["pop"],
                 "Synthpop" | "Dream Pop" => &[],
+                "Classic Rock" => &["classic rock", "classic rock hits"],
                 "Rock" | "Grunge" | "Punk" | "Post-Punk" | "Pop Punk" => &["rock", "alternative"],
                 "Indie" | "Alternative" | "Shoegaze" | "Emo" => &["alternative", "indie", "rock"],
                 "Hip-Hop" | "Rap" | "Trap" => &["rap", "hip hop"],
@@ -3698,6 +3703,37 @@ impl TasteEngine {
         }
         let mut merged_tracks = merge_tracks_dedup(dz_top_tracks, combined_local);
 
+        // Deezer's artist/top endpoint caps at 50 tracks, so an artist page
+        // would only show a handful of songs until the user happened to search
+        // for the rest (which is how they entered the local catalog). Walk the
+        // artist's albums and collect their tracks so the full discography is
+        // present on the first visit. Results are persisted below, making
+        // subsequent loads instant.
+        let album_ids = artist_album_ids(&dz_albums, 60);
+        if !album_ids.is_empty() {
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+            let mut tasks = Vec::with_capacity(album_ids.len());
+            for id in album_ids {
+                let dz = self.sources.deezer.clone();
+                let sem = sem.clone();
+                tasks.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok()?;
+                    let (_album, tracks) = dz.fetch_album(&id).await?;
+                    Some(tracks)
+                }));
+            }
+            let mut album_tracks = Vec::new();
+            for task in tasks {
+                if let Ok(Some(tracks)) = task.await {
+                    album_tracks.extend(tracks);
+                }
+            }
+            if !album_tracks.is_empty() {
+                let _ = self.store.upsert_tracks(&album_tracks);
+                merged_tracks = merge_tracks_dedup(merged_tracks, album_tracks);
+            }
+        }
+
         // When Deezer returned few/no tracks (or was offline/rate-limited), supplement from YTM & Deezer track search.
         let artist_name_for_search = if !meta.name.trim().is_empty() {
             meta.name.clone()
@@ -3707,14 +3743,23 @@ impl TasteEngine {
         if merged_tracks.len() < 15 && !artist_name_for_search.trim().is_empty() {
             use crate::sources::MusicSource;
             let want_dz = (!meta.deezer_id.is_empty()).then(|| meta.deezer_id.as_str());
-            let (ytm_hits, dz_hits) = tokio::join!(
+            let songs_query = format!("{} songs", artist_name_for_search);
+            let (ytm_hits, dz_hits, ytm_songs, dz_songs) = tokio::join!(
                 tokio::time::timeout(
                     std::time::Duration::from_millis(3500),
-                    self.sources.ytm.search(&artist_name_for_search, 25),
+                    self.sources.ytm.search(&artist_name_for_search, 50),
                 ),
                 tokio::time::timeout(
                     std::time::Duration::from_millis(3500),
-                    self.sources.deezer.search_tracks(&artist_name_for_search, 25),
+                    self.sources.deezer.search_tracks(&artist_name_for_search, 50),
+                ),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(3500),
+                    self.sources.ytm.search(&songs_query, 50),
+                ),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(3500),
+                    self.sources.deezer.search_tracks(&songs_query, 50),
                 ),
             );
             let mut extra = Vec::new();
@@ -3723,6 +3768,8 @@ impl TasteEngine {
                 .unwrap_or_default()
                 .into_iter()
                 .chain(ytm_hits.unwrap_or_default())
+                .chain(dz_songs.unwrap_or_default())
+                .chain(ytm_songs.unwrap_or_default())
             {
                 if !is_same_or_featured_artist(&t.artist, &artist_name_for_search) {
                     continue;
@@ -5681,7 +5728,9 @@ impl TasteEngine {
                 .map(|e| (e.mix_score, e.track.clone()))
                 .collect();
 
-            if mix_pool.len() < 2 {
+            // Pad thin mixes, not just empty ones. A 2-track single-artist result
+            // is not a mix; it should pull in verified radio/search candidates.
+            if mix_pool.len() < 8 {
                 let mut seen_fallback_keys: HashSet<String> = mix_pool
                     .iter()
                     .map(|(_, t)| t.song_key())
@@ -5807,8 +5856,17 @@ impl TasteEngine {
                                     .genres
                                     .iter()
                                     .any(|g| genre_matches_text(&meta_low, g));
-                            let ytm_backed =
-                                e.track.source == "ytm" || e.track.id.starts_with("ytm:");
+                            // Origin alone is weak evidence. For decade/vibe
+                            // queries a YTM radio hit is usable, but for a pure
+                            // genre query ("classic rock") it can be a modern
+                            // J-Rock upload, so require real genre/era evidence.
+                            let genre_only = intent.is_theme_mix
+                                && !intent.genres.is_empty()
+                                && intent.themes.is_empty()
+                                && intent.moods.is_empty()
+                                && intent.year_range.is_none();
+                            let ytm_backed = !genre_only
+                                && (e.track.source == "ytm" || e.track.id.starts_with("ytm:"));
                             let has_evidence = e.curated_prior > 0.0
                                 || e.theme_match >= 0.25
                                 || e.era_match > 0.0
@@ -5856,6 +5914,19 @@ impl TasteEngine {
             let mix_ranked: Vec<Track> = mix_pool.into_iter().map(|(_, t)| t).collect();
             let mut mix_tracks = dedup_and_interleave(mix_ranked, 25, 2);
 
+            // Two tracks by one artist is a coincidence, not a mix. Padding has
+            // already been attempted above, so reject it instead of presenting
+            // a misleading "Classic Rock Mix" made of one J-Rock artist.
+            if mix_tracks.len() < 5 {
+                let distinct_artists: HashSet<String> = mix_tracks
+                    .iter()
+                    .map(|t| primary_artist(&t.artist).to_lowercase())
+                    .collect();
+                if distinct_artists.len() < 2 {
+                    mix_tracks.clear();
+                }
+            }
+
             // A pure genre mix needs at least a couple of tracks whose own metadata confirms
             // the genre. Playlist-title provenance alone is not enough: a mis-tagged
             // "jrock" playlist full of unrelated tracks must never be labelled a J-Rock Mix.
@@ -5868,15 +5939,18 @@ impl TasteEngine {
                 let confirmed = mix_tracks
                     .iter()
                     .filter(|t| {
-                        if t.source == "ytm" || t.id.starts_with("ytm:") {
-                            return true;
-                        }
                         let ag = artist_genres
                             .get(&primary_artist(&t.artist).to_lowercase())
                             .map(|s| s.as_str())
                             .unwrap_or("");
                         let meta = format!("{} {}", t.genre, ag).to_lowercase();
-                        intent.genres.iter().any(|g| genre_matches_text(&meta, g))
+                        if intent.genres.iter().any(|g| genre_matches_text(&meta, g)) {
+                            return true;
+                        }
+                        // A YTM/Deezer track with no genre metadata must not be
+                        // auto-approved just because of where it came from. A
+                        // strong era signal is verifiable evidence instead.
+                        intent.wants_classic && compute_query_era_match(t, &intent) >= 0.6
                     })
                     .count();
                 if confirmed < 2 {
@@ -6829,6 +6903,7 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         ("afrobeat", "Afrobeats"),
         ("reggaeton", "Reggaeton"),
         ("soundtrack", "Soundtrack"),
+        ("classic rock", "Classic Rock"),
         ("rock", "Rock"),
         ("pop", "Pop"),
         ("jazz", "Jazz"),
@@ -7349,6 +7424,7 @@ fn is_mix_clutter_track(t: &Track, query_low: &str) -> bool {
 
 fn genre_variants(term_low: &str) -> &'static [&'static str] {
     match term_low {
+        "classic rock" | "classicrock" => &["classic rock", "classicrock"],
         "j-pop" | "jpop" | "j pop" | "japanese pop" => {
             &["jpop", "j-pop", "j pop", "japanese pop"]
         }
@@ -7692,6 +7768,25 @@ pub(crate) fn has_genre_clash(t: &Track, artist_genres: &str, wanted_genres: &[S
     if meta.trim().is_empty() {
         return false;
     }
+
+    // `contains_term` uses non-alphanumeric boundaries, so "j-rock" is treated
+    // as a "rock" match. That let Japanese/Korean/Chinese scenes satisfy plain
+    // Western genre queries like "classic rock" (e.g. Mr.Children). Reject
+    // scene markers up front unless the query explicitly wants that scene.
+    let wants_scene = wanted_genres
+        .iter()
+        .any(|g| matches!(genre_family(&g.to_lowercase()), Some(f) if f >= 10));
+    if !wants_scene {
+        const SCENE_MARKERS: &[&str] = &[
+            "jpop", "j-pop", "j pop", "japanese pop", "jrock", "j-rock", "j rock",
+            "japanese rock", "kpop", "k-pop", "k pop", "korean pop", "cpop", "c-pop",
+            "c pop", "mandopop", "cantopop", "city pop", "city-pop", "citypop",
+        ];
+        if SCENE_MARKERS.iter().any(|s| contains_term(&meta, s)) {
+            return true;
+        }
+    }
+
     if wanted_genres.iter().any(|g| genre_matches_text(&meta, g)) {
         return false;
     }
@@ -8121,7 +8216,9 @@ fn build_instant_mix_title(
 ) -> (String, String) {
     if intent.is_theme_mix {
         let mut parts: Vec<String> = Vec::new();
-        if intent.wants_classic {
+        if intent.wants_classic
+            && !intent.genres.iter().any(|g| g.to_lowercase().contains("classic"))
+        {
             parts.push("Classic".to_string());
         }
         if let Some(dec) = intent.decade_label {
@@ -8738,7 +8835,11 @@ fn dedup_and_interleave_with_anchor(
     out
 }
 
-fn enrich_slsk_hit_with_base(hit: &mut Track, base: &Track, lock_album_track_pos: bool) {
+pub(crate) fn enrich_slsk_hit_with_base(
+    hit: &mut Track,
+    base: &Track,
+    lock_album_track_pos: bool,
+) {
     hit.artist = base.artist.clone();
     if lock_album_track_pos || !base.album.is_empty() {
         hit.album = base.album.clone();
@@ -8812,6 +8913,20 @@ fn parse_rank_bonus(meta: &str) -> f64 {
     } else {
         ((rank as f64) / 200_000.0).clamp(0.2, 5.0)
     }
+}
+
+/// Deezer album IDs worth fetching full track lists for, deduplicated and
+/// bounded so a large discography cannot spawn unbounded requests.
+fn artist_album_ids(albums: &[AlbumSummary], limit: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    albums
+        .iter()
+        .filter_map(|a| {
+            let id = a.deezer_id.trim();
+            (!id.is_empty() && id != "0" && seen.insert(id.to_string())).then(|| id.to_string())
+        })
+        .take(limit)
+        .collect()
 }
 
 fn merge_albums_dedup(primary: Vec<AlbumSummary>, secondary: Vec<AlbumSummary>) -> Vec<AlbumSummary> {
@@ -9977,6 +10092,79 @@ mod tests {
         assert!(!ids.contains(&"dz:80sbaby"), "ids={:?}", ids);
         assert!(!ids.contains(&"ytm:slowed"), "ids={:?}", ids);
         assert!(!ids.contains(&"dz:trap24"), "ids={:?}", ids);
+    }
+
+    #[test]
+    fn classic_rock_intent_is_a_first_class_genre_with_real_search_queries() {
+        let intent = parse_search_intent("classic rock");
+        assert!(intent.is_theme_mix);
+        assert_eq!(intent.genres, vec!["Classic Rock".to_string()]);
+        assert!(intent.wants_classic);
+        assert!(intent.expanded_track_queries().contains(&"classic rock hits".to_string()));
+        assert!(intent.deezer_genre_hints().contains(&"classic rock"));
+        assert!(genre_matches_text("classic rock", "Classic Rock"));
+        assert!(!genre_matches_text("j-rock", "Classic Rock"));
+    }
+
+    #[test]
+    fn scene_genres_are_rejected_for_western_genre_queries() {
+        let jrock = Track {
+            genre: "J-Rock".into(),
+            ..Default::default()
+        };
+        assert!(has_genre_clash(&jrock, "", &["Classic Rock".into()]));
+        assert!(has_genre_clash(&jrock, "", &["Rock".into()]));
+        // An explicit J-Rock query must still accept the same track.
+        assert!(!has_genre_clash(&jrock, "", &["J-Rock".into()]));
+    }
+
+    #[test]
+    fn classic_rock_mix_rejects_jrock_and_is_named_from_real_tracks() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("classic_rocker", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+        let mk = |id: &str, title: &str, artist: &str, genre: &str, year: i32| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: title.into(),
+            genre: genre.into(),
+            year,
+            duration: 240,
+            bitrate: 256,
+            meta: r#"{"rank":850000}"#.into(),
+            ..Default::default()
+        };
+
+        let zep = mk("dz:zep", "Stairway to Heaven", "Led Zeppelin", "classic rock", 1971);
+        let floyd = mk("dz:floyd", "Comfortably Numb", "Pink Floyd", "classic rock", 1979);
+        let beatles = mk("dz:beatles", "Hey Jude", "The Beatles", "Rock", 1968);
+        let jrock_a = mk("dz:mc1", "toriko", "Mr.Children", "J-Rock", 1996);
+        let jrock_b = mk("dz:mc2", "tegami", "Mr.Children", "J-Rock", 1996);
+
+        let res = taste.search_and_refine(
+            u.id,
+            "classic rock",
+            vec![zep.clone(), floyd.clone(), beatles.clone(), jrock_a, jrock_b],
+            vec![(
+                "Classic Rock Essentials".to_string(),
+                vec![zep.clone(), floyd.clone(), beatles.clone()],
+            )],
+        );
+        let mix = res.instant_mix.expect("classic rock mix should exist");
+        assert_eq!(mix.title, "Classic Rock Mix");
+        let ids: Vec<&str> = mix.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"dz:zep"), "ids={:?}", ids);
+        assert!(!ids.contains(&"dz:mc1"), "ids={:?}", ids);
+        assert!(!ids.contains(&"dz:mc2"), "ids={:?}", ids);
     }
 
     #[test]
@@ -11554,5 +11742,25 @@ mod tests {
             "Playlist Discover Christmas radio leaked J-Pop: {:?}",
             pl_disc_ids
         );
+    }
+
+    #[test]
+    fn artist_album_ids_are_deduplicated_and_bounded() {
+        let mk = |id: &str| AlbumSummary {
+            id: id.to_string(),
+            deezer_id: id.to_string(),
+            name: id.to_string(),
+            ..Default::default()
+        };
+        let albums = vec![
+            mk("10"),
+            mk("0"),
+            mk(" "),
+            mk("10"),
+            mk("22"),
+            mk("33"),
+        ];
+        assert_eq!(artist_album_ids(&albums, 2), vec!["10", "22"]);
+        assert_eq!(artist_album_ids(&albums, 10), vec!["10", "22", "33"]);
     }
 }

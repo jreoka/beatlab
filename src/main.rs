@@ -3,6 +3,7 @@ mod auth;
 mod engine;
 mod models;
 mod navidrome;
+mod quality_hunter;
 mod remote_cache;
 mod share_page;
 mod sources;
@@ -186,6 +187,24 @@ async fn main() -> models::AppResult<()> {
             tick = tick.wrapping_add(1);
         }
     });
+
+    // Slowly hunt for higher-quality versions of catalog tracks in the
+    // background. The installed file replaces the cached audio under the same
+    // track ID, so artwork and metadata remain those of the original.
+    let hunter = crate::quality_hunter::QualityHunter::new(
+        state.store.clone(),
+        (*state.engine).clone(),
+    );
+    if hunter.enabled() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(hunter.interval());
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                hunter.run_tick().await;
+            }
+        });
+    }
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
