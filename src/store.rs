@@ -4898,6 +4898,19 @@ impl Store {
         )?)
     }
 
+    /// Per-kind (audio / cover / embed / avatar) object counts and byte totals.
+    pub fn remote_cache_kind_stats(&self) -> AppResult<Vec<(String, i64, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*), COALESCE(SUM(bytes), 0)
+             FROM remote_cache_entries GROUP BY kind ORDER BY SUM(bytes) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Least-recently-used first, for cool-cache quota eviction. Returns
     /// (kind, asset_id, object_key, bytes) so any asset kind can be evicted.
     pub fn remote_cache_eviction_candidates(

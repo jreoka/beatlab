@@ -165,6 +165,13 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "remoteCacheBytes": state.store.remote_cache_total_bytes().unwrap_or(0),
             "remoteCacheMaxBytes": state.engine.remote.as_ref().map(|r| r.max_bytes).unwrap_or(0),
             "remoteCacheTarget": state.engine.remote.as_ref().map(|r| r.describe()).unwrap_or_default(),
+            "remoteCacheHighWaterBytes": state.engine.remote.as_ref().map(|r| r.high_water_bytes).unwrap_or(0),
+            "remoteCacheByKind": state.store.remote_cache_kind_stats().unwrap_or_default()
+                .into_iter()
+                .map(|(kind, objects, bytes)| json!({ "kind": kind, "objects": objects, "bytes": bytes }))
+                .collect::<Vec<_>>(),
+            "maxTrackBytes": state.engine.max_track_bytes,
+            "qualityHunter": state.quality_hunter.stats_json(),
         })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

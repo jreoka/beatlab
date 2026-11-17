@@ -8,7 +8,7 @@
   <style>
     :root {
       --bg:#090a0d; --surface:#12141a; --surface-2:#1a1d26; --border:#272b36;
-      --text:#eef1f6; --muted:#9aa3b2; --dim:#666f80; --accent:#1ed760; --danger:#f43f5e;
+      --text:#eef1f6; --muted:#9aa3b2; --dim:#666f80; --accent:#1ed760; --danger:#f43f5e; --warn:#f5b54a;
       --radius:10px; --radius-sm:7px;
     }
     * { box-sizing:border-box; }
@@ -68,7 +68,28 @@
     .close { background:none; border:0; color:var(--muted); font-size:20px; }
     .muted { color:var(--muted); }
     #toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius); padding:10px 16px; z-index:40; }
-    @media (max-width:700px) { .actions { max-width:130px; } th:nth-child(n+5), td:nth-child(n+5) { display:none; } }
+    /* --- refreshed panels --- */
+    .tab { display:flex; align-items:center; gap:7px; }
+    .tab.active { background:rgba(30,215,96,.07); border-radius:8px 8px 0 0; }
+    .card { position:relative; overflow:hidden; }
+    .card::before { content:''; position:absolute; left:0; top:0; bottom:0; width:2px; background:var(--accent); opacity:.6; }
+    .card.warn::before { background:var(--warn); }
+    .card.off::before { background:var(--dim); }
+    .card .v { font-variant-numeric:tabular-nums; }
+    .panel-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }
+    .stat-row { display:flex; justify-content:space-between; gap:14px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,.045); font-size:12.5px; }
+    .stat-row:last-child { border-bottom:0; }
+    .stat-row .label { color:var(--muted); }
+    .stat-row .value { font-weight:700; font-variant-numeric:tabular-nums; text-align:right; }
+    .subhead { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:28px 0 12px; }
+    .subhead h2 { margin:0; font-size:15px; }
+    .pager { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:14px; }
+    .pager .info { color:var(--muted); font-size:12px; margin-right:6px; }
+    .progress-label { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:7px; }
+    .marker { position:relative; }
+    .marker i { position:absolute; top:0; bottom:0; width:2px; background:var(--warn); }
+    .empty { padding:22px; text-align:center; color:var(--muted); border:1px dashed var(--border); border-radius:var(--radius); }
+    @media (max-width:700px) { .actions { max-width:130px; } th:nth-child(n+5), td:nth-child(n+5) { display:none; } .panel-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -89,10 +110,11 @@
 
     <div id="panel" class="hidden">
       <div class="tabs">
-        <button class="tab active" data-tab="overview" onclick="showTab('overview')">Overview</button>
-        <button class="tab" data-tab="users" onclick="showTab('users')">Users</button>
-        <button class="tab" data-tab="events" onclick="showTab('events')">Security Events</button>
-        <button class="tab" data-tab="config" onclick="showTab('config')">Configuration</button>
+        <button class="tab active" data-tab="overview" onclick="showTab('overview')">◈ Overview</button>
+        <button class="tab" data-tab="users" onclick="showTab('users')">◉ Users</button>
+        <button class="tab" data-tab="cache" onclick="showTab('cache')">⬡ Cache &amp; Quality</button>
+        <button class="tab" data-tab="events" onclick="showTab('events')">⛨ Security Events</button>
+        <button class="tab" data-tab="config" onclick="showTab('config')">⚙ Configuration</button>
       </div>
 
       <section id="tab-overview">
@@ -102,8 +124,16 @@
       </section>
 
       <section id="tab-users" class="hidden">
-        <input id="user-search" type="search" placeholder="Search users…" oninput="renderUsers()" />
+        <input id="user-search" type="search" placeholder="Search users…" oninput="state.userPage=1;renderUsers()" />
         <div id="users-wrap"></div>
+        <div id="users-pager" class="pager"></div>
+      </section>
+
+      <section id="tab-cache" class="hidden">
+        <div class="subhead"><h2>Storage tiers</h2><span id="cache-summary" class="muted"></span></div>
+        <div id="cache-box" class="panel-grid"></div>
+        <div class="subhead"><h2>Quality hunter</h2><span id="hunter-status" class="pill"></span></div>
+        <div id="hunter-box" class="panel-grid"></div>
       </section>
 
       <section id="tab-events" class="hidden">
@@ -112,8 +142,6 @@
 
       <section id="tab-config" class="hidden">
         <div id="config-box" class="card"></div>
-        <h2 class="section">Audio cache</h2>
-        <div id="cache-box" class="card"></div>
       </section>
     </div>
   </main>
@@ -129,7 +157,8 @@
   <script>
   (() => {
     const $ = (id) => document.getElementById(id);
-    const state = { token: localStorage.getItem('beatlab_token') || '', users: [], overview: null, events: [], tab: 'overview' };
+    const USERS_PER_PAGE = 10;
+    const state = { token: localStorage.getItem('beatlab_token') || '', users: [], overview: null, events: [], tab: 'overview', userPage: 1 };
     window.state = state;
 
     const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -181,6 +210,7 @@
         ['Tracks', o.tracks, 'in library'],
         ['Hot cache', Math.round(o.localCacheBytes / 1048576) + ' MB', o.localCacheEntries + ' files / ' + Math.round(o.cacheMaxBytes / 1073741824) + ' GB cap'],
         ['Cool cache', o.remoteCacheEnabled ? Math.round(o.remoteCacheBytes / 1048576) + ' MB' : 'Off', o.remoteCacheEnabled ? o.remoteCacheObjects + ' objects' : 'configure S3/R2 to enable'],
+        ['Quality upgrades', (o.qualityHunter && o.qualityHunter.installed) || 0, (o.qualityHunter && o.qualityHunter.enabled ? 'hunter running' : 'hunter disabled')],
         ['2FA users', o.totpUsers, o.passkeys + ' passkeys'],
         ['Recovery codes', o.recoveryCodes, 'unused'],
         ['Playlists', o.playlists, 'across accounts'],
@@ -196,10 +226,19 @@
       $('overview-events').innerHTML = recent.length ? recent.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
     };
 
+    window.setUserPage = (page) => { state.userPage = page; renderUsers(); };
     window.renderUsers = () => {
       const q = ($('user-search').value || '').toLowerCase().trim();
-      const rows = state.users.filter((u) => !q || u.username.toLowerCase().includes(q));
-      if (!rows.length) { $('users-wrap').innerHTML = '<p class="muted">No matching users.</p>'; return; }
+      const filtered = state.users.filter((u) => !q || u.username.toLowerCase().includes(q));
+      const pages = Math.max(1, Math.ceil(filtered.length / USERS_PER_PAGE));
+      state.userPage = Math.min(Math.max(1, state.userPage), pages);
+      const start = (state.userPage - 1) * USERS_PER_PAGE;
+      const rows = filtered.slice(start, start + USERS_PER_PAGE);
+      if (!rows.length) {
+        $('users-wrap').innerHTML = '<div class="empty">No matching users.</div>';
+        $('users-pager').innerHTML = '';
+        return;
+      }
       let html = '<table><thead><tr><th>ID</th><th>User</th><th>Joined</th><th>Status</th><th>2FA</th><th>Activity</th><th style="width:320px">Actions</th></tr></thead><tbody>';
       for (const u of rows) {
         const status = u.deletedAt ? '<span class="pill del">Pending deletion</span>' : '<span class="pill on">Active</span>';
@@ -223,6 +262,12 @@
           '<td><div class="actions">' + (self ? '<span class="muted">Your account</span>' : actions) + '</div></td></tr>';
       }
       $('users-wrap').innerHTML = html + '</table>';
+      const from = start + 1;
+      const to = Math.min(start + USERS_PER_PAGE, filtered.length);
+      $('users-pager').innerHTML =
+        '<span class="info">Showing ' + from + '–' + to + ' of ' + filtered.length + ' · page ' + state.userPage + ' of ' + pages + '</span>' +
+        '<button class="mini" ' + (state.userPage <= 1 ? 'disabled' : '') + ' onclick="setUserPage(' + (state.userPage - 1) + ')">← Previous</button>' +
+        '<button class="mini" ' + (state.userPage >= pages ? 'disabled' : '') + ' onclick="setUserPage(' + (state.userPage + 1) + ')">Next →</button>';
     };
 
     window.userAction = async (id, action) => {
@@ -276,7 +321,7 @@
     window.showTab = (tab) => {
       state.tab = tab;
       document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-      ['overview','users','events','config'].forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
+      ['overview','users','cache','events','config'].forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
     };
 
     window.backfillCache = async () => {
@@ -287,29 +332,75 @@
       } catch (e) { toast(e.message); }
     };
 
+    const pctOf = (used, max) => (max > 0 ? Math.min(100, (used / max) * 100) : 0);
+    const bar = (used, max, marker) => {
+      const mark = marker > 0 ? '<i style="left:' + marker.toFixed(1) + '%"></i>' : '';
+      return '<div class="usage-bar marker"><div class="usage-fill" style="width:' + pctOf(used, max).toFixed(1) + '%"></div>' + mark + '</div>';
+    };
+    const statRow = (k, v) => '<div class="stat-row"><span class="label">' + k + '</span><span class="value">' + esc(v) + '</span></div>';
+    const mb = (n) => ((n || 0) / 1048576).toFixed(1) + ' MB';
+    const gb = (n) => ((n || 0) / 1073741824).toFixed(1) + ' GB';
+
     function renderCache(o) {
-      const mb = (n) => (n / 1024 / 1024).toFixed(1) + ' MB';
-      const kv = (k, v) => '<div class="kv"><span>' + k + '</span><span>' + esc(v) + '</span></div>';
-      const bar = (used, max) => {
-        const pct = max > 0 ? Math.min(100, (used / max) * 100) : 0;
-        return '<div class="usage-bar"><div class="usage-fill" style="width:' + pct.toFixed(1) + '%"></div></div>';
-      };
-      let html = '<h3 style="margin:0 0 6px;font-size:13px">Hot cache · local disk</h3>';
-      html += kv('Size', mb(o.localCacheBytes) + ' / ' + mb(o.cacheMaxBytes));
-      html += bar(o.localCacheBytes, o.cacheMaxBytes);
-      html += kv('Cached tracks', o.localCacheEntries);
-      html += '<h3 style="margin:16px 0 6px;font-size:13px">Cool cache · S3/R2</h3>';
+      const hotPct = pctOf(o.localCacheBytes, o.cacheMaxBytes);
+      let hot = '<div class="card' + (hotPct > 85 ? ' warn' : '') + '">';
+      hot += '<div class="k">Hot cache · local disk</div><div class="v">' + mb(o.localCacheBytes) + '</div>';
+      hot += bar(o.localCacheBytes, o.cacheMaxBytes);
+      hot += '<div class="progress-label"><span>' + hotPct.toFixed(1) + '% used</span><span>' + gb(o.cacheMaxBytes) + ' cap</span></div>';
+      hot += statRow('Cached tracks', o.localCacheEntries);
+      hot += statRow('Max per track', mb(o.maxTrackBytes));
+      hot += '</div>';
+
+      let cool;
       if (o.remoteCacheEnabled) {
-        html += kv('Bucket / prefix', o.remoteCacheTarget);
-        html += kv('Objects', o.remoteCacheObjects);
-        html += kv('Size', mb(o.remoteCacheBytes) + ' / ' + mb(o.remoteCacheMaxBytes));
-        html += bar(o.remoteCacheBytes, o.remoteCacheMaxBytes);
-        html += '<button class="mini" style="margin-top:12px" onclick="backfillCache()">Backfill from local cache</button>';
+        const highPct = o.remoteCacheMaxBytes > 0 ? (o.remoteCacheHighWaterBytes / o.remoteCacheMaxBytes) * 100 : 0;
+        const coolPct = pctOf(o.remoteCacheBytes, o.remoteCacheMaxBytes);
+        cool = '<div class="card' + (highPct > 0 && coolPct >= highPct ? ' warn' : '') + '">';
+        cool += '<div class="k">Cool cache · S3/R2</div><div class="v">' + mb(o.remoteCacheBytes) + '</div>';
+        cool += bar(o.remoteCacheBytes, o.remoteCacheMaxBytes, highPct);
+        cool += '<div class="progress-label"><span>' + coolPct.toFixed(1) + '% used</span><span>' + gb(o.remoteCacheMaxBytes) + ' cap · ' + highPct.toFixed(0) + '% high-water mark</span></div>';
+        cool += statRow('Bucket / prefix', o.remoteCacheTarget);
+        cool += statRow('Total objects', o.remoteCacheObjects);
+        const kinds = o.remoteCacheByKind || [];
+        if (kinds.length) {
+          cool += '<h3 style="margin:14px 0 2px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">By asset type</h3>';
+          for (const k of kinds) cool += statRow(k.kind, k.objects + ' objects · ' + mb(k.bytes));
+        }
+        cool += '<button class="mini" style="margin-top:12px" onclick="backfillCache()">Backfill from local cache</button>';
+        cool += '</div>';
       } else {
-        html += kv('Status', 'Not configured');
-        html += '<p class="muted" style="margin:8px 0 0">Set BEATLAB_S3_BUCKET and credentials to enable a larger cool tier.</p>';
+        cool = '<div class="card off"><div class="k">Cool cache · S3/R2</div><div class="v">Off</div>';
+        cool += statRow('Status', 'Not configured');
+        cool += '<p class="muted" style="margin:8px 0 0">Set BEATLAB_S3_BUCKET and credentials to enable a larger cool tier.</p></div>';
       }
-      $('cache-box').innerHTML = html;
+      $('cache-box').innerHTML = hot + cool;
+      $('cache-summary').textContent = o.localCacheEntries + ' hot files · ' + (o.remoteCacheEnabled ? o.remoteCacheObjects + ' cool objects' : 'cool tier off');
+    }
+
+    function renderHunter(o) {
+      const h = o.qualityHunter || {};
+      const status = $('hunter-status');
+      status.textContent = h.enabled ? 'Running' : 'Disabled';
+      status.className = 'pill ' + (h.enabled ? 'on' : 'off');
+      let activity = '<div class="card">';
+      activity += '<div class="k">Hunt activity</div><div class="v">' + (h.installed || 0) + '</div>';
+      activity += '<div class="muted" style="font-size:11px">higher-quality versions installed</div>';
+      activity += statRow('Tracks probed', h.probes || 0);
+      activity += statRow('Candidates found', h.candidates || 0);
+      activity += statRow('Downloads started', h.downloads || 0);
+      activity += statRow('Failures', h.failures || 0);
+      activity += statRow('Bytes acquired', mb(h.bytesUpgraded));
+      activity += '</div>';
+      let recency = '<div class="card">';
+      recency += '<div class="k">Latest upgrade</div><div class="v" style="font-size:17px">' + esc(h.lastTrack || '—') + '</div>';
+      recency += statRow('Last scan', ago(h.lastTick));
+      recency += statRow('Last upgrade', ago(h.lastUpgrade));
+      recency += '<h3 style="margin:14px 0 2px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">Settings</h3>';
+      recency += statRow('Scan interval', (h.intervalSecs || 0) + 's');
+      recency += statRow('Tracks per scan', h.batch || 0);
+      recency += statRow('Retry cooldown', Math.round((h.cooldownSecs || 0) / 3600) + 'h');
+      recency += '</div>';
+      $('hunter-box').innerHTML = activity + recency;
     }
 
     async function load() {
@@ -325,6 +416,7 @@
         state.events = events.events || [];
         renderOverview();
         renderCache(data);
+        renderHunter(data);
         renderUsers();
         $('all-events').innerHTML = state.events.length ? state.events.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
         $('config-box').innerHTML = Object.entries(config).map(([k,v]) => {

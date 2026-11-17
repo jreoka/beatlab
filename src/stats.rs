@@ -710,24 +710,36 @@ pub fn compute_stats_from_data(
                 }
             }
 
-            let classified_moods = classify_moods_str(&t.title, &t.album, &t.genre, "");
-            let moods_raw = if !classified_moods.is_empty() {
-                classified_moods
-            } else if !t.moods.trim().is_empty() {
-                t.moods.clone()
-            } else {
-                String::new()
-            };
-            let mut seen_moods = HashSet::new();
-            for m in moods_raw.split(',').filter_map(Mood::from_slug) {
-                if !crate::taste::is_track_compatible_with_mood(t, "", m) {
+            // Use the artist's known genres as extra classification input and
+            // combine freshly classified moods with the moods already stored on
+            // the track (which were derived from album/artist metadata). Using
+            // only the genre/title here used to collapse diverse libraries into
+            // a single bucket whenever the track's own genre was missing.
+            let artist_g = artist_genre_lookup
+                .get(&primary_artist(&t.artist).to_lowercase())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let classified = classify_moods_str(&t.title, &t.album, &t.genre, artist_g);
+            let mut seen_moods: HashSet<&'static str> = HashSet::new();
+            let mut counted: Vec<Mood> = Vec::new();
+            for slug in classified
+                .split(',')
+                .chain(t.moods.split(','))
+                .filter(|s| !s.trim().is_empty())
+            {
+                if let Some(mood) = Mood::from_slug(slug.trim()) {
+                    if seen_moods.insert(mood.slug()) {
+                        counted.push(mood);
+                    }
+                }
+            }
+            for m in counted {
+                if !crate::taste::is_track_compatible_with_mood(t, artist_g, m) {
                     continue;
                 }
-                if seen_moods.insert(m.slug()) {
-                    let me = mood_counts.entry(m.slug().to_string()).or_insert((0, 0));
-                    me.0 += 1;
-                    me.1 += l.listened_secs;
-                }
+                let me = mood_counts.entry(m.slug().to_string()).or_insert((0, 0));
+                me.0 += 1;
+                me.1 += l.listened_secs;
             }
 
             let mut seen_genres = HashSet::new();
@@ -1867,6 +1879,84 @@ mod tests {
             bitrate: if format == "flac" { 950 } else { 256 },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn mood_breakdown_combines_classified_and_stored_tags() {
+        let user = User {
+            id: 1,
+            username: "moodfan".into(),
+            password: "pw".into(),
+            created: 1_700_000_000,
+        };
+        let samples = [
+            ("Electronic", "party"),
+            ("Rock", ""),
+            ("Jazz", "groove"),
+            ("Classical", "focus"),
+            ("Folk", "acoustic"),
+            ("Pop", "upbeat"),
+            ("Reggae", "chill"),
+        ];
+        let mut events = Vec::new();
+        for (i, (genre, moods)) in samples.iter().enumerate() {
+            let mut t = mk_track(
+                &format!("mood:{}", i),
+                "Some Song",
+                "Some Artist",
+                "Some Album",
+                genre,
+                2000,
+                200,
+                "m4a",
+                "deezer",
+            );
+            t.moods = moods.to_string();
+            let at = 1_760_000_000 + (i as i64) * 1000;
+            events.push(UserEventRow {
+                track_id: t.id.clone(),
+                kind: "play".into(),
+                value: 1.0,
+                at,
+                track: Some(t.clone()),
+            });
+            events.push(UserEventRow {
+                track_id: t.id.clone(),
+                kind: "complete".into(),
+                value: 1.0,
+                at: at + 200,
+                track: Some(t),
+            });
+        }
+        let stats = compute_stats_from_data(
+            &user,
+            &events,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &[],
+            0,
+            StatsRange::All,
+            0,
+            FixedOffset::east_opt(0).unwrap(),
+            1_760_100_000,
+        );
+        let active: Vec<&str> = stats
+            .moods
+            .iter()
+            .filter(|m| m.streams > 0)
+            .map(|m| m.slug.as_str())
+            .collect();
+        assert!(
+            active.len() >= 6,
+            "diverse library collapsed into {:?}",
+            active
+        );
+        assert!(active.contains(&"party"));
+        assert!(active.contains(&"rock_indie"));
+        assert!(active.contains(&"groove"));
+        assert!(active.contains(&"focus"));
     }
 
     #[test]

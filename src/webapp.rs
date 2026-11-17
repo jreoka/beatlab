@@ -5339,9 +5339,10 @@ mod tests {
         let state = AppState {
             store: store.clone(),
             sources,
-            engine,
+            engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -5439,9 +5440,10 @@ mod tests {
         let state = AppState {
             store: store.clone(),
             sources,
-            engine,
+            engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -5788,9 +5790,10 @@ mod tests {
         let state = AppState {
             store: store.clone(),
             sources,
-            engine,
+            engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
 
         // Unauthenticated fails
@@ -5928,9 +5931,10 @@ mod tests {
         let state = AppState {
             store: store.clone(),
             sources,
-            engine,
+            engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
 
         let mut h1 = HeaderMap::new();
@@ -6098,17 +6102,20 @@ mod tests {
             std::sync::Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), tmp.join("slsk")),
         );
+        let engine = std::sync::Arc::new(crate::engine::StreamEngine::new(
+            store.clone(),
+            sources.clone(),
+            &tmp,
+            1.0,
+        ));
+        let quality_hunter = crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone());
         let state = AppState {
             store: store.clone(),
             sources: sources.clone(),
-            engine: std::sync::Arc::new(crate::engine::StreamEngine::new(
-                store.clone(),
-                sources.clone(),
-                &tmp,
-                1.0,
-            )),
+            engine,
             taste: std::sync::Arc::new(crate::taste::TasteEngine::new(store, sources)),
             now_playing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            quality_hunter,
         };
 
         let mut hdr = HeaderMap::new();
@@ -6217,9 +6224,10 @@ mod tests {
         let state = AppState {
             store: store.clone(),
             sources,
-            engine,
+            engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -6342,9 +6350,10 @@ mod tests {
         let state = AppState {
             store: store.clone(),
             sources,
-            engine,
+            engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let (u, _) = store.authenticate_or_create_user("avataruser", "pw").unwrap();
         let tok = store.create_session(u.id, "web").unwrap();

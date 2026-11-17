@@ -165,6 +165,10 @@ async fn main() -> models::AppResult<()> {
         remote_cache.clone().map(Arc::new),
     ));
     let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+    let quality_hunter = crate::quality_hunter::QualityHunter::new(
+        store.clone(),
+        (*engine).clone(),
+    );
 
     let state = AppState {
         store: store.clone(),
@@ -172,6 +176,7 @@ async fn main() -> models::AppResult<()> {
         engine,
         taste: taste.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
+        quality_hunter,
     };
 
     // Fast startup catalog warming + continuous RoPE-QKVO/XSA/GEGLU Transformer training & curation
@@ -191,10 +196,7 @@ async fn main() -> models::AppResult<()> {
     // Slowly hunt for higher-quality versions of catalog tracks in the
     // background. The installed file replaces the cached audio under the same
     // track ID, so artwork and metadata remain those of the original.
-    let hunter = crate::quality_hunter::QualityHunter::new(
-        state.store.clone(),
-        (*state.engine).clone(),
-    );
+    let hunter = state.quality_hunter.clone();
     if hunter.enabled() {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(hunter.interval());

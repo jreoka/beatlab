@@ -13,10 +13,32 @@ use crate::store::Store;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
+
+/// Counters surfaced on the admin panel so an operator can see what the
+/// background hunter is actually doing.
+#[derive(Default)]
+struct HunterStats {
+    probes: AtomicU64,
+    candidates: AtomicU64,
+    downloads: AtomicU64,
+    installed: AtomicU64,
+    failures: AtomicU64,
+    bytes_upgraded: AtomicU64,
+    last_tick: AtomicI64,
+    last_upgrade: AtomicI64,
+    last_track: Mutex<String>,
+}
+
+impl HunterStats {
+    fn inc(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 const DEFAULT_COOLDOWN_SECS: i64 = 6 * 3600;
 const DEFAULT_INTERVAL_SECS: usize = 300;
@@ -97,6 +119,7 @@ pub struct QualityHunter {
     enabled: bool,
     batch: usize,
     cooldown_secs: i64,
+    stats: Arc<HunterStats>,
 }
 
 impl QualityHunter {
@@ -110,7 +133,28 @@ impl QualityHunter {
             enabled: env_bool("BEATLAB_QUALITY_HUNTER", true),
             batch: env_usize("BEATLAB_QUALITY_HUNTER_BATCH", DEFAULT_BATCH),
             cooldown_secs,
+            stats: Arc::new(HunterStats::default()),
         }
+    }
+
+    /// Snapshot of hunt activity for the admin panel.
+    pub fn stats_json(&self) -> serde_json::Value {
+        let s = &self.stats;
+        serde_json::json!({
+            "enabled": self.enabled,
+            "intervalSecs": self.interval().as_secs(),
+            "batch": self.batch,
+            "cooldownSecs": self.cooldown_secs,
+            "probes": s.probes.load(Ordering::Relaxed),
+            "candidates": s.candidates.load(Ordering::Relaxed),
+            "downloads": s.downloads.load(Ordering::Relaxed),
+            "installed": s.installed.load(Ordering::Relaxed),
+            "failures": s.failures.load(Ordering::Relaxed),
+            "bytesUpgraded": s.bytes_upgraded.load(Ordering::Relaxed),
+            "lastTick": s.last_tick.load(Ordering::Relaxed),
+            "lastUpgrade": s.last_upgrade.load(Ordering::Relaxed),
+            "lastTrack": s.last_track.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        })
     }
 
     pub fn enabled(&self) -> bool {
@@ -151,6 +195,7 @@ impl QualityHunter {
         if !self.should_probe(&base.id) {
             return;
         }
+        HunterStats::inc(&self.stats.probes);
 
         let query = format!("{} {} flac", primary_artist(&base.artist), base.title);
         let hits = match tokio::time::timeout(
@@ -165,6 +210,7 @@ impl QualityHunter {
         let Some(candidate) = choose_upgrade_candidate(&base, hits) else {
             return;
         };
+        HunterStats::inc(&self.stats.candidates);
 
         let resolved = match tokio::time::timeout(
             Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
@@ -176,12 +222,15 @@ impl QualityHunter {
             _ => return,
         };
         let Some(path) = resolved.strip_prefix("file:") else {
+            self.stats.failures.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let path = PathBuf::from(path);
         if !path.exists() {
+            self.stats.failures.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        HunterStats::inc(&self.stats.downloads);
 
         // The catalog row may have changed while the download was running.
         let fresh = match self.store.get_track(&base.id) {
@@ -197,8 +246,22 @@ impl QualityHunter {
             .install_quality_upgrade(&fresh.id, &path, &candidate)
             .await
         {
-            Ok(()) => info!(track_id = %fresh.id, "background quality upgrade installed"),
-            Err(e) => warn!(track_id = %fresh.id, error = %e, "quality upgrade install failed"),
+            Ok(()) => {
+                let bytes = tokio::fs::metadata(&path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                self.stats.bytes_upgraded.fetch_add(bytes, Ordering::Relaxed);
+                self.stats.installed.fetch_add(1, Ordering::Relaxed);
+                self.stats.last_upgrade.store(Utc::now().timestamp(), Ordering::Relaxed);
+                *self.stats.last_track.lock().unwrap_or_else(|p| p.into_inner()) =
+                    format!("{} — {}", primary_artist(&fresh.artist), fresh.title);
+                info!(track_id = %fresh.id, "background quality upgrade installed");
+            }
+            Err(e) => {
+                self.stats.failures.fetch_add(1, Ordering::Relaxed);
+                warn!(track_id = %fresh.id, error = %e, "quality upgrade install failed");
+            }
         }
     }
 
@@ -212,6 +275,7 @@ impl QualityHunter {
         let Ok(tracks) = self.store.all_tracks(self.batch, self.rotating_offset()) else {
             return;
         };
+        self.stats.last_tick.store(Utc::now().timestamp(), Ordering::Relaxed);
         for track in tracks {
             self.hunt_one(track).await;
             tokio::task::yield_now().await;
