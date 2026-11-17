@@ -570,60 +570,6 @@ pub struct ExploreMixSpec {
 
 pub const EXPLORE_MIX_SPECS: &[ExploreMixSpec] = &[
     ExploreMixSpec {
-        key: "morning_coffee",
-        kind: "moment",
-        title: "Morning Coffee",
-        subtitle: "Warm acoustic, indie folk & gentle grooves",
-        query: "acoustic chill",
-        c1: "#d97706",
-        c2: "#451a03",
-    },
-    ExploreMixSpec {
-        key: "deep_work",
-        kind: "moment",
-        title: "Deep Work & Focus",
-        subtitle: "Ambient instrumentals, piano & flow-state",
-        query: "deep focus",
-        c1: "#0d9488",
-        c2: "#134e4a",
-    },
-    ExploreMixSpec {
-        key: "late_night_drive",
-        kind: "moment",
-        title: "Late Night Drive",
-        subtitle: "Synthwave, moody alt-R&B & after-hours",
-        query: "late night vibes",
-        c1: "#6366f1",
-        c2: "#1e1b4b",
-    },
-    ExploreMixSpec {
-        key: "workout_pump",
-        kind: "moment",
-        title: "Workout & Gym",
-        subtitle: "High-tempo anthems & adrenaline fuel",
-        query: "workout hits",
-        c1: "#ef4444",
-        c2: "#7f1d1d",
-    },
-    ExploreMixSpec {
-        key: "rainy_day",
-        kind: "moment",
-        title: "Rainy Day",
-        subtitle: "Cozy indie, soft acoustic & reflective cuts",
-        query: "melancholy indie",
-        c1: "#64748b",
-        c2: "#1e293b",
-    },
-    ExploreMixSpec {
-        key: "road_trip",
-        kind: "moment",
-        title: "Road Trip Anthems",
-        subtitle: "Sing-along classics & open-highway hits",
-        query: "road trip hits",
-        c1: "#0284c7",
-        c2: "#0c4a6e",
-    },
-    ExploreMixSpec {
         key: "70s_classics",
         kind: "decade",
         title: "70s Classics",
@@ -2173,7 +2119,7 @@ impl TasteEngine {
             let _ = self.store.upsert_artist_meta(art);
         }
 
-        // Warm any unpopulated Moods & Moments and core Explore mixes gently at startup.
+        // Warm any unpopulated Moods and core Explore mixes gently at startup.
         for &mood in Mood::ALL.iter() {
             if self.load_curated_pool_ids(&mood_cache_key(mood), 6 * 3600).len() < 12 {
                 let _ = tokio::time::timeout(
@@ -2184,7 +2130,7 @@ impl TasteEngine {
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             }
         }
-        for spec in EXPLORE_MIX_SPECS.iter().take(6) {
+        for spec in EXPLORE_MIX_SPECS.iter() {
             if self.load_curated_pool_ids(&explore_cache_key(spec.key), 6 * 3600).len() < 10 {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(7),
@@ -2260,7 +2206,7 @@ impl TasteEngine {
             tokio::time::sleep(std::time::Duration::from_millis(160)).await;
         }
 
-        // 3. Curate 2 Explore moments / decades per cycle, prioritizing missing/oldest first.
+        // 3. Curate 2 Explore decades per cycle, prioritizing missing/oldest first.
         let mut mix_order: Vec<(i64, &'static ExploreMixSpec)> = EXPLORE_MIX_SPECS
             .iter()
             .map(|spec| {
@@ -2453,37 +2399,10 @@ impl TasteEngine {
     }
 }
 
-fn moment_mood(key: &str) -> Option<Mood> {
-    match key {
-        "morning_coffee" => Some(Mood::Acoustic),
-        "deep_work" => Some(Mood::Focus),
-        "late_night_drive" => Some(Mood::LateNight),
-        "workout_pump" => Some(Mood::Energy),
-        "rainy_day" => Some(Mood::Melancholy),
-        "road_trip" => Some(Mood::Upbeat),
-        _ => None,
-    }
-}
-
-fn moment_playlist_queries(key: &str) -> Option<&'static [&'static str]> {
-    match key {
-        "morning_coffee" => Some(&["acoustic chill", "morning coffee acoustic", "coffeehouse acoustic"]),
-        "deep_work" => Some(&["deep focus", "ambient instrumental", "lofi study beats"]),
-        "late_night_drive" => Some(&["late night vibes", "late night drive", "after hours"]),
-        "workout_pump" => Some(&["workout hits", "workout motivation", "gym pump"]),
-        "rainy_day" => Some(&["melancholy indie", "rainy day indie", "sad indie acoustic"]),
-        "road_trip" => Some(&["road trip hits", "road trip classics", "feel good hits"]),
-        _ => None,
-    }
-}
-
 impl TasteEngine {
     pub async fn curate_explore_mix(&self, spec: &ExploreMixSpec) -> Vec<Track> {
         let intent = parse_search_intent(spec.query);
-        let mapped_mood = moment_mood(spec.key);
-        let mut pl_queries: Vec<String> = if let Some(mqs) = moment_playlist_queries(spec.key) {
-            mqs.iter().map(|s| (*s).to_string()).collect()
-        } else if intent.is_theme_mix {
+        let mut pl_queries: Vec<String> = if intent.is_theme_mix {
             let mut q = intent.playlist_search_queries();
             if q.is_empty() {
                 q.push(spec.query.to_string());
@@ -2492,8 +2411,7 @@ impl TasteEngine {
         } else {
             vec![spec.query.to_string()]
         };
-        if mapped_mood.is_none()
-            && intent.genres.is_empty()
+        if intent.genres.is_empty()
             && intent.decade_label.is_none()
             && intent.themes.is_empty()
             && intent.moods.len() == 1
@@ -2510,11 +2428,6 @@ impl TasteEngine {
         for pq in &pl_queries {
             let batches = self.sources.deezer.fetch_curated_mix_tracks(pq, 3, 25).await;
             for (pl_title, batch) in batches {
-                if let Some(m) = mapped_mood {
-                    if !is_curated_playlist_for_mood(&pl_title, m) {
-                        continue;
-                    }
-                }
                 if !batch.is_empty() {
                     curated_batches.push((pl_title, batch));
                 }
@@ -2523,44 +2436,40 @@ impl TasteEngine {
 
         let mut raw_tracks = Vec::new();
         if curated_batches.is_empty() {
-            if let Some(m) = mapped_mood {
-                raw_tracks = self.curate_mood_pool(m).await;
-            } else {
-                // Avoid `deezer.search_tracks` for mood-only queries like "late night vibes",
-                // since Deezer track search mainly returns literal title-collision tracks.
-                let is_mood_only = !intent.moods.is_empty()
-                    && intent.genres.is_empty()
-                    && intent.decade_label.is_none()
-                    && intent.themes.is_empty();
-                if is_mood_only {
-                    let hints = intent.deezer_genre_hints();
-                    if !hints.is_empty() {
-                        let dz_genres = self.sources.deezer.fetch_genres().await;
-                        let matched: Vec<_> = dz_genres
-                            .into_iter()
-                            .filter(|g| {
-                                let gl = g.name.to_lowercase();
-                                hints.iter().any(|want| contains_term(&gl, want))
-                            })
-                            .take(2)
-                            .collect();
-                        for g in matched {
-                            let chart = self
-                                .sources
-                                .deezer
-                                .fetch_genre_chart_tracks(g.id, &g.name, 20)
-                                .await;
-                            raw_tracks.extend(chart);
-                        }
+            // Avoid `deezer.search_tracks` for mood-only queries,
+            // since Deezer track search mainly returns literal title-collision tracks.
+            let is_mood_only = !intent.moods.is_empty()
+                && intent.genres.is_empty()
+                && intent.decade_label.is_none()
+                && intent.themes.is_empty();
+            if is_mood_only {
+                let hints = intent.deezer_genre_hints();
+                if !hints.is_empty() {
+                    let dz_genres = self.sources.deezer.fetch_genres().await;
+                    let matched: Vec<_> = dz_genres
+                        .into_iter()
+                        .filter(|g| {
+                            let gl = g.name.to_lowercase();
+                            hints.iter().any(|want| contains_term(&gl, want))
+                        })
+                        .take(2)
+                        .collect();
+                    for g in matched {
+                        let chart = self
+                            .sources
+                            .deezer
+                            .fetch_genre_chart_tracks(g.id, &g.name, 20)
+                            .await;
+                        raw_tracks.extend(chart);
                     }
-                } else {
-                    raw_tracks = self.sources.deezer.search_tracks(spec.query, 20).await;
                 }
-                if raw_tracks.len() < 8 {
-                    use crate::sources::MusicSource;
-                    let ytm_tracks = self.sources.ytm.search(spec.query, 15).await;
-                    raw_tracks.extend(ytm_tracks);
-                }
+            } else {
+                raw_tracks = self.sources.deezer.search_tracks(spec.query, 20).await;
+            }
+            if raw_tracks.len() < 8 {
+                use crate::sources::MusicSource;
+                let ytm_tracks = self.sources.ytm.search(spec.query, 15).await;
+                raw_tracks.extend(ytm_tracks);
             }
         }
 
@@ -2572,7 +2481,7 @@ impl TasteEngine {
             let _ = self.store.upsert_tracks(&to_upsert);
         }
 
-        let has_curated = !curated_batches.is_empty() || mapped_mood.is_some();
+        let has_curated = !curated_batches.is_empty();
         let res = self.search_and_refine_with_context(
             0,
             spec.query,
@@ -2584,23 +2493,7 @@ impl TasteEngine {
             .instant_mix
             .map(|m| m.tracks)
             .unwrap_or_else(|| res.tracks);
-        tracks.retain(|t| {
-            !is_mood_clutter_track(t)
-                && mapped_mood.map_or(true, |m| is_track_compatible_with_mood(t, "", m))
-        });
-        if let Some(m) = mapped_mood {
-            if tracks.len() < 12 {
-                let mut seen: HashSet<String> = tracks.iter().map(|t| t.id.clone()).collect();
-                for t in self.curate_mood_pool(m).await {
-                    if !is_mood_clutter_track(&t)
-                        && is_track_compatible_with_mood(&t, "", m)
-                        && seen.insert(t.id.clone())
-                    {
-                        tracks.push(t);
-                    }
-                }
-            }
-        }
+        tracks.retain(|t| !is_mood_clutter_track(t));
         if has_curated && tracks.len() >= 8 {
             let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
             self.save_curated_pool(&explore_cache_key(spec.key), &ids);
@@ -2624,29 +2517,10 @@ impl TasteEngine {
         if curated_tracks.len() < 8 {
             curated_tracks = self.curate_explore_mix(spec).await;
         }
-        if curated_tracks.len() < 12 {
-            if let Some(m) = moment_mood(spec.key) {
-                let mood_ids = self.load_curated_pool_ids(&mood_cache_key(m), 24 * 3600);
-                let mood_tracks = if mood_ids.len() >= 8 {
-                    self.store.get_tracks_by_ids(&mood_ids).unwrap_or_default()
-                } else {
-                    self.curate_mood_pool(m).await
-                };
-                let mut seen: HashSet<String> = curated_tracks.iter().map(|t| t.id.clone()).collect();
-                for t in mood_tracks {
-                    if seen.insert(t.id.clone()) {
-                        curated_tracks.push(t);
-                    }
-                }
-            }
-        }
 
         let intent = parse_search_intent(spec.query);
         let sctx = self.build_scoring_context(user_id);
-        // Moment tiles map to a mood even when their search phrase ("workout
-        // hits", "road trip hits") carries no explicit mood/genre cue. Without
-        // this, the listener's own library was skipped entirely for those tiles.
-        let category_mood = moment_mood(spec.key).or_else(|| intent.moods.first().copied());
+        let category_mood = intent.moods.first().copied();
 
         let mut pool: Vec<(Option<usize>, Track)> = Vec::new();
         let mut seen_ids = HashSet::new();

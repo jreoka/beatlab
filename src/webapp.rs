@@ -1089,11 +1089,13 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         })
         .collect();
 
-    let mut moments: Vec<Value> = Vec::new();
     let mut decades: Vec<Value> = Vec::new();
     for spec in crate::taste::EXPLORE_MIX_SPECS {
+        if spec.kind != "decade" {
+            continue;
+        }
         let (track_count, covers) = state.taste.curated_explore_preview(spec);
-        let item = json!({
+        decades.push(json!({
             "key": spec.key,
             "kind": spec.kind,
             "title": spec.title,
@@ -1103,12 +1105,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
             "c2": spec.c2,
             "trackCount": track_count,
             "covers": covers,
-        });
-        if spec.kind == "decade" {
-            decades.push(item);
-        } else {
-            moments.push(item);
-        }
+        }));
     }
 
     let genres: Vec<Value> = dz_genres
@@ -1173,7 +1170,6 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
     json_res(json!({
         "moods": moods,
-        "moments": moments,
         "decades": decades,
         "discoveryPicks": to_web_tracks(&state, uid, &discovery_picks),
         "relatedTracks": to_web_tracks(&state, uid, &related_tracks),
@@ -5217,7 +5213,7 @@ mod tests {
             ]
         );
 
-        // Explore mix endpoint serves pre-curated moment/decade mixes cleanly
+        // Explore mix endpoint serves pre-curated decade mixes cleanly
         let exp_tracks: Vec<Track> = (0..8)
             .map(|i| Track {
                 id: format!("loc:exp80_{}", i),

@@ -1708,7 +1708,7 @@
     return `<div class="explore-mix-card" style="border-color:${esc(item.c1)}44" onclick="App.navigate('explore-mix/${encodeURIComponent(item.key)}')">
       <div class="explore-mix-art" style="background:${esc(item.c2)}">${artHtml}</div>
       <div class="explore-mix-body">
-        <div class="explore-mix-kicker" style="color:${esc(item.c1)}">${item.kind === 'decade' ? 'ERA MIX' : 'MOMENT'}</div>
+        <div class="explore-mix-kicker" style="color:${esc(item.c1)}">ERA MIX</div>
         <h3>${esc(item.title)}</h3>
         <p>${esc(item.subtitle)}</p>
         <div class="explore-mix-meta">${esc(countLabel)}</div>
@@ -1738,20 +1738,19 @@
 
   async function renderExplore() {
     const { reqToken, signal } = beginViewRequest();
-    setMainLoading('Exploring charts, moments & genres...');
+    setMainLoading('Exploring charts, moods & genres...');
     try {
       const d = await api('/api/web/explore', { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const charts = cacheTracks(d.charts || []);
       const discoveryPicks = cacheTracks(d.discoveryPicks || []);
       const relatedTracks = cacheTracks(d.relatedTracks || []);
-      const moments = d.moments || [];
       const decades = d.decades || [];
       const artists = d.artists || [];
       const recommendedArtists = d.recommendedArtists || [];
       const curator = d.curator || null;
       const curatorBadge = curator
-        ? `<span class="curator-pill" title="Server continuously curates moods, moments, and discovery pools in the background"><span class="curator-dot"></span>Live Curator · ${Number(curator.catalogTracks || 0).toLocaleString()} tracks · ${curator.readyMoods || 0}/${curator.totalMoods || 10} moods ready</span>`
+        ? `<span class="curator-pill" title="Server continuously curates moods, decades, and discovery pools in the background"><span class="curator-dot"></span>Live Curator · ${Number(curator.catalogTracks || 0).toLocaleString()} tracks · ${curator.readyMoods || 0}/${curator.totalMoods || 10} moods ready</span>`
         : '';
 
       let html = `<div class="section-head" style="margin-bottom:18px;gap:12px;flex-wrap:wrap">
@@ -1761,13 +1760,6 @@
         </div>
         <button class="btn-secondary" onclick="App.promptInstantMix()">Create Instant Mix</button>
       </div>`;
-
-      if (moments.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>Moments &amp; Activities</h2></div>
-          <div class="explore-mix-grid">${moments.map(renderExploreMixCard).join('')}</div>
-        </section>`;
-      }
 
       html += `<section class="section">
         <div class="section-head"><h2>Moods &amp; Vibes</h2></div>
@@ -1867,7 +1859,7 @@
       let html = `<div class="hero-header" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)};">
         ${artHtml}
         <div class="hero-info">
-          <div class="hero-kicker" style="color:#fff">${m.kind === 'decade' ? 'ERA MIX' : 'CURATED MOMENT'}</div>
+          <div class="hero-kicker" style="color:#fff">ERA MIX</div>
           <h1 class="hero-title">${esc(m.title)}</h1>
           <div class="hero-sub" style="color:rgba(255,255,255,0.88)">${esc(m.subtitle)} · ${tracks.length} tracks · ${fmtTotalDur(m.totalDuration || 0)}</div>
           <div class="hero-actions">
