@@ -399,6 +399,15 @@ pub async fn list_songs(
     if desc && !sort.is_empty() {
         list.reverse();
     }
+    // When the client hasn't asked for a specific sort, let the AI curator's
+    // cached plan decide the order (read-only — no model call here).
+    if sort.is_empty() {
+        if let Some(term) = q.get("title").or_else(|| q.get("q")).filter(|s| !s.is_empty()) {
+            list = state.taste.llm_rank_tracks("nd_search", term, list);
+        } else if let Some(genre) = q.get("genre").or_else(|| q.get("genre_id")).filter(|s| !s.is_empty()) {
+            list = state.taste.llm_rank_tracks("nd_genre", genre, list);
+        }
+    }
 
     let total = list.len();
     let items: Vec<Value> = list
@@ -474,6 +483,17 @@ pub async fn list_albums(
     if desc && !sort.is_empty() {
         list.reverse();
     }
+    if sort.is_empty() {
+        let context = q
+            .get("name")
+            .or_else(|| q.get("q"))
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| user.id.to_string());
+        list = state
+            .taste
+            .llm_rank_items("nd_albums", &context, list, |a| a.id.clone());
+    }
 
     let total = list.len();
     let items: Vec<Value> = list
@@ -525,6 +545,17 @@ pub async fn list_artists(
     }
     if q.get("starred").map(|v| v == "true").unwrap_or(false) {
         list.retain(|a| followed.contains(&a.id));
+    }
+    if q.get("_sort").map(|s| s.as_str()).unwrap_or("").is_empty() {
+        let context = q
+            .get("name")
+            .or_else(|| q.get("q"))
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| user.id.to_string());
+        list = state
+            .taste
+            .llm_rank_items("nd_artists", &context, list, |a| a.id.clone());
     }
 
     let total = list.len();
@@ -1114,14 +1145,12 @@ mod tests {
                 ..Default::default()
             }])
             .unwrap();
-        let quality_hunter = crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone());
         AppState {
             store,
             sources,
             engine,
             taste,
             now_playing: Arc::new(Mutex::new(HashMap::new())),
-            quality_hunter,
         }
     }
 

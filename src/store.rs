@@ -1899,9 +1899,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// Updates only the fields describing the audio bytes. Used by the quality
-    /// hunter when a better file is installed under an existing track ID: all
-    /// metadata (title, artist, artwork, ids, moods, …) stays untouched.
+    /// Updates only the fields describing the audio bytes when a better file
+    /// is installed under an existing track ID: all metadata (title, artist,
+    /// artwork, ids, moods, …) stays untouched.
     pub fn update_track_audio_quality(
         &self,
         track_id: &str,

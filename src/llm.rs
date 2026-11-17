@@ -10,7 +10,6 @@
 //!   BEATLAB_LLM_MODEL     (or OPENAI_MODEL)                        default gpt-4o-mini
 //!   BEATLAB_LLM_ENABLED   1/true/yes to force on, 0/false/no to force off (default: on when key set)
 //!   BEATLAB_LLM_TIMEOUT_MS            default 12000
-//!   BEATLAB_LLM_JSON_MODE             default 1 — send response_format=json_object
 //!   BEATLAB_LLM_MAX_TOKENS            default 0 (uncapped)
 //!   BEATLAB_LLM_TEMPERATURE           default 0.2
 //!
@@ -30,7 +29,7 @@ use tracing::{info, warn};
 
 const STATS_KV_KEY: &str = "llm:stats:v1";
 const PENDING_Q_KV_KEY: &str = "llm:pending_queries:v1";
-const MIX_CACHE_PREFIX: &str = "llm:mix:v1:";
+const MIX_CACHE_PREFIX: &str = "llm:mix:v2:";
 const META_CACHE_PREFIX: &str = "llm:meta:v1:";
 const POOL_CACHE_PREFIX: &str = "llm:pool:v1:";
 const QUERY_EXP_PREFIX: &str = "llm:qexp:v1:";
@@ -76,7 +75,6 @@ pub struct LlmConfig {
     pub model: String,
     pub api_key: String,
     pub timeout_ms: u64,
-    pub json_mode: bool,
     pub max_tokens: u64,
     pub temperature: f32,
     /// Optional background web research when the model is unsure about a fact.
@@ -111,7 +109,6 @@ impl LlmConfig {
             model,
             api_key,
             timeout_ms: parse_u64(env_any(&["BEATLAB_LLM_TIMEOUT_MS"]), 12_000),
-            json_mode: parse_bool(env_any(&["BEATLAB_LLM_JSON_MODE"]), true),
             // 0 means "uncapped" — no max_tokens field is sent to the model.
             max_tokens: parse_u64(env_any(&["BEATLAB_LLM_MAX_TOKENS"]), 0),
             temperature,
@@ -168,6 +165,7 @@ pub struct MixPlan {
     pub title: String,
     pub subtitle: String,
     pub ranked_track_ids: Vec<String>,
+    pub rejected_track_ids: Vec<String>,
     pub extra_queries: Vec<String>,
     #[serde(default)]
     pub generated_at: i64,
@@ -206,6 +204,19 @@ impl MixPlan {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let rejected_track_ids = value
+            .get("rejectedTrackIds")
+            .or_else(|| value.get("rejected_track_ids"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|id| allowed_ids.contains(*id))
+                    .take(32)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let extra_queries = value
             .get("extraQueries")
             .or_else(|| value.get("extra_queries"))
@@ -219,31 +230,53 @@ impl MixPlan {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if title.is_empty() && ranked_track_ids.is_empty() {
+        if title.is_empty() && ranked_track_ids.is_empty() && rejected_track_ids.is_empty() {
             return None;
         }
         Some(Self {
             title,
             subtitle,
             ranked_track_ids,
+            rejected_track_ids,
             extra_queries,
             generated_at: Utc::now().timestamp(),
         })
     }
 }
 
-/// Reorder / filter a deterministic mix using an LLM plan. Tracks the model
-/// did not mention stay at the end, so a partial or bad plan can never shrink
-/// a mix below the deterministic result in a harmful way.
+/// Apply an LLM plan to a deterministic mix. The model can both reject
+/// off-theme tracks and rank the keepers. A floor is enforced so a bad plan
+/// can never strip a mix down to almost nothing.
 pub fn apply_mix_plan(plan: &MixPlan, tracks: Vec<Track>) -> Vec<Track> {
-    if plan.ranked_track_ids.is_empty() || tracks.is_empty() {
+    if tracks.is_empty() {
         return tracks;
     }
-    let mut pool: BTreeMap<String, Track> = tracks
+    let rejects: HashSet<&str> = plan
+        .rejected_track_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let floor = (tracks.len() * 3 / 5).max(6).min(tracks.len());
+    let mut filtered: Vec<Track> = tracks
+        .iter()
+        .filter(|t| !rejects.contains(t.id.as_str()))
+        .cloned()
+        .collect();
+    if filtered.len() < floor {
+        for t in &tracks {
+            if rejects.contains(t.id.as_str()) && filtered.len() < floor {
+                filtered.push(t.clone());
+            }
+        }
+    }
+    if plan.ranked_track_ids.is_empty() {
+        return filtered;
+    }
+    let mut pool: BTreeMap<String, Track> = filtered
         .iter()
         .map(|t| (t.id.clone(), t.clone()))
         .collect();
-    let mut ordered: Vec<Track> = Vec::with_capacity(tracks.len());
+    let mut ordered: Vec<Track> = Vec::with_capacity(filtered.len());
     let mut seen = HashSet::new();
     for id in &plan.ranked_track_ids {
         if seen.insert(id.clone()) {
@@ -252,16 +285,16 @@ pub fn apply_mix_plan(plan: &MixPlan, tracks: Vec<Track>) -> Vec<Track> {
             }
         }
     }
-    for t in &tracks {
+    for t in &filtered {
         if pool.contains_key(&t.id) {
             pool.remove(&t.id);
             ordered.push(t.clone());
         }
     }
-    if ordered.len() >= tracks.len().min(3) {
+    if ordered.len() >= filtered.len().min(3) {
         ordered
     } else {
-        tracks
+        filtered
     }
 }
 
@@ -290,6 +323,7 @@ pub struct WebResult {
 #[serde(rename_all = "camelCase", default)]
 pub struct RankPlan {
     pub ranked_ids: Vec<String>,
+    pub extra_queries: Vec<String>,
     pub title: String,
     pub subtitle: String,
     pub generated_at: i64,
@@ -403,7 +437,6 @@ impl LlmClient {
             "apiKeySet": !c.api_key.trim().is_empty(),
             "apiKeyMasked": mask_key(&c.api_key),
             "timeoutMs": c.timeout_ms,
-            "jsonMode": c.json_mode,
             "maxTokens": c.max_tokens,
             "temperature": c.temperature,
             "researchEnabled": c.research_enabled && c.enabled,
@@ -575,9 +608,8 @@ impl LlmClient {
         if self.config.max_tokens > 0 {
             body["max_tokens"] = json!(self.config.max_tokens);
         }
-        if self.config.json_mode {
-            body["response_format"] = json!({ "type": "json_object" });
-        }
+        // JSON mode is always on: every task expects a JSON object reply.
+        body["response_format"] = json!({ "type": "json_object" });
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
         let result = self
             .http
@@ -738,7 +770,7 @@ impl LlmClient {
         }
         // One attempt per query per 10 minutes — request-driven mix building
         // must never turn into a stream of model calls for an unresponsive API.
-        let attempt_key = format!("llm:mix_attempt:v1:{}", slug(query));
+        let attempt_key = format!("llm:mix_attempt:v2:{}", slug(query));
         if let Some(raw) = self.store.kv_get(&attempt_key) {
             if let Ok(ts) = raw.trim().parse::<i64>() {
                 if Utc::now().timestamp().saturating_sub(ts) < 600 {
@@ -749,11 +781,16 @@ impl LlmClient {
         self.store
             .kv_set(&attempt_key, &Utc::now().timestamp().to_string());
         let listing = track_lines(tracks, 24);
-        let system = "You are a music curation assistant for a self-hosted music library. \
-            Return ONLY a JSON object with keys: title (short mix title), subtitle (one vivid sentence), \
-            rankedTrackIds (an array of track ids chosen ONLY from the supplied list, best first, at most 24), \
-            extraQueries (1-3 short alternate search phrases that would find more tracks like this mix). \
-            Never invent or guess an id. Prefer coherent genre/era/mood over raw popularity.";
+        let system = "You are a strict music curator for a self-hosted library. Decide which of the \
+            supplied tracks genuinely fit the listener's request and throw out the rest. \
+            Return ONLY a JSON object with keys: \
+            rejectedTrackIds (array of ids that are NOT a good fit — unrelated genre, wrong era, \
+            novelty/phonk/tribute/cover versions, title-word collisions, or low-quality noise), \
+            rankedTrackIds (array of the remaining good ids, best first), \
+            title (short mix title), subtitle (one vivid sentence), \
+            extraQueries (1-3 short search phrases that would find MORE genuinely on-theme tracks). \
+            Only use ids from the supplied list, never invent one. Be aggressive: a focused mix of 8 \
+            correct tracks is far better than 24 loosely related ones.";
         let user = format!(
             "Listener request: {query}\n\nCandidate tracks (each id is exact):\n{listing}\n\nJSON:"
         );
@@ -1120,7 +1157,8 @@ impl LlmClient {
             for the given surface and listener. Return ONLY a JSON object with keys: \
             rankedIds (array of exact ids from the supplied list only, best first, at most 40), \
             title (a short display title for the mix/section, or empty), \
-            subtitle (one short line describing the selection, or empty). \
+            subtitle (one short line describing the selection, or empty), \
+            extraQueries (1-3 short search phrases that would find more items like this). \
             If you are unsure about a factual detail that affects the ranking (an artist's era, \
             a genre's origins, what fits a theme), you may instead return {\"needResearch\": \
             [\"short search query\"], \"rankedIds\": [], \"title\": \"\", \"subtitle\": \"\"} \
@@ -1154,8 +1192,21 @@ impl LlmClient {
         if ranked_ids.len() < 3 {
             return None;
         }
+        let extra_queries: Vec<String> = value
+            .get("extraQueries")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|q| truncate(q.trim(), 80))
+                    .filter(|q| !q.is_empty())
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
         let plan = RankPlan {
             ranked_ids,
+            extra_queries,
             title: truncate(
                 value.get("title").and_then(Value::as_str).unwrap_or(""),
                 80,
@@ -1613,6 +1664,26 @@ mod tests {
         };
         let result = apply_plan(&plan, items, |s| (*s).to_string());
         assert_eq!(result, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn mix_plan_drops_off_theme_tracks_but_keeps_a_floor() {
+        let tracks: Vec<Track> = (0..10)
+            .map(|i| Track {
+                id: format!("t{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let plan = MixPlan {
+            rejected_track_ids: (0..8).map(|i| format!("t{i}")).collect(),
+            ranked_track_ids: vec!["t9".into(), "t8".into()],
+            ..Default::default()
+        };
+        let result = apply_mix_plan(&plan, tracks);
+        // 10 tracks * 60% = 6 track floor, so only 4 rejections survive.
+        assert!(result.len() >= 6);
+        assert_eq!(result[0].id, "t9");
+        assert_eq!(result[1].id, "t8");
     }
 
     #[test]

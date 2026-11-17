@@ -133,8 +133,6 @@
       <section id="tab-cache" class="hidden">
         <div class="subhead"><h2>Storage tiers</h2><span id="cache-summary" class="muted"></span></div>
         <div id="cache-box" class="panel-grid"></div>
-        <div class="subhead"><h2>Quality hunter</h2><span id="hunter-status" class="pill"></span></div>
-        <div id="hunter-box" class="panel-grid"></div>
       </section>
 
       <section id="tab-ai" class="hidden">
@@ -222,7 +220,6 @@
         ['Tracks', o.tracks, 'in library'],
         ['Hot cache', Math.round(o.localCacheBytes / 1048576) + ' MB', o.localCacheEntries + ' files / ' + Math.round(o.cacheMaxBytes / 1073741824) + ' GB cap'],
         ['Cool cache', o.remoteCacheEnabled ? Math.round(o.remoteCacheBytes / 1048576) + ' MB' : 'Off', o.remoteCacheEnabled ? o.remoteCacheObjects + ' objects' : 'configure S3/R2 to enable'],
-        ['Quality upgrades', (o.qualityHunter && o.qualityHunter.installed) || 0, (o.qualityHunter && o.qualityHunter.enabled ? 'hunter running' : 'hunter disabled')],
         ['2FA users', o.totpUsers, o.passkeys + ' passkeys'],
         ['Recovery codes', o.recoveryCodes, 'unused'],
         ['Playlists', o.playlists, 'across accounts'],
@@ -330,11 +327,24 @@
       } catch (e) { toast(e.message); }
     };
 
-    window.showTab = (tab) => {
+    const ADMIN_TABS = ['overview','users','cache','ai','events','config'];
+    const pathTab = () => {
+      const match = location.pathname.match(/^\/admin\/([^/]+)\/?$/);
+      const tab = match ? decodeURIComponent(match[1]).toLowerCase() : 'overview';
+      return ADMIN_TABS.includes(tab) ? tab : 'overview';
+    };
+    window.showTab = (tab, push = true) => {
+      if (!ADMIN_TABS.includes(tab)) tab = 'overview';
       state.tab = tab;
       document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-      ['overview','users','cache','ai','events','config'].forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
+      ADMIN_TABS.forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
+      const path = tab === 'overview' ? '/admin' : '/admin/' + tab;
+      if (location.pathname !== path) {
+        if (push) history.pushState({ tab }, '', path);
+        else history.replaceState({ tab }, '', path);
+      }
     };
+    window.addEventListener('popstate', () => showTab(pathTab(), false));
 
     window.backfillCache = async () => {
       if (!confirm('Upload all locally cached tracks to the cool cache now?')) return;
@@ -389,32 +399,6 @@
       $('cache-summary').textContent = o.localCacheEntries + ' hot files · ' + (o.remoteCacheEnabled ? o.remoteCacheObjects + ' cool objects' : 'cool tier off');
     }
 
-    function renderHunter(o) {
-      const h = o.qualityHunter || {};
-      const status = $('hunter-status');
-      status.textContent = h.enabled ? 'Running' : 'Disabled';
-      status.className = 'pill ' + (h.enabled ? 'on' : 'off');
-      let activity = '<div class="card">';
-      activity += '<div class="k">Hunt activity</div><div class="v">' + (h.installed || 0) + '</div>';
-      activity += '<div class="muted" style="font-size:11px">higher-quality versions installed</div>';
-      activity += statRow('Tracks probed', h.probes || 0);
-      activity += statRow('Candidates found', h.candidates || 0);
-      activity += statRow('Downloads started', h.downloads || 0);
-      activity += statRow('Failures', h.failures || 0);
-      activity += statRow('Bytes acquired', mb(h.bytesUpgraded));
-      activity += '</div>';
-      let recency = '<div class="card">';
-      recency += '<div class="k">Latest upgrade</div><div class="v" style="font-size:17px">' + esc(h.lastTrack || '—') + '</div>';
-      recency += statRow('Last scan', ago(h.lastTick));
-      recency += statRow('Last upgrade', ago(h.lastUpgrade));
-      recency += '<h3 style="margin:14px 0 2px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">Settings</h3>';
-      recency += statRow('Scan interval', (h.intervalSecs || 0) + 's');
-      recency += statRow('Tracks per scan', h.batch || 0);
-      recency += statRow('Retry cooldown', Math.round((h.cooldownSecs || 0) / 3600) + 'h');
-      recency += '</div>';
-      $('hunter-box').innerHTML = activity + recency;
-    }
-
     function renderAi(o) {
       const a = o.llm || {};
       const cfg = (state.config && state.config.llm) || a.config || {};
@@ -437,7 +421,6 @@
         statRow('Model', cfg.model || '—'),
         statRow('API key', cfg.apiKeySet ? (cfg.apiKeyMasked || 'set') : 'not set'),
         statRow('Timeout', (cfg.timeoutMs || 0) + ' ms'),
-        statRow('JSON mode', cfg.jsonMode ? 'on' : 'off'),
         statRow('Max tokens', cfg.maxTokens ? cfg.maxTokens : 'uncapped'),
         statRow('Web research', cfg.researchEnabled ? 'enabled' : 'disabled'),
         statRow('Search endpoint', cfg.searchUrl || '—'),
@@ -466,7 +449,6 @@
         state.config = config;
         renderOverview();
         renderCache(data);
-        renderHunter(data);
         renderAi(data);
         renderUsers();
         $('all-events').innerHTML = state.events.length ? state.events.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
@@ -479,6 +461,7 @@
     }
 
     async function boot() {
+      showTab(pathTab(), false);
       if (!state.token) { gate('Sign in required', 'Sign in to the Beatlab player first, then open this page.'); return; }
       try {
         const s = await api('/api/admin/session');

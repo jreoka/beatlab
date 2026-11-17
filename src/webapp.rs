@@ -1806,6 +1806,12 @@ async fn build_new_releases(
     saved: &HashSet<String>,
 ) -> (Vec<Value>, usize, i64) {
     let new_releases = collect_new_releases(state, uid, 12).await;
+    let new_releases = state.taste.llm_rank_items(
+        "new_releases",
+        &uid.to_string(),
+        new_releases,
+        |a| a.id.clone(),
+    );
     for a in &new_releases {
         let _ = state.store.upsert_album_meta(a);
     }
@@ -2954,6 +2960,16 @@ async fn build_search_response_with_options(
     refined.tracks = state
         .taste
         .llm_rank_cached("search", &query, std::mem::take(&mut refined.tracks));
+    // The assistant also writes the search UI copy — suggestions are the
+    // alternate queries it produced while warming this search in background.
+    if let Some(plan) = state.taste.llm.cached_plan("search", &query) {
+        if !plan.extra_queries.is_empty() {
+            refined.refinements.query_suggestions = plan.extra_queries;
+        }
+        if refined.refinements.detected_intent.is_empty() && !plan.subtitle.is_empty() {
+            refined.refinements.detected_intent = plan.subtitle;
+        }
+    }
 
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
@@ -3314,7 +3330,23 @@ fn maybe_apply_llm_mix(
     }
     if let Some(mix) = refined.instant_mix.as_ref() {
         if mix.tracks.len() >= 4 {
-            let candidates: Vec<Track> = mix.tracks.iter().take(24).cloned().collect();
+            // Give the model a much wider pool than the deterministic mix:
+            // locally indexed matches plus whatever the background curator
+            // already prepared for this query. Otherwise it can only shuffle
+            // the same handful of mediocre candidates.
+            let mut candidates: Vec<Track> = mix.tracks.iter().take(32).cloned().collect();
+            let normalized = crate::models::slug(query);
+            for t in state
+                .taste
+                .load_curated_query_tracks(&normalized)
+                .into_iter()
+                .chain(state.store.search_tracks(query, 40, 0).unwrap_or_default())
+            {
+                if !candidates.iter().any(|existing| existing.id == t.id) {
+                    candidates.push(t);
+                }
+            }
+            candidates.truncate(48);
             let llm = llm.clone();
             let q = query.to_string();
             tokio::spawn(async move {
@@ -3406,6 +3438,18 @@ pub async fn artist_detail(
             .taste
             .artist_related_tracks(&artist, &related, &top_tracks, 12)
             .await,
+    );
+    let top_tracks = state.taste.llm_rank_tracks(
+        "artist_top",
+        &artist.id,
+        top_tracks,
+    );
+    let albums = state.taste.llm_rank_items("artist_albums", &artist.id, albums, |a| a.id.clone());
+    let related = state.taste.llm_rank_items("artist_related", &artist.id, related, |a| a.id.clone());
+    let related_tracks = state.taste.llm_rank_tracks(
+        "artist_related_tracks",
+        &artist.id,
+        related_tracks,
     );
     let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
     let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
@@ -5438,7 +5482,6 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
-            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -5539,7 +5582,6 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
-            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -5889,7 +5931,6 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
-            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
 
         // Unauthenticated fails
@@ -6030,7 +6071,6 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
-            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
 
         let mut h1 = HeaderMap::new();
@@ -6204,14 +6244,12 @@ mod tests {
             &tmp,
             1.0,
         ));
-        let quality_hunter = crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone());
         let state = AppState {
             store: store.clone(),
             sources: sources.clone(),
             engine,
             taste: std::sync::Arc::new(crate::taste::TasteEngine::new(store, sources)),
             now_playing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            quality_hunter,
         };
 
         let mut hdr = HeaderMap::new();
@@ -6323,7 +6361,6 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
-            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -6449,7 +6486,6 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
-            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let (u, _) = store.authenticate_or_create_user("avataruser", "pw").unwrap();
         let tok = store.create_session(u.id, "web").unwrap();

@@ -2654,11 +2654,77 @@ impl TasteEngine {
         if tick % 4 == 0 {
             self.llm_enrich_metadata().await;
         }
+        if tick % 8 == 0 {
+            self.llm_retag_rotation(tick).await;
+        }
         self.llm_curate_one_pool(tick).await;
         self.llm_warm_search_pools().await;
         // Ranking plans drive radio, made-for-you rails, Explore and search.
         self.llm_queue_standard_plans(tick);
         self.llm_generate_pending_plans().await;
+    }
+
+    /// Rotates through the whole catalog letting the assistant refine tags,
+    /// not just tracks with completely empty metadata. Existing good tags are
+    /// left alone; only weak/generic values are replaced.
+    async fn llm_retag_rotation(&self, tick: usize) {
+        let store = self.store.clone();
+        let total = store.count_tracks().unwrap_or(0).max(0) as usize;
+        if total == 0 {
+            return;
+        }
+        let batch = 12usize;
+        let offset = ((tick / 8) * batch) % total;
+        let tracks = tokio::task::spawn_blocking(move || {
+            store.all_tracks(batch, offset).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        if tracks.len() < 3 {
+            return;
+        }
+        let suggestions = self.llm.enrich_metadata(&tracks).await;
+        if suggestions.is_empty() {
+            return;
+        }
+        let by_id: HashMap<String, &Track> = tracks.iter().map(|t| (t.id.clone(), t)).collect();
+        let valid_moods: HashSet<&str> = Mood::ALL.iter().map(|m| m.slug()).collect();
+        let mut updated = Vec::new();
+        for suggestion in suggestions {
+            let Some(base) = by_id.get(&suggestion.track_id) else {
+                continue;
+            };
+            let mut track = (*base).clone();
+            let genre_weak = track.genre.trim().is_empty()
+                || matches!(track.genre.trim().to_ascii_lowercase().as_str(), "unknown" | "other" | "misc");
+            if genre_weak && !suggestion.genre.trim().is_empty() {
+                track.genre = suggestion.genre.trim().to_string();
+            }
+            if track.year <= 0 && suggestion.year > 0 {
+                track.year = suggestion.year;
+            }
+            if track.moods.trim().is_empty() || genre_weak {
+                let moods: Vec<String> = suggestion
+                    .moods
+                    .iter()
+                    .map(|m| m.trim().to_ascii_lowercase().replace('-', "_").replace(' ', "_"))
+                    .filter(|m| valid_moods.contains(m.as_str()))
+                    .collect();
+                if !moods.is_empty() {
+                    track.moods = moods.join(",");
+                }
+            }
+            updated.push(track);
+        }
+        if !updated.is_empty() {
+            let count = updated.len();
+            let store = self.store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = store.upsert_tracks(&updated);
+            })
+            .await;
+            info!(count, "AI curator refined a catalog metadata slice");
+        }
     }
 
     /// Ask the model to fill in missing genre / year / moods for catalog tracks.
@@ -2901,6 +2967,10 @@ impl TasteEngine {
                 _ => uid.to_string(),
             };
             self.llm.queue_plan(scope, &context);
+            if i == 0 {
+                self.llm.queue_plan("new_releases", &uid.to_string());
+                self.llm.queue_plan("nd_albums", &uid.to_string());
+            }
             let mode = ["default", "familiar", "discover"][(tick + i) % 3];
             self.llm.queue_plan("radio", &format!("{}:{}", uid, mode));
         }
@@ -3004,6 +3074,80 @@ impl TasteEngine {
                     })
                     .collect();
             }
+            "artist_top" | "artist_related_tracks" => {
+                let store = self.store.clone();
+                let artist_id = context.to_string();
+                let found = tokio::task::spawn_blocking(move || {
+                    store.artist_tracks(&artist_id).unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                if found.len() >= 3 {
+                    tracks = found;
+                }
+            }
+            "artist_albums" | "artist_related" | "new_releases" | "nd_albums" | "nd_artists" => {
+                let store = self.store.clone();
+                let user_id = uid;
+                let is_album = scope == "artist_albums"
+                    || scope == "new_releases"
+                    || scope == "nd_albums";
+                let pseudo = tokio::task::spawn_blocking(move || {
+                    if is_album {
+                        store
+                            .build_album_summaries(user_id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|a| Track {
+                                id: a.id,
+                                title: a.name,
+                                artist: a.artist,
+                                ..Default::default()
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        store
+                            .build_artist_summaries()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|a| Track {
+                                id: a.id,
+                                title: a.name,
+                                ..Default::default()
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                })
+                .await
+                .unwrap_or_default();
+                if pseudo.len() >= 3 {
+                    tracks = pseudo;
+                }
+            }
+            "nd_search" => {
+                let store = self.store.clone();
+                let term = context.to_string();
+                let found = tokio::task::spawn_blocking(move || {
+                    store.search_tracks(&term, 80, 0).unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                if found.len() >= 3 {
+                    tracks = found;
+                }
+            }
+            "nd_genre" => {
+                let store = self.store.clone();
+                let genre = context.to_string();
+                let found = tokio::task::spawn_blocking(move || {
+                    store.tracks_by_genre(&genre, 80, 0).unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                if found.len() >= 3 {
+                    tracks = found;
+                }
+            }
             "playlist" => {
                 let store = self.store.clone();
                 let playlist_id = context.to_string();
@@ -3106,6 +3250,13 @@ fn plan_hint(scope: &str, context: &str) -> String {
             _ => "tracks worth featuring in Explore",
         }
         .into(),
+        "new_releases" | "nd_albums" => "albums worth surfacing first right now".into(),
+        "nd_artists" | "artist_related" => "artists worth surfacing first".into(),
+        "artist_top" => "the strongest tracks by this artist for this listener".into(),
+        "artist_albums" => "the most essential albums by this artist".into(),
+        "artist_related_tracks" => "tracks that pair well with this artist".into(),
+        "nd_search" => "the most relevant matches for this music-client search".into(),
+        "nd_genre" => "the strongest tracks in this genre for this listener".into(),
         "auto" => "tracks for a personalized auto-playlist".into(),
         s if s.starts_with("auto:") => {
             format!("tracks for the {s} personalized auto-playlist")
