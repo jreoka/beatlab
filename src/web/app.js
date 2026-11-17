@@ -2247,7 +2247,7 @@
   function renderSearchView() {
     const s = state.searchState;
     if (!s) return;
-    const { query, albums, artists, users, instantMix, instantMixLoading, instantMixError, refinements, activeFilter, mixExpanded } = s;
+    const { query, albums, artists, users, instantMix, refinements, activeFilter, mixExpanded } = s;
     const tracks = applySearchFilter(s.tracks, activeFilter);
 
     // "@username" searches render people directly in the main results view.
@@ -2297,21 +2297,6 @@
         </div>`;
       }
       html += `</div>`;
-    }
-
-    if (activeFilter === 'all' && !instantMix) {
-      html += `<div class="instant-mix-cta-row">
-        <div class="instant-mix-cta-copy">
-          <div class="instant-mix-cta-title">Want an on-demand mix for "${esc(query)}"?</div>
-          <div class="instant-mix-cta-sub">${instantMixError ? esc(instantMixError) : 'Build a fresh instant mix on demand without cluttering search results.'}</div>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn-secondary" ${instantMixLoading ? 'disabled' : ''} onclick="App.createInstantMixForSearch()">
-            ${instantMixLoading ? 'Creating Mix...' : 'Create Instant Mix'}
-          </button>
-          <button class="mini-btn" onclick="App.promptInstantMix()">Custom Term</button>
-        </div>
-      </div>`;
     }
 
     if (instantMix && activeFilter === 'all') {
