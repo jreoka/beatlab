@@ -6347,6 +6347,20 @@
                   </div>`
                 : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.startTotpSetup()">Set up authenticator app</button></div>`
           }
+          ${
+            sec.twoFactorEnabled
+              ? confirmDisable
+                ? `<div class="settings-confirm-bar">
+                    <span>Disable all two-factor authentication? This removes your authenticator, passkeys and recovery codes.</span>
+                    <input id="disable-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code (if required)" style="width:100%" />
+                    <div class="settings-confirm-actions">
+                      <button class="btn-secondary danger-btn" onclick="App.confirmDisable2fa()">Yes, disable 2FA</button>
+                      <button class="mini-btn ghost" onclick="App.cancelDisable2fa()">Cancel</button>
+                    </div>
+                  </div>`
+                : `<div class="settings-actions-row"><button class="btn-secondary danger-btn" onclick="App.promptDisable2fa()">Disable two-factor authentication</button></div>`
+              : ''
+          }
         </div>
 
         <div class="settings-section">
@@ -6389,7 +6403,7 @@
                         <div class="recovery-codes-grid">${codes.map((c) => `<code>${esc(c)}</code>`).join('')}</div>
                         <button class="btn-secondary" style="margin-top:10px" onclick="App.dismissRecoveryCodes()">I've saved them</button>
                       </div>`
-                    : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.generateRecoveryCodes()">Generate new recovery codes</button></div>`
+                    : `<div class="settings-actions-row"><button class="btn-secondary" onclick="App.promptGenerateRecoveryCodes()">Generate new recovery codes</button></div>`
                 }
               </div>`
             : ''
@@ -6403,28 +6417,6 @@
             <button class="btn-secondary" ${!sec.passkeysAvailable || !passkeySupported() ? 'disabled' : ''} onclick="App.addPasskey()">Add a passkey</button>
           </div>
         </div>
-
-        ${
-          sec.twoFactorEnabled
-            ? `<div class="settings-section">
-                <div class="settings-section-title">Two-Factor Verification</div>
-                <div class="settings-row-desc" style="margin-bottom:10px">Confirm with an authenticator code, a recovery code, or a passkey before changing security settings.</div>
-                <input id="sec-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code" style="width:100%;margin-bottom:8px" />
-                ${sec.passkeys.length && sec.passkeysAvailable ? '<button class="mini-btn" style="margin-bottom:12px" onclick="App.stepUpWithPasskey()">Verify with a passkey instead</button>' : ''}
-                ${
-                  confirmDisable
-                    ? `<div class="settings-confirm-bar">
-                        <span>Disable all two-factor authentication? This removes your authenticator, passkeys and recovery codes.</span>
-                        <div class="settings-confirm-actions">
-                          <button class="btn-secondary danger-btn" onclick="App.confirmDisable2fa()">Yes, disable 2FA</button>
-                          <button class="mini-btn ghost" onclick="App.cancelDisable2fa()">Cancel</button>
-                        </div>
-                      </div>`
-                    : `<div class="settings-actions-row"><button class="btn-secondary danger-btn" onclick="App.promptDisable2fa()">Disable two-factor authentication</button></div>`
-                }
-              </div>`
-            : ''
-        }
 
         <div class="settings-section">
           <div class="settings-section-title">Delete Account</div>
@@ -7816,16 +7808,31 @@
         showToast(err.message);
       }
     },
-    generateRecoveryCodes: async () => {
+    promptGenerateRecoveryCodes: async () => {
+      const code = await promptModal({
+        title: 'Confirm your identity',
+        message: 'Enter a code from your authenticator app or an unused recovery code before generating a new set.',
+        label: '2FA or recovery code',
+        placeholder: '000000',
+        confirmLabel: 'Generate codes',
+      });
+      if (code === null) {
+        openSettingsModal('security');
+        return;
+      }
+      await window.App.generateRecoveryCodes(code);
+    },
+    generateRecoveryCodes: async (code) => {
       try {
         const res = await api('/api/web/2fa/recovery', {
           method: 'POST',
-          body: JSON.stringify({ code: securityCodeValue() || undefined }),
+          body: JSON.stringify({ code: code || securityCodeValue() || undefined }),
         });
         state.settingsData.recoveryCodes = res.recoveryCodes;
-        renderSettingsModalBody();
+        openSettingsModal('security');
         showToast('New recovery codes generated');
       } catch (err) {
+        openSettingsModal('security');
         showToast(err.message);
       }
     },
@@ -7898,14 +7905,26 @@
       }
     },
     removePasskey: async (id) => {
+      const code = await promptModal({
+        title: 'Confirm your identity',
+        message: 'Enter a code from your authenticator app or an unused recovery code to remove this passkey.',
+        label: '2FA or recovery code',
+        placeholder: '000000',
+        confirmLabel: 'Remove passkey',
+      });
+      if (code === null) {
+        openSettingsModal('security');
+        return;
+      }
       try {
-        const code = securityCodeValue();
         const query = code ? `?code=${encodeURIComponent(code)}` : '';
         await api(`/api/web/2fa/passkey/${encodeURIComponent(id)}${query}`, { method: 'DELETE' });
         showToast('Passkey removed');
         await window.App.refreshSecurityStatus();
+        openSettingsModal('security');
       } catch (err) {
         showToast(err.message);
+        openSettingsModal('security');
       }
     },
     promptDisable2fa: () => {
@@ -7917,10 +7936,12 @@
       renderSettingsModalBody();
     },
     confirmDisable2fa: async () => {
+      const codeInput = $('disable-code');
+      const code = codeInput ? codeInput.value.trim() : '';
       try {
         await api('/api/web/2fa/disable', {
           method: 'POST',
-          body: JSON.stringify({ code: securityCodeValue() || undefined }),
+          body: JSON.stringify({ code: code || undefined }),
         });
         if (state.user) {
           state.user.twoFactorEnabled = false;
