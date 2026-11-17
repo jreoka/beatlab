@@ -2217,11 +2217,88 @@ impl Store {
         limit: usize,
         offset: usize,
     ) -> AppResult<Vec<Track>> {
+        self.search_tracks_filtered(query, None, limit, offset)
+    }
+
+    pub fn search_local_tracks(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<Track>> {
+        self.search_tracks_filtered(query, Some("local"), limit, offset)
+    }
+
+    fn search_tracks_filtered(
+        &self,
+        query: &str,
+        source_filter: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<Track>> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
-            return self.all_tracks(limit, offset);
+            return match source_filter {
+                Some(src) => {
+                    let conn = self.lock();
+                    let sql = format!(
+                        "SELECT {} FROM tracks WHERE source = ?1 ORDER BY created DESC LIMIT ?2 OFFSET ?3",
+                        TRACK_COLS
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt
+                        .query_map(params![src, limit as i64, offset as i64], row_to_track)?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                }
+                None => self.all_tracks(limit, offset),
+            };
         }
-        let candidates = self.all_tracks(6000, 0)?;
+
+        let tokens: Vec<String> = q
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .take(8)
+            .map(|tok| {
+                let escaped = tok
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                format!("%{}%", escaped)
+            })
+            .collect();
+
+        let candidates = {
+            let conn = self.lock();
+            let mut clauses = Vec::new();
+            let mut param_vals: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(src) = source_filter {
+                clauses.push(format!("source = ?{}", param_vals.len() + 1));
+                param_vals.push(rusqlite::types::Value::Text(src.to_string()));
+            }
+            for pat in &tokens {
+                let idx = param_vals.len() + 1;
+                clauses.push(format!(
+                    "(LOWER(title) LIKE ?{idx} ESCAPE '\\' OR LOWER(artist) LIKE ?{idx} ESCAPE '\\' OR LOWER(album) LIKE ?{idx} ESCAPE '\\' OR LOWER(genre) LIKE ?{idx} ESCAPE '\\')"
+                ));
+                param_vals.push(rusqlite::types::Value::Text(pat.clone()));
+            }
+            let where_sql = if clauses.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", clauses.join(" AND "))
+            };
+            let sql = format!(
+                "SELECT {} FROM tracks {} ORDER BY created DESC LIMIT 1500",
+                TRACK_COLS, where_sql
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(param_vals), row_to_track)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
         let mut scored: Vec<(i32, Track)> = candidates
             .into_iter()
             .filter_map(|t| {

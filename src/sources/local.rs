@@ -112,13 +112,15 @@ impl MusicSource for LocalSource {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
-        self.store
-            .search_tracks(query, limit * 2, 0)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| t.source == "local")
-            .take(limit)
-            .collect()
+        let store = self.store.clone();
+        let q = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            store
+                .search_local_tracks(&q, limit, 0)
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 }
 

@@ -1084,7 +1084,7 @@ impl MusicSource for SoulseekSource {
             if connected {
                 w
             } else if connecting {
-                let _ = tokio::time::timeout(Duration::from_millis(2500), notified).await;
+                let _ = tokio::time::timeout(Duration::from_millis(800), notified).await;
                 let rt = self.runtime.read().await;
                 if rt.connected {
                     rt.writer.clone()
@@ -1135,7 +1135,7 @@ impl MusicSource for SoulseekSource {
         let mut lossless_keys: HashSet<String> = HashSet::new();
         let mut batch_count = 0usize;
         let started = tokio::time::Instant::now();
-        let deadline = tokio::time::sleep(Duration::from_millis(5500));
+        let deadline = tokio::time::sleep(Duration::from_millis(3200));
         tokio::pin!(deadline);
 
         loop {
@@ -1148,8 +1148,9 @@ impl MusicSource for SoulseekSource {
                         }
                     }
                     collected.extend(batch);
-                    if (lossless_keys.len() >= limit && batch_count >= 2 && started.elapsed() >= Duration::from_millis(2200))
-                        || collected.len() >= 1500
+                    if (lossless_keys.len() >= limit && batch_count >= 1 && started.elapsed() >= Duration::from_millis(900))
+                        || (batch_count >= 2 && !lossless_keys.is_empty() && started.elapsed() >= Duration::from_millis(1200))
+                        || collected.len() >= 1200
                     {
                         break;
                     }

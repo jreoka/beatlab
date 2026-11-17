@@ -4,12 +4,13 @@ pub mod local;
 pub mod soulseek;
 pub mod ytm;
 
-use crate::models::Track;
+use crate::models::{AlbumSummary, ArtistSummary, Track};
 use async_trait::async_trait;
 use futures::future::join_all;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use archive::ArchiveSource;
 use deezer::DeezerSource;
@@ -35,6 +36,23 @@ pub struct SourceStatus {
     pub status: String,
 }
 
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(90);
+const SEARCH_CACHE_MAX_ENTRIES: usize = 128;
+
+#[derive(Clone)]
+struct CachedTrackSearch {
+    created: Instant,
+    tracks: Vec<Track>,
+    ytm_hints: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct CachedCatalogSearch {
+    created: Instant,
+    albums: Vec<AlbumSummary>,
+    artists: Vec<ArtistSummary>,
+}
+
 #[derive(Clone)]
 pub struct SourceRegistry {
     pub deezer: DeezerSource,
@@ -42,6 +60,8 @@ pub struct SourceRegistry {
     pub archive: ArchiveSource,
     pub local: Arc<LocalSource>,
     pub soulseek: Arc<SoulseekSource>,
+    track_cache: Arc<Mutex<HashMap<String, CachedTrackSearch>>>,
+    catalog_cache: Arc<Mutex<HashMap<String, CachedCatalogSearch>>>,
 }
 
 impl SourceRegistry {
@@ -58,6 +78,8 @@ impl SourceRegistry {
             archive,
             local,
             soulseek,
+            track_cache: Arc::new(Mutex::new(HashMap::new())),
+            catalog_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -94,24 +116,123 @@ impl SourceRegistry {
         if q.is_empty() {
             return (vec![], HashMap::new());
         }
-        let sources: Vec<&dyn MusicSource> = {
-            let mut v: Vec<&dyn MusicSource> = vec![
-                &*self.local,
-                &self.deezer,
-                &self.ytm,
-                &self.archive,
-            ];
-            if self.soulseek.available_or_connecting() {
-                v.push(&*self.soulseek);
-            }
-            v
-        };
+        let cache_key = format!("all:{}:{}", per_source, q.to_lowercase());
+        if let Some(hit) = self.get_cached_tracks(&cache_key) {
+            return hit;
+        }
+        let mut sources: Vec<&dyn MusicSource> = vec![
+            &*self.local,
+            &self.deezer,
+            &self.ytm,
+            &self.archive,
+        ];
+        if self.soulseek.available_or_connecting() {
+            sources.push(&*self.soulseek);
+        }
+        let res = self.run_source_search(sources, q, per_source).await;
+        self.put_cached_tracks(cache_key, res.0.clone(), res.1.clone());
+        res
+    }
 
+    /// Queries only low-latency sources (`local`, `deezer`, `ytm`) so search UI renders immediately.
+    pub async fn search_fast_with_ytm_hints(
+        &self,
+        query: &str,
+        per_source: usize,
+    ) -> (Vec<Track>, HashMap<String, String>) {
+        let q = query.trim();
+        if q.is_empty() {
+            return (vec![], HashMap::new());
+        }
+        let cache_key = format!("fast:{}:{}", per_source, q.to_lowercase());
+        if let Some(hit) = self.get_cached_tracks(&cache_key) {
+            return hit;
+        }
+        let sources: Vec<&dyn MusicSource> = vec![&*self.local, &self.deezer, &self.ytm];
+        let res = self.run_source_search(sources, q, per_source).await;
+        self.put_cached_tracks(cache_key, res.0.clone(), res.1.clone());
+        res
+    }
+
+    /// Queries slower/lossless-heavy sources (`archive`, `soulseek`) in a second phase.
+    pub async fn search_slow(&self, query: &str, per_source: usize) -> Vec<Track> {
+        let q = query.trim();
+        if q.is_empty() {
+            return vec![];
+        }
+        let cache_key = format!("slow:{}:{}", per_source, q.to_lowercase());
+        if let Some((tracks, _)) = self.get_cached_tracks(&cache_key) {
+            return tracks;
+        }
+        let mut sources: Vec<&dyn MusicSource> = vec![&self.archive];
+        if self.soulseek.available_or_connecting() {
+            sources.push(&*self.soulseek);
+        }
+        let (tracks, hints) = self.run_source_search(sources, q, per_source).await;
+        self.put_cached_tracks(cache_key, tracks.clone(), hints);
+        tracks
+    }
+
+    /// Cached Deezer album & artist search for fast repeated/back-button queries.
+    pub async fn search_deezer_catalog(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> (Vec<AlbumSummary>, Vec<ArtistSummary>) {
+        let q = query.trim();
+        if q.is_empty() {
+            return (vec![], vec![]);
+        }
+        let cache_key = format!("{}:{}", limit, q.to_lowercase());
+        if let Ok(guard) = self.catalog_cache.lock() {
+            if let Some(entry) = guard.get(&cache_key) {
+                if entry.created.elapsed() < SEARCH_CACHE_TTL {
+                    return (entry.albums.clone(), entry.artists.clone());
+                }
+            }
+        }
+        let (albums, artists) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_millis(3500),
+                self.deezer.search_albums(q, limit),
+            ),
+            tokio::time::timeout(
+                Duration::from_millis(3500),
+                self.deezer.search_artists(q, limit),
+            ),
+        );
+        let albums = albums.unwrap_or_default();
+        let artists = artists.unwrap_or_default();
+        if let Ok(mut guard) = self.catalog_cache.lock() {
+            if guard.len() >= SEARCH_CACHE_MAX_ENTRIES {
+                guard.retain(|_, v| v.created.elapsed() < SEARCH_CACHE_TTL);
+                if guard.len() >= SEARCH_CACHE_MAX_ENTRIES {
+                    guard.clear();
+                }
+            }
+            guard.insert(
+                cache_key,
+                CachedCatalogSearch {
+                    created: Instant::now(),
+                    albums: albums.clone(),
+                    artists: artists.clone(),
+                },
+            );
+        }
+        (albums, artists)
+    }
+
+    async fn run_source_search(
+        &self,
+        sources: Vec<&dyn MusicSource>,
+        q: &str,
+        per_source: usize,
+    ) -> (Vec<Track>, HashMap<String, String>) {
         let futs = sources.into_iter().map(|s| {
             let per_src_timeout = match s.name() {
-                "local" => std::time::Duration::from_secs(3),
-                "archive" | "soulseek" => std::time::Duration::from_secs(5),
-                _ => std::time::Duration::from_secs(7),
+                "local" => Duration::from_millis(1500),
+                "archive" | "soulseek" => Duration::from_millis(3500),
+                _ => Duration::from_millis(4000),
             };
             async move {
                 tokio::time::timeout(per_src_timeout, s.search(q, per_source))
@@ -137,6 +258,40 @@ impl SourceRegistry {
             }
         }
         (dedup_and_rank_search(combined, q), ytm_ids_by_key)
+    }
+
+    fn get_cached_tracks(&self, key: &str) -> Option<(Vec<Track>, HashMap<String, String>)> {
+        let guard = self.track_cache.lock().ok()?;
+        let entry = guard.get(key)?;
+        if entry.created.elapsed() < SEARCH_CACHE_TTL {
+            Some((entry.tracks.clone(), entry.ytm_hints.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn put_cached_tracks(
+        &self,
+        key: String,
+        tracks: Vec<Track>,
+        ytm_hints: HashMap<String, String>,
+    ) {
+        if let Ok(mut guard) = self.track_cache.lock() {
+            if guard.len() >= SEARCH_CACHE_MAX_ENTRIES {
+                guard.retain(|_, v| v.created.elapsed() < SEARCH_CACHE_TTL);
+                if guard.len() >= SEARCH_CACHE_MAX_ENTRIES {
+                    guard.clear();
+                }
+            }
+            guard.insert(
+                key,
+                CachedTrackSearch {
+                    created: Instant::now(),
+                    tracks,
+                    ytm_hints,
+                },
+            );
+        }
     }
 }
 

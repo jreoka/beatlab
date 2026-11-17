@@ -603,6 +603,7 @@ pub struct PasswordChangeReq {
 pub struct SearchQuery {
     pub q: Option<String>,
     pub mode: Option<String>,
+    pub phase: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1171,6 +1172,18 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
     let recommended_artists = state.taste.recommended_artists_for_user(uid, 14);
 
+    let ready_mood_cards = moods
+        .iter()
+        .filter(|m| m["trackCount"].as_u64().unwrap_or(0) > 0)
+        .count();
+    let mut curator = state.taste.curator_status_snapshot();
+    if let Some(obj) = curator.as_object_mut() {
+        let cur_ready = obj.get("readyMoods").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if ready_mood_cards > cur_ready {
+            obj.insert("readyMoods".to_string(), json!(ready_mood_cards));
+        }
+    }
+
     json_res(json!({
         "moods": moods,
         "decades": decades,
@@ -1181,7 +1194,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         "genres": genres,
         "charts": to_web_tracks(&state, uid, &visible_charts),
         "newAlbums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
-        "curator": state.taste.curator_status_snapshot(),
+        "curator": curator,
     }))
 }
 
@@ -1338,6 +1351,12 @@ pub async fn search(
         }));
     }
 
+    let phase = q
+        .phase
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_lowercase);
+
     let intent = crate::taste::parse_search_intent(&query);
     let base_query = intent
         .entity_query
@@ -1345,9 +1364,33 @@ pub async fn search(
         .unwrap_or(&query)
         .to_string();
 
+    if phase.as_deref() == Some("slow") {
+        let slow_tracks = state.sources.search_slow(&base_query, 20).await;
+        if !slow_tracks.is_empty() {
+            let store = state.store.clone();
+            let to_save = slow_tracks.clone();
+            tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = store.upsert_tracks(&to_save);
+                })
+                .await;
+            });
+        }
+        return json_res(json!({
+            "query": query,
+            "tracks": to_web_tracks(&state, user.id, &slow_tracks),
+        }));
+    }
+
+    let fast_only = phase.as_deref() == Some("fast");
+
     let raw_radio_fut = async {
         if intent.has_trailing_radio_ambiguity && !base_query.eq_ignore_ascii_case(&query) {
-            state.sources.search_all_with_ytm_hints(&query, 10).await
+            if fast_only {
+                state.sources.search_fast_with_ytm_hints(&query, 10).await
+            } else {
+                state.sources.search_all_with_ytm_hints(&query, 10).await
+            }
         } else {
             (Vec::new(), std::collections::HashMap::new())
         }
@@ -1355,27 +1398,39 @@ pub async fn search(
 
     let ((all_tracks, _ytm_hints), (dz_albums, dz_artists), (raw_tracks_extra, _raw_ytm_hints)) =
         tokio::join!(
-            state.sources.search_all_with_ytm_hints(&base_query, 20),
             async {
-                tokio::join!(
-                    state.sources.deezer.search_albums(&base_query, 12),
-                    state.sources.deezer.search_artists(&base_query, 12),
-                )
+                if fast_only {
+                    state.sources.search_fast_with_ytm_hints(&base_query, 20).await
+                } else {
+                    state.sources.search_all_with_ytm_hints(&base_query, 20).await
+                }
             },
+            state.sources.search_deezer_catalog(&base_query, 12),
             raw_radio_fut,
         );
 
     let mut combined = [all_tracks, raw_tracks_extra].concat();
     crate::sources::disambiguate_batch_tracks(&mut combined, &dz_artists);
 
-    if !combined.is_empty() {
-        let _ = state.store.upsert_tracks(&combined);
-    }
-    for a in &dz_albums {
-        let _ = state.store.upsert_album_meta(a);
-    }
-    for ar in &dz_artists {
-        let _ = state.store.upsert_artist_meta(ar);
+    if !combined.is_empty() || !dz_albums.is_empty() || !dz_artists.is_empty() {
+        let store = state.store.clone();
+        let save_tracks = combined.clone();
+        let save_albums = dz_albums.clone();
+        let save_artists = dz_artists.clone();
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                if !save_tracks.is_empty() {
+                    let _ = store.upsert_tracks(&save_tracks);
+                }
+                for a in &save_albums {
+                    let _ = store.upsert_album_meta(a);
+                }
+                for ar in &save_artists {
+                    let _ = store.upsert_artist_meta(ar);
+                }
+            })
+            .await;
+        });
     }
 
     build_search_response_with_options(

@@ -201,7 +201,7 @@ impl MusicSource for ArchiveSource {
             Err(_) => return vec![],
         };
 
-        let docs: Vec<_> = parsed.response.docs.into_iter().take(6).collect();
+        let docs: Vec<_> = parsed.response.docs.into_iter().take(4).collect();
         let mut futs = Vec::new();
         for doc in &docs {
             futs.push(self.item_tracks(&doc.identifier));

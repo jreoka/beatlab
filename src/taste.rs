@@ -2457,7 +2457,16 @@ impl TasteEngine {
             .unwrap_or(0);
         let ready_moods = Mood::ALL
             .iter()
-            .filter(|&&m| !self.load_curated_pool_ids(&mood_cache_key(m), 24 * 3600).is_empty())
+            .filter(|&&m| {
+                !self
+                    .load_curated_pool_ids(&mood_cache_key(m), 24 * 3600)
+                    .is_empty()
+                    || !self
+                        .store
+                        .tracks_by_mood(m, 1, 0)
+                        .unwrap_or_default()
+                        .is_empty()
+            })
             .count();
         let ready_mixes = EXPLORE_MIX_SPECS
             .iter()

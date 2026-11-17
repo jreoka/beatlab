@@ -1669,7 +1669,7 @@
 
   async function renderHome() {
     const { reqToken, signal } = beginViewRequest();
-    setMainLoading('Curating your feed...');
+    setMainLoading('Loading...');
     try {
       const d = await api('/api/web/home', { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
@@ -1971,7 +1971,7 @@
       const [d, social] = await Promise.all([
         personQuery
           ? Promise.resolve({ tracks: [], albums: [], artists: [], refinements: null })
-          : api(`/api/web/search?q=${encodeURIComponent(cleanQ)}`, { signal }),
+          : api(`/api/web/search?q=${encodeURIComponent(cleanQ)}&phase=fast`, { signal }),
         api(`/api/web/social/search?q=${encodeURIComponent(cleanQ)}&limit=20`, { signal }).catch(() => ({ users: [] })),
       ]);
       if (!isViewRequestCurrent(reqToken, signal)) return;
@@ -1984,28 +1984,8 @@
       const users = social.users || [];
       const refinements = d.refinements || null;
 
-      if (!tracks.length && !albums.length && !artists.length && !users.length) {
-        state.searchState = {
-          query: cleanQ,
-          tracks: [],
-          albums: [],
-          artists: [],
-          users,
-          instantMix: null,
-          instantMixLoading: false,
-          instantMixError: '',
-          refinements,
-          activeFilter: 'all',
-          mixExpanded: false,
-        };
-        state.activeInstantMix = null;
-        renderSearchView();
-        $('main-view').scrollTop = 0;
-        return;
-      }
-
       state.searchState = {
-        query,
+        query: (!tracks.length && !albums.length && !artists.length && !users.length) ? cleanQ : query,
         tracks,
         albums,
         artists,
@@ -2020,6 +2000,51 @@
       state.activeInstantMix = null;
       renderSearchView();
       $('main-view').scrollTop = 0;
+
+      if (!personQuery) {
+        api(`/api/web/search?q=${encodeURIComponent(cleanQ)}&phase=slow`, { signal })
+          .then((slowData) => {
+            if (!isViewRequestCurrent(reqToken, signal) || !state.searchState) return;
+            const extra = cacheTracks(slowData?.tracks || []);
+            if (!extra.length) return;
+            const existing = state.searchState.tracks || [];
+            const seenIds = new Set(existing.map((t) => t.id));
+            const byKey = new Map();
+            existing.forEach((t, idx) => {
+              const k = `${String(t.title || '').toLowerCase()}::${String(t.artist || '').toLowerCase()}`;
+              if (!byKey.has(k)) byKey.set(k, idx);
+            });
+            const merged = existing.slice();
+            let changed = false;
+            for (const t of extra) {
+              if (seenIds.has(t.id)) continue;
+              const k = `${String(t.title || '').toLowerCase()}::${String(t.artist || '').toLowerCase()}`;
+              const idx = byKey.get(k);
+              if (idx !== undefined) {
+                const cur = merged[idx];
+                const curFmt = String(cur.format || '').toLowerCase();
+                const newFmt = String(t.format || '').toLowerCase();
+                const curLossless = curFmt === 'flac' || curFmt === 'alac' || curFmt === 'wav' || curFmt === 'aiff';
+                const newLossless = newFmt === 'flac' || newFmt === 'alac' || newFmt === 'wav' || newFmt === 'aiff';
+                if (newLossless && !curLossless) {
+                  merged[idx] = t;
+                  seenIds.add(t.id);
+                  changed = true;
+                }
+              } else {
+                byKey.set(k, merged.length);
+                merged.push(t);
+                seenIds.add(t.id);
+                changed = true;
+              }
+            }
+            if (changed) {
+              state.searchState.tracks = merged;
+              renderSearchView();
+            }
+          })
+          .catch(() => {});
+      }
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
     }
