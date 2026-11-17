@@ -3322,6 +3322,7 @@ fn maybe_apply_llm_mix(
             let tracks = crate::llm::apply_mix_plan(&plan, std::mem::take(&mut mix.tracks));
             mix.total_duration = tracks.iter().map(|t| t.duration.max(0)).sum();
             mix.tracks = tracks;
+            mix.subtitle = format!("✦ AI-curated · {}", mix.subtitle);
         }
         for extra in plan.extra_queries {
             llm.queue_query(&extra);
@@ -3451,6 +3452,9 @@ pub async fn artist_detail(
         &artist.id,
         related_tracks,
     );
+    let curated_similar = state
+        .taste
+        .curated_similar_artists(user.id, &artist, &related, 12);
     let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
     let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
     json_res(json!({
@@ -3459,6 +3463,13 @@ pub async fn artist_detail(
         "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "related": related.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "relatedTracks": to_web_tracks(&state, user.id, &related_tracks),
+        "curatedSimilar": curated_similar.iter().map(|(a, reason)| {
+            let mut value = artist_json(a, followed.contains(&a.id));
+            if let Value::Object(map) = &mut value {
+                map.insert("reason".to_string(), json!(reason));
+            }
+            value
+        }).collect::<Vec<_>>(),
     }))
 }
 

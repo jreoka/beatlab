@@ -362,6 +362,18 @@
     const statRow = (k, v) => '<div class="stat-row"><span class="label">' + k + '</span><span class="value">' + esc(v) + '</span></div>';
     const mb = (n) => ((n || 0) / 1048576).toFixed(1) + ' MB';
     const gb = (n) => ((n || 0) / 1073741824).toFixed(1) + ' GB';
+    const compact = (n) => {
+      const v = Number(n) || 0;
+      if (Math.abs(v) < 1000) return String(v);
+      for (const [size, suffix] of [[1e12,'T'], [1e9,'B'], [1e6,'M'], [1e3,'K']]) {
+        if (Math.abs(v) >= size) {
+          const scaled = v / size;
+          const text = Math.abs(scaled) < 10 ? scaled.toFixed(1) : Math.round(scaled).toString();
+          return text.replace(/\.0$/, '') + suffix;
+        }
+      }
+      return String(v);
+    };
 
     function renderCache(o) {
       const hotPct = pctOf(o.localCacheBytes, o.cacheMaxBytes);
@@ -406,12 +418,12 @@
       status.textContent = a.enabled ? 'Enabled' : 'Disabled';
       status.className = 'pill ' + (a.enabled ? 'on' : 'off');
       const cards = [
-        ['Model calls', a.callsTotal || 0, (a.callsOk || 0) + ' ok · ' + (a.callsFailed || 0) + ' failed'],
+        ['Model calls', compact(a.callsTotal), compact(a.callsOk) + ' ok · ' + compact(a.callsFailed) + ' failed'],
         ['Success rate', (a.successRate || 0) + '%', 'across all tasks'],
-        ['Tokens used', a.totalTokens || 0, (a.promptTokens || 0) + ' in · ' + (a.completionTokens || 0) + ' out'],
+        ['Tokens used', compact(a.totalTokens), compact(a.promptTokens) + ' in · ' + compact(a.completionTokens) + ' out'],
         ['Avg latency', (a.avgLatencyMs || 0) + ' ms', 'last ' + (a.lastLatencyMs || 0) + ' ms'],
-        ['Cache writes', a.cacheWrites || 0, 'mix plans, pools & metadata'],
-        ['Web research', a.researchCalls || 0, (a.researchCacheHits || 0) + ' cached · ' + (a.researchFailures || 0) + ' failed'],
+        ['Cache writes', compact(a.cacheWrites), 'mix plans, pools & metadata'],
+        ['Web research', compact(a.researchCalls), compact(a.researchCacheHits) + ' cached · ' + compact(a.researchFailures) + ' failed'],
         ['Last call', ago(a.lastCallAt), a.lastOkAt ? 'last success ' + ago(a.lastOkAt) : 'no successful call yet'],
       ];
       $('ai-cards').innerHTML = cards.map(([k, v, s]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="muted" style="font-size:11px">' + esc(s) + '</div></div>').join('');
@@ -426,7 +438,7 @@
         statRow('Search endpoint', cfg.searchUrl || '—'),
       ].join('');
       const tasks = a.byTask || [];
-      $('ai-tasks').innerHTML = tasks.length ? tasks.map((t) => statRow(t.task, t.calls + ' calls')).join('') : '<div class="muted">No assistant calls yet.</div>';
+      $('ai-tasks').innerHTML = tasks.length ? tasks.map((t) => statRow(t.task, compact(t.calls) + ' calls')).join('') : '<div class="muted">No assistant calls yet.</div>';
       const recent = a.recent || [];
       $('ai-recent').innerHTML = recent.length
         ? '<table><thead><tr><th>When</th><th>Task</th><th>Result</th><th>Time</th><th>Detail</th></tr></thead><tbody>' +

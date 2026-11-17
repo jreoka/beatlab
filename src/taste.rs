@@ -2832,6 +2832,7 @@ impl TasteEngine {
         }
         for query in queries {
             let expansions = self.llm.query_expansions(&query).await;
+            let seeds = self.llm.discover_seed_artists(&query).await;
             let mut search_queries = vec![query.clone()];
             search_queries.extend(expansions);
             let mut pool = self.load_curated_query_tracks(&query);
@@ -2844,6 +2845,32 @@ impl TasteEngine {
                 .unwrap_or_default();
                 for (_, batch) in batches {
                     pool.extend(batch);
+                }
+            }
+            // Generic playlist search is easily fooled by anime-style cover
+            // art on unrelated tracks. Fetch the actual artists/songs the
+            // assistant named so the pool contains genuinely on-theme music.
+            if !seeds.is_empty() {
+                use crate::sources::MusicSource;
+                let lookups = futures::future::join_all(seeds.iter().take(8).map(|name| async {
+                    let dz = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        self.sources.deezer.search_tracks(name, 12),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    let ytm = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        self.sources.ytm.search(name, 6),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    (dz, ytm)
+                }))
+                .await;
+                for (dz, ytm) in lookups {
+                    pool.extend(dz);
+                    pool.extend(ytm);
                 }
             }
             dedup_tracks_by_id(&mut pool);
@@ -2863,6 +2890,9 @@ impl TasteEngine {
             {
                 if ids.len() >= 8 {
                     self.save_curated_pool(&query_cache_key(&query), &ids);
+                    // Force the next instant mix to rebuild its plan from this
+                    // improved pool rather than reusing an old bad selection.
+                    self.llm.invalidate_mix(&query);
                     info!(query = %query, tracks = ids.len(), "AI curator warmed a search pool");
                 }
             }
@@ -2942,6 +2972,49 @@ impl TasteEngine {
 
     pub fn llm_plan_text(&self, scope: &str, context: &str) -> Option<(String, String)> {
         self.llm.plan_text(scope, context)
+    }
+
+    /// AI-curated "similar artists" for an artist page: a wider candidate set
+    /// than the raw related list, re-ranked by a cached plan that also supplies
+    /// a one-line reason for each pick.
+    pub fn curated_similar_artists(
+        &self,
+        user_id: i64,
+        artist: &ArtistSummary,
+        related: &[ArtistSummary],
+        limit: usize,
+    ) -> Vec<(ArtistSummary, String)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<ArtistSummary> = related.to_vec();
+        candidates.extend(self.recommended_artists_for_user(user_id, 16));
+        let mut seen = HashSet::new();
+        candidates.retain(|a| {
+            !a.id.is_empty() && a.id != artist.id && seen.insert(a.id.clone())
+        });
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let ranked = self.llm_rank_items("artist_curated", &artist.id, candidates, |a| {
+            a.id.clone()
+        });
+        let notes = self
+            .llm
+            .cached_plan("artist_curated", &artist.id)
+            .map(|p| p.notes)
+            .unwrap_or_default();
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|a| {
+                let reason = notes
+                    .get(&a.id)
+                    .cloned()
+                    .unwrap_or_else(|| "Picked for your listening taste".to_string());
+                (a, reason)
+            })
+            .collect()
     }
 
     /// Queue a rotating set of standard plans so popular surfaces are ready
@@ -3086,7 +3159,8 @@ impl TasteEngine {
                     tracks = found;
                 }
             }
-            "artist_albums" | "artist_related" | "new_releases" | "nd_albums" | "nd_artists" => {
+            "artist_albums" | "artist_related" | "artist_curated" | "new_releases" | "nd_albums"
+        | "nd_artists" => {
                 let store = self.store.clone();
                 let user_id = uid;
                 let is_album = scope == "artist_albums"
@@ -3252,6 +3326,7 @@ fn plan_hint(scope: &str, context: &str) -> String {
         .into(),
         "new_releases" | "nd_albums" => "albums worth surfacing first right now".into(),
         "nd_artists" | "artist_related" => "artists worth surfacing first".into(),
+        "artist_curated" => "the most worthwhile similar artists, each with a short reason why they fit".into(),
         "artist_top" => "the strongest tracks by this artist for this listener".into(),
         "artist_albums" => "the most essential albums by this artist".into(),
         "artist_related_tracks" => "tracks that pair well with this artist".into(),

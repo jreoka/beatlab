@@ -324,6 +324,8 @@ pub struct WebResult {
 pub struct RankPlan {
     pub ranked_ids: Vec<String>,
     pub extra_queries: Vec<String>,
+    /// Optional one-line reason per ranked id (used by curated-artist cards).
+    pub notes: BTreeMap<String, String>,
     pub title: String,
     pub subtitle: String,
     pub generated_at: i64,
@@ -957,6 +959,60 @@ impl LlmClient {
         queries
     }
 
+    /// Background-only: name real artists/songs that genuinely fit a theme.
+    /// Used to pull actual on-theme tracks into a mix pool instead of asking
+    /// the model to reorder whatever noisy playlist search returned.
+    pub async fn discover_seed_artists(&self, query: &str) -> Vec<String> {
+        if !self.enabled() || query.trim().is_empty() {
+            return Vec::new();
+        }
+        let key = format!("llm:seed:v1:{}", slug(query));
+        if let Some(cached) = self.cache_get::<Vec<String>>(&key, 7 * 24 * 3600) {
+            return cached;
+        }
+        let system = "You are a music researcher. Name REAL, well-known artists and songs that \
+            genuinely belong to the given music theme or scene. For 'anime', name actual anime \
+            opening/ending artists and songs — not tracks that merely use anime artwork. \
+            Return ONLY a JSON object with keys: artists (6-10 exact artist names), songs (4-6 \
+            exact song titles), and optionally needResearch (1-2 short search queries if unsure). \
+            Use your own knowledge first.";
+        let user = format!("Theme: {query}\n\nJSON:");
+        let Some(mut value) = self.chat_json("seed", system, &user).await else {
+            return Vec::new();
+        };
+        if let Some(researched) = self
+            .research_followup(&value, system, &user, "seed_research")
+            .await
+        {
+            value = researched;
+        }
+        let mut names = Vec::new();
+        for key in ["artists", "songs"] {
+            if let Some(items) = value.get(key).and_then(Value::as_array) {
+                for item in items.iter().filter_map(Value::as_str) {
+                    let name = truncate(item.trim(), 80);
+                    if !name.is_empty() && !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names.truncate(14);
+        if names.is_empty() {
+            return Vec::new();
+        }
+        self.cache_set(&key, &names);
+        self.bump_cache_writes();
+        names
+    }
+
+    /// Drops a cached instant-mix plan so the next request regenerates it from
+    /// an improved candidate pool.
+    pub fn invalidate_mix(&self, query: &str) {
+        self.store
+            .kv_set(&format!("{}{}", MIX_CACHE_PREFIX, slug(query)), "");
+    }
+
     // ---- Optional background web research ---------------------------------
 
     /// Keyless web search used only by background LLM tasks when the model
@@ -1158,7 +1214,8 @@ impl LlmClient {
             rankedIds (array of exact ids from the supplied list only, best first, at most 40), \
             title (a short display title for the mix/section, or empty), \
             subtitle (one short line describing the selection, or empty), \
-            extraQueries (1-3 short search phrases that would find more items like this). \
+            extraQueries (1-3 short search phrases that would find more items like this), \
+            notes (an object mapping each id you ranked to one short sentence explaining why it fits). \
             If you are unsure about a factual detail that affects the ranking (an artist's era, \
             a genre's origins, what fits a theme), you may instead return {\"needResearch\": \
             [\"short search query\"], \"rankedIds\": [], \"title\": \"\", \"subtitle\": \"\"} \
@@ -1204,9 +1261,29 @@ impl LlmClient {
                     .collect()
             })
             .unwrap_or_default();
+        let notes: BTreeMap<String, String> = value
+            .get("notes")
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter()
+                    .filter(|(id, _)| allowed.contains(id.as_str()))
+                    .map(|(id, text)| {
+                        (
+                            id.clone(),
+                            truncate(
+                                text.as_str().unwrap_or("").trim(),
+                                160,
+                            ),
+                        )
+                    })
+                    .filter(|(_, text)| !text.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         let plan = RankPlan {
             ranked_ids,
             extra_queries,
+            notes,
             title: truncate(
                 value.get("title").and_then(Value::as_str).unwrap_or(""),
                 80,
