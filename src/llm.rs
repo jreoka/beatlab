@@ -11,7 +11,7 @@
 //!   BEATLAB_LLM_ENABLED   1/true/yes to force on, 0/false/no to force off (default: on when key set)
 //!   BEATLAB_LLM_TIMEOUT_MS            default 12000
 //!   BEATLAB_LLM_JSON_MODE             default 1 — send response_format=json_object
-//!   BEATLAB_LLM_MAX_TOKENS            default 900
+//!   BEATLAB_LLM_MAX_TOKENS            default 0 (uncapped)
 //!   BEATLAB_LLM_TEMPERATURE           default 0.2
 //!
 //! All LLM work happens in background tasks. Live search / instant mix only
@@ -112,7 +112,8 @@ impl LlmConfig {
             api_key,
             timeout_ms: parse_u64(env_any(&["BEATLAB_LLM_TIMEOUT_MS"]), 12_000),
             json_mode: parse_bool(env_any(&["BEATLAB_LLM_JSON_MODE"]), true),
-            max_tokens: parse_u64(env_any(&["BEATLAB_LLM_MAX_TOKENS"]), 900),
+            // 0 means "uncapped" — no max_tokens field is sent to the model.
+            max_tokens: parse_u64(env_any(&["BEATLAB_LLM_MAX_TOKENS"]), 0),
             temperature,
             research_enabled: parse_bool(env_any(&["BEATLAB_LLM_RESEARCH"]), true),
             search_url_template: env_any(&["BEATLAB_LLM_SEARCH_URL"])
@@ -536,7 +537,16 @@ impl LlmClient {
         task: &str,
         system: &str,
         user: &str,
-        max_tokens: Option<u64>,
+    ) -> Option<Value> {
+        self.chat_json_attempt(task, system, user, true).await
+    }
+
+    async fn chat_json_attempt(
+        &self,
+        task: &str,
+        system: &str,
+        user: &str,
+        allow_retry: bool,
     ) -> Option<Value> {
         if !self.enabled() {
             return None;
@@ -560,8 +570,11 @@ impl LlmClient {
                 { "role": "user", "content": user },
             ],
             "temperature": self.config.temperature,
-            "max_tokens": max_tokens.unwrap_or(self.config.max_tokens),
         });
+        // Uncapped by default: a cap is only sent when explicitly configured.
+        if self.config.max_tokens > 0 {
+            body["max_tokens"] = json!(self.config.max_tokens);
+        }
         if self.config.json_mode {
             body["response_format"] = json!({ "type": "json_object" });
         }
@@ -613,15 +626,8 @@ impl LlmClient {
                 )
             })
             .unwrap_or((0, 0));
-        let content = parsed
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        match extract_json_object(content) {
+        let content = message_text(&parsed);
+        match extract_json_object(&content) {
             Some(obj) => {
                 self.record_call(
                     task,
@@ -634,13 +640,36 @@ impl LlmClient {
                 Some(obj)
             }
             None => {
+                // Cheap endpoints often ignore the format instruction. Give
+                // them one explicit second chance with their own bad reply
+                // pasted back before counting a failure.
+                if allow_retry {
+                    let strict_system = format!(
+                        "{system}\n\nCRITICAL: Reply with EXACTLY one valid JSON object. \
+                         No prose, no markdown fences, no explanation of any kind."
+                    );
+                    let preview: String = content.chars().take(220).collect();
+                    let strict_user = format!(
+                        "{user}\n\nYour previous reply was not valid JSON. This is what you said:\n\
+                         {preview}\n\nReply with ONLY the corrected JSON object now."
+                    );
+                    return Box::pin(self.chat_json_attempt(
+                        task,
+                        &strict_system,
+                        &strict_user,
+                        false,
+                    ))
+                    .await;
+                }
+                let err = format!("not JSON: {}", truncate(&content, 180));
+                warn!(task = %task, detail = %err, "AI curator response could not be parsed");
                 self.record_call(
                     task,
                     false,
                     elapsed,
                     prompt_tokens,
                     completion_tokens,
-                    "model response was not a JSON object",
+                    &err,
                 );
                 None
             }
@@ -728,7 +757,7 @@ impl LlmClient {
         let user = format!(
             "Listener request: {query}\n\nCandidate tracks (each id is exact):\n{listing}\n\nJSON:"
         );
-        let value = self.chat_json("mix", system, &user, Some(700)).await?;
+        let value = self.chat_json("mix", system, &user).await?;
         let plan = MixPlan::from_value(&value, tracks)?;
         self.cache_set(&key, &plan);
         self.bump_cache_writes();
@@ -768,11 +797,11 @@ impl LlmClient {
             with at most two queries and the system will look it up and ask you again. Be conservative, \
             never guess a year, and only use ids from the input.";
         let user = format!("Tracks:\n{listing}\n\nJSON:");
-        let Some(mut value) = self.chat_json("metadata", system, &user, Some(700)).await else {
+        let Some(mut value) = self.chat_json("metadata", system, &user).await else {
             return Vec::new();
         };
         if let Some(researched) = self
-            .research_followup(&value, system, &user, "metadata_research", 700)
+            .research_followup(&value, system, &user, "metadata_research")
             .await
         {
             value = researched;
@@ -833,7 +862,7 @@ impl LlmClient {
             Add \"title\" and \"subtitle\" for the mix. Reject covers, karaoke, slowed/reverb and \
             title-word collisions. Never invent an id.";
         let user = format!("Mix theme: {query}\n\nCandidates:\n{listing}\n\nJSON:");
-        let value = self.chat_json("pool", system, &user, Some(700)).await?;
+        let value = self.chat_json("pool", system, &user).await?;
         let allowed: HashSet<&str> = tracks.iter().map(|t| t.id.as_str()).collect();
         let ids: Vec<String> = value
             .get("trackIds")
@@ -870,7 +899,7 @@ impl LlmClient {
             \"queries\": an array of 1-3 concise alternate search phrases (genre, era, mood or \
             playlist-style) that would find more music matching the listener's intent.";
         let user = format!("Query: {query}\n\nJSON:");
-        let Some(value) = self.chat_json("query", system, &user, Some(200)).await else {
+        let Some(value) = self.chat_json("query", system, &user).await else {
             return Vec::new();
         };
         let queries: Vec<String> = value
@@ -945,7 +974,6 @@ impl LlmClient {
         system: &str,
         original_user: &str,
         task: &str,
-        max_tokens: u64,
     ) -> Option<Value> {
         if !self.config.research_enabled {
             return None;
@@ -983,8 +1011,7 @@ impl LlmClient {
         let followed_up = format!(
             "{original_user}\n\nWeb research notes (verify against your own knowledge, they may be incomplete or stale):\n{notes}\n\nReturn the FINAL JSON now, using the same keys as before."
         );
-        self.chat_json(task, system, &followed_up, Some(max_tokens))
-            .await
+        self.chat_json(task, system, &followed_up).await
     }
 
     // ---- Generic preference plans -----------------------------------------
@@ -1102,9 +1129,9 @@ impl LlmClient {
         let user = format!(
             "Surface: {scope}\nListener/context: {context}\nGoal: {hint}\n\nItems:\n{listing}\n\nJSON:"
         );
-        let mut value = self.chat_json("plan", system, &user, Some(800)).await?;
+        let mut value = self.chat_json("plan", system, &user).await?;
         if let Some(researched) = self
-            .research_followup(&value, system, &user, "plan_research", 800)
+            .research_followup(&value, system, &user, "plan_research")
             .await
         {
             value = researched;
@@ -1283,16 +1310,164 @@ fn mask_key(key: &str) -> String {
     format!("{}…{}", &k[..4], &k[k.len() - 4..])
 }
 
+/// Pull the model's text out of the many response shapes used by compatible
+/// endpoints (plain string, array of content parts, completion-style `text`).
+fn text_from_content(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| {
+                p.as_str()
+                    .map(str::to_string)
+                    .or_else(|| p.get("text").and_then(Value::as_str).map(str::to_string))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Reasoning models frequently prefix their visible answer with a `<think>`
+/// block (or use full-width variants). Left in place, braces inside the
+/// reasoning text confuse JSON extraction — so strip complete blocks first.
+fn strip_thinking(text: &str) -> String {
+    const PAIRS: [(&str, &str); 6] = [
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+        ("<reasoning>", "</reasoning>"),
+        ("\u{ff1c}think\u{ff1e}", "\u{ff1c}/think\u{ff1e}"),
+        ("[THINK]", "[/THINK]"),
+        ("<scratchpad>", "</scratchpad>"),
+    ];
+    let mut out = text.to_string();
+    for (open, close) in PAIRS {
+        loop {
+            let Some(start) = out.find(open) else { break };
+            let after_open = start + open.len();
+            let Some(end_rel) = out[after_open..].find(close) else { break };
+            let end = after_open + end_rel + close.len();
+            out = format!("{}{}", &out[..start], &out[end..]);
+        }
+    }
+    out
+}
+
+fn message_text(parsed: &Value) -> String {
+    if let Some(choice) = parsed
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+    {
+        let content = text_from_content(
+            choice
+                .get("message")
+                .and_then(|m| m.get("content")),
+        );
+        if !content.trim().is_empty() {
+            return strip_thinking(&content);
+        }
+        // Some proxies put the model's text in a reasoning-specific field.
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            let reasoning = text_from_content(
+                choice.get("message").and_then(|m| m.get(key)),
+            );
+            if !reasoning.trim().is_empty() {
+                return strip_thinking(&reasoning);
+            }
+        }
+        if let Some(text) = choice.get("text").and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                return strip_thinking(text);
+            }
+        }
+    }
+    for key in ["output_text", "content", "result", "response"] {
+        let text = text_from_content(parsed.get(key));
+        if !text.trim().is_empty() {
+            return strip_thinking(&text);
+        }
+    }
+    String::new()
+}
+
+/// Heuristically close a JSON object the model cut off before its final brace
+/// (very common when a completion hits its token limit).
+fn repair_truncated_json(text: &str) -> Option<Value> {
+    let start = text.find('{')?;
+    let mut candidate = text[start..].trim_end().to_string();
+    let bytes = candidate.as_bytes();
+    let mut braces = 0i32;
+    let mut brackets = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => braces += 1,
+            b'}' => braces -= 1,
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
+            _ => {}
+        }
+    }
+    if braces <= 0 && brackets <= 0 {
+        return None;
+    }
+    // A truncated value string is the most common case — close it so the
+    // appended braces produce a valid object.
+    if in_string {
+        candidate.push('"');
+    }
+    candidate = candidate.trim_end_matches(',').to_string();
+    if candidate.ends_with(':') {
+        candidate = candidate
+            .trim_end_matches(':')
+            .trim_end()
+            .trim_end_matches(',')
+            .to_string();
+    }
+    for _ in 0..brackets.max(0) {
+        candidate.push(']');
+    }
+    for _ in 0..braces.max(0) {
+        candidate.push('}');
+    }
+    serde_json::from_str::<Value>(&candidate)
+        .ok()
+        .filter(|v| v.is_object())
+}
+
 /// Robustly pull the first JSON object out of a model response, tolerating
-/// markdown fences and chatty wrappers from cheap / free endpoints.
+/// markdown fences, chatty wrappers and truncation from cheap / free endpoints.
 pub fn extract_json_object(text: &str) -> Option<Value> {
-    let trimmed = text.trim();
+    let cleaned = strip_thinking(text);
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
     }
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         if v.is_object() {
             return Some(v);
+        }
+        // A bare array is a common shortcut from small models.
+        if let Value::Array(items) = v {
+            if items.iter().any(|i| i.get("trackId").is_some()) {
+                return Some(json!({ "tracks": items }));
+            }
+            if !items.is_empty() && items.iter().all(Value::is_string) {
+                return Some(json!({ "rankedIds": items }));
+            }
         }
     }
     let unfenced = trimmed
@@ -1338,7 +1513,7 @@ pub fn extract_json_object(text: &str) -> Option<Value> {
             _ => {}
         }
     }
-    None
+    repair_truncated_json(unfenced)
 }
 
 #[cfg(test)]
@@ -1365,6 +1540,43 @@ mod tests {
         assert!(!c.base_url.is_empty());
         assert!(!c.model.is_empty());
         assert!(c.timeout_ms > 0);
+    }
+
+    #[test]
+    fn parses_alternate_content_shapes_and_truncated_json() {
+        let parts = json!({ "choices": [{ "message": { "content": [
+            { "type": "text", "text": "Here you go: {\"rankedIds\": [\"a\", \"b\"]}" }
+        ] } }] });
+        assert_eq!(message_text(&parts), "Here you go: {\"rankedIds\": [\"a\", \"b\"]}");
+
+        let completion = json!({ "choices": [{ "text": "{\"title\": \"Test\"}" }] });
+        assert_eq!(message_text(&completion), "{\"title\": \"Test\"}");
+
+        let truncated = "{\"rankedIds\": [\"a\", \"b\"], \"title\": \"Night";
+        let repaired = extract_json_object(truncated).expect("truncated json repaired");
+        assert_eq!(repaired["rankedIds"][0], "a");
+        assert_eq!(repaired["rankedIds"][1], "b");
+
+        let bare = extract_json_object("[\"a\", \"b\"]").expect("bare array accepted");
+        assert_eq!(bare["rankedIds"][1], "b");
+    }
+
+    #[test]
+    fn strips_thinking_blocks_before_json_extraction() {
+        let raw = "<think>The user wants a {\"wrong\": \"object\"} with this title.</think>\n\
+                   Here is the result: {\"rankedIds\": [\"a\", \"b\"], \"title\": \"Night Drive\"}";
+        let value = extract_json_object(raw).expect("json after thinking block");
+        assert_eq!(value["title"], "Night Drive");
+        assert_eq!(value["rankedIds"][0], "a");
+        assert!(value.get("wrong").is_none());
+
+        let with_field = json!({
+            "choices": [{ "message": {
+                "reasoning_content": "thinking... {\"bad\": 1}",
+                "content": "<think>more thinking</think>{\"title\": \"Final\"}"
+            }}]
+        });
+        assert_eq!(message_text(&with_field), "{\"title\": \"Final\"}");
     }
 
     #[test]

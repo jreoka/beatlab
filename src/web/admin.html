@@ -438,7 +438,7 @@
         statRow('API key', cfg.apiKeySet ? (cfg.apiKeyMasked || 'set') : 'not set'),
         statRow('Timeout', (cfg.timeoutMs || 0) + ' ms'),
         statRow('JSON mode', cfg.jsonMode ? 'on' : 'off'),
-        statRow('Max tokens', cfg.maxTokens || 0),
+        statRow('Max tokens', cfg.maxTokens ? cfg.maxTokens : 'uncapped'),
         statRow('Web research', cfg.researchEnabled ? 'enabled' : 'disabled'),
         statRow('Search endpoint', cfg.searchUrl || '—'),
       ].join('');
