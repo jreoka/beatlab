@@ -5133,6 +5133,16 @@ impl Store {
         );
     }
 
+    pub fn kv_count_prefix(&self, prefix: &str) -> i64 {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE ?1",
+            params![format!("{prefix}%")],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
     pub fn load_mood_catalog(&self) -> Vec<crate::models::MoodDef> {
         if let Some(raw) = self.kv_get("moods:catalog:v1") {
             if let Ok(defs) = serde_json::from_str::<Vec<crate::models::MoodDef>>(&raw) {

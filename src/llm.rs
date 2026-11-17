@@ -34,6 +34,7 @@ const META_CACHE_PREFIX: &str = "llm:meta:v1:";
 const POOL_CACHE_PREFIX: &str = "llm:pool:v1:";
 const QUERY_EXP_PREFIX: &str = "llm:qexp:v1:";
 const SEARCH_ANSWER_PREFIX: &str = "llm:answer:v1:";
+const VERIFIED_MIX_PREFIX: &str = "llm:verified_mix:v1:";
 const MIX_CACHE_TTL_SECS: i64 = 14 * 24 * 3600;
 const PLAN_CACHE_PREFIX: &str = "llm:plan:v1:";
 const PLAN_PENDING_KV_KEY: &str = "llm:pending_plans:v1";
@@ -310,6 +311,18 @@ pub struct MetaSuggestion {
     pub moods: Vec<String>,
 }
 
+/// A background-built, AI-verified instant mix: an ordered list of real track
+/// ids drawn only from editorial sources, plus the model's title/subtitle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VerifiedMix {
+    pub track_ids: Vec<String>,
+    pub title: String,
+    pub subtitle: String,
+    pub note: String,
+    pub built_at: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MoodCatalogChange {
@@ -529,6 +542,15 @@ impl LlmClient {
             "researchCalls": s.research_calls,
             "researchCacheHits": s.research_cache_hits,
             "researchFailures": s.research_failures,
+            "verifiedMixes": self.store.kv_count_prefix("llm:verified_mix:v1:"),
+            "searchPlans": self.store.kv_count_prefix("llm:plan:v1:search:"),
+            "catalogChangeCached": self.store.kv_get("llm:mood_catalog:v1").is_some(),
+            "pendingQueries": self
+                .store
+                .kv_get(PENDING_Q_KV_KEY)
+                .and_then(|raw| serde_json::from_str::<Vec<(String, String)>>(&raw).ok())
+                .map(|v| v.len())
+                .unwrap_or(0),
             "byTask": by_task,
             "recent": s.recent,
             "config": self.config_snapshot(),
@@ -790,6 +812,24 @@ impl LlmClient {
             self.store.kv_set(PENDING_Q_KV_KEY, &raw);
         }
         picked
+    }
+
+    pub fn cached_verified_mix(&self, query: &str) -> Option<VerifiedMix> {
+        if !self.enabled() {
+            return None;
+        }
+        self.cache_get(
+            &format!("{}{}", VERIFIED_MIX_PREFIX, slug(query)),
+            7 * 24 * 3600,
+        )
+    }
+
+    pub fn save_verified_mix(&self, query: &str, mix: &VerifiedMix) {
+        self.cache_set(
+            &format!("{}{}", VERIFIED_MIX_PREFIX, slug(query)),
+            mix,
+        );
+        self.bump_cache_writes();
     }
 
     pub fn cached_mix(&self, query: &str) -> Option<MixPlan> {
@@ -1094,6 +1134,15 @@ impl LlmClient {
                 })
                 .unwrap_or_default(),
         };
+        // Never cache an empty result: a free model often returns prose or an
+        // empty object, and caching that would freeze the catalog for a week.
+        if change.renames.is_empty()
+            && change.subtitles.is_empty()
+            && change.remove.is_empty()
+            && change.add.is_empty()
+        {
+            return None;
+        }
         self.cache_set(key, &change);
         self.bump_cache_writes();
         Some(change)
@@ -1231,6 +1280,56 @@ impl LlmClient {
         self.cache_set(&key, &names);
         self.bump_cache_writes();
         names
+    }
+
+    /// Build an entire verified mix from a clean editorial candidate pool.
+    /// Background-only; the live endpoint just reads the cached result.
+    pub async fn curate_verified_mix(
+        &self,
+        query: &str,
+        candidates: &[Track],
+    ) -> Option<VerifiedMix> {
+        if !self.enabled() || candidates.len() < 8 {
+            return None;
+        }
+        if let Some(cached) = self.cached_verified_mix(query) {
+            return Some(cached);
+        }
+        let listing = track_lines(candidates, 40);
+        let system = "You are a music curator. The candidate list comes from editorial genre \
+            charts and curated playlists, not keyword search. Choose the tracks that genuinely \
+            fit the listener's request and discard the rest. Return ONLY a JSON object with keys: \
+            rankedTrackIds (8-20 exact ids from the list, best first), title (a short mix title), \
+            subtitle (one vivid sentence), note (one short sentence on what ties the picks together). \
+            Never invent an id. Prefer a tight, coherent selection over a long one.";
+        let user = format!("Listener request: {query}\n\nCandidates:\n{listing}\n\nJSON:");
+        let value = self.chat_json("verified_mix", system, &user).await?;
+        let allowed: HashSet<&str> = candidates.iter().map(|t| t.id.as_str()).collect();
+        let track_ids: Vec<String> = value
+            .get("rankedTrackIds")
+            .or_else(|| value.get("trackIds"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|id| allowed.contains(*id))
+                    .take(20)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if track_ids.len() < 8 {
+            return None;
+        }
+        let mix = VerifiedMix {
+            track_ids,
+            title: truncate(value.get("title").and_then(Value::as_str).unwrap_or("").trim(), 80),
+            subtitle: truncate(value.get("subtitle").and_then(Value::as_str).unwrap_or("").trim(), 160),
+            note: truncate(value.get("note").and_then(Value::as_str).unwrap_or("").trim(), 160),
+            built_at: Utc::now().timestamp(),
+        };
+        self.save_verified_mix(query, &mix);
+        Some(mix)
     }
 
     /// Drops a cached instant-mix plan so the next request regenerates it from

@@ -2488,6 +2488,55 @@ pub async fn instant_mix(
     let llm_query = query.clone();
     tokio::spawn(async move { llm_queue.queue_query(&llm_query); });
 
+    // Ground-up theme mix path: the assistant builds a verified mix from
+    // editorial sources in the background. The live request only reads that
+    // cached result — no keyword search, no YTM, no junk to re-rank.
+    let use_verified = !force_entity
+        && (intent.is_theme_mix
+            || (intent.entity_query.is_none() && query.split_whitespace().count() <= 3));
+    if use_verified {
+        if let Some(verified) = state.taste.llm.cached_verified_mix(&query) {
+            let tracks = state
+                .store
+                .get_tracks_by_ids(&verified.track_ids)
+                .unwrap_or_default();
+            if tracks.len() >= 8 {
+                let match_ids = personal_match_ids(&state, user.id);
+                let title = if verified.title.trim().is_empty() {
+                    format!("{} Mix", query)
+                } else {
+                    verified.title.clone()
+                };
+                let subtitle = if verified.subtitle.trim().is_empty() {
+                    verified.note.clone()
+                } else {
+                    verified.subtitle.clone()
+                };
+                let instant = json!({
+                    "title": title,
+                    "subtitle": format!("✦ AI-verified · {}", subtitle),
+                    "query": query,
+                    "isThemeMix": true,
+                    "prominent": true,
+                    "totalDuration": tracks.iter().map(|t| t.duration.max(0)).sum::<i32>(),
+                    "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
+                });
+                return json_res(json!({
+                    "query": query,
+                    "instantMix": instant,
+                    "refinements": { "detectedIntent": verified.note },
+                }));
+            }
+        }
+        // Nothing verified yet — say so instead of shipping keyword-search junk.
+        return json_res(json!({
+            "query": query,
+            "instantMix": Value::Null,
+            "status": "curating",
+            "refinements": { "detectedIntent": "Building a verified mix from curated sources…" },
+        }));
+    }
+
     let mix_future = async {
         if force_entity {
             return (Vec::new(), Vec::new());

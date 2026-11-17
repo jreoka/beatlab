@@ -193,6 +193,7 @@ pub async fn config(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "listenAddr": std::env::var("BEATLAB_ADDR").unwrap_or_else(|_| "0.0.0.0:4533".to_string()),
         "webauthnEnabled": crate::auth::webauthn().is_some(),
         "llm": state.taste.llm.config_snapshot(),
+        "moodCatalog": state.store.load_mood_catalog(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }

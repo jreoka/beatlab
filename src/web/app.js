@@ -2434,6 +2434,17 @@
       const modeParam = cleanMode !== 'auto' ? `&mode=${encodeURIComponent(cleanMode)}` : '';
       const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}${modeParam}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
+      if (d.status === 'curating') {
+        state.activeInstantMix = null;
+        $('main-view').innerHTML = `
+          ${builderHeader(cleanQ)}
+          <div class="notice">
+            <h2>Building your mix</h2>
+            <p class="muted">The AI curator is putting together a verified mix for “${esc(cleanQ)}” from curated sources. Try again in a moment — this avoids filling it with random search results.</p>
+          </div>
+        `;
+        return;
+      }
       if (!d.instantMix || !Array.isArray(d.instantMix.tracks) || !d.instantMix.tracks.length) {
         state.activeInstantMix = null;
         $('main-view').innerHTML = `

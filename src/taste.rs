@@ -2823,28 +2823,34 @@ impl TasteEngine {
         let Some(change) = self.llm.curate_mood_catalog(&catalog).await else {
             return;
         };
-        let existing: HashMap<String, usize> = catalog
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (d.slug.clone(), i))
-            .collect();
-        for (slug, label) in change.renames {
-            if let Some(&idx) = existing.get(&slug) {
+        // Small models often key their JSON by the visible label rather than
+        // the slug — accept both so a valid proposal isn't silently dropped.
+        let mut lookup: HashMap<String, usize> = HashMap::new();
+        for (i, d) in catalog.iter().enumerate() {
+            lookup.insert(slug(&d.slug), i);
+            lookup.insert(slug(&d.label), i);
+        }
+        let resolve = |key: &str| -> Option<usize> { lookup.get(&slug(key)).copied() };
+        for (key, label) in change.renames {
+            if let Some(idx) = resolve(&key) {
                 catalog[idx].label = label;
             }
         }
-        for (slug, subtitle) in change.subtitles {
-            if let Some(&idx) = existing.get(&slug) {
+        for (key, subtitle) in change.subtitles {
+            if let Some(idx) = resolve(&key) {
                 catalog[idx].subtitle = subtitle;
             }
         }
-        let removed: HashSet<&str> = change.remove.iter().map(String::as_str).collect();
+        let removed: HashSet<String> = change
+            .remove
+            .iter()
+            .filter_map(|key| resolve(key).map(|i| catalog[i].slug.clone()))
+            .collect();
         if catalog.len() > 5 {
-            catalog.retain(|d| !removed.contains(d.slug.as_str()));
+            catalog.retain(|d| !removed.contains(&d.slug));
         }
         for suggestion in change.add {
-            if existing.contains_key(&suggestion.slug)
-                || catalog.iter().any(|d| d.slug == suggestion.slug)
+            if catalog.iter().any(|d| d.slug == suggestion.slug)
                 || catalog.len() >= 16
             {
                 continue;
@@ -3047,6 +3053,9 @@ impl TasteEngine {
             if pool.len() < 8 {
                 continue;
             }
+            // Build the whole mix from this clean editorial pool. The live
+            // endpoint will use only this result — no keyword search at all.
+            let _ = self.llm.curate_verified_mix(&query, &pool).await;
             let to_save = pool.clone();
             let store = self.store.clone();
             let _ = tokio::task::spawn_blocking(move || {

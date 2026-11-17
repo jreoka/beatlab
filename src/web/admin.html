@@ -140,6 +140,8 @@
         <div id="ai-cards" class="cards"></div>
         <h2 class="section">Configuration</h2>
         <div id="ai-config" class="card"></div>
+        <h2 class="section">Moods &amp; Vibes catalog</h2>
+        <div id="ai-moods" class="card"></div>
         <h2 class="section">Work by task</h2>
         <div id="ai-tasks" class="card"></div>
         <h2 class="section">Recent calls</h2>
@@ -424,6 +426,9 @@
         ['Avg latency', (a.avgLatencyMs || 0) + ' ms', 'last ' + (a.lastLatencyMs || 0) + ' ms'],
         ['Cache writes', compact(a.cacheWrites), 'mix plans, pools & metadata'],
         ['Web research', compact(a.researchCalls), compact(a.researchCacheHits) + ' cached · ' + compact(a.researchFailures) + ' failed'],
+        ['Verified mixes', a.verifiedMixes || 0, 'ready instant mixes'],
+        ['Search plans', a.searchPlans || 0, 'cached search answers'],
+        ['Pending queries', a.pendingQueries || 0, 'waiting for curation'],
         ['Last call', ago(a.lastCallAt), a.lastOkAt ? 'last success ' + ago(a.lastOkAt) : 'no successful call yet'],
       ];
       $('ai-cards').innerHTML = cards.map(([k, v, s]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="muted" style="font-size:11px">' + esc(s) + '</div></div>').join('');
@@ -436,7 +441,14 @@
         statRow('Max tokens', cfg.maxTokens ? cfg.maxTokens : 'uncapped'),
         statRow('Web research', cfg.researchEnabled ? 'enabled' : 'disabled'),
         statRow('Search endpoint', cfg.searchUrl || '—'),
+        statRow('Catalog change cached', a.catalogChangeCached ? 'yes' : 'no'),
       ].join('');
+      const moods = (state.config && state.config.moodCatalog) || [];
+      $('ai-moods').innerHTML = moods.length
+        ? '<table><thead><tr><th>Slug</th><th>Label</th><th>Source</th></tr></thead><tbody>' +
+          moods.map((m) => '<tr><td>' + esc(m.slug) + '</td><td>' + esc(m.label) + '</td><td>' + (m.builtIn ? 'built-in' : 'AI-made') + '</td></tr>').join('') +
+          '</tbody></table>'
+        : '<p class="muted">No Moods & Vibes catalog yet.</p>';
       const tasks = a.byTask || [];
       $('ai-tasks').innerHTML = tasks.length ? tasks.map((t) => statRow(t.task, compact(t.calls) + ' calls')).join('') : '<div class="muted">No assistant calls yet.</div>';
       const recent = a.recent || [];
