@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 const STATS_KV_KEY: &str = "llm:stats:v1";
 const PENDING_Q_KV_KEY: &str = "llm:pending_queries:v1";
-const MIX_CACHE_PREFIX: &str = "llm:mix:v3:";
+const MIX_CACHE_PREFIX: &str = "llm:mix:v4:";
 const META_CACHE_PREFIX: &str = "llm:meta:v1:";
 const POOL_CACHE_PREFIX: &str = "llm:pool:v1:";
 const QUERY_EXP_PREFIX: &str = "llm:qexp:v1:";
@@ -811,7 +811,7 @@ impl LlmClient {
         }
         // One attempt per query per 10 minutes — request-driven mix building
         // must never turn into a stream of model calls for an unresponsive API.
-        let attempt_key = format!("llm:mix_attempt:v3:{}", slug(query));
+        let attempt_key = format!("llm:mix_attempt:v4:{}", slug(query));
         if let Some(raw) = self.store.kv_get(&attempt_key) {
             if let Ok(ts) = raw.trim().parse::<i64>() {
                 if Utc::now().timestamp().saturating_sub(ts) < 600 {
@@ -1188,12 +1188,13 @@ impl LlmClient {
         if let Some(cached) = self.cache_get::<Vec<String>>(&key, 7 * 24 * 3600) {
             return cached;
         }
-        let system = "You are a music researcher. Name REAL, well-known artists and songs that \
-            genuinely belong to the given music theme or scene. For 'anime', name actual anime \
-            opening/ending artists and songs — not tracks that merely use anime artwork. \
-            Return ONLY a JSON object with keys: artists (6-10 exact artist names), songs (4-6 \
-            exact song titles), and optionally needResearch (1-2 short search queries if unsure). \
-            Use your own knowledge first.";
+        let system = "You are a music researcher. Name REAL, well-known artists that genuinely \
+            belong to the given music theme or scene. For 'anime', name actual anime opening/ending \
+            artists (e.g. Yoasobi, LiSA, Kenshi Yonezu, Asian Kung-Fu Generation) — never tracks \
+            that merely use anime-style artwork or put the word 'anime' in the title. \
+            Return ONLY a JSON object with keys: artists (8-12 exact artist names, each at least \
+            two words or a distinctive single name), songs (optional 4-6 {title,artist} objects), \
+            and optionally needResearch (1-2 short queries if unsure). Use your own knowledge first.";
         let user = format!("Theme: {query}\n\nJSON:");
         let Some(mut value) = self.chat_json("seed", system, &user).await else {
             return Vec::new();
@@ -1205,13 +1206,21 @@ impl LlmClient {
             value = researched;
         }
         let mut names = Vec::new();
-        for key in ["artists", "songs"] {
-            if let Some(items) = value.get(key).and_then(Value::as_array) {
-                for item in items.iter().filter_map(Value::as_str) {
-                    let name = truncate(item.trim(), 80);
-                    if !name.is_empty() && !names.contains(&name) {
-                        names.push(name);
-                    }
+        if let Some(items) = value.get("artists").and_then(Value::as_array) {
+            for item in items.iter().filter_map(Value::as_str) {
+                let name = truncate(item.trim(), 80);
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        if let Some(items) = value.get("songs").and_then(Value::as_array) {
+            for item in items {
+                let title = item.get("title").and_then(Value::as_str).unwrap_or("").trim();
+                let artist = item.get("artist").and_then(Value::as_str).unwrap_or("").trim();
+                let name = truncate(&format!("{title} {artist}"), 100);
+                if !title.is_empty() && !artist.is_empty() && !names.contains(&name) {
+                    names.push(name);
                 }
             }
         }

@@ -2934,6 +2934,8 @@ impl TasteEngine {
         for query in queries {
             let expansions = self.llm.query_expansions(&query).await;
             let mut seed_names = self.llm.discover_seed_artists(&query).await;
+            let query_slug = slug(&query);
+            seed_names.retain(|name| slug(name) != query_slug && name.split_whitespace().count() > 1);
             let answer = self.llm.resolve_search_intent(&query).await;
             if let Some(ref answer) = answer {
                 for track in &answer.tracks {
@@ -3014,6 +3016,8 @@ impl TasteEngine {
             {
                 if ids.len() >= 8 {
                     self.save_curated_pool(&query_cache_key(&query), &ids);
+                    self.store
+                        .kv_set(&format!("llm:verified:{}", slug(&query)), "1");
                     // Force the next instant mix to rebuild its plan from this
                     // improved pool rather than reusing an old bad selection.
                     self.llm.invalidate_mix(&query);
@@ -3034,17 +3038,33 @@ impl TasteEngine {
 /// appears in its title or artist. Broad searches return tracks that merely
 /// contain the theme word ("Anime Bae", "Anime Funk"), which are not matches.
 fn seed_name_matches(name: &str, track: &Track) -> bool {
-    let norm = |s: &str| slug(s);
-    let needle = norm(name);
-    if needle.len() < 3 {
+    let norm = |s: &str| -> String {
+        s.to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let seed = norm(name);
+    let artist = norm(&primary_artist(&track.artist));
+    if seed.len() < 4 || artist.is_empty() {
         return false;
     }
-    let title = norm(&track.title);
-    let artist = norm(&primary_artist(&track.artist));
-    title.contains(&needle)
-        || artist.contains(&needle)
-        || (artist.len() > 2 && needle.contains(&artist))
-        || (title.len() > 3 && needle.contains(&title))
+    // The artist must actually be the seed (or appear inside it) — a track
+    // that merely contains the theme word in its title is not a match.
+    if artist.len() > 3 && seed.contains(&artist) {
+        return true;
+    }
+    if seed.len() > 5 && artist.contains(&seed) {
+        return true;
+    }
+    let hits = artist
+        .split_whitespace()
+        .filter(|w| w.len() > 2 && seed.contains(*w))
+        .count();
+    hits >= 2 || (artist.split_whitespace().count() == 1 && hits == 1 && seed.len() > 6)
 }
 
 fn dedup_tracks_by_id(tracks: &mut Vec<Track>) {
@@ -3109,6 +3129,13 @@ impl TasteEngine {
             Some(plan) => crate::llm::apply_plan(&plan, items, id_of),
             None => items,
         }
+    }
+
+    pub fn has_verified_query_pool(&self, query: &str) -> bool {
+        self.store
+            .kv_get(&format!("llm:verified:{}", slug(query)))
+            .map(|v| v == "1")
+            .unwrap_or(false)
     }
 
     pub fn llm_plan_text(&self, scope: &str, context: &str) -> Option<(String, String)> {

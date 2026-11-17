@@ -2547,10 +2547,14 @@ pub async fn instant_mix(
     }
 
     if intent.is_theme_mix {
-        // The background AI pool is the highest-quality evidence we have —
-        // always include it, ahead of generic playlist-search batches.
         let pre_curated = state.taste.load_curated_query_tracks(&intent.normalized);
-        if pre_curated.len() >= 5 {
+        if state.taste.has_verified_query_pool(&query) && pre_curated.len() >= 8 {
+            // Once the assistant has verified an on-theme pool, use ONLY that.
+            // Generic playlist/YTM search is what keeps injecting junk.
+            curated_batches.clear();
+            curated_batches.push((query.clone(), pre_curated.clone()));
+            combined = pre_curated;
+        } else if pre_curated.len() >= 5 {
             curated_batches.insert(0, (query.clone(), pre_curated));
         }
     }
