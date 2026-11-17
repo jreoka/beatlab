@@ -4140,11 +4140,6 @@ a {
   #user-name {
     max-width: 84px;
   }
-  .signout-btn {
-    padding: 6px 8px;
-    font-size: 12px;
-    white-space: nowrap;
-  }
   .search-box {
     grid-column: 1 / -1;
     grid-row: 2;
