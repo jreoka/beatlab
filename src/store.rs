@@ -3579,6 +3579,32 @@ impl Store {
         Ok(rows)
     }
 
+    /// Returns up to `limit` catalog tracks missing `genre` or `year`, so the
+    /// background AI curator can hydrate metadata without touching the live
+    /// search path. Prefers tracks that are actually referenced by events so
+    /// user-visible music gets enriched first.
+    pub fn tracks_missing_metadata(&self, limit: usize) -> AppResult<Vec<Track>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}
+             FROM tracks t
+             WHERE trim(t.genre) = '' OR t.year <= 0
+             ORDER BY
+               CASE WHEN EXISTS (SELECT 1 FROM events e WHERE e.track_id = t.id) THEN 0 ELSE 1 END,
+               t.created DESC
+             LIMIT ?1",
+            prefixed_track_cols("t")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![limit as i64], row_to_track)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn star_track(&self, user_id: i64, track_id: &str) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();

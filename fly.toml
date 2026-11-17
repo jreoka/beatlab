@@ -5,20 +5,28 @@ primary_region = "ord"
   dockerfile = "Dockerfile"
 
 [env]
+  URL = "https://music.dill.moe"
   BEATLAB_ADDR = "0.0.0.0:4533"
   BEATLAB_DATA = "/data"
-  BEATLAB_CACHE_GB = "10.0"
+  BEATLAB_CACHE_GB = "10"
   BEATLAB_ORIGIN = "https://music.dill.moe"
-  # Username allowed into /admin (comma-separated for more than one).
-  # ADMIN_USERNAME = "your-admin-username"
-  # Optional S3/R2 cool cache (local disk stays the hot cache):
-  # BEATLAB_S3_BUCKET = "your-bucket"
+  ADMIN_USERNAME = "cross"
+  BEATLAB_S3_BUCKET = "beatlab"
   # BEATLAB_S3_ENDPOINT = "https://your-account.r2.cloudflarestorage.com"
-  # BEATLAB_S3_REGION = "auto"
+  BEATLAB_S3_REGION = "auto"
   # BEATLAB_S3_ACCESS_KEY_ID = "..."
   # BEATLAB_S3_SECRET_ACCESS_KEY = "..."
-  # BEATLAB_S3_PREFIX = "beatlab/audio/"
-  # BEATLAB_S3_MAX_GB = "100"
+  BEATLAB_S3_MAX_GB = "500"
+  # Optional OpenAI-compatible AI curator (mixes, metadata, search warmth — all background):
+  # BEATLAB_LLM_API_KEY = "..."
+  BEATLAB_LLM_BASE_URL = "https://openrouter.ai/api/v1"
+  BEATLAB_LLM_MODEL = "inclusionai/ling-3.2-flash:free"
+  BEATLAB_LLM_ENABLED = "1"
+  BEATLAB_LLM_TIMEOUT_MS = "1200000"
+  BEATLAB_LLM_RESEARCH_TIMEOUT_MS = "1200000"
+  BEATLAB_LLM_JSON_MODE = "1"
+  BEATLAB_LLM_RESEARCH = "1"
+  BEATLAB_LLM_SEARCH_URL = "https://html.duckduckgo.com/html/?q={q}"
   RUST_LOG = "info"
 
 [http_service]

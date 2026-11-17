@@ -1531,7 +1531,7 @@ a {
   margin-top: 4px;
 }
 
-/* Personalized "Mixed for you" rail â€” server-curated numbered mixes */
+/* Personalized "Daily Mix" rail — server-curated numbered mixes */
 .mixed-for-you-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(145px, 1fr));
@@ -4221,7 +4221,7 @@ a {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
   }
-  /* Keep the personalized mix tiles (Party Mix, Chill Mix, ...) compact on
+  /* Keep the personalized Daily Mix tiles compact on
      phones instead of letting them balloon into full-width squares. */
   .mixed-for-you-grid {
     grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));

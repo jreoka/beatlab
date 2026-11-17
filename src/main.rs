@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod engine;
+mod llm;
 mod models;
 mod navidrome;
 mod quality_hunter;

@@ -1965,7 +1965,7 @@
       if (mixedForYou.length > 0) {
         html += `<section class="section">
           <div class="section-head">
-            <h2>Mixed for you</h2>
+            <h2>Daily Mixes</h2>
           </div>
           <div class="mixed-for-you-grid">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;

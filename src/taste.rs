@@ -545,7 +545,7 @@ impl RecentHeardPenalties {
     }
 }
 
-/// One card in the personalized "Mixed for you" rail. The artwork, artist list
+/// One card in the personalized "Daily Mix" rail. The artwork, artist list
 /// and track ids are all prepared server-side so the client never has to build
 /// a mix itself.
 #[derive(Debug, Clone, Serialize)]
@@ -590,6 +590,14 @@ pub enum RadioMode {
 }
 
 impl RadioMode {
+    pub fn key(&self) -> &'static str {
+        match self {
+            RadioMode::Default => "default",
+            RadioMode::Familiar => "familiar",
+            RadioMode::Discover => "discover",
+        }
+    }
+
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(str::trim).map(str::to_lowercase).as_deref() {
             Some("familiar") => Self::Familiar,
@@ -916,6 +924,8 @@ pub struct TasteEngine {
     pub store: Store,
     pub sources: SourceRegistry,
     pub neural: std::sync::Arc<crate::transformer::TransformerEngine>,
+    /// Optional OpenAI-compatible assistant. All of its work is background-only.
+    pub llm: std::sync::Arc<crate::llm::LlmClient>,
     expanding_users: std::sync::Arc<std::sync::Mutex<HashSet<i64>>>,
     slsk_checked: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>,
 }
@@ -923,10 +933,12 @@ pub struct TasteEngine {
 impl TasteEngine {
     pub fn new(store: Store, sources: SourceRegistry) -> Self {
         let neural = std::sync::Arc::new(crate::transformer::TransformerEngine::load_or_new(&store));
+        let llm = std::sync::Arc::new(crate::llm::LlmClient::new(store.clone()));
         Self {
             store,
             sources,
             neural,
+            llm,
             expanding_users: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
             slsk_checked: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -1321,6 +1333,7 @@ impl TasteEngine {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        let ranked = self.llm_rank_tracks("for_you", &user_id.to_string(), ranked);
         dedup_and_interleave(ranked, limit, 2)
     }
 
@@ -1364,6 +1377,7 @@ impl TasteEngine {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        let ranked = self.llm_rank_tracks("on_repeat", &user_id.to_string(), ranked);
         dedup_and_interleave(ranked, limit, 2)
     }
 
@@ -1410,6 +1424,7 @@ impl TasteEngine {
 
         pool.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = pool.into_iter().map(|(_, t)| t).collect();
+        let ranked = self.llm_rank_tracks("gems", &user_id.to_string(), ranked);
         dedup_and_interleave(ranked, limit, 2)
     }
 
@@ -1471,6 +1486,7 @@ impl TasteEngine {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        let ranked = self.llm_rank_tracks("discover", &user_id.to_string(), ranked);
         dedup_and_interleave(ranked, limit, 1)
     }
 
@@ -1528,6 +1544,7 @@ impl TasteEngine {
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        let ranked = self.llm_rank_tracks("related", &user_id.to_string(), ranked);
         dedup_and_interleave(ranked, limit, 2)
     }
 
@@ -1554,7 +1571,7 @@ impl TasteEngine {
         if !has_taste {
             // Fresh accounts only see artists from the external Deezer charts,
             // never local/cached artists that happen to exist in the catalog.
-            return self
+            let fresh: Vec<ArtistSummary> = self
                 .store
                 .featured_artist_summaries(limit * 3)
                 .unwrap_or_default()
@@ -1562,6 +1579,7 @@ impl TasteEngine {
                 .filter(|a| !a.deezer_id.trim().is_empty() && !followed.contains(&a.id))
                 .take(limit)
                 .collect();
+            return self.llm_rank_items("artists", &user_id.to_string(), fresh, |a| a.id.clone());
         }
 
         let prefiltered: Vec<(ArtistSummary, String, f64, f64, &str)> = summaries
@@ -1650,20 +1668,22 @@ impl TasteEngine {
             .collect();
 
         if scored.is_empty() {
-            return self
+            let fallback: Vec<ArtistSummary> = self
                 .store
                 .featured_artist_summaries(limit)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|a| !followed.contains(&a.id))
                 .collect();
+            return self.llm_rank_items("artists", &user_id.to_string(), fallback, |a| a.id.clone());
         }
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
         });
-        scored.into_iter().take(limit).map(|(_, a)| a).collect()
+        let ranked: Vec<ArtistSummary> = scored.into_iter().take(limit).map(|(_, a)| a).collect();
+        self.llm_rank_items("artists", &user_id.to_string(), ranked, |a| a.id.clone())
     }
 
     /// Synthesizes a mix built from the musical DNA across all of a user's curated playlists.
@@ -1718,6 +1738,7 @@ impl TasteEngine {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        let ranked = self.llm_rank_tracks("playlist_dna", &user_id.to_string(), ranked);
         dedup_and_interleave(ranked, limit, 2)
     }
 
@@ -1736,6 +1757,7 @@ impl TasteEngine {
             .chain(gems)
             .chain(fresh)
             .collect();
+        let pool = self.llm_rank_tracks("user_radio", &user_id.to_string(), pool);
         dedup_and_interleave(pool, limit, 2)
     }
 
@@ -1787,70 +1809,60 @@ impl TasteEngine {
         if user_id <= 0 {
             return;
         }
-        let specs: [(&str, &str, &str, &str, Vec<String>); 6] = [
+        let specs: [(&str, &str, &str, &str, Vec<Track>); 6] = [
             (
                 "supermix",
                 "My Supermix",
                 "Personalized blend of your favorites, playlists & fresh discoveries",
                 "supermix",
-                self.for_you_tracks(user_id, 35)
-                    .into_iter()
-                    .map(|t| t.id)
-                    .collect(),
+                self.for_you_tracks(user_id, 35),
             ),
             (
                 "discover",
                 "Discover Weekly",
                 "Fresh tracks tailored to your taste & playlists",
                 "discover",
-                self.discover_weekly(user_id, 30)
-                    .into_iter()
-                    .map(|t| t.id)
-                    .collect(),
+                self.discover_weekly(user_id, 30),
             ),
             (
                 "repeat",
                 "On Repeat",
                 "Songs you can't stop playing",
                 "repeat",
-                self.on_repeat_tracks(user_id, 25)
-                    .into_iter()
-                    .map(|t| t.id)
-                    .collect(),
+                self.on_repeat_tracks(user_id, 25),
             ),
             (
                 "gems",
                 "Forgotten Favorites",
                 "Loved & curated tracks you haven't spun lately",
                 "gems",
-                self.forgotten_gems(user_id, 25)
-                    .into_iter()
-                    .map(|t| t.id)
-                    .collect(),
+                self.forgotten_gems(user_id, 25),
             ),
             (
                 "playlist-dna",
                 "Playlist DNA",
                 "Synthesized from the styles inside your own playlists",
                 "playlist_dna",
-                self.playlist_dna_mix(user_id, 30)
-                    .into_iter()
-                    .map(|t| t.id)
-                    .collect(),
+                self.playlist_dna_mix(user_id, 30),
             ),
             (
                 "user-radio",
                 "My Radio",
                 "An evolving mix of the songs you keep coming back to",
                 "user_radio",
-                self.user_radio_tracks(user_id, 40)
-                    .into_iter()
-                    .map(|t| t.id)
-                    .collect(),
+                self.user_radio_tracks(user_id, 40),
             ),
         ];
 
-        for (suffix, title, comment, kind, ids) in specs {
+        for (suffix, title, comment, kind, tracks) in specs {
+            // The AI curator gets a final say over each auto-playlist's track
+            // order using a cached plan; no model call happens in this loop.
+            let ranked = self.llm_rank_tracks(
+                &format!("auto:{suffix}"),
+                &user_id.to_string(),
+                tracks,
+            );
+            let ids: Vec<String> = ranked.into_iter().map(|t| t.id).collect();
             let pid = format!("auto-u{}-{}", user_id, suffix);
             if !ids.is_empty() {
                 let _ = self
@@ -1869,10 +1881,13 @@ impl TasteEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Personalized "Mixed for you" rails (YouTube-Music-style numbered mixes)
+    // Personalized "Daily Mix" rails (once-a-day numbered mixes)
     // -----------------------------------------------------------------------
 
     const MIXED_FOR_YOU_PARTS: [&'static str; 4] = ["1", "2", "3", "supermix"];
+    /// Daily Mixes are rebuilt at most once per day; the AI curator refreshes
+    /// their preference plan on the same cadence when configured.
+    pub const DAILY_MIX_REFRESH_SECS: i64 = 24 * 3600;
 
     fn mixed_for_you_playlist_id(user_id: i64, mood_slug: &str, part: &str) -> String {
         format!("mixfu-u{}-{}-{}", user_id, mood_slug, part)
@@ -1909,11 +1924,8 @@ impl TasteEngine {
         if user_id <= 0 {
             return false;
         }
-        let dirty = self
-            .store
-            .kv_get(&format!("taste:dirty:{user_id}"))
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // Daily Mixes follow a fixed daily cadence — listening activity must
+        // not make them refresh more than once a day.
         let last_rebuilt = self
             .store
             .kv_get(&format!("mix4u:rebuilt_at:{user_id}"))
@@ -1925,7 +1937,7 @@ impl TasteEngine {
             .map(|pls| pls.iter().any(|p| p.kind.starts_with("mixed_for_you:")))
             .unwrap_or(false);
 
-        !has_mixes || dirty || (Utc::now().timestamp() - last_rebuilt) >= max_age_secs
+        !has_mixes || (Utc::now().timestamp() - last_rebuilt) >= max_age_secs
     }
 
     /// Rebuild the four personalized mixes in the background. Called by the
@@ -1936,6 +1948,7 @@ impl TasteEngine {
         }
         let mood = self.featured_mixed_for_you_mood(user_id);
         let slug = mood.slug();
+        let plan_context = format!("{}:{}", user_id, slug);
 
         // If the user's dominant mood changed, drop the old theme's cards so a
         // single rail never shows two different moods at once.
@@ -1961,6 +1974,29 @@ impl TasteEngine {
         if pool.len() < 12 {
             return;
         }
+        // Daily rebuild is the one place where a short, bounded AI call is
+        // allowed: it runs in the background curator, never in a user request.
+        // A fresh plan is produced first so today's mixes are AI-curated, with
+        // the deterministic pool as the fallback if the model is unavailable.
+        if self.llm.enabled() {
+            self.llm.invalidate_plan("mix4u", &plan_context);
+            let fresh = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.llm.generate_plan(
+                    "mix4u",
+                    &plan_context,
+                    &pool,
+                    &plan_hint("mix4u", &plan_context),
+                ),
+            )
+            .await
+            .ok()
+            .flatten();
+            if fresh.is_none() {
+                self.llm.queue_plan("mix4u", &plan_context);
+            }
+        }
+        let pool = self.llm_rank_tracks("mix4u", &plan_context, pool);
 
         // Three overlapping but distinct windows over the same ranked pool,
         // plus a best-of "Supermix" — the shape listeners expect from a
@@ -1974,11 +2010,8 @@ impl TasteEngine {
             let _ = self.store.upsert_auto_playlist(
                 &Self::mixed_for_you_playlist_id(user_id, slug, part),
                 user_id,
-                &format!("{} Mix {}", mood.mix_name(), idx + 1),
-                &format!(
-                    "A {} mix picked for you and refreshed in the background",
-                    mood.label()
-                ),
+                &format!("Daily Mix {}", idx + 1),
+                "A daily mix picked for you and refreshed once a day by the background curator",
                 &Self::mixed_for_you_kind(slug, part),
                 &ids,
             );
@@ -1991,11 +2024,8 @@ impl TasteEngine {
         let _ = self.store.upsert_auto_playlist(
             &Self::mixed_for_you_playlist_id(user_id, slug, "supermix"),
             user_id,
-            &format!("{} Supermix", mood.mix_name()),
-            &format!(
-                "The best of your {} mixes, kept fresh by the background curator",
-                mood.label()
-            ),
+            "Daily Mix Supermix",
+            "The best of your Daily Mixes, refreshed once a day by the background curator",
             &Self::mixed_for_you_kind(slug, "supermix"),
             &super_ids,
         );
@@ -2013,7 +2043,9 @@ impl TasteEngine {
             return;
         }
         let engine = self.clone();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), async move {
+        // Daily cadence means this runs rarely, so it can afford the bounded
+        // AI-plan refresh inside `rebuild_mixed_for_you`.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(25), async move {
             engine.rebuild_mixed_for_you(user_id).await;
         })
         .await;
@@ -2078,13 +2110,20 @@ impl TasteEngine {
                 }
             }
 
+            // The assistant's cached plan provides the card's subtitle while
+            // the numbered title/design stay deterministic and consistent.
+            let ai_subtitle = self
+                .llm_plan_text("mix4u", &format!("{}:{}", user_id, mood.slug()))
+                .and_then(|(_, subtitle)| {
+                    (!subtitle.trim().is_empty()).then(|| subtitle.trim().to_string())
+                });
             cards.push(MixedForYouCard {
                 id: p.id,
                 title: p.name,
                 art_title: if is_super {
-                    format!("{} Supermix", mood.mix_name())
+                    "Daily Mix Supermix".to_string()
                 } else {
-                    format!("{} Mix", mood.mix_name())
+                    "Daily Mix".to_string()
                 },
                 number: if is_super {
                     String::new()
@@ -2092,11 +2131,13 @@ impl TasteEngine {
                     format!("{:02}", part.parse::<usize>().unwrap_or(0))
                 },
                 is_super,
-                subtitle: if artists.is_empty() {
-                    mood.subtitle().to_string()
-                } else {
-                    artists.join(", ")
-                },
+                subtitle: ai_subtitle.unwrap_or_else(|| {
+                    if artists.is_empty() {
+                        mood.subtitle().to_string()
+                    } else {
+                        artists.join(", ")
+                    }
+                }),
                 covers,
                 c1: c1.to_string(),
                 c2: c2.to_string(),
@@ -2136,7 +2177,7 @@ impl TasteEngine {
         // Rebuild from the clean, chart-only slate produced above.
         self.rebuild_auto_playlists(user_id);
         // Bounded so a cold catalog never slows down account creation.
-        self.refresh_mixed_for_you_if_stale_async(user_id, 900).await;
+        self.refresh_mixed_for_you_if_stale_async(user_id, Self::DAILY_MIX_REFRESH_SECS).await;
     }
 
     /// Cold-start / periodic background warming using pure HTTP Deezer global + multi-genre charts,
@@ -2229,6 +2270,14 @@ impl TasteEngine {
                 self.enrich_user_listened_tracks(uid).await;
                 self.rebuild_auto_playlists_async(uid).await;
             }
+        }
+        // AI curation is fire-and-forget at startup so a slow endpoint can never
+        // hold up the first page load.
+        if self.llm.enabled() {
+            let warm = self.clone();
+            tokio::spawn(async move {
+                warm.curate_llm_background_step(1).await;
+            });
         }
         self.update_curator_status();
         info!(
@@ -2374,9 +2423,9 @@ impl TasteEngine {
                 let _ = self
                     .expand_taste_candidates_async(uid, std::time::Duration::from_secs(4))
                     .await;
-                // Refresh personalized mixes first: rebuilding the generic auto
-                // mixes clears the shared "taste dirty" flag.
-                self.refresh_mixed_for_you_if_stale_async(uid, 900).await;
+                // Daily Mixes run on their own once-a-day schedule; the generic
+                // auto mixes still refresh from listening activity.
+                self.refresh_mixed_for_you_if_stale_async(uid, Self::DAILY_MIX_REFRESH_SECS).await;
                 self.refresh_auto_playlists_if_stale_async(uid, 900).await;
             }
         }
@@ -2388,6 +2437,11 @@ impl TasteEngine {
             radio_engine.refresh_saved_user_radios();
         })
         .await;
+
+        // Optional AI curation runs last and entirely in this background task.
+        // The deterministic curator above has already produced usable pools,
+        // so the app stays fully functional even if the model is down.
+        self.curate_llm_background_step(tick).await;
 
         self.store.kv_set("curator:last_tick_at", &now.to_string());
         self.update_curator_status();
@@ -2579,12 +2633,484 @@ impl TasteEngine {
             "readyMixes": ready_mixes,
             "totalMixes": EXPLORE_MIX_SPECS.len(),
             "transformer": self.neural.status_snapshot(),
+            "llm": self.llm.stats_snapshot(),
         })
     }
 
     fn update_curator_status(&self) {
         let now = Utc::now().timestamp();
         self.store.kv_set("curator:last_tick_at", &now.to_string());
+    }
+}
+
+/// Background-only AI curation. None of these methods are awaited by a user
+/// request; they run inside the existing curator loop (or a startup task) so
+/// an unavailable / slow model can never delay search or playback.
+impl TasteEngine {
+    pub async fn curate_llm_background_step(&self, tick: usize) {
+        if !self.llm.enabled() {
+            return;
+        }
+        if tick % 4 == 0 {
+            self.llm_enrich_metadata().await;
+        }
+        self.llm_curate_one_pool(tick).await;
+        self.llm_warm_search_pools().await;
+        // Ranking plans drive radio, made-for-you rails, Explore and search.
+        self.llm_queue_standard_plans(tick);
+        self.llm_generate_pending_plans().await;
+    }
+
+    /// Ask the model to fill in missing genre / year / moods for catalog tracks.
+    async fn llm_enrich_metadata(&self) {
+        let store = self.store.clone();
+        let tracks = tokio::task::spawn_blocking(move || {
+            store.tracks_missing_metadata(12).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        if tracks.is_empty() {
+            return;
+        }
+        let suggestions = self.llm.enrich_metadata(&tracks).await;
+        if suggestions.is_empty() {
+            return;
+        }
+        let by_id: HashMap<String, &Track> = tracks
+            .iter()
+            .map(|t| (t.id.clone(), t))
+            .collect();
+        let valid_moods: HashSet<&str> = Mood::ALL.iter().map(|m| m.slug()).collect();
+        let mut updated = Vec::new();
+        for s in suggestions {
+            let Some(base) = by_id.get(&s.track_id) else {
+                continue;
+            };
+            let mut track = (*base).clone();
+            if track.genre.trim().is_empty() && !s.genre.trim().is_empty() {
+                track.genre = s.genre.trim().to_string();
+            }
+            if track.year <= 0 && s.year > 0 {
+                track.year = s.year;
+            }
+            if track.moods.trim().is_empty() {
+                let moods: Vec<String> = s
+                    .moods
+                    .iter()
+                    .map(|m| m.trim().to_ascii_lowercase().replace('-', "_").replace(' ', "_"))
+                    .filter(|m| valid_moods.contains(m.as_str()))
+                    .collect();
+                if !moods.is_empty() {
+                    track.moods = moods.join(",");
+                }
+            }
+            updated.push(track);
+        }
+        if !updated.is_empty() {
+            let count = updated.len();
+            let store = self.store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = store.upsert_tracks(&updated);
+            })
+            .await;
+            info!(count, "AI curator hydrated missing track metadata");
+        }
+    }
+
+    /// Let the model re-rank one mood or Explore pool per tick, replacing the
+    /// deterministic curated IDs only when it returns a healthy selection.
+    async fn llm_curate_one_pool(&self, tick: usize) {
+        let (cache_key, label, query, mut candidates) = if tick % 2 == 0 {
+            let mood = Mood::ALL[(tick / 2) % Mood::ALL.len()];
+            let cache_key = mood_cache_key(mood);
+            let cached = self.load_curated_pool_ids(&cache_key, 0);
+            let mut tracks = self.store.get_tracks_by_ids(&cached).unwrap_or_default();
+            tracks.extend(self.store.tracks_by_mood(mood, 40, 0).unwrap_or_default());
+            (
+                cache_key,
+                format!("mood:{}", mood.slug()),
+                format!("{} music", mood.label()),
+                tracks,
+            )
+        } else {
+            let spec = EXPLORE_MIX_SPECS[(tick / 2) % EXPLORE_MIX_SPECS.len()];
+            let cache_key = explore_cache_key(spec.key);
+            let cached = self.load_curated_pool_ids(&cache_key, 0);
+            let tracks = self.store.get_tracks_by_ids(&cached).unwrap_or_default();
+            (
+                cache_key,
+                format!("explore:{}", spec.key),
+                spec.query.to_string(),
+                tracks,
+            )
+        };
+        dedup_tracks_by_id(&mut candidates);
+        if candidates.len() < 8 {
+            return;
+        }
+        if let Some(ids) = self.llm.curate_pool(&label, &query, &candidates).await {
+            if ids.len() >= 8 {
+                self.save_curated_pool(&cache_key, &ids);
+                info!(label = %label, tracks = ids.len(), "AI curator refreshed a mix pool");
+            }
+        }
+    }
+
+    /// Turn search queries people actually typed into warm, LLM-ranked pools.
+    /// Live search only reads the resulting SQLite rows — no model call is ever
+    /// made on the request path.
+    async fn llm_warm_search_pools(&self) {
+        let queries = self.llm.take_pending_queries(2);
+        if queries.is_empty() {
+            return;
+        }
+        for query in queries {
+            let expansions = self.llm.query_expansions(&query).await;
+            let mut search_queries = vec![query.clone()];
+            search_queries.extend(expansions);
+            let mut pool = self.load_curated_query_tracks(&query);
+            for sq in search_queries.into_iter().take(3) {
+                let batches = tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    self.sources.deezer.fetch_curated_mix_tracks(&sq, 2, 20),
+                )
+                .await
+                .unwrap_or_default();
+                for (_, batch) in batches {
+                    pool.extend(batch);
+                }
+            }
+            dedup_tracks_by_id(&mut pool);
+            if pool.len() < 8 {
+                continue;
+            }
+            let to_save = pool.clone();
+            let store = self.store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = store.upsert_tracks(&to_save);
+            })
+            .await;
+            if let Some(ids) = self
+                .llm
+                .curate_pool(&format!("query:{}", query), &query, &pool)
+                .await
+            {
+                if ids.len() >= 8 {
+                    self.save_curated_pool(&query_cache_key(&query), &ids);
+                    info!(query = %query, tracks = ids.len(), "AI curator warmed a search pool");
+                }
+            }
+            // A cached search plan lets the live endpoint re-rank results
+            // instantly without ever contacting the model.
+            let _ = self
+                .llm
+                .generate_plan("search", &query, &pool, &plan_hint("search", &query))
+                .await;
+        }
+    }
+}
+
+fn dedup_tracks_by_id(tracks: &mut Vec<Track>) {
+    let mut seen = HashSet::new();
+    tracks.retain(|t| seen.insert(t.id.clone()));
+}
+
+/// Request-time application of cached AI preference plans, plus the
+/// background job that produces them. Request paths only ever read SQLite;
+/// the model is called exclusively from the curator loop.
+impl TasteEngine {
+    pub fn llm_rank_tracks(&self, scope: &str, context: &str, tracks: Vec<Track>) -> Vec<Track> {
+        if !self.llm.enabled() || tracks.len() < 2 {
+            return tracks;
+        }
+        if let Some(plan) = self.llm.cached_plan(scope, context) {
+            return crate::llm::apply_plan(&plan, tracks, |t| t.id.clone());
+        }
+        self.llm.queue_plan(scope, context);
+        tracks
+    }
+
+    /// Read-only variant for the search path: never queues work or calls out.
+    pub fn llm_rank_cached(&self, scope: &str, context: &str, tracks: Vec<Track>) -> Vec<Track> {
+        if !self.llm.enabled() {
+            return tracks;
+        }
+        match self.llm.cached_plan(scope, context) {
+            Some(plan) => crate::llm::apply_plan(&plan, tracks, |t| t.id.clone()),
+            None => tracks,
+        }
+    }
+
+    pub fn llm_rank_items<T, F>(&self, scope: &str, context: &str, items: Vec<T>, id_of: F) -> Vec<T>
+    where
+        F: Fn(&T) -> String,
+    {
+        if !self.llm.enabled() || items.len() < 2 {
+            return items;
+        }
+        if let Some(plan) = self.llm.cached_plan(scope, context) {
+            return crate::llm::apply_plan(&plan, items, id_of);
+        }
+        self.llm.queue_plan(scope, context);
+        items
+    }
+
+    pub fn llm_rank_items_cached<T, F>(
+        &self,
+        scope: &str,
+        context: &str,
+        items: Vec<T>,
+        id_of: F,
+    ) -> Vec<T>
+    where
+        F: Fn(&T) -> String,
+    {
+        if !self.llm.enabled() {
+            return items;
+        }
+        match self.llm.cached_plan(scope, context) {
+            Some(plan) => crate::llm::apply_plan(&plan, items, id_of),
+            None => items,
+        }
+    }
+
+    pub fn llm_plan_text(&self, scope: &str, context: &str) -> Option<(String, String)> {
+        self.llm.plan_text(scope, context)
+    }
+
+    /// Queue a rotating set of standard plans so popular surfaces are ready
+    /// before anyone asks for them.
+    fn llm_queue_standard_plans(&self, tick: usize) {
+        if !self.llm.enabled() {
+            return;
+        }
+        let Ok(uids) = self.store.all_user_ids() else {
+            return;
+        };
+        if uids.is_empty() {
+            return;
+        }
+        const USER_SCOPES: &[&str] = &[
+            "for_you", "discover", "on_repeat", "gems", "related", "artists", "mix4u", "mood",
+        ];
+        for i in 0..uids.len().min(2) {
+            let uid = uids[(tick + i) % uids.len()];
+            let scope = USER_SCOPES[(tick + i) % USER_SCOPES.len()];
+            let context = match scope {
+                "mix4u" | "mood" => format!("{}:{}", uid, self.featured_mixed_for_you_mood(uid).slug()),
+                _ => uid.to_string(),
+            };
+            self.llm.queue_plan(scope, &context);
+            let mode = ["default", "familiar", "discover"][(tick + i) % 3];
+            self.llm.queue_plan("radio", &format!("{}:{}", uid, mode));
+        }
+        const GLOBALS: [(&str, &str); 4] = [
+            ("explore", "charts"),
+            ("explore", "albums"),
+            ("explore", "artists"),
+            ("explore", "genres"),
+        ];
+        let (scope, context) = GLOBALS[tick % GLOBALS.len()];
+        self.llm.queue_plan(scope, context);
+    }
+
+    async fn llm_generate_pending_plans(&self) {
+        let pending = self.llm.take_pending_plans(4);
+        for (scope, context) in pending {
+            let candidates = self.plan_candidates(&scope, &context).await;
+            if candidates.len() < 3 {
+                continue;
+            }
+            let hint = plan_hint(&scope, &context);
+            let _ = self
+                .llm
+                .generate_plan(&scope, &context, &candidates, &hint)
+                .await;
+        }
+    }
+
+    /// Builds the candidate universe for a plan. Never calls the LLM and never
+    /// runs on a user request — only from the background curator task.
+    async fn plan_candidates(&self, scope: &str, context: &str) -> Vec<Track> {
+        let mut parts = context.splitn(2, ':');
+        let uid = parts.next().unwrap_or("").parse::<i64>().unwrap_or(0);
+        let tail = parts.next().unwrap_or("");
+        let store = self.store.clone();
+        let mut tracks = if uid > 0 {
+            tokio::task::spawn_blocking(move || {
+                store
+                    .candidate_tracks_for_user(uid, 240)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || store.popular_chart_tracks(160).unwrap_or_default())
+                .await
+                .unwrap_or_default()
+        };
+
+        match scope {
+            "mood" | "mix4u" => {
+                if let Some(mood) = Mood::from_slug(tail) {
+                    let store = self.store.clone();
+                    let local = tokio::task::spawn_blocking(move || {
+                        store.tracks_by_mood(mood, 80, 0).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let mut merged = Vec::new();
+                    let mut seen = HashSet::new();
+                    for t in local.into_iter().chain(tracks) {
+                        if seen.insert(t.id.clone()) {
+                            merged.push(t);
+                        }
+                    }
+                    tracks = merged;
+                }
+            }
+            "genre" => {
+                let store = self.store.clone();
+                let genre = tail.to_string();
+                let local = tokio::task::spawn_blocking(move || {
+                    store.tracks_by_genre(&genre, 80, 0).unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                let mut merged = Vec::new();
+                let mut seen = HashSet::new();
+                for t in local.into_iter().chain(tracks) {
+                    if seen.insert(t.id.clone()) {
+                        merged.push(t);
+                    }
+                }
+                tracks = merged;
+            }
+            "search" => {
+                let cached = self.load_curated_query_tracks(context);
+                if cached.len() >= 3 {
+                    tracks = cached;
+                }
+            }
+            "genre_artists" => {
+                let found = self.sources.deezer.search_artists(tail, 30).await;
+                tracks = found
+                    .into_iter()
+                    .map(|a| Track {
+                        id: a.id,
+                        title: a.name,
+                        ..Default::default()
+                    })
+                    .collect();
+            }
+            "playlist" => {
+                let store = self.store.clone();
+                let playlist_id = context.to_string();
+                let found = tokio::task::spawn_blocking(move || {
+                    store.playlist_tracks(&playlist_id).unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                if found.len() >= 3 {
+                    tracks = found;
+                }
+            }
+            "explore" => match tail {
+                "charts" => {
+                    let store = self.store.clone();
+                    tracks = tokio::task::spawn_blocking(move || {
+                        store.popular_chart_tracks(80).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                }
+                "albums" => {
+                    let store = self.store.clone();
+                    let summaries = tokio::task::spawn_blocking(move || {
+                        store.build_album_summaries(0).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    tracks = summaries
+                        .into_iter()
+                        .map(|a| Track {
+                            id: a.id,
+                            title: a.name,
+                            ..Default::default()
+                        })
+                        .collect();
+                }
+                "artists" => {
+                    let store = self.store.clone();
+                    let summaries = tokio::task::spawn_blocking(move || {
+                        store.build_artist_summaries().unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    tracks = summaries
+                        .into_iter()
+                        .map(|a| Track {
+                            id: a.id,
+                            title: a.name,
+                            ..Default::default()
+                        })
+                        .collect();
+                }
+                "genres" => {
+                    let genres = self.sources.deezer.fetch_genres().await;
+                    tracks = genres
+                        .into_iter()
+                        .map(|g| Track {
+                            id: g.name.clone(),
+                            title: g.name,
+                            ..Default::default()
+                        })
+                        .collect();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        dedup_tracks_by_id(&mut tracks);
+        tracks
+    }
+}
+
+fn plan_hint(scope: &str, context: &str) -> String {
+    let tail = context.splitn(2, ':').nth(1).unwrap_or("");
+    match scope {
+        "for_you" => "the best overall mix of this listener's favorites and fresh discoveries".into(),
+        "discover" => "fresh, unheard, adventurous tracks this listener is likely to love".into(),
+        "on_repeat" => "songs this listener keeps playing on repeat".into(),
+        "gems" => "beloved older tracks this listener hasn't played lately".into(),
+        "related" => "tracks connected to this listener's taste graph and radio history".into(),
+        "artists" => "artists this listener is most likely to enjoy next".into(),
+        "radio" => match tail {
+            "familiar" => "familiar, well-loved songs the listener knows by heart",
+            "discover" => "new and unfamiliar tracks that still fit the listener's taste",
+            _ => "tracks that keep the current vibe going",
+        }
+        .into(),
+        "mix4u" | "mood" => format!("a coherent {tail} mood mix"),
+        "explore_mix" => format!("the essential tracks and artists of a {tail} decade mix"),
+        "genre" => format!("the very best tracks in the {tail} genre"),
+        "genre_artists" => format!("the most interesting artists in the {tail} genre"),
+        "search" => format!("the most relevant matches for the search query: {context}"),
+        "playlist" => "tracks that fit this playlist's DNA and lead to nearby discoveries".into(),
+        "explore" => match tail {
+            "charts" => "currently popular tracks worth featuring",
+            "albums" => "albums worth featuring in Explore",
+            "artists" => "artists worth featuring in Explore",
+            "genres" => "genres worth featuring in Explore",
+            _ => "tracks worth featuring in Explore",
+        }
+        .into(),
+        "auto" => "tracks for a personalized auto-playlist".into(),
+        s if s.starts_with("auto:") => {
+            format!("tracks for the {s} personalized auto-playlist")
+        }
+        _ => "tracks this listener is most likely to enjoy".into(),
     }
 }
 
@@ -2859,6 +3385,11 @@ impl TasteEngine {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ordered: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        let ordered = self.llm_rank_tracks(
+            "explore_mix",
+            &format!("{}:{}", user_id, spec.key),
+            ordered,
+        );
         dedup_and_interleave(ordered, limit, 2)
     }
 
@@ -4385,6 +4916,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             }
             ranked
         };
+        let ranked = self.llm_rank_tracks("mood", &format!("{}:{}", user_id, mood.slug()), ranked);
         if user_id > 0 && !ranked.is_empty() {
             let ids: Vec<String> = ranked.iter().map(|t| t.id.clone()).collect();
             self.save_curated_pool(&mood_user_cache_key(user_id, mood), &ids);
@@ -4829,6 +5361,7 @@ impl TasteEngine {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        let ranked = self.llm_rank_tracks("playlist", playlist_id, ranked);
         dedup_and_interleave(ranked, limit, 2)
     }
 
@@ -5023,7 +5556,36 @@ impl TasteEngine {
         .await
     }
 
+    /// Upcoming-track selection. The deterministic engine builds a coherent,
+    /// already-deduped candidate list; the AI curator then gets the final say
+    /// using a cached per-user/per-mode preference plan.
     pub async fn radio_next_tracks_with_mode(
+        &self,
+        user_id: i64,
+        seed: Option<&Track>,
+        exclude_ids: &HashSet<String>,
+        client_recent: &[(String, i64)],
+        count: usize,
+        mode: RadioMode,
+    ) -> Vec<Track> {
+        let picks = self
+            .radio_next_tracks_deterministic(
+                user_id,
+                seed,
+                exclude_ids,
+                client_recent,
+                count,
+                mode,
+            )
+            .await;
+        self.llm_rank_tracks(
+            "radio",
+            &format!("{}:{}", user_id, mode.key()),
+            picks,
+        )
+    }
+
+    async fn radio_next_tracks_deterministic(
         &self,
         user_id: i64,
         seed: Option<&Track>,
@@ -11058,13 +11620,17 @@ mod tests {
 
         let cards = taste.mixed_for_you_cards(u.id);
         assert_eq!(cards.len(), 4, "cards: {:?}", cards.iter().map(|c| &c.title).collect::<Vec<_>>());
-        assert_eq!(cards[0].title, "Energy Mix 1");
+        assert_eq!(cards[0].title, "Daily Mix 1");
         assert_eq!(cards[0].number, "01");
-        assert_eq!(cards[3].title, "Energy Supermix");
+        assert_eq!(cards[3].title, "Daily Mix Supermix");
         assert!(cards[3].is_super);
         assert!(cards[3].number.is_empty());
         assert_eq!(cards[0].covers.len(), 4);
         assert!(cards[0].subtitle.contains("Energy Artist"));
+        // Daily Mixes follow a once-a-day cadence: fresh listening signals must
+        // not trigger an early rebuild.
+        taste.mark_taste_dirty(u.id);
+        assert!(!taste.mixed_for_you_needs_refresh(u.id, TasteEngine::DAILY_MIX_REFRESH_SECS));
 
         let p1 = store.playlist_tracks(&cards[0].id).unwrap();
         let p2 = store.playlist_tracks(&cards[1].id).unwrap();

@@ -172,6 +172,7 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 .collect::<Vec<_>>(),
             "maxTrackBytes": state.engine.max_track_bytes,
             "qualityHunter": state.quality_hunter.stats_json(),
+            "llm": state.taste.llm.stats_snapshot(),
         })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -192,6 +193,7 @@ pub async fn config(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "cacheGb": std::env::var("BEATLAB_CACHE_GB").unwrap_or_else(|_| "5.0".to_string()),
         "listenAddr": std::env::var("BEATLAB_ADDR").unwrap_or_else(|_| "0.0.0.0:4533".to_string()),
         "webauthnEnabled": crate::auth::webauthn().is_some(),
+        "llm": state.taste.llm.config_snapshot(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
