@@ -9,9 +9,13 @@ use std::collections::{HashMap, HashSet};
 use tracing::info;
 
 pub fn split_genres(raw: &str) -> Vec<String> {
-    raw.split([',', ';', '/'])
+    let normalized = raw
+        .replace("Films/Games", "Soundtrack")
+        .replace("films/games", "soundtrack");
+    normalized
+        .split([',', ';', '/'])
         .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s != "all")
         .collect()
 }
 
@@ -93,6 +97,12 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "bedroom pop",
             "easy listening",
             "lounge",
+            "reggae",
+            "dub",
+            "brazilian music",
+            "mpb",
+            "ambient pop",
+            "soft rock",
         ],
     ),
     (
@@ -112,6 +122,12 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "new age",
             "soundscape",
             "soundtrack",
+            "soundtracks",
+            "films/games",
+            "film score",
+            "video game",
+            "post-rock",
+            "post rock",
             "score",
             "drone",
             "focus",
@@ -125,6 +141,11 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "metal",
             "heavy metal",
             "hard rock",
+            "j-rock",
+            "jrock",
+            "pop punk",
+            "alt metal",
+            "nu metal",
             "punk",
             "hardcore",
             "drum and bass",
@@ -172,6 +193,20 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "kpop",
             "j-pop",
             "jpop",
+            "c-pop",
+            "cpop",
+            "city pop",
+            "asian music",
+            "japanese music",
+            "korean music",
+            "anime",
+            "latin",
+            "latin music",
+            "afrobeats",
+            "afropop",
+            "indie pop",
+            "pop rock",
+            "power pop",
             "happy",
             "sunshine",
             "summer",
@@ -213,6 +248,12 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "rave",
             "eurodance",
             "uk garage",
+            "reggaeton",
+            "salsa",
+            "cumbia",
+            "bachata",
+            "merengue",
+            "amapiano",
         ],
     ),
     (
@@ -226,6 +267,9 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "country",
             "singer-songwriter",
             "singer songwriter",
+            "singer & songwriter",
+            "chanson",
+            "traditional",
             "unplugged",
             "bluegrass",
         ],
@@ -235,6 +279,7 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
         &[
             "funk",
             "soul",
+            "soul & funk",
             "jazz",
             "r&b",
             "rnb",
@@ -249,11 +294,22 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "nu-disco",
             "boogie",
             "gospel",
+            "african music",
+            "afrobeats",
+            "afropop",
+            "amapiano",
+            "reggae",
+            "blues",
+            "brazilian music",
+            "latin",
+            "salsa",
+            "cumbia",
         ],
     ),
     (
         Mood::RockIndie,
         &[
+            "rock",
             "indie",
             "indie rock",
             "indie pop",
@@ -261,6 +317,17 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
             "alternative",
             "alt-rock",
             "alt rock",
+            "hard rock",
+            "classic rock",
+            "pop rock",
+            "punk rock",
+            "j-rock",
+            "jrock",
+            "k-rock",
+            "prog rock",
+            "progressive rock",
+            "folk rock",
+            "blues rock",
             "shoegaze",
             "grunge",
             "britpop",
@@ -2093,6 +2160,8 @@ impl TasteEngine {
             dz.fetch_genre_chart_tracks(85, "Alternative", 20),
         );
 
+        let mut chart_tracks = chart_tracks;
+        dz.enrich_track_genres(&mut chart_tracks).await;
         let global_chart_tracks = chart_tracks.clone();
         let mut all_tracks = chart_tracks;
         let mut genre_chart_tracks = Vec::new();
@@ -2152,6 +2221,7 @@ impl TasteEngine {
 
         if let Ok(uids) = self.store.all_user_ids() {
             for uid in uids {
+                self.enrich_user_listened_tracks(uid).await;
                 self.rebuild_auto_playlists_async(uid).await;
             }
         }
@@ -2162,6 +2232,29 @@ impl TasteEngine {
             model_loss = train_stats.avg_loss,
             "catalog warming & neural transformer warm-up complete"
         );
+    }
+
+    /// Enriches any tracks in a user's listening history that are missing `genre`, `year`, or `moods`
+    /// using Deezer album metadata and artist album lookup, persisting the enriched metadata to SQLite.
+    pub async fn enrich_user_listened_tracks(&self, user_id: i64) {
+        if user_id <= 0 {
+            return;
+        }
+        let store = self.store.clone();
+        let mut missing = tokio::task::spawn_blocking(move || {
+            store.user_tracks_missing_metadata(user_id, 64).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        if missing.is_empty() {
+            return;
+        }
+        self.sources.deezer.enrich_track_genres(&mut missing).await;
+        let store = self.store.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = store.upsert_tracks(&missing);
+        })
+        .await;
     }
 
     /// Runs one incremental background curation cycle even when no user is actively listening:
@@ -3156,14 +3249,31 @@ impl TasteEngine {
 
     /// Ensures a full album is loaded into SQLite (hydrating from Deezer if it only has stubs).
     pub async fn get_or_hydrate_album(&self, album_id: &str) -> Option<(AlbumSummary, Vec<Track>)> {
+        self.get_or_hydrate_album_with_hints(album_id, None, None).await
+    }
+
+    pub async fn get_or_hydrate_album_with_hints(
+        &self,
+        album_id: &str,
+        name_hint: Option<&str>,
+        artist_hint: Option<&str>,
+    ) -> Option<(AlbumSummary, Vec<Track>)> {
         let existing_tracks = self.store.album_tracks(album_id).unwrap_or_default();
         let existing_meta = self.store.get_album_meta(album_id).ok().flatten();
 
+        let local_summary = self.store.album_summary_by_id(0, album_id).ok().flatten();
+
         // Determine if we know a Deezer album ID to hydrate full tracklist from.
-        let dz_album_id = existing_meta
+        let mut dz_album_id = existing_meta
             .as_ref()
             .map(|m| m.deezer_id.clone())
             .filter(|id| !id.is_empty())
+            .or_else(|| {
+                local_summary
+                    .as_ref()
+                    .map(|s| s.deezer_id.clone())
+                    .filter(|id| !id.is_empty())
+            })
             .or_else(|| {
                 album_id
                     .strip_prefix("dz:")
@@ -3179,6 +3289,67 @@ impl TasteEngine {
                 })
             });
 
+        let hint_pair = existing_meta
+            .as_ref()
+            .map(|m| (m.artist.clone(), m.name.clone()))
+            .or_else(|| {
+                local_summary
+                    .as_ref()
+                    .map(|s| (s.artist.clone(), s.name.clone()))
+            })
+            .or_else(|| {
+                existing_tracks
+                    .first()
+                    .map(|t| (t.artist.clone(), t.album.clone()))
+            })
+            .or_else(|| {
+                let nh = name_hint.map(str::trim).filter(|s| !s.is_empty())?;
+                let ah = artist_hint.map(str::trim).unwrap_or("");
+                Some((ah.to_string(), nh.to_string()))
+            });
+
+        if dz_album_id.is_none() && existing_tracks.len() <= 2 {
+            if let Some((ref artist_name, ref album_name)) = hint_pair {
+                let alb_clean = album_name.trim();
+                if !alb_clean.is_empty() {
+                    let pa = primary_artist(artist_name);
+                    let q = if pa.is_empty() {
+                        alb_clean.to_string()
+                    } else {
+                        format!("{} {}", pa, alb_clean)
+                    };
+                    let want_alb_slug = slug(alb_clean);
+                    let want_art_slug = slug(&pa);
+                    let want_inst = alb_clean.to_lowercase().contains("instrumental");
+                    let candidates = self.sources.deezer.search_albums(&q, 10).await;
+                    dz_album_id = candidates
+                        .into_iter()
+                        .filter(|a| !a.deezer_id.is_empty())
+                        .filter(|a| {
+                            let cand_inst = a.name.to_lowercase().contains("instrumental");
+                            want_inst == cand_inst
+                        })
+                        .find(|a| {
+                            slug(&a.name) == want_alb_slug
+                                && (want_art_slug.is_empty()
+                                    || slug(&primary_artist(&a.artist)) == want_art_slug)
+                        })
+                        .map(|a| a.deezer_id);
+                }
+            } else if let Some(rest) = album_id.strip_prefix("al:dz-") {
+                if let Some((dz_aid, alb_slug)) = rest.split_once('-') {
+                    if !dz_aid.is_empty() && !alb_slug.is_empty() {
+                        if let Some((_, _, albs, _)) = self.sources.deezer.fetch_artist(dz_aid).await {
+                            dz_album_id = albs
+                                .into_iter()
+                                .find(|a| slug(&a.name) == alb_slug && !a.deezer_id.is_empty())
+                                .map(|a| a.deezer_id);
+                        }
+                    }
+                }
+            }
+        }
+
         if existing_tracks.len() <= 2 {
             if let Some(ref dz_id) = dz_album_id {
                 if let Some((meta, tracks)) = self.sources.deezer.fetch_album(dz_id).await {
@@ -3191,7 +3362,7 @@ impl TasteEngine {
             }
         }
 
-        if let Some(summary) = self.store.album_summary_by_id(0, album_id).ok().flatten() {
+        if let Some(summary) = local_summary.or_else(|| self.store.album_summary_by_id(0, album_id).ok().flatten()) {
             let tracks = if existing_tracks.is_empty() {
                 self.store.album_tracks(&summary.id).unwrap_or_default()
             } else {
@@ -3207,6 +3378,58 @@ impl TasteEngine {
                 let _ = self.store.upsert_tracks(&tracks);
                 let upgraded = self.upgrade_album_from_soulseek(&meta, tracks).await;
                 return Some((meta, upgraded));
+            }
+        }
+
+        if let Some((artist_name, album_name)) = hint_pair {
+            let alb_clean = album_name.trim();
+            if !alb_clean.is_empty() {
+                let pa = primary_artist(&artist_name);
+                let q = if pa.is_empty() {
+                    alb_clean.to_string()
+                } else {
+                    format!("{} {}", pa, alb_clean)
+                };
+                let mut tracks = existing_tracks;
+                if tracks.is_empty() {
+                    let found = self.sources.search_all(&q, 15).await;
+                    let want_alb_slug = slug(alb_clean);
+                    let want_art_slug = slug(&pa);
+                    for t in found {
+                        let t_alb_slug = slug(&t.album);
+                        let t_title_slug = slug(&crate::models::core_song_title(&t.title));
+                        let art_ok = want_art_slug.is_empty()
+                            || slug(&primary_artist(&t.artist)) == want_art_slug;
+                        if art_ok && (t_alb_slug == want_alb_slug || t_title_slug == want_alb_slug) {
+                            tracks.push(t);
+                        }
+                    }
+                    if !tracks.is_empty() {
+                        let _ = self.store.upsert_tracks(&tracks);
+                    }
+                }
+                if !tracks.is_empty() {
+                    let first = &tracks[0];
+                    let summary = AlbumSummary {
+                        id: first.album_id(),
+                        name: alb_clean.to_string(),
+                        artist: first.artist.clone(),
+                        artist_id: first.artist_id(),
+                        cover_id: first.id.clone(),
+                        cover_url: first.cover_url.clone(),
+                        genre: first.genre.clone(),
+                        year: first.year,
+                        label: String::new(),
+                        deezer_id: String::new(),
+                        song_count: tracks.len(),
+                        duration: tracks.iter().map(|t| t.duration.max(0)).sum(),
+                        play_count: 0,
+                        last_played: 0,
+                        created: first.created,
+                    };
+                    let _ = self.store.upsert_album_meta(&summary);
+                    return Some((summary, tracks));
+                }
             }
         }
         None
@@ -3312,6 +3535,15 @@ impl TasteEngine {
         artist_id: &str,
         user_id: i64,
     ) -> Option<(ArtistSummary, Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
+        self.get_or_hydrate_artist_with_hint(artist_id, user_id, None).await
+    }
+
+    pub async fn get_or_hydrate_artist_with_hint(
+        &self,
+        artist_id: &str,
+        user_id: i64,
+        name_hint: Option<&str>,
+    ) -> Option<(ArtistSummary, Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
         let local_summary = self.store.artist_summary_by_id(artist_id).ok().flatten();
         let stored_for_id = self.store.artist_tracks(artist_id).unwrap_or_default();
         let search_name = local_summary
@@ -3322,6 +3554,11 @@ impl TasteEngine {
                 stored_for_id
                     .first()
                     .map(|t| primary_artist(&t.artist))
+                    .filter(|n| !n.trim().is_empty())
+            })
+            .or_else(|| {
+                name_hint
+                    .map(primary_artist)
                     .filter(|n| !n.trim().is_empty())
             })
             .unwrap_or_else(|| {
@@ -3406,10 +3643,36 @@ impl TasteEngine {
             m.clone()
         } else if let Some(s) = local_summary.clone() {
             s
+        } else if !stored_for_id.is_empty() || !search_name.trim().is_empty() {
+            let fallback_name = if !search_name.trim().is_empty() {
+                search_name.clone()
+            } else {
+                primary_artist(&stored_for_id[0].artist)
+            };
+            let fallback_id = if let Some(ref dz_id) = dz_artist_id {
+                format!("ar:dz:{}", dz_id)
+            } else if let Some(first) = stored_for_id.first() {
+                first.artist_id()
+            } else {
+                artist_id.to_string()
+            };
+            ArtistSummary {
+                id: fallback_id,
+                name: fallback_name,
+                cover_url: stored_for_id
+                    .iter()
+                    .find_map(|t| (!t.cover_url.trim().is_empty()).then(|| t.cover_url.clone()))
+                    .unwrap_or_default(),
+                bio: String::new(),
+                deezer_id: dz_artist_id.clone().unwrap_or_default(),
+                album_count: 0,
+                song_count: stored_for_id.len(),
+            }
         } else {
             return None;
         };
 
+        let had_hydrated = hydrated.is_some();
         let mut dz_top_tracks = Vec::new();
         let mut dz_albums = Vec::new();
         let mut related = Vec::new();
@@ -3498,6 +3761,17 @@ impl TasteEngine {
         }
         if meta.album_count < merged_albums.len() {
             meta.album_count = merged_albums.len();
+        }
+        if meta.cover_url.trim().is_empty() {
+            if let Some(c) = final_tracks
+                .iter()
+                .find_map(|t| (!t.cover_url.trim().is_empty()).then(|| t.cover_url.clone()))
+            {
+                meta.cover_url = c;
+            }
+        }
+        if final_tracks.is_empty() && merged_albums.is_empty() && local_summary.is_none() && !had_hydrated {
+            return None;
         }
         Some((meta, final_tracks, merged_albums, related))
     }

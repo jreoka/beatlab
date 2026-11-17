@@ -442,11 +442,59 @@ pub fn compute_stats_from_data(
             .map(|dt| dt.timestamp())
     });
 
-    // Build canonical track lookup across all events so any referenced track retains metadata.
+    // Build canonical track lookup across all events so any referenced track retains metadata,
+    // and propagate known genre/year/moods across same-song and same-artist events.
     let mut track_lookup: HashMap<String, Track> = HashMap::new();
+    let mut song_meta_lookup: HashMap<String, (String, i32, String)> = HashMap::new();
+    let mut artist_genre_lookup: HashMap<String, String> = HashMap::new();
     for ev in events {
         if let Some(ref t) = ev.track {
-            track_lookup.entry(ev.track_id.clone()).or_insert_with(|| t.clone());
+            let sk = canonical_song_key(t, &ev.track_id);
+            song_meta_lookup
+                .entry(sk)
+                .and_modify(|(g, y, m)| {
+                    if g.is_empty() && !t.genre.trim().is_empty() {
+                        *g = t.genre.clone();
+                    }
+                    if *y <= 0 && t.year > 0 {
+                        *y = t.year;
+                    }
+                    if m.is_empty() && !t.moods.trim().is_empty() {
+                        *m = t.moods.clone();
+                    }
+                })
+                .or_insert_with(|| (t.genre.clone(), t.year, t.moods.clone()));
+            if !t.genre.trim().is_empty() {
+                let pa = primary_artist(&t.artist).to_lowercase();
+                if !pa.is_empty() {
+                    artist_genre_lookup
+                        .entry(pa)
+                        .or_insert_with(|| t.genre.clone());
+                }
+            }
+            track_lookup
+                .entry(ev.track_id.clone())
+                .or_insert_with(|| t.clone());
+        }
+    }
+    for t in track_lookup.values_mut() {
+        let sk = canonical_song_key(t, &t.id);
+        if let Some((sg, sy, sm)) = song_meta_lookup.get(&sk) {
+            if t.genre.trim().is_empty() && !sg.trim().is_empty() {
+                t.genre = sg.clone();
+            }
+            if t.year <= 0 && *sy > 0 {
+                t.year = *sy;
+            }
+            if t.moods.trim().is_empty() && !sm.trim().is_empty() {
+                t.moods = sm.clone();
+            }
+        }
+        if t.genre.trim().is_empty() {
+            let pa = primary_artist(&t.artist).to_lowercase();
+            if let Some(ag) = artist_genre_lookup.get(&pa) {
+                t.genre = ag.clone();
+            }
         }
     }
 
@@ -662,13 +710,19 @@ pub fn compute_stats_from_data(
                 }
             }
 
-            let moods_raw = if t.moods.trim().is_empty() {
-                classify_moods_str(&t.title, &t.album, &t.genre, "")
-            } else {
+            let classified_moods = classify_moods_str(&t.title, &t.album, &t.genre, "");
+            let moods_raw = if !classified_moods.is_empty() {
+                classified_moods
+            } else if !t.moods.trim().is_empty() {
                 t.moods.clone()
+            } else {
+                String::new()
             };
             let mut seen_moods = HashSet::new();
             for m in moods_raw.split(',').filter_map(Mood::from_slug) {
+                if !crate::taste::is_track_compatible_with_mood(t, "", m) {
+                    continue;
+                }
                 if seen_moods.insert(m.slug()) {
                     let me = mood_counts.entry(m.slug().to_string()).or_insert((0, 0));
                     me.0 += 1;
@@ -679,13 +733,18 @@ pub fn compute_stats_from_data(
             let mut seen_genres = HashSet::new();
             for g in split_genres(&t.genre) {
                 let clean = g.trim();
-                if clean.is_empty() || !seen_genres.insert(clean.to_string()) {
+                if clean.is_empty() {
+                    continue;
+                }
+                let display_name = title_case_genre(clean);
+                let norm_key = display_name.to_lowercase();
+                if norm_key.is_empty() || !seen_genres.insert(norm_key.clone()) {
                     continue;
                 }
                 let ge = genre_counts
-                    .entry(clean.to_string())
+                    .entry(norm_key)
                     .or_insert_with(|| GenreAccum {
-                        display_name: title_case_genre(clean),
+                        display_name,
                         streams: 0,
                         secs: 0,
                         song_keys: HashSet::new(),
@@ -901,6 +960,7 @@ pub fn compute_stats_from_data(
     genres.sort_by(|a, b| b.streams.cmp(&a.streams).then(b.secs.cmp(&a.secs)));
     genres.truncate(12);
 
+    let total_decade_streams: usize = decade_counts.values().map(|v| v.0).sum();
     let decades: Vec<DecadeStat> = decade_counts
         .into_iter()
         .map(|(dec, (streams, secs))| DecadeStat {
@@ -908,7 +968,7 @@ pub fn compute_stats_from_data(
             label: format!("{}s", dec),
             streams,
             secs,
-            pct: pct(streams, total_streams),
+            pct: pct(streams, total_decade_streams),
         })
         .collect();
 
@@ -1683,22 +1743,41 @@ fn title_case_genre(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "edm" => "EDM".to_string(),
         "idm" => "IDM".to_string(),
+        "mpb" => "MPB".to_string(),
         "r&b" | "rnb" => "R&B".to_string(),
         "uk garage" => "UK Garage".to_string(),
-        "dnb" => "Drum & Bass".to_string(),
+        "dnb" | "drum & bass" | "drum and bass" => "Drum & Bass".to_string(),
         "k-pop" | "kpop" => "K-Pop".to_string(),
         "j-pop" | "jpop" => "J-Pop".to_string(),
+        "c-pop" | "cpop" => "C-Pop".to_string(),
+        "j-rock" | "jrock" => "J-Rock".to_string(),
+        "k-rock" | "krock" => "K-Rock".to_string(),
         "lo-fi" | "lofi" => "Lo-Fi".to_string(),
         "hip-hop" | "hip hop" => "Hip-Hop".to_string(),
         "synth-pop" | "synthpop" => "Synth-Pop".to_string(),
+        "alt-rock" | "alt rock" => "Alt-Rock".to_string(),
+        "post-punk" | "post punk" => "Post-Punk".to_string(),
+        "post-rock" | "post rock" => "Post-Rock".to_string(),
+        "neo-soul" | "neosoul" | "neo soul" => "Neo-Soul".to_string(),
+        "nu-disco" | "nu disco" => "Nu-Disco".to_string(),
+        "trip-hop" | "trip hop" => "Trip-Hop".to_string(),
+        "singer-songwriter" | "singer songwriter" | "singer & songwriter" => {
+            "Singer-Songwriter".to_string()
+        }
+        "films/games" | "soundtracks" => "Soundtrack".to_string(),
         other => other
             .split_whitespace()
             .map(|word| {
-                let mut ch = word.chars();
-                match ch.next() {
-                    Some(c) => format!("{}{}", c.to_uppercase(), ch.as_str()),
-                    None => String::new(),
-                }
+                word.split('-')
+                    .map(|part| {
+                        let mut ch = part.chars();
+                        match ch.next() {
+                            Some(c) => format!("{}{}", c.to_uppercase(), ch.as_str()),
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("-")
             })
             .collect::<Vec<_>>()
             .join(" "),
@@ -2023,5 +2102,76 @@ mod tests {
         assert_eq!(stats_7d.summary.new_artists_discovered, 1);
         assert_eq!(stats_7d.summary.discovery_rate_pct, 50.0);
         assert_eq!(stats_7d.timeline.points.len(), 7);
+    }
+
+    #[test]
+    fn stats_propagates_album_and_artist_genres_and_moods_for_untagged_streams() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("genre_user", "pw123").unwrap();
+
+        // Streamed YTM track has no genre or year, while its album meta in SQLite has Alternative / 2026.
+        let ytm_track = Track {
+            id: "ytm:aizo".into(),
+            source: "ytm".into(),
+            title: "AIZO".into(),
+            artist: "King Gnu".into(),
+            album: "AIZO".into(),
+            genre: String::new(),
+            moods: String::new(),
+            year: 0,
+            duration: 215,
+            bitrate: 192,
+            format: "m4a".into(),
+            ..Default::default()
+        };
+        // Another streamed track by the same artist has no album match, so it inherits the artist's genre.
+        let ytm_other = Track {
+            id: "ytm:specialz".into(),
+            source: "ytm".into(),
+            title: "SPECIALZ".into(),
+            artist: "King Gnu".into(),
+            album: "Unknown Single".into(),
+            genre: String::new(),
+            moods: "party".into(), // stale unverified tag should be replaced by classified genre mood
+            year: 2023,
+            duration: 238,
+            bitrate: 192,
+            format: "m4a".into(),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[ytm_track.clone(), ytm_other.clone()]).unwrap();
+        store
+            .upsert_album_meta(&crate::models::AlbumSummary {
+                id: "al:dz-12944623-aizo".into(),
+                name: "AIZO".into(),
+                artist: "King Gnu".into(),
+                artist_id: "ar:dz:12944623".into(),
+                genre: "Alternative, J-Rock".into(),
+                year: 2026,
+                deezer_id: "875208692".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        store.record_event(u.id, &ytm_track.id, "complete", 1.0).unwrap();
+        store.record_event(u.id, &ytm_other.id, "complete", 1.0).unwrap();
+
+        let now_ts = Utc::now().timestamp();
+        let stats = build_user_stats(&store, &u, StatsRange::All, 0, now_ts);
+
+        assert_eq!(stats.summary.total_streams, 2);
+        let genre_names: Vec<&str> = stats.genres.iter().map(|g| g.name.as_str()).collect();
+        assert!(genre_names.contains(&"Alternative"), "genres={:?}", genre_names);
+        assert!(genre_names.contains(&"J-Rock"), "genres={:?}", genre_names);
+
+        let rock_mood = stats.moods.iter().find(|m| m.slug == "rock_indie").unwrap();
+        assert_eq!(rock_mood.streams, 2);
+        let party_mood = stats.moods.iter().find(|m| m.slug == "party").unwrap();
+        assert_eq!(party_mood.streams, 0);
+
+        assert_eq!(stats.decades.len(), 1);
+        assert_eq!(stats.decades[0].decade, 2020);
+        assert_eq!(stats.decades[0].pct, 100.0);
+        assert_eq!(stats.newest_track.as_ref().unwrap().year, 2026);
     }
 }

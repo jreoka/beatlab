@@ -1411,25 +1411,58 @@ pub async fn search(
 
     let mut combined = [all_tracks, raw_tracks_extra].concat();
     crate::sources::disambiguate_batch_tracks(&mut combined, &dz_artists);
+    if !dz_albums.is_empty() {
+        for t in &mut combined {
+            if !t.genre.trim().is_empty() && t.year > 0 {
+                continue;
+            }
+            let dz_aid = t.deezer_album_id();
+            let want_slug = crate::models::slug(&t.album);
+            if let Some(alb) = dz_albums.iter().find(|a| {
+                (dz_aid.is_some() && dz_aid.as_deref() == Some(a.deezer_id.as_str()))
+                    || (!want_slug.is_empty() && crate::models::slug(&a.name) == want_slug)
+            }) {
+                if t.genre.trim().is_empty() && !alb.genre.trim().is_empty() {
+                    t.genre = alb.genre.clone();
+                }
+                if t.year <= 0 && alb.year > 0 {
+                    t.year = alb.year;
+                }
+                if !t.genre.trim().is_empty() && t.moods.trim().is_empty() {
+                    t.moods = crate::taste::classify_moods_str(&t.title, &t.album, &t.genre, "");
+                }
+            }
+        }
+    }
 
     if !combined.is_empty() || !dz_albums.is_empty() || !dz_artists.is_empty() {
         let store = state.store.clone();
-        let save_tracks = combined.clone();
+        let dz = state.sources.deezer.clone();
+        let mut save_tracks = combined.clone();
         let save_albums = dz_albums.clone();
         let save_artists = dz_artists.clone();
         tokio::spawn(async move {
+            let store_first = store.clone();
+            let initial_tracks = save_tracks.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                if !save_tracks.is_empty() {
-                    let _ = store.upsert_tracks(&save_tracks);
+                if !initial_tracks.is_empty() {
+                    let _ = store_first.upsert_tracks(&initial_tracks);
                 }
                 for a in &save_albums {
-                    let _ = store.upsert_album_meta(a);
+                    let _ = store_first.upsert_album_meta(a);
                 }
                 for ar in &save_artists {
-                    let _ = store.upsert_artist_meta(ar);
+                    let _ = store_first.upsert_artist_meta(ar);
                 }
             })
             .await;
+            if save_tracks.iter().any(|t| t.genre.trim().is_empty() || t.year <= 0) {
+                dz.enrich_track_genres(&mut save_tracks).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = store.upsert_tracks(&save_tracks);
+                })
+                .await;
+            }
         });
     }
 
@@ -2300,16 +2333,27 @@ async fn build_instant_mix_response(
     )
 }
 
+#[derive(Deserialize, Default)]
+pub struct EntityHintQuery {
+    pub name: Option<String>,
+    pub artist: Option<String>,
+}
+
 pub async fn album_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<EntityHintQuery>,
     headers: HeaderMap,
 ) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some((album, tracks)) = state.taste.get_or_hydrate_album(&id).await else {
+    let Some((album, tracks)) = state
+        .taste
+        .get_or_hydrate_album_with_hints(&id, q.name.as_deref(), q.artist.as_deref())
+        .await
+    else {
         return err_res(StatusCode::NOT_FOUND, "Album not found");
     };
     let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
@@ -2322,14 +2366,17 @@ pub async fn album_detail(
 pub async fn artist_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<EntityHintQuery>,
     headers: HeaderMap,
 ) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some((artist, top_tracks, albums, related)) =
-        state.taste.get_or_hydrate_artist(&id, user.id).await
+    let Some((artist, top_tracks, albums, related)) = state
+        .taste
+        .get_or_hydrate_artist_with_hint(&id, user.id, q.name.as_deref())
+        .await
     else {
         return err_res(StatusCode::NOT_FOUND, "Artist not found");
     };
@@ -2421,6 +2468,7 @@ pub async fn stats(
     let uid = user.id;
     let range = crate::stats::StatsRange::from_str(q.range.as_deref());
     let tz = q.tz.unwrap_or(0);
+    state.taste.enrich_user_listened_tracks(uid).await;
     let store = state.store.clone();
     let user_clone = user.clone();
 
@@ -2854,6 +2902,18 @@ pub async fn record_event(
         .taste
         .record_event(user.id, &req.track_id, &req.kind, req.value);
     if let Ok(Some(t)) = state.store.get_track(&req.track_id) {
+        if t.genre.trim().is_empty() || t.year <= 0 {
+            let dz = state.sources.deezer.clone();
+            let store = state.store.clone();
+            let mut batch = vec![t.clone()];
+            tokio::spawn(async move {
+                dz.enrich_track_genres(&mut batch).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = store.upsert_tracks(&batch);
+                })
+                .await;
+            });
+        }
         if req.kind == "play" {
             let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
             np.insert(user.id, (t, Utc::now().timestamp(), user.username));

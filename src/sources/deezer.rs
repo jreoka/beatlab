@@ -245,12 +245,7 @@ impl DeezerSource {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Various Artists".to_string());
         let cover_url = album.best_cover();
-        let genre = album
-            .genres
-            .as_ref()
-            .and_then(|g| g.data.first())
-            .map(|g| g.name.trim().to_string())
-            .unwrap_or_default();
+        let genre = album.resolved_genre();
         let year = parse_year(&album.release_date);
 
         let fallback_album = DzTrackAlbum {
@@ -334,15 +329,6 @@ impl DeezerSource {
         let artist_obj: DzArtist = r_info?;
         let mut summary = artist_obj.clone().into_summary()?;
 
-        let top_tracks: Vec<Track> = r_top
-            .map(|d| {
-                d.data
-                    .into_iter()
-                    .filter_map(|t| t.into_track(None, &summary.name, artist_obj.id, 0, ""))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         let mut albums: Vec<AlbumSummary> = r_albums
             .map(|d| {
                 d.data
@@ -357,6 +343,57 @@ impl DeezerSource {
             })
             .unwrap_or_default();
         albums.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
+
+        let mut album_by_dz_id: HashMap<u64, (i32, String)> = HashMap::new();
+        let mut album_by_slug: HashMap<String, (i32, String)> = HashMap::new();
+        let mut genre_freq: HashMap<String, usize> = HashMap::new();
+        for alb in &albums {
+            if let Ok(dz_id) = alb.deezer_id.parse::<u64>() {
+                if dz_id > 0 {
+                    album_by_dz_id.insert(dz_id, (alb.year, alb.genre.clone()));
+                }
+            }
+            let s = slug(&alb.name);
+            if !s.is_empty() {
+                album_by_slug
+                    .entry(s)
+                    .or_insert_with(|| (alb.year, alb.genre.clone()));
+            }
+            if !alb.genre.trim().is_empty() {
+                *genre_freq.entry(alb.genre.clone()).or_insert(0) += 1;
+            }
+        }
+        let artist_fallback_genre = genre_freq
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(g, _)| g)
+            .unwrap_or_default();
+
+        let top_tracks: Vec<Track> = r_top
+            .map(|d| {
+                d.data
+                    .into_iter()
+                    .filter_map(|t| {
+                        let (alb_year, alb_genre) = t
+                            .album
+                            .as_ref()
+                            .and_then(|a| {
+                                album_by_dz_id
+                                    .get(&a.id)
+                                    .or_else(|| album_by_slug.get(&slug(&a.title)))
+                            })
+                            .cloned()
+                            .unwrap_or((0, String::new()));
+                        let use_genre = if !alb_genre.trim().is_empty() {
+                            alb_genre.as_str()
+                        } else {
+                            artist_fallback_genre.as_str()
+                        };
+                        t.into_track(None, &summary.name, artist_obj.id, alb_year, use_genre)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let related: Vec<ArtistSummary> = r_related
             .map(|d| d.data.into_iter().filter_map(|a| a.into_summary()).collect())
@@ -502,58 +539,151 @@ impl DeezerSource {
     /// Deezer's search/playlist endpoints omit the album genre from track objects, so every
     /// remote candidate arrives with an empty `genre`. That makes genre-clash validation of
     /// curated instant mixes impossible (a mis-tagged "Jrock" playlist full of rap tracks
-    /// would be trusted purely because its *title* matched). Fill the missing genre from
-    /// each distinct album's primary Deezer genre. Results are cached by `get_json`, so
-    /// repeated albums across playlists are cheap.
+    /// would be trusted purely because its *title* matched). Fill the missing genre and release
+    /// year from each distinct album's Deezer metadata (and artist album search fallback for
+    /// non-Deezer tracks), then recompute moods. Results are cached by `get_json`.
     pub async fn enrich_track_genres(&self, tracks: &mut [Track]) {
         let mut album_ids: Vec<u64> = tracks
             .iter()
-            .filter(|t| t.source == "deezer" && t.genre.trim().is_empty())
+            .filter(|t| t.genre.trim().is_empty() || t.year <= 0)
             .filter_map(|t| t.deezer_album_id().and_then(|id| id.parse::<u64>().ok()))
             .filter(|&id| id > 0)
             .collect();
         album_ids.sort_unstable();
         album_ids.dedup();
-        if album_ids.is_empty() {
-            return;
-        }
-        // Bound the work: a genre mix pulls a few curated batches of ~24 tracks each.
+        // Bound the work: a genre mix or stats batch pulls up to 64 distinct albums.
         album_ids.truncate(64);
 
-        let lookup = async {
-            let futs = album_ids.into_iter().map(|id| async move {
-                let url = format!("https://api.deezer.com/album/{}", id);
-                let genre = self
-                    .get_json::<DzAlbumFull>(&url)
+        if !album_ids.is_empty() {
+            let lookup = async {
+                let futs = album_ids.into_iter().map(|id| async move {
+                    let url = format!("https://api.deezer.com/album/{}", id);
+                    let info = self.get_json::<DzAlbumFull>(&url).await.map(|a| {
+                        let g = a.resolved_genre();
+                        let y = parse_year(&a.release_date);
+                        (g, y)
+                    });
+                    (id, info)
+                });
+                futures::future::join_all(futs).await
+            };
+            let by_album: HashMap<u64, (String, i32)> =
+                tokio::time::timeout(Duration::from_secs(5), lookup)
                     .await
-                    .and_then(|a| a.genres)
-                    .and_then(|g| g.data.into_iter().next())
-                    .map(|g| g.name.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                (id, genre)
-            });
-            futures::future::join_all(futs).await
-        };
-        let by_album: HashMap<u64, String> = tokio::time::timeout(Duration::from_secs(5), lookup)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(id, g)| g.map(|g| (id, g)))
-            .collect();
-        if by_album.is_empty() {
-            return;
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(id, info)| info.map(|v| (id, v)))
+                    .collect();
+
+            for t in tracks.iter_mut() {
+                if let Some((genre, year)) = t
+                    .deezer_album_id()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .and_then(|id| by_album.get(&id))
+                {
+                    if t.genre.trim().is_empty() && !genre.is_empty() {
+                        t.genre = genre.clone();
+                    }
+                    if t.year <= 0 && *year > 0 {
+                        t.year = *year;
+                    }
+                }
+            }
+        }
+
+        // Fallback for tracks (e.g. YTM / Soulseek or untagged singles) that still lack a genre:
+        // query Deezer's album search by primary artist name so `genre_id` on their albums fills it.
+        let mut missing_artists: Vec<String> = Vec::new();
+        let mut seen_artists: HashSet<String> = HashSet::new();
+        for t in tracks.iter() {
+            if !t.genre.trim().is_empty() {
+                continue;
+            }
+            let pa = crate::models::primary_artist(&t.artist);
+            let key = slug(&pa);
+            if !pa.is_empty() && !key.is_empty() && seen_artists.insert(key) {
+                missing_artists.push(pa);
+                if missing_artists.len() >= 16 {
+                    break;
+                }
+            }
+        }
+
+        if !missing_artists.is_empty() {
+            let artist_lookup = async {
+                let futs = missing_artists.into_iter().map(|art| async move {
+                    let albs = self.search_albums(&art, 10).await;
+                    (slug(&art), albs)
+                });
+                futures::future::join_all(futs).await
+            };
+            let by_artist: HashMap<String, Vec<AlbumSummary>> =
+                tokio::time::timeout(Duration::from_secs(4), artist_lookup)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(_, albs)| !albs.is_empty())
+                    .collect();
+
+            for t in tracks.iter_mut() {
+                if !t.genre.trim().is_empty() {
+                    continue;
+                }
+                let art_slug = slug(&crate::models::primary_artist(&t.artist));
+                let Some(albs) = by_artist.get(&art_slug) else {
+                    continue;
+                };
+                let matching: Vec<&AlbumSummary> = albs
+                    .iter()
+                    .filter(|a| slug(&crate::models::primary_artist(&a.artist)) == art_slug)
+                    .collect();
+                let pool: Vec<&AlbumSummary> = if matching.is_empty() {
+                    albs.iter().collect()
+                } else {
+                    matching
+                };
+                let want_alb_slug = slug(&t.album);
+                let exact_alb = (!want_alb_slug.is_empty())
+                    .then(|| pool.iter().copied().find(|a| slug(&a.name) == want_alb_slug))
+                    .flatten();
+                if let Some(alb) = exact_alb {
+                    if !alb.genre.trim().is_empty() {
+                        t.genre = alb.genre.clone();
+                    }
+                    if t.year <= 0 && alb.year > 0 {
+                        t.year = alb.year;
+                    }
+                }
+                if t.genre.trim().is_empty() {
+                    let mut freq: HashMap<&str, usize> = HashMap::new();
+                    for a in &pool {
+                        let g = a.genre.trim();
+                        if !g.is_empty() {
+                            *freq.entry(g).or_insert(0) += 1;
+                        }
+                    }
+                    if let Some((best_g, _)) = freq.into_iter().max_by_key(|(_, c)| *c) {
+                        t.genre = best_g.to_string();
+                    }
+                }
+                if t.deezer_artist_id().is_none() {
+                    if let Some(dz_aid) = pool
+                        .iter()
+                        .filter(|a| slug(&crate::models::primary_artist(&a.artist)) == art_slug)
+                        .find_map(|a| a.artist_id.strip_prefix("ar:dz:"))
+                    {
+                        t.set_deezer_artist_id(dz_aid);
+                    }
+                }
+            }
         }
 
         for t in tracks.iter_mut() {
-            if t.source != "deezer" || !t.genre.trim().is_empty() {
-                continue;
-            }
-            if let Some(genre) = t
-                .deezer_album_id()
-                .and_then(|id| id.parse::<u64>().ok())
-                .and_then(|id| by_album.get(&id))
-            {
-                t.genre = genre.clone();
+            if !t.genre.trim().is_empty() {
+                let classified = classify_moods_str(&t.title, &t.album, &t.genre, "");
+                if !classified.is_empty() || t.moods.trim().is_empty() {
+                    t.moods = classified;
+                }
             }
         }
     }
@@ -889,6 +1019,8 @@ struct DzAlbum {
     #[serde(default)]
     release_date: String,
     #[serde(default)]
+    genre_id: i64,
+    #[serde(default)]
     nb_tracks: usize,
     #[serde(default)]
     artist: Option<DzArtist>,
@@ -924,7 +1056,7 @@ impl DzAlbum {
             artist,
             cover_id: aid,
             cover_url,
-            genre: String::new(),
+            genre: deezer_genre_name(self.genre_id).to_string(),
             year: parse_year(&self.release_date),
             label: String::new(),
             deezer_id: self.id.to_string(),
@@ -954,6 +1086,8 @@ struct DzAlbumFull {
     #[serde(default)]
     release_date: String,
     #[serde(default)]
+    genre_id: i64,
+    #[serde(default)]
     artist: Option<DzArtist>,
     #[serde(default)]
     genres: Option<DzDataList<DzGenreName>>,
@@ -968,6 +1102,66 @@ impl DzAlbumFull {
             self.cover_big.clone(),
             self.cover_medium.clone(),
         ])
+    }
+
+    fn resolved_genre(&self) -> String {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(ref g) = self.genres {
+            for item in &g.data {
+                let raw = item.name.trim();
+                if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+                    continue;
+                }
+                let mapped = if raw.eq_ignore_ascii_case("films/games") {
+                    "Soundtrack"
+                } else {
+                    raw
+                };
+                if !names.iter().any(|existing| existing.eq_ignore_ascii_case(mapped)) {
+                    names.push(mapped.to_string());
+                }
+            }
+        }
+        if names.is_empty() {
+            let fallback = deezer_genre_name(self.genre_id);
+            if !fallback.is_empty() {
+                return fallback.to_string();
+            }
+        }
+        names.join(", ")
+    }
+}
+
+pub fn deezer_genre_name(genre_id: i64) -> &'static str {
+    match genre_id {
+        2 => "Afrobeats",
+        16 => "Asian Music",
+        65 => "Regional Mexican, Latin",
+        67 => "Salsa, Latin",
+        71 => "Cumbia, Latin",
+        75 => "Brazilian Music",
+        81 => "Indian Music",
+        84 => "Country",
+        85 => "Alternative",
+        95 => "Kids",
+        98 => "Classical",
+        106 => "Electro",
+        113 => "Dance",
+        116 => "Rap/Hip Hop",
+        122 => "Reggaeton",
+        129 => "Jazz",
+        132 => "Pop",
+        144 => "Reggae",
+        152 => "Rock",
+        153 => "Blues",
+        165 => "R&B",
+        169 => "Soul & Funk",
+        173 => "Soundtrack",
+        186 => "Christian",
+        197 => "Latin Music",
+        464 => "Metal",
+        466 => "Folk",
+        _ => "",
     }
 }
 

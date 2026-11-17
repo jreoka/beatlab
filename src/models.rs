@@ -267,6 +267,19 @@ impl Track {
         format!("ar:{}", slug(name))
     }
 
+    pub fn matches_artist_id(&self, want_id: &str) -> bool {
+        if self.artist_id() == want_id {
+            return true;
+        }
+        if let Some(dz_aid) = want_id.strip_prefix("ar:dz:") {
+            return self.deezer_artist_id().as_deref() == Some(dz_aid);
+        }
+        if let Some(ytm_aid) = want_id.strip_prefix("ar:ytm:") {
+            return self.ytm_artist_id().as_deref() == Some(ytm_aid);
+        }
+        false
+    }
+
     pub fn album_id(&self) -> String {
         let alb = if self.album.trim().is_empty() {
             &self.title
@@ -286,6 +299,33 @@ impl Track {
             &pa
         };
         format!("al:{}", slug(&format!("{}|{}", art, alb)))
+    }
+
+    pub fn matches_album_id(&self, want_id: &str) -> bool {
+        if self.album_id() == want_id {
+            return true;
+        }
+        let alb = if self.album.trim().is_empty() {
+            &self.title
+        } else {
+            &self.album
+        };
+        let alb_slug = slug(alb);
+        if want_id.starts_with("al:dz-") {
+            if let Some(dz_aid) = self.deezer_artist_id() {
+                if format!("al:dz-{}-{}", dz_aid, alb_slug) == want_id {
+                    return true;
+                }
+            }
+        }
+        if want_id.starts_with("al:ytm-") {
+            if let Some(ytm_aid) = self.ytm_artist_id() {
+                if format!("al:ytm-{}-{}", slug(&ytm_aid), alb_slug) == want_id {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn is_lossless(&self) -> bool {

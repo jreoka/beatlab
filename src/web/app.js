@@ -8,6 +8,8 @@
   let vizSource = null;
   let vizData = null;
   let vizStream = null;
+  let vizBoundTrack = null;
+  let vizMode = '';
   let vizUnavailable = false;
 
   const ICONS = {
@@ -714,43 +716,82 @@
   }
 
   function ensureVisualizerAnalyser() {
-    if (vizUnavailable || vizAnalyser) {
-      if (vizCtx && vizCtx.state === 'suspended' && audio && !audio.paused) {
-        vizCtx.resume().catch(() => {});
-      }
+    if (vizUnavailable || !audio) return;
+    if (vizCtx && vizCtx.state === 'suspended' && !audio.paused) {
+      vizCtx.resume().catch(() => {});
+    }
+    if (vizAnalyser && vizMode === 'element') {
       return;
     }
     const AC = window.AudioContext || window.webkitAudioContext;
-    const capture =
-      audio && typeof audio.captureStream === 'function'
-        ? () => audio.captureStream()
-        : audio && typeof audio.mozCaptureStream === 'function'
-          ? () => audio.mozCaptureStream()
-          : null;
-    if (!AC || !capture) {
+    if (!AC) {
       vizUnavailable = true;
       return;
     }
+    const isMobileUa = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '');
     try {
-      if (!vizStream) {
-        vizStream = capture();
-      }
-      if (!vizStream || vizStream.getAudioTracks().length === 0) {
-        return;
-      }
       if (!vizCtx) {
         vizCtx = new AC();
+        audio.addEventListener('play', () => {
+          if (vizCtx && vizCtx.state === 'suspended') {
+            vizCtx.resume().catch(() => {});
+          }
+        });
       }
       if (vizCtx.state === 'suspended') {
         vizCtx.resume().catch(() => {});
       }
+      if (!vizAnalyser) {
+        vizAnalyser = vizCtx.createAnalyser();
+        vizAnalyser.fftSize = 256;
+        vizAnalyser.smoothingTimeConstant = 0.78;
+        vizData = new Uint8Array(vizAnalyser.frequencyBinCount);
+      }
+      if (!isMobileUa && typeof vizCtx.createMediaElementSource === 'function') {
+        vizSource = vizCtx.createMediaElementSource(audio);
+        vizSource.connect(vizAnalyser);
+        vizAnalyser.connect(vizCtx.destination);
+        vizMode = 'element';
+        return;
+      }
+      const capture =
+        typeof audio.captureStream === 'function'
+          ? () => audio.captureStream()
+          : typeof audio.mozCaptureStream === 'function'
+            ? () => audio.mozCaptureStream()
+            : null;
+      if (!capture) {
+        if (typeof vizCtx.createMediaElementSource === 'function' && !vizSource) {
+          vizSource = vizCtx.createMediaElementSource(audio);
+          vizSource.connect(vizAnalyser);
+          vizAnalyser.connect(vizCtx.destination);
+          vizMode = 'element';
+        } else {
+          vizUnavailable = true;
+        }
+        return;
+      }
+      let liveTrack =
+        vizStream && vizStream.getAudioTracks().find((t) => t.readyState === 'live');
+      if (!liveTrack) {
+        vizStream = capture();
+        liveTrack =
+          vizStream && vizStream.getAudioTracks().find((t) => t.readyState === 'live');
+      }
+      if (!liveTrack) {
+        return;
+      }
+      if (vizMode === 'stream' && vizBoundTrack === liveTrack && vizSource) {
+        return;
+      }
+      if (vizSource) {
+        try {
+          vizSource.disconnect();
+        } catch {}
+      }
       vizSource = vizCtx.createMediaStreamSource(vizStream);
-      vizAnalyser = vizCtx.createAnalyser();
-      vizAnalyser.fftSize = 256;
-      vizAnalyser.smoothingTimeConstant = 0.78;
-      vizData = new Uint8Array(vizAnalyser.frequencyBinCount);
-      // Route into a 0-gain node so Chromium pulls the analyser graph without
-      // duplicating or hijacking native <audio> background/lock-screen output.
+      vizBoundTrack = liveTrack;
+      vizMode = 'stream';
       const silentGain = vizCtx.createGain();
       silentGain.gain.value = 0;
       vizSource.connect(vizAnalyser);
@@ -778,17 +819,8 @@
       if (playing && audio.readyState >= 2) {
         ensureVisualizerAnalyser();
       }
-      let hasSignal = false;
       if (playing && vizAnalyser && vizData) {
         vizAnalyser.getByteFrequencyData(vizData);
-        for (let k = 0; k < vizData.length; k++) {
-          if (vizData[k] > 0) {
-            hasSignal = true;
-            break;
-          }
-        }
-      }
-      if (hasSignal) {
         const usableBins = Math.max(1, Math.floor(vizData.length * 0.65));
         for (let i = 0; i < bars; i++) {
           const bin = Math.min(
@@ -800,14 +832,8 @@
           ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
         }
       } else {
-        // Fallback synthetic animation when captureStream is unavailable (e.g. iOS Safari)
-        // or before audio frames arrive.
-        const t = (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000;
         for (let i = 0; i < bars; i++) {
-          const wave = playing
-            ? 0.18 + 0.45 * Math.abs(Math.sin(t * 2.1 + i * 0.42)) + 0.25 * Math.abs(Math.sin(t * 3.6 - i * 0.27))
-            : 0.08;
-          const h = Math.min(canvas.height, Math.max(3, wave * canvas.height * 0.9));
+          const h = Math.max(3, canvas.height * 0.06);
           ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
         }
       }
@@ -2385,7 +2411,26 @@
     const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading album & tracklist...');
     try {
-      const d = await api(`/api/web/album/${encodeURIComponent(id)}`, { signal });
+      let hintName = '';
+      let hintArtist = '';
+      const cur = currentTrack();
+      if (cur && cur.albumId === id) {
+        hintName = cur.album || '';
+        hintArtist = cur.artist || '';
+      } else {
+        for (const t of state.trackMap.values()) {
+          if (t.albumId === id) {
+            hintName = t.album || '';
+            hintArtist = t.artist || '';
+            break;
+          }
+        }
+      }
+      const qs = new URLSearchParams();
+      if (hintName) qs.set('name', hintName);
+      if (hintArtist) qs.set('artist', hintArtist);
+      const qStr = qs.toString() ? `?${qs.toString()}` : '';
+      const d = await api(`/api/web/album/${encodeURIComponent(id)}${qStr}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const alb = d.album;
       const tracks = cacheTracks(d.tracks || []);
@@ -2435,7 +2480,20 @@
     const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading artist profile...');
     try {
-      const d = await api(`/api/web/artist/${encodeURIComponent(id)}`, { signal });
+      let hintName = '';
+      const cur = currentTrack();
+      if (cur && cur.artistId === id) {
+        hintName = cur.artist || '';
+      } else {
+        for (const t of state.trackMap.values()) {
+          if (t.artistId === id) {
+            hintName = t.artist || '';
+            break;
+          }
+        }
+      }
+      const qStr = hintName ? `?name=${encodeURIComponent(hintName)}` : '';
+      const d = await api(`/api/web/artist/${encodeURIComponent(id)}${qStr}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const art = d.artist;
       const top = cacheTracks(d.topTracks || []);
