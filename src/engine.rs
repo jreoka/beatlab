@@ -114,6 +114,8 @@ impl StreamEngine {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(12))
             .timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(8)
             .redirect(reqwest::redirect::Policy::limited(8))
             .build()
             .unwrap_or_default();
@@ -123,6 +125,8 @@ impl StreamEngine {
         let stream_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .read_timeout(Duration::from_secs(45))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(8)
             .redirect(reqwest::redirect::Policy::limited(8))
             .build()
             .unwrap_or_default();
@@ -563,18 +567,29 @@ impl StreamEngine {
                 webpage_url,
                 cacheable,
             } => {
-                if cacheable {
-                    self.spawn_background_cache(&track.id, &url, &headers, &ext);
+                let resp = self
+                    .serve_remote_http_range(
+                        track,
+                        &url,
+                        &headers,
+                        &content_type,
+                        &webpage_url,
+                        range_hdr.as_deref(),
+                    )
+                    .await;
+                if cacheable
+                    && (resp.status().is_success() || resp.status() == StatusCode::PARTIAL_CONTENT)
+                {
+                    // Delay background disk caching slightly so the initial playback range request
+                    // gets full upstream bandwidth and starts immediately.
+                    let this = self.clone();
+                    let tid = track.id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        this.spawn_background_cache(&tid, &url, &headers, &ext);
+                    });
                 }
-                self.serve_remote_http_range(
-                    track,
-                    &url,
-                    &headers,
-                    &content_type,
-                    &webpage_url,
-                    range_hdr.as_deref(),
-                )
-                .await
+                resp
             }
         }
     }
@@ -772,12 +787,13 @@ impl StreamEngine {
         };
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-loglevel", "error"]);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-fflags", "+nobuffer"]);
         let safe_offset = sanitize_time_offset(time_offset);
         if safe_offset > 0.5 {
             cmd.args(["-ss", &format!("{:.2}", safe_offset)]);
         }
         if input_arg.starts_with("http://") || input_arg.starts_with("https://") {
+            cmd.args(["-probesize", "1048576", "-analyzeduration", "1500000"]);
             let mut ua = String::new();
             let mut hdr_blob = String::new();
             for (k, v) in &custom_headers {
@@ -794,7 +810,7 @@ impl StreamEngine {
                 cmd.args(["-headers", &hdr_blob]);
             }
         }
-        cmd.args(["-i", &input_arg, "-vn", "-map_metadata", "-1"]);
+        cmd.args(["-i", &input_arg, "-vn", "-map_metadata", "-1", "-flush_packets", "1"]);
 
         match fmt {
             "opus" => {
@@ -824,7 +840,15 @@ impl StreamEngine {
                 ]);
             }
             "flac" => {
-                cmd.args(["-c:a", "flac", "-f", "flac", "pipe:1"]);
+                cmd.args([
+                    "-c:a",
+                    "flac",
+                    "-compression_level",
+                    "0",
+                    "-f",
+                    "flac",
+                    "pipe:1",
+                ]);
             }
             "aac" | "m4a" => {
                 cmd.args([
@@ -1603,7 +1627,7 @@ async fn serve_local_file_range(
                 return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
             }
             let limited = file.take(len);
-            let stream = ReaderStream::new(limited);
+            let stream = ReaderStream::with_capacity(limited, 65536);
             return Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, content_type)
@@ -1628,7 +1652,7 @@ async fn serve_local_file_range(
     let Ok(file) = File::open(path).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::with_capacity(file, 65536);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -1706,7 +1730,7 @@ fn stream_child_stdout(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let stream = ChildStdoutStream {
-        reader: ReaderStream::new(stdout),
+        reader: ReaderStream::with_capacity(stdout, 65536),
         _child: child,
         _permit: permit,
     };

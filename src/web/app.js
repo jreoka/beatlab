@@ -4176,12 +4176,19 @@
       state.queueWarmTimer = null;
     }
     const next = state.queue[state.queueIndex + 1];
+    const next2 = state.queue[state.queueIndex + 2];
     if (!next) return;
     state.queueWarmTimer = setTimeout(() => {
       state.queueWarmTimer = null;
       if (loadToken !== state.activeAudioToken) return;
       api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
-    }, 450);
+      if (next2) {
+        setTimeout(() => {
+          if (loadToken !== state.activeAudioToken) return;
+          api(`/api/web/warm/${encodeURIComponent(next2.id)}`, { method: 'POST' }).catch(() => {});
+        }, 1050);
+      }
+    }, 150);
   }
 
   function restoreUpcomingOrder(upcoming, original, cur) {
