@@ -2684,8 +2684,8 @@ impl TasteEngine {
         if tick % 8 == 0 {
             self.llm_retag_rotation(tick).await;
         }
-        if tick % 16 == 0 {
-            self.llm_apply_mood_catalog().await;
+        if tick % 8 == 0 {
+            self.llm_apply_mood_catalog(tick).await;
         }
         self.llm_curate_one_pool(tick).await;
         self.llm_warm_search_pools().await;
@@ -2818,9 +2818,62 @@ impl TasteEngine {
     /// Let the assistant rename/add/retire Moods & Vibes in the background.
     /// The built-in classifier stays intact — this only changes what the UI
     /// shows and which mood slugs get curated.
-    async fn llm_apply_mood_catalog(&self) {
-        let mut catalog = self.store.load_mood_catalog();
-        let Some(change) = self.llm.curate_mood_catalog(&catalog).await else {
+    /// Compact summary of a listener's actual taste, used to personalize their
+    /// Moods & Vibes topics. No model call — just existing profile data.
+    fn mood_catalog_taste_summary(&self, user_id: i64) -> String {
+        let prof = self.user_profile(user_id);
+        let top_genres: Vec<String> = {
+            let mut g: Vec<(String, f64)> = prof
+                .genre_affinity
+                .iter()
+                .chain(prof.playlist_genre_affinity.iter())
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            g.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            g.into_iter().take(8).map(|(k, _)| k).collect()
+        };
+        let top_artists: Vec<String> = {
+            let mut a: Vec<(String, f64)> = prof
+                .artist_affinity
+                .iter()
+                .chain(prof.related_artist_affinity.iter())
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            a.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            a.into_iter().take(8).map(|(k, _)| k).collect()
+        };
+        let manual: Vec<String> = prof.manual_playlist_names.iter().take(6).cloned().collect();
+        format!(
+            "genres: [{}]; artists: [{}]; playlists: [{}]; starred: {}; hidden: {}",
+            top_genres.join(", "),
+            top_artists.join(", "),
+            manual.join(", "),
+            prof.starred.len(),
+            prof.hidden_ids.len(),
+        )
+    }
+
+    async fn llm_apply_mood_catalog(&self, tick: usize) {
+        // Rotate a few users per tick so each listener gets their own catalog.
+        let Ok(all_users) = self.store.all_user_ids() else {
+            return;
+        };
+        let mut targets: Vec<i64> = all_users.into_iter().filter(|id| *id > 0).collect();
+        if targets.is_empty() {
+            return;
+        }
+        let start = tick % targets.len();
+        targets.rotate_left(start);
+        for uid in targets.into_iter().take(3) {
+            self.llm_apply_mood_catalog_for(uid).await;
+        }
+    }
+
+    async fn llm_apply_mood_catalog_for(&self, user_id: i64) {
+        let mut catalog = self.store.load_mood_catalog_for(user_id);
+        let scope = format!("u{user_id}");
+        let summary = self.mood_catalog_taste_summary(user_id);
+        let Some(change) = self.llm.curate_mood_catalog(&catalog, &scope, &summary).await else {
             return;
         };
         // Small models often key their JSON by the visible label rather than
@@ -2869,8 +2922,12 @@ impl TasteEngine {
         if catalog.len() < 5 {
             return;
         }
-        self.store.save_mood_catalog(&catalog);
-        info!(moods = catalog.len(), "AI curator refreshed the Moods & Vibes catalog");
+        self.store.save_mood_catalog_for(user_id, &catalog);
+        info!(
+            user_id,
+            moods = catalog.len(),
+            "AI curator personalized a listener's Moods & Vibes"
+        );
     }
 
     /// Let the model re-rank one mood or Explore pool per tick, replacing the

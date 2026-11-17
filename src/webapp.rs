@@ -1867,7 +1867,7 @@ async fn build_new_releases(
 fn mood_catalog_tiles(state: &AppState, uid: i64) -> Vec<Value> {
     let mut catalog: Vec<crate::models::MoodDef> = state
         .store
-        .load_mood_catalog()
+        .load_mood_catalog_for(uid)
         .into_iter()
         .filter(|d| d.enabled)
         .collect();
@@ -2233,7 +2233,7 @@ pub async fn mood_mix(
     };
     let def = state
         .store
-        .load_mood_catalog()
+        .load_mood_catalog_for(user.id)
         .into_iter()
         .find(|d| d.enabled && d.slug == slug_str.to_ascii_lowercase().replace('-', "_"));
     let Some(def) = def else {

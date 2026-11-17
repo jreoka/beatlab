@@ -223,7 +223,6 @@
         ['Hot cache', Math.round(o.localCacheBytes / 1048576) + ' MB', o.localCacheEntries + ' files / ' + Math.round(o.cacheMaxBytes / 1073741824) + ' GB cap'],
         ['Cool cache', o.remoteCacheEnabled ? Math.round(o.remoteCacheBytes / 1048576) + ' MB' : 'Off', o.remoteCacheEnabled ? o.remoteCacheObjects + ' objects' : 'configure S3/R2 to enable'],
         ['2FA users', o.totpUsers, o.passkeys + ' passkeys'],
-        ['Recovery codes', o.recoveryCodes, 'unused'],
         ['Playlists', o.playlists, 'across accounts'],
         ['Security events', o.securityEvents, 'recorded'],
       ];
@@ -442,6 +441,7 @@
         statRow('Web research', cfg.researchEnabled ? 'enabled' : 'disabled'),
         statRow('Search endpoint', cfg.searchUrl || '—'),
         statRow('Catalog change cached', a.catalogChangeCached ? 'yes' : 'no'),
+        statRow('Personalized catalogs', state.config && state.config.personalizedMoodCatalogs || 0),
       ].join('');
       const moods = (state.config && state.config.moodCatalog) || [];
       $('ai-moods').innerHTML = moods.length

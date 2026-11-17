@@ -194,6 +194,7 @@ pub async fn config(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "webauthnEnabled": crate::auth::webauthn().is_some(),
         "llm": state.taste.llm.config_snapshot(),
         "moodCatalog": state.store.load_mood_catalog(),
+        "personalizedMoodCatalogs": state.store.user_ids_with_mood_catalog().len(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }

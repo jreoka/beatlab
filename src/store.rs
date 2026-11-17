@@ -5143,13 +5143,33 @@ impl Store {
         .unwrap_or(0)
     }
 
+    fn mood_catalog_key(user_id: i64) -> String {
+        if user_id > 0 {
+            format!("moods:catalog:v1:u{user_id}")
+        } else {
+            "moods:catalog:v1".to_string()
+        }
+    }
+
+    /// Loads a user's personalized Moods & Vibes catalog. Falls back to the
+    /// global catalog, then the built-in defaults, when no user catalog exists.
     pub fn load_mood_catalog(&self) -> Vec<crate::models::MoodDef> {
-        if let Some(raw) = self.kv_get("moods:catalog:v1") {
+        self.load_mood_catalog_for(0)
+    }
+
+    pub fn load_mood_catalog_for(&self, user_id: i64) -> Vec<crate::models::MoodDef> {
+        if let Some(raw) = self.kv_get(&Self::mood_catalog_key(user_id)) {
             if let Ok(defs) = serde_json::from_str::<Vec<crate::models::MoodDef>>(&raw) {
                 if !defs.is_empty() {
                     return defs;
                 }
             }
+        }
+        if user_id > 0 {
+            // Seed a new user from the global catalog (or defaults).
+            let base = self.load_mood_catalog_for(0);
+            self.save_mood_catalog_for(user_id, &base);
+            return base;
         }
         let defs: Vec<crate::models::MoodDef> = Mood::ALL
             .iter()
@@ -5161,9 +5181,30 @@ impl Store {
     }
 
     pub fn save_mood_catalog(&self, defs: &[crate::models::MoodDef]) {
+        self.save_mood_catalog_for(0, defs);
+    }
+
+    pub fn save_mood_catalog_for(&self, user_id: i64, defs: &[crate::models::MoodDef]) {
         if let Ok(raw) = serde_json::to_string(defs) {
-            self.kv_set("moods:catalog:v1", &raw);
+            self.kv_set(&Self::mood_catalog_key(user_id), &raw);
         }
+    }
+
+    pub fn user_ids_with_mood_catalog(&self) -> Vec<i64> {
+        let conn = self.lock();
+        let mut stmt = match conn.prepare("SELECT key FROM kv WHERE key LIKE 'moods:catalog:v1:u%'") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok())
+            .filter_map(|key| key.strip_prefix("moods:catalog:v1:u")?.parse::<i64>().ok())
+            .collect();
+        rows
     }
 
     // -------------------------------------------------------------------------

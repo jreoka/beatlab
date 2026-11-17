@@ -634,7 +634,7 @@ impl LlmClient {
         system: &str,
         user: &str,
     ) -> Option<Value> {
-        self.chat_json_attempt(task, system, user, true).await
+        self.chat_json_attempt(task, system, user, true, true).await
     }
 
     async fn chat_json_attempt(
@@ -643,6 +643,7 @@ impl LlmClient {
         system: &str,
         user: &str,
         allow_retry: bool,
+        json_mode: bool,
     ) -> Option<Value> {
         if !self.enabled() {
             return None;
@@ -671,8 +672,11 @@ impl LlmClient {
         if self.config.max_tokens > 0 {
             body["max_tokens"] = json!(self.config.max_tokens);
         }
-        // JSON mode is always on: every task expects a JSON object reply.
-        body["response_format"] = json!({ "type": "json_object" });
+        // JSON mode is on by default, but some cheap/free endpoints reject it
+        // by returning an empty 200 body — retry without it if needed.
+        if json_mode {
+            body["response_format"] = json!({ "type": "json_object" });
+        }
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
         let result = self
             .http
@@ -696,7 +700,30 @@ impl LlmClient {
             }
         };
         let status = response.status();
-        let raw = response.text().await.unwrap_or_default();
+        let body_result = response.text().await;
+        let raw = match body_result {
+            Ok(text) => text,
+            Err(e) => {
+                let err = format!("response body read failed: {e}");
+                warn!(task = %task, error = %err, "AI curator call failed");
+                self.record_call(task, false, elapsed, 0, 0, &err);
+                return None;
+            }
+        };
+        if raw.trim().is_empty() {
+            // An empty 200 usually means the endpoint rejected response_format
+            // or the model/provider isn't actually serving the request.
+            let err = format!(
+                "empty response body (status {status}, jsonMode={json_mode}, {} bytes)",
+                raw.len()
+            );
+            if allow_retry && json_mode {
+                return Box::pin(self.chat_json_attempt(task, system, user, false, false)).await;
+            }
+            warn!(task = %task, error = %err, "AI curator returned empty body");
+            self.record_call(task, false, elapsed, 0, 0, &err);
+            return None;
+        }
         if !status.is_success() {
             let err = format!("HTTP {status}: {}", raw.chars().take(200).collect::<String>());
             warn!(task = %task, error = %err, "AI curator returned an error");
@@ -706,7 +733,14 @@ impl LlmClient {
         let parsed: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
-                self.record_call(task, false, elapsed, 0, 0, &format!("invalid JSON: {e}"));
+                let err = format!(
+                    "invalid response (status {status}, jsonMode={json_mode}): {e}; body: {}",
+                    truncate(&raw, 160)
+                );
+                if allow_retry {
+                    return Box::pin(self.chat_json_attempt(task, system, user, false, false)).await;
+                }
+                self.record_call(task, false, elapsed, 0, 0, &err);
                 return None;
             }
         };
@@ -753,6 +787,7 @@ impl LlmClient {
                         &strict_system,
                         &strict_user,
                         false,
+                        json_mode,
                     ))
                     .await;
                 }
@@ -1046,12 +1081,14 @@ impl LlmClient {
     pub async fn curate_mood_catalog(
         &self,
         current: &[crate::models::MoodDef],
+        scope: &str,
+        taste_summary: &str,
     ) -> Option<MoodCatalogChange> {
         if !self.enabled() || current.is_empty() {
             return None;
         }
-        let key = "llm:mood_catalog:v1";
-        if let Some(cached) = self.cache_get::<MoodCatalogChange>(key, 7 * 24 * 3600) {
+        let key = format!("llm:mood_catalog:v1:{scope}");
+        if let Some(cached) = self.cache_get::<MoodCatalogChange>(&key, 7 * 24 * 3600) {
             return Some(cached);
         }
         let catalog_json = serde_json::to_string(current).unwrap_or_default();
@@ -1063,7 +1100,9 @@ impl LlmClient {
             remove (array of slugs), add (array of {slug,label,subtitle,c1,c2}). Slugs must be \
             lowercase ascii letters/digits/underscore, max 24 chars. Only use slugs that exist \
             in the catalog for renames/subtitles/remove.";
-        let user = format!("Current catalog:\n{catalog_json}\n\nJSON:");
+        let user = format!(
+            "Listener profile: {taste_summary}\n\nCurrent catalog:\n{catalog_json}\n\nJSON:"
+        );
         let value = self.chat_json("mood_catalog", system, &user).await?;
         let strings = |key: &str| -> HashMap<String, String> {
             value
@@ -1143,7 +1182,7 @@ impl LlmClient {
         {
             return None;
         }
-        self.cache_set(key, &change);
+        self.cache_set(&key, &change);
         self.bump_cache_writes();
         Some(change)
     }
