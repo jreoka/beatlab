@@ -2522,13 +2522,26 @@ pub async fn instant_mix(
     }
 
     let base_slug = crate::models::slug(&base_query);
-    let has_exact_artist = !base_slug.is_empty()
+    let name_matches_artist = !base_slug.is_empty()
         && (dz_artists
             .iter()
             .any(|a| crate::models::slug(&a.name) == base_slug)
             || combined.iter().any(|t| {
                 crate::models::slug(&crate::models::primary_artist(&t.artist)) == base_slug
             }));
+    // A query can collide with an obscure artist's name (e.g. "anime" is also a hardcore DJ
+    // called "Anime"). Playlists titled with the query tell us which meaning people intend:
+    // "100% Queen" is full of Queen tracks, "Anime Essentials" contains no tracks by "Anime".
+    // When the matching artist is nearly absent from those playlists, treat it as a topic.
+    let artist_absent_from_curated = {
+        let curated: Vec<&Track> = curated_batches.iter().flat_map(|(_, b)| b.iter()).collect();
+        let by_artist = curated
+            .iter()
+            .filter(|t| crate::models::slug(&crate::models::primary_artist(&t.artist)) == base_slug)
+            .count();
+        curated.len() >= 10 && (by_artist as f64) < (curated.len() as f64) * 0.1
+    };
+    let has_exact_artist = name_matches_artist && !artist_absent_from_curated;
     let has_topic_evidence = !curated_batches.is_empty()
         || state.store.has_catalog_genre(&intent.normalized);
     let use_topic_path = force_topic
