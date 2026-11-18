@@ -117,17 +117,6 @@ pub struct AdminOverview {
     pub security_events: usize,
 }
 
-/// A security event with the account it belongs to (global admin feed).
-#[derive(Debug, Clone)]
-pub struct AdminEvent {
-    pub user_id: i64,
-    pub username: String,
-    pub kind: String,
-    pub detail: String,
-    pub ip: String,
-    pub created: i64,
-}
-
 /// One line in the account's security audit trail.
 #[derive(Debug, Clone)]
 pub struct SecurityEvent {
@@ -1406,28 +1395,6 @@ impl Store {
                     events: r.get::<_, i64>(10)? as usize,
                     listens: r.get::<_, i64>(11)? as usize,
                     last_seen: r.get(12)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn admin_global_events(&self, limit: usize) -> AppResult<Vec<AdminEvent>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT e.user_id, u.username, e.kind, e.detail, e.ip, e.created
-             FROM security_events e JOIN users u ON u.id = e.user_id
-             ORDER BY e.created DESC, e.id DESC LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64], |r| {
-                Ok(AdminEvent {
-                    user_id: r.get(0)?,
-                    username: r.get(1)?,
-                    kind: r.get(2)?,
-                    detail: r.get(3)?,
-                    ip: r.get(4)?,
-                    created: r.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

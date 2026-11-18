@@ -275,25 +275,6 @@ pub async fn user_detail(
     }))
 }
 
-pub async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(r) = require_admin(&state, &headers) {
-        return r;
-    }
-    match state.store.admin_global_events(100) {
-        Ok(rows) => json_res(json!({
-            "events": rows.iter().map(|e| json!({
-                "userId": e.user_id,
-                "username": e.username,
-                "kind": e.kind,
-                "detail": e.detail,
-                "ip": e.ip,
-                "created": e.created,
-            })).collect::<Vec<_>>()
-        })),
-        Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
-}
-
 fn target_user(state: &AppState, id: i64) -> Result<User, Response> {
     // Look up without the deleted filter so soft-deleted accounts can be
     // restored or purged from the panel too.
