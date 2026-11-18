@@ -606,7 +606,7 @@ fn mood_cache_key(mood: Mood) -> String {
 }
 
 fn mood_user_cache_key(user_id: i64, mood: Mood) -> String {
-    format!("curated:mood_user:v2:{}:{}", user_id, mood.slug())
+    format!("curated:mood_user:v3:{}:{}", user_id, mood.slug())
 }
 
 fn explore_cache_key(key: &str) -> String {
@@ -2434,7 +2434,11 @@ impl TasteEngine {
                     .get(&primary_artist(&t.artist).to_lowercase())
                     .map(|s| s.as_str())
                     .unwrap_or("");
-                if is_track_compatible_with_mood(&t, ag, mood)
+                let meta_low = format!("{} {}", t.genre, ag).to_lowercase();
+                let has_evidence = has_mood_meta_match(&meta_low, mood)
+                    || classify_moods(&t.title, &t.album, &t.genre, ag).contains(&mood);
+                if has_evidence
+                    && is_track_compatible_with_mood(&t, ag, mood)
                     && !is_mood_title_trap(&t, mood)
                     && !track_matches_topic(&t, "christmas")
                     && !track_matches_topic(&t, "halloween")
@@ -4285,7 +4289,11 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                         .get(&primary_artist(&t.artist).to_lowercase())
                         .map(|s| s.as_str())
                         .unwrap_or("");
-                    if is_track_compatible_with_mood(&t, ag, mood)
+                    let meta_low = format!("{} {}", t.genre, ag).to_lowercase();
+                    let has_evidence = has_mood_meta_match(&meta_low, mood)
+                        || classify_moods(&t.title, &t.album, &t.genre, ag).contains(&mood);
+                    if has_evidence
+                        && is_track_compatible_with_mood(&t, ag, mood)
                         && !is_mood_title_trap(&t, mood)
                         && !track_matches_topic(&t, "christmas")
                         && !track_matches_topic(&t, "halloween")
@@ -4349,9 +4357,10 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             if !meta_match && !is_familiar && is_mood_title_trap(&t, mood) {
                 continue;
             }
-            // Compatible music in the listener's own taste realm is welcome.
-            let realm_compatible = user_id > 0 && realm >= 0.5 && !is_mood_title_trap(&t, mood);
-            if !is_curated && !meta_match && !clean_match && !realm_compatible {
+            // Every track needs real evidence for THIS mood. Taste alone never admits a track,
+            // otherwise each mood collapses into the same "favorites" playlist.
+            let stored_match = t.mood_list().contains(&mood) && (has_known_genre || is_curated);
+            if !is_curated && !meta_match && !clean_match && !stored_match {
                 continue;
             }
             eligible.push((t, is_curated, meta_match, clean_moods, realm));
@@ -4372,23 +4381,27 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                     ScoreMode::Supermix,
                 );
 
-                // Category evidence leads; the listener's realm personalizes the mix.
-                let mut evidence = if meta_match {
-                    2.2
-                } else if is_curated {
-                    0.5
-                } else {
-                    0.0
-                };
-                if clean_moods.contains(&mood) {
-                    evidence += 1.4;
+                // Category evidence leads; the listener's realm only personalizes within it.
+                let mut evidence = if meta_match { 3.0 } else { 0.0 };
+                if is_curated {
+                    evidence += 1.5;
                 }
-                if t.mood_list().contains(&mood) && (!t.genre.trim().is_empty() || is_curated) {
+                if clean_moods.contains(&mood) {
                     evidence += 1.2;
                 }
+                if t.mood_list().contains(&mood) && (!t.genre.trim().is_empty() || is_curated) {
+                    evidence += 1.0;
+                }
+                // Prefer tracks whose strongest mood is this one, so overlapping genres
+                // (e.g. rock in both Energy and Rock/Indie) don't make every mood identical.
+                if clean_moods.first() == Some(&mood) {
+                    evidence += 1.0;
+                } else if clean_moods.len() >= 3 && !is_curated {
+                    evidence -= 0.6;
+                }
 
-                let mut score = taste_s * 1.1 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
-                score += evidence + realm * 2.5;
+                let mut score = taste_s * 0.6 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w * 0.6;
+                score += evidence + realm * 1.2;
                 if t.source == "local" && realm == 0.0 {
                     score += 0.6;
                 }
@@ -5784,13 +5797,24 @@ fn mix_query_evidence(
             return 0.0;
         }
     }
-    if !intent.moods.is_empty()
-        && intent
+    if !intent.moods.is_empty() {
+        if !intent
             .moods
             .iter()
             .all(|m| is_track_compatible_with_mood(t, ag, *m))
-    {
-        ev += 0.45;
+        {
+            return 0.0;
+        }
+        let classified = classify_moods(&t.title, &t.album, &t.genre, ag);
+        let has_known_genre = !meta_low.trim().is_empty();
+        let real_mood = intent.moods.iter().any(|m| {
+            has_mood_meta_match(&meta_low, *m)
+                || classified.contains(m)
+                || (has_known_genre && t.mood_list().contains(m))
+        });
+        if real_mood {
+            ev += 0.5;
+        }
     }
     if let Some((lo, hi)) = intent.year_range {
         if t.year > 0 {
@@ -5948,13 +5972,15 @@ fn compose_coherent_mix(
         top_keys.insert(t.song_key());
     }
 
-    // Tracks returned by a query-targeted YTM search/radio are legitimate (if
-    // weak) evidence for a theme when they carry no parseable metadata.
-    let mut ytm_query_keys: HashSet<String> = mix_ctx
+    // Topic radio is seeded from verified tracks, so it is legitimate (if weak)
+    // evidence for a theme. Raw YTM keyword search hits are much noisier: they
+    // may fill a mix but can never define what it is about (seed it).
+    let ytm_radio_keys: HashSet<String> = mix_ctx
         .ytm_radio
         .iter()
         .map(Track::song_key)
         .collect();
+    let mut ytm_query_keys: HashSet<String> = ytm_radio_keys.clone();
     for e in evals {
         if e.track.source == "ytm" {
             ytm_query_keys.insert(e.track.song_key());
@@ -6015,8 +6041,12 @@ fn compose_coherent_mix(
             let key = t.song_key();
             let prior = curated_priors.get(&key).copied().unwrap_or(0.0);
             let mut evidence = mix_query_evidence(&t, intent, artist_genres, prior);
-            if evidence <= 0.0 && !is_entity && ytm_query_keys.contains(&key) {
-                evidence = 0.45;
+            if evidence <= 0.0 && !is_entity {
+                if ytm_radio_keys.contains(&key) {
+                    evidence = 0.45;
+                } else if ytm_query_keys.contains(&key) && t.genre.trim().is_empty() {
+                    evidence = 0.25;
+                }
             }
             (evidence, t)
         })
@@ -6045,11 +6075,23 @@ fn compose_coherent_mix(
     } else {
         scored.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut idx = 0;
-        while seeds.len() < 8 && idx < scored.len() {
+        while seeds.len() < 12 && idx < scored.len() {
             if scored[idx].0 >= 0.4 {
                 seeds.push(scored.remove(idx).1);
             } else {
                 idx += 1;
+            }
+        }
+        // Last resort when no curated/metadata evidence exists at all: let the
+        // query's own YTM hits define the mix rather than returning nothing.
+        if seeds.len() < 2 {
+            let mut idx = 0;
+            while seeds.len() < 4 && idx < scored.len() {
+                if scored[idx].0 > 0.0 && ytm_query_keys.contains(&scored[idx].1.song_key()) {
+                    seeds.push(scored.remove(idx).1);
+                } else {
+                    idx += 1;
+                }
             }
         }
     }
@@ -6059,9 +6101,21 @@ fn compose_coherent_mix(
 
     let threshold = if is_entity { 0.35 } else { 0.4 };
     let mut neighbours: Vec<(f64, Track)> = Vec::new();
-    for (_, t) in scored {
+    for (own_evidence, t) in scored {
         let related = related_keys.contains(&t.song_key())
             || (is_entity && top_keys.contains(&t.song_key()));
+        // Eligibility gate. Entity mixes only take the anchor's own catalogue or
+        // tracks from its radio / related-artist feeds; theme mixes only take
+        // tracks with independent query evidence. Generic search noise that
+        // merely shares a broad genre with a seed is the source of off-topic junk.
+        let eligible = if let Some(a) = anchor {
+            related || mix_artist_matches(&t, a)
+        } else {
+            own_evidence > 0.0
+        };
+        if !eligible {
+            continue;
+        }
         let similarity = seeds
             .iter()
             .map(|s| {
@@ -6102,9 +6156,9 @@ fn compose_coherent_mix(
         None => (String::new(), 3),
     };
     let mut mix_tracks = if anchor.is_some() {
-        dedup_and_interleave_with_anchor(ordered, 20, 3, Some((&anchor_slug, cap)))
+        dedup_and_interleave_with_anchor(ordered, 30, 3, Some((&anchor_slug, cap)))
     } else {
-        dedup_and_interleave(ordered, 20, 3)
+        dedup_and_interleave(ordered, 30, 3)
     };
 
     // An entity mix always opens with the track that seeded it.
@@ -10457,11 +10511,127 @@ mod tests {
         assert!(!ids.contains(&"dz:dk"), "title trap leaked: {:?}", ids);
         assert!(!ids.contains(&"dz:man"), "title trap leaked: {:?}", ids);
         assert!(!ids.contains(&"dz:box"), "title trap leaked: {:?}", ids);
-        assert!(ids.contains(&"dz:fav"), "user's own compatible music missing: {:?}", ids);
+        // A favourite with no melancholy evidence must not leak in just because the
+        // listener loves it — otherwise every mood collapses into the same playlist.
+        assert!(!ids.contains(&"dz:fav"), "off-mood favourite leaked into mood mix: {:?}", ids);
         assert!(ids.contains(&"dz:bal"), "user's genre-aligned ballad missing: {:?}", ids);
-        let fav_pos = ids.iter().position(|id| *id == "dz:fav").unwrap();
-        let gen_pos = ids.iter().position(|id| *id == "dz:gen").unwrap();
-        assert!(fav_pos < gen_pos, "user's own music should rank above generic filler: {:?}", ids);
+        assert!(ids.contains(&"dz:gen"), "curated melancholy track missing: {:?}", ids);
+    }
+
+    #[test]
+    fn mood_mixes_differ_for_a_listener_with_a_mixed_library() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("mixedlib", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mut lib = Vec::new();
+        for (prefix, genre) in [
+            ("rock", "Indie Rock"),
+            ("soul", "Soul & Funk"),
+            ("folk", "Folk"),
+            ("edm", "Deep House"),
+            ("lofi", "Lo-Fi, Chillhop"),
+        ] {
+            for i in 0..8 {
+                lib.push(Track {
+                    id: format!("dz:{prefix}{i}"),
+                    source: "deezer".into(),
+                    title: format!("{prefix} song {i}"),
+                    artist: format!("{prefix} artist {i}"),
+                    album: "Album".into(),
+                    genre: genre.into(),
+                    duration: 210,
+                    bitrate: 320,
+                    stream_url: format!("dz:{prefix}{i}"),
+                    ..Default::default()
+                });
+            }
+        }
+        store.upsert_tracks(&lib).unwrap();
+        for t in &lib {
+            let _ = store.record_event(u.id, &t.id, "play", 1.0);
+            let _ = store.record_event(u.id, &t.id, "like", 1.0);
+        }
+
+        let none = HashSet::new();
+        let run = |m: Mood| -> HashSet<String> {
+            taste
+                .rank_mood_mix(u.id, m, lib.clone(), &none, 35)
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        };
+        let rock = run(Mood::RockIndie);
+        let groove = run(Mood::Groove);
+        let acoustic = run(Mood::Acoustic);
+        let party = run(Mood::Party);
+        let chill = run(Mood::Chill);
+
+        assert!(rock.iter().all(|id| id.starts_with("dz:rock")), "rock: {:?}", rock);
+        assert!(groove.iter().all(|id| id.starts_with("dz:soul")), "groove: {:?}", groove);
+        assert!(acoustic.iter().all(|id| id.starts_with("dz:folk")), "acoustic: {:?}", acoustic);
+        assert!(party.iter().all(|id| id.starts_with("dz:edm")), "party: {:?}", party);
+        assert!(chill.iter().all(|id| id.starts_with("dz:lofi")), "chill: {:?}", chill);
+        for set in [&rock, &groove, &acoustic, &party, &chill] {
+            assert!(set.len() >= 6, "mood mix too sparse: {:?}", set);
+        }
+    }
+
+    #[test]
+    fn mood_query_instant_mix_excludes_untagged_and_off_mood_filler() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("chillq", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, artist: &str, genre: &str| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: format!("Song {id}"),
+            artist: artist.into(),
+            album: "Album".into(),
+            genre: genre.into(),
+            duration: 200,
+            bitrate: 320,
+            stream_url: id.into(),
+            ..Default::default()
+        };
+        let mut raw = Vec::new();
+        for i in 0..6 {
+            raw.push(mk(&format!("dz:lofi{i}"), &format!("Lofi Artist {i}"), "Lo-Fi, Chillhop"));
+        }
+        for i in 0..6 {
+            raw.push(mk(&format!("dz:untagged{i}"), &format!("Random {i}"), ""));
+        }
+        raw.push(mk("dz:pop", "Pop Star", "Pop"));
+
+        let res = taste.search_and_refine_with_context(
+            u.id,
+            "chill",
+            raw,
+            vec![],
+            SearchMixContext {
+                mode_override: Some("topic".into()),
+                ..Default::default()
+            },
+        );
+        let mix = res.instant_mix.expect("chill mix should build from verified lofi tracks");
+        let ids: Vec<&str> = mix.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.iter().all(|id| id.starts_with("dz:lofi")), "off-topic filler leaked: {:?}", ids);
+        assert!(ids.len() >= 5, "ids={:?}", ids);
     }
 
     #[test]
@@ -10648,7 +10818,7 @@ mod tests {
                 title: format!("Midnight Drive {i}"),
                 artist: format!("Night Artist {i}"),
                 album: "After Hours".into(),
-                genre: "Electronic".into(),
+                genre: "Synthwave".into(),
                 moods: if i == 0 { "late-night".into() } else { String::new() },
                 cover_url: format!("https://example.com/ln{i}.jpg"),
                 duration: 210,

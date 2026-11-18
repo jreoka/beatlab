@@ -1766,6 +1766,7 @@
           if (byId >= 0) idx = byId;
         }
         state.queueIndex = idx;
+        if (reconcileRestoredQueueShuffle()) saveServerQueue();
         const cur = currentTrack();
         const savedSec = q.positionMs > 1000 ? q.positionMs / 1000 : 0;
         state.pendingSeekSec = savedSec;
@@ -1802,6 +1803,7 @@
     state.queueSaveDirty = false;
     if (!state.token) return;
     const cur = currentTrack();
+    rememberQueueShuffleState();
     api('/api/web/queue', {
       method: 'PUT',
       keepalive: !!keepalive,
@@ -1812,6 +1814,64 @@
         trackIds: state.queue.map((t) => t.id),
       }),
     }).catch(() => {});
+  }
+
+  // The shuffle toggle is stored per browser while the queue is synced through the
+  // server (and can be rewritten by other devices / Subsonic clients). Remember which
+  // exact order this browser shuffled so a restored queue can be reconciled with it.
+  const QUEUE_SHUFFLE_KEY = 'beatlab_queue_shuffle_state';
+
+  function rememberQueueShuffleState() {
+    try {
+      if (state.shuffle && Array.isArray(state.unshuffledQueue) && state.queue.length) {
+        localStorage.setItem(
+          QUEUE_SHUFFLE_KEY,
+          JSON.stringify({
+            shuffled: state.queue.map((t) => t.id),
+            original: state.unshuffledQueue.map((t) => t.id),
+          }),
+        );
+      } else {
+        localStorage.removeItem(QUEUE_SHUFFLE_KEY);
+      }
+    } catch {
+      // storage unavailable; reconciliation falls back to reshuffling
+    }
+  }
+
+  // Ensures a restored queue actually matches the shuffle button. Returns true when the
+  // queue order changed and needs to be saved back.
+  function reconcileRestoredQueueShuffle() {
+    state.unshuffledQueue = null;
+    if (!state.shuffle || state.queue.length < 2) return false;
+    let saved = null;
+    try {
+      saved = JSON.parse(localStorage.getItem(QUEUE_SHUFFLE_KEY) || 'null');
+    } catch {
+      saved = null;
+    }
+    const ids = state.queue.map((t) => t.id);
+    if (
+      saved &&
+      Array.isArray(saved.shuffled) &&
+      Array.isArray(saved.original) &&
+      saved.shuffled.length === ids.length &&
+      saved.shuffled.every((id, i) => id === ids[i])
+    ) {
+      // Same shuffled queue this browser saved: restore the original order for un-shuffling.
+      const byId = new Map(state.queue.map((t) => [t.id, t]));
+      const original = saved.original.map((id) => byId.get(id)).filter(Boolean);
+      if (original.length === state.queue.length) state.unshuffledQueue = original;
+      return false;
+    }
+    // Queue came back in natural order (another device, a Subsonic client, or saved with
+    // shuffle off) while shuffle is on here: shuffle what hasn't played yet.
+    const splitIdx = state.queueIndex >= 0 ? state.queueIndex + 1 : 0;
+    const upcoming = state.queue.slice(splitIdx);
+    if (upcoming.length < 2) return false;
+    state.unshuffledQueue = state.queue.slice();
+    state.queue = state.queue.slice(0, splitIdx).concat(shuffleArray(upcoming));
+    return true;
   }
 
   function saveServerQueue(immediate = false) {

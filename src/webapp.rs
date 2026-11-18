@@ -2596,6 +2596,7 @@ pub async fn instant_mix(
         + mix_ctx.dz_artist_top.len()
         + mix_ctx.dz_artist_radio.len()
         + mix_ctx.dz_related_tracks.len();
+    let expand_inputs = (combined.clone(), curated_batches.clone(), mix_ctx.clone());
     let mut refined = run_instant_mix_refine(
         &state,
         user.id,
@@ -2640,9 +2641,19 @@ pub async fn instant_mix(
                 &state,
                 user.id,
                 &query,
-                fb_combined,
-                fb_curated,
-                fb_ctx,
+                fb_combined.clone(),
+                fb_curated.clone(),
+                fb_ctx.clone(),
+            )
+            .await;
+            refined = expand_sparse_theme_mix(
+                &state,
+                user.id,
+                &query,
+                &intent,
+                refined,
+                (fb_combined, fb_curated, fb_ctx),
+                &ytm_hints,
             )
             .await;
             return format_instant_mix_response(
@@ -2657,6 +2668,17 @@ pub async fn instant_mix(
         }
     }
 
+    let refined = expand_sparse_theme_mix(
+        &state,
+        user.id,
+        &query,
+        &intent,
+        refined,
+        expand_inputs,
+        &ytm_hints,
+    )
+    .await;
+
     format_instant_mix_response(
         &state,
         user.id,
@@ -2666,6 +2688,46 @@ pub async fn instant_mix(
         radio_len,
         refined,
     )
+}
+
+/// Minimum size a theme mix should reach before we try to grow it.
+const SPARSE_THEME_MIX_TRACKS: usize = 18;
+
+/// A theme mix built only from strictly verified tracks can come out thin. Grow
+/// it with YTM radio seeded from those verified tracks (never from raw search
+/// noise) and re-run composition, which still applies every evidence/clash rule.
+async fn expand_sparse_theme_mix(
+    state: &AppState,
+    uid: i64,
+    query: &str,
+    intent: &crate::taste::SearchIntent,
+    refined: crate::taste::SearchMixResult,
+    inputs: (Vec<Track>, Vec<(String, Vec<Track>)>, crate::taste::SearchMixContext),
+    ytm_hints: &std::collections::HashMap<String, String>,
+) -> crate::taste::SearchMixResult {
+    let Some(mix) = refined.instant_mix.as_ref() else {
+        return refined;
+    };
+    if !mix.is_theme_mix || mix.tracks.len() >= SPARSE_THEME_MIX_TRACKS {
+        return refined;
+    }
+    let mut seed_intent = intent.clone();
+    seed_intent.is_theme_mix = true;
+    let radio = fetch_topic_ytm_radio_fallback(state, &seed_intent, &mix.tracks, ytm_hints).await;
+    if radio.is_empty() {
+        return refined;
+    }
+    let before = mix.tracks.len();
+    let (combined, curated, mut ctx) = inputs;
+    ctx.ytm_radio.extend(radio);
+    if ctx.mode_override.is_none() {
+        ctx.mode_override = Some("topic".to_string());
+    }
+    let expanded = run_instant_mix_refine(state, uid, query, combined, curated, ctx).await;
+    match expanded.instant_mix.as_ref() {
+        Some(m) if m.tracks.len() > before => expanded,
+        _ => refined,
+    }
 }
 
 async fn expand_entity_mix_context(
@@ -2781,14 +2843,14 @@ async fn expand_entity_mix_context(
                     !r.deezer_id.is_empty()
                         && crate::models::slug(&r.name) != artist_slug
                 })
-                .take(3)
+                .take(5)
                 .cloned()
                 .collect();
             related_artists.push(meta);
             related_artists.extend(related);
             let rel_futs = hop_targets.into_iter().map(|rel| {
                 let dz_c = dz.clone();
-                async move { dz_c.fetch_artist_top_tracks(&rel.deezer_id, 5).await }
+                async move { dz_c.fetch_artist_top_tracks(&rel.deezer_id, 6).await }
             });
             let batches = tokio::time::timeout(
                 std::time::Duration::from_millis(2200),
@@ -2968,7 +3030,7 @@ async fn fetch_topic_mix_inputs(
         async move {
             tokio::time::timeout(
                 std::time::Duration::from_secs(6),
-                dz.fetch_curated_mix_tracks(&pq_owned, 2, 24),
+                dz.fetch_curated_mix_tracks(&pq_owned, 3, 40),
             )
             .await
             .unwrap_or_default()
