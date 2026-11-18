@@ -8,7 +8,7 @@ use crate::models::{AlbumSummary, ArtistSummary, Track};
 use async_trait::async_trait;
 use futures::future::join_all;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,100 @@ impl SourceRegistry {
             track_cache: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Curated playlists matching `query` for building topic mixes ("anime", "80s hits").
+    /// Deezer's playlists are preferred because their tracks carry genre metadata, but Deezer
+    /// can be unreachable (it blocks some server IPs), so YouTube Music's own editorial
+    /// playlists are fetched alongside and used whenever Deezer comes back empty.
+    pub async fn fetch_curated_mix_tracks(
+        &self,
+        query: &str,
+        max_playlists: usize,
+        per_playlist: usize,
+    ) -> Vec<(String, Vec<Track>)> {
+        let dz_fut = async {
+            if self.deezer.is_blocked() {
+                return Vec::new();
+            }
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                self.deezer
+                    .fetch_curated_mix_tracks(query, max_playlists, per_playlist),
+            )
+            .await
+            .unwrap_or_default()
+        };
+        let ytm_fut = self.ytm_curated_mix_tracks(query, max_playlists, per_playlist);
+        let (dz, ytm) = tokio::join!(dz_fut, ytm_fut);
+        if !dz.is_empty() {
+            dz
+        } else {
+            ytm
+        }
+    }
+
+    async fn ytm_curated_mix_tracks(
+        &self,
+        query: &str,
+        max_playlists: usize,
+        per_playlist: usize,
+    ) -> Vec<(String, Vec<Track>)> {
+        let q_low = query.trim().to_lowercase();
+        if q_low.is_empty() {
+            return vec![];
+        }
+        // `max_extra`: how many title words beyond the query a playlist may carry
+        // ("Uplifting Anime Songs" is fine for "anime", "Asha Bhosle: 80s Hits" is not
+        // for "80s hits"). User-made playlists must match the query outright.
+        let pick = |hits: Vec<ytm::YtmPlaylistHit>, max_extra: usize| {
+            let mut scored: Vec<(i32, ytm::YtmPlaylistHit)> = hits
+                .into_iter()
+                .filter_map(|h| {
+                    if has_unrequested_scene_qualifier(&h.title, &q_low) {
+                        return None;
+                    }
+                    let extra = extra_title_words(&h.title, &q_low);
+                    if extra > max_extra {
+                        return None;
+                    }
+                    let s = deezer::score_mix_playlist(&h.title, h.song_count, &q_low)?;
+                    Some((s - 6 * extra as i32, h))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut seen_titles = HashSet::new();
+            scored
+                .into_iter()
+                .map(|(_, h)| h)
+                .filter(|h| seen_titles.insert(h.title.trim().to_lowercase()))
+                .take(max_playlists.max(1))
+                .collect::<Vec<_>>()
+        };
+        let mut chosen = pick(self.ytm.search_playlists(query, true, 20).await, 1);
+        if chosen.is_empty() {
+            chosen = pick(self.ytm.search_playlists(query, false, 20).await, 0);
+        }
+        if chosen.is_empty() {
+            return vec![];
+        }
+        tracing::info!(
+            query,
+            playlists = ?chosen.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(),
+            "using youtube music playlists for curated mix"
+        );
+        let batches = join_all(
+            chosen
+                .iter()
+                .map(|h| self.ytm.fetch_playlist_tracks(&h.playlist_id, per_playlist)),
+        )
+        .await;
+        chosen
+            .into_iter()
+            .zip(batches)
+            .filter(|(_, tracks)| !tracks.is_empty())
+            .map(|(h, tracks)| (h.title, tracks))
+            .collect()
     }
 
     pub fn sources_info(&self) -> Vec<SourceStatus> {
@@ -450,4 +544,50 @@ pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
         .collect();
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.quality_score().cmp(&a.1.quality_score())));
     ranked.into_iter().map(|(_, t)| t).collect()
+}
+
+/// YouTube Music's featured playlists are global, so a search for "80s hits" also returns
+/// "The Turkish Hits: 80s" or "Egyptian '80s". Reject playlists scoped to a regional or
+/// language scene the query did not ask for.
+fn has_unrequested_scene_qualifier(title: &str, query_low: &str) -> bool {
+    const SCENES: &[&str] = &[
+        "arabic", "khaleeji", "egyptian", "turkish", "persian", "kurdish", "bollywood",
+        "tollywood", "kollywood", "hindi", "punjabi", "tamil", "telugu", "bhojpuri", "haryanvi",
+        "desi", "indonesian", "malaysian", "thai", "vietnamese", "filipino", "opm", "mandopop",
+        "cantopop", "chinese", "korean", "japanese", "nigeria", "nigerian", "ghanaian",
+        "naija", "argentinian", "mexican", "brazilian", "colombian", "latin", "latino",
+        "spanish", "español", "éxitos", "french", "german", "italian", "polish", "russian",
+        "ukrainian", "greek", "dutch", "swedish", "canrock", "canadian", "australian",
+        "japan", "korea", "china", "taiwan", "india", "pakistan", "turkey", "egypt", "iran",
+        "indonesia", "malaysia", "thailand", "vietnam", "philippines", "africa", "african",
+        "ghana", "kenya", "brazil", "brasil", "mexico", "argentina", "colombia", "france",
+        "germany", "italy", "spain", "poland", "russia", "ukraine", "greece", "sweden",
+    ];
+    let t = title.to_lowercase();
+    SCENES.iter().any(|s| {
+        crate::taste::contains_term(&t, s) && !crate::taste::contains_term(query_low, s)
+    })
+}
+
+/// Number of meaningful title words that are not part of the query, used to prefer
+/// "The Hits: '80s" over "Relaxing 80s Rock" for the query "80s hits".
+fn extra_title_words(title: &str, query_low: &str) -> usize {
+    const FILLER: &[&str] = &[
+        "the", "of", "and", "a", "an", "in", "for", "to", "hits", "hit", "best", "top",
+        "songs", "song", "music", "mix", "playlist", "essentials", "biggest", "greatest", "all",
+        "time", "classics", "classic", "anthems", "favorites", "favourites",
+    ];
+    let q_words: HashSet<String> = query_low
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.trim_end_matches('s').to_string())
+        .collect();
+    title
+        .to_lowercase()
+        .replace("'s", "")
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !w.chars().all(|c| c.is_ascii_digit()))
+        .filter(|w| !FILLER.contains(w))
+        .filter(|w| !q_words.contains(w.trim_end_matches('s')))
+        .count()
 }

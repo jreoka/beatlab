@@ -11,12 +11,40 @@ use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::warn;
 
+/// Deezer allows 50 requests per 5 seconds per IP and bans IPs that keep exceeding it.
+/// A token bucket keeps us well under that: short bursts of up to 25, then 5/s.
+const DZ_BUCKET_CAPACITY: f64 = 25.0;
+const DZ_BUCKET_REFILL_PER_SEC: f64 = 5.0;
+/// After Deezer refuses us outright (HTTP 403), stop calling it for a while instead of
+/// hammering a blocked endpoint; callers fall back to other sources immediately.
+const DZ_BLOCK_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const DZ_JSON_CACHE_MAX: usize = 800;
+const DZ_ALBUM_INFO_CACHE_MAX: usize = 20_000;
+
+struct TokenBucket {
+    tokens: f64,
+    last: Instant,
+}
+
 #[derive(Clone)]
 pub struct DeezerSource {
     http: reqwest::Client,
     http_sem: Arc<Semaphore>,
     genres_cache: Arc<RwLock<Option<(Instant, Vec<DeezerGenre>)>>>,
     json_cache: Arc<RwLock<HashMap<String, (Instant, serde_json::Value)>>>,
+    /// Album genre/year never change, so they are cached for the life of the process.
+    album_info_cache: Arc<std::sync::Mutex<HashMap<u64, (String, i32)>>>,
+    bucket: Arc<std::sync::Mutex<TokenBucket>>,
+    blocked_until: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+/// Search and chart results drift; entity lookups (albums, artists, playlists) barely do.
+fn json_cache_ttl(url: &str) -> Duration {
+    if url.contains("/search") || url.contains("/chart") || url.contains("/radio") {
+        Duration::from_secs(60 * 60)
+    } else {
+        Duration::from_secs(6 * 60 * 60)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +66,55 @@ impl DeezerSource {
             http_sem: Arc::new(Semaphore::new(4)),
             genres_cache: Arc::new(RwLock::new(None)),
             json_cache: Arc::new(RwLock::new(HashMap::new())),
+            album_info_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bucket: Arc::new(std::sync::Mutex::new(TokenBucket {
+                tokens: DZ_BUCKET_CAPACITY,
+                last: Instant::now(),
+            })),
+            blocked_until: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// True while Deezer is refusing this server's requests (see `DZ_BLOCK_COOLDOWN`).
+    pub fn is_blocked(&self) -> bool {
+        let guard = self.blocked_until.lock().unwrap_or_else(|e| e.into_inner());
+        guard.map_or(false, |until| Instant::now() < until)
+    }
+
+    fn mark_blocked(&self, url: &str) {
+        let mut guard = self.blocked_until.lock().unwrap_or_else(|e| e.into_inner());
+        let already = guard.map_or(false, |until| Instant::now() < until);
+        *guard = Some(Instant::now() + DZ_BLOCK_COOLDOWN);
+        if !already {
+            warn!(
+                url,
+                cooldown_secs = DZ_BLOCK_COOLDOWN.as_secs(),
+                "deezer is refusing requests (HTTP 403); pausing deezer calls"
+            );
+        }
+    }
+
+    async fn throttle(&self) {
+        loop {
+            let wait = {
+                let mut b = self.bucket.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                let refill = now.duration_since(b.last).as_secs_f64() * DZ_BUCKET_REFILL_PER_SEC;
+                b.tokens = (b.tokens + refill).min(DZ_BUCKET_CAPACITY);
+                b.last = now;
+                if b.tokens >= 1.0 {
+                    b.tokens -= 1.0;
+                    None
+                } else {
+                    Some(Duration::from_secs_f64(
+                        (1.0 - b.tokens) / DZ_BUCKET_REFILL_PER_SEC,
+                    ))
+                }
+            };
+            match wait {
+                None => return,
+                Some(d) => tokio::time::sleep(d).await,
+            }
         }
     }
 
@@ -45,7 +122,7 @@ impl DeezerSource {
         {
             let guard = self.json_cache.read().await;
             if let Some((ts, cached)) = guard.get(url) {
-                if ts.elapsed() < Duration::from_secs(600) {
+                if ts.elapsed() < json_cache_ttl(url) {
                     if let Ok(parsed) = serde_json::from_value::<T>(cached.clone()) {
                         return Some(parsed);
                     }
@@ -54,6 +131,10 @@ impl DeezerSource {
         }
 
         for attempt in 0..3 {
+            if self.is_blocked() {
+                return None;
+            }
+            self.throttle().await;
             let permit = self.http_sem.acquire().await.ok();
             let resp = match self.http.get(url).send().await {
                 Ok(r) => r,
@@ -76,6 +157,11 @@ impl DeezerSource {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     continue;
                 }
+                return None;
+            }
+            if status.as_u16() == 403 {
+                drop(permit);
+                self.mark_blocked(url);
                 return None;
             }
             if !status.is_success() {
@@ -109,10 +195,16 @@ impl DeezerSource {
             }
             if let Ok(parsed) = serde_json::from_value::<T>(val.clone()) {
                 let mut guard = self.json_cache.write().await;
-                if guard.len() >= 300 {
-                    guard.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(600));
-                    if guard.len() >= 300 {
-                        guard.clear();
+                if guard.len() >= DZ_JSON_CACHE_MAX {
+                    guard.retain(|k, (ts, _)| ts.elapsed() < json_cache_ttl(k));
+                    if guard.len() >= DZ_JSON_CACHE_MAX {
+                        // Evict the oldest quarter rather than dropping everything at once.
+                        let mut ages: Vec<(Instant, String)> =
+                            guard.iter().map(|(k, (ts, _))| (*ts, k.clone())).collect();
+                        ages.sort_by_key(|(ts, _)| *ts);
+                        for (_, k) in ages.into_iter().take(DZ_JSON_CACHE_MAX / 4) {
+                            guard.remove(&k);
+                        }
                     }
                 }
                 guard.insert(url.to_string(), (Instant::now(), val));
@@ -543,6 +635,9 @@ impl DeezerSource {
     /// year from each distinct album's Deezer metadata (and artist album search fallback for
     /// non-Deezer tracks), then recompute moods. Results are cached by `get_json`.
     pub async fn enrich_track_genres(&self, tracks: &mut [Track]) {
+        if self.is_blocked() {
+            return;
+        }
         let mut album_ids: Vec<u64> = tracks
             .iter()
             .filter(|t| t.genre.trim().is_empty() || t.year <= 0)
@@ -551,8 +646,21 @@ impl DeezerSource {
             .collect();
         album_ids.sort_unstable();
         album_ids.dedup();
-        // Bound the work: a genre mix or stats batch pulls up to 64 distinct albums.
-        album_ids.truncate(64);
+
+        // Album genre/year never change: answer from the process-wide cache first.
+        let mut by_album: HashMap<u64, (String, i32)> = HashMap::new();
+        {
+            let cache = self.album_info_cache.lock().unwrap_or_else(|e| e.into_inner());
+            album_ids.retain(|id| match cache.get(id) {
+                Some(info) => {
+                    by_album.insert(*id, info.clone());
+                    false
+                }
+                None => true,
+            });
+        }
+        // Bound the network work per call; uncached albums are picked up on later requests.
+        album_ids.truncate(24);
 
         if !album_ids.is_empty() {
             let lookup = async {
@@ -567,14 +675,26 @@ impl DeezerSource {
                 });
                 futures::future::join_all(futs).await
             };
-            let by_album: HashMap<u64, (String, i32)> =
+            let fetched: Vec<(u64, (String, i32))> =
                 tokio::time::timeout(Duration::from_secs(5), lookup)
                     .await
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|(id, info)| info.map(|v| (id, v)))
                     .collect();
+            {
+                let mut cache = self.album_info_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if cache.len() >= DZ_ALBUM_INFO_CACHE_MAX {
+                    cache.clear();
+                }
+                for (id, info) in &fetched {
+                    cache.insert(*id, info.clone());
+                }
+            }
+            by_album.extend(fetched);
+        }
 
+        if !by_album.is_empty() {
             for t in tracks.iter_mut() {
                 if let Some((genre, year)) = t
                     .deezer_album_id()
@@ -603,7 +723,7 @@ impl DeezerSource {
             let key = slug(&pa);
             if !pa.is_empty() && !key.is_empty() && seen_artists.insert(key) {
                 missing_artists.push(pa);
-                if missing_artists.len() >= 16 {
+                if missing_artists.len() >= 6 {
                     break;
                 }
             }
@@ -819,6 +939,20 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Source-agnostic playlist filter + relevance score shared by Deezer and YouTube Music
+/// curated-mix lookups. `None` means the playlist must not be used for `query_low`.
+pub(crate) fn score_mix_playlist(title: &str, nb_tracks: usize, query_low: &str) -> Option<i32> {
+    let probe = DzPlaylist {
+        id: 0,
+        title: title.to_string(),
+        nb_tracks,
+    };
+    if !is_usable_mix_playlist(&probe, query_low) {
+        return None;
+    }
+    playlist_title_relevance_score(title, query_low)
 }
 
 fn normalize_playlist_terms(s: &str) -> String {

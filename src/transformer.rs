@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::RwLock;
+use tracing::{info, warn};
 
 pub const D_MODEL: usize = 48;
 pub const N_HEADS: usize = 4;
@@ -39,7 +40,9 @@ pub const N_FEAT_ROWS: usize = ERA_OFFSET + N_ERA_BUCKETS; // 5408
 const ROPE_BASE: f32 = 10000.0;
 const XSA_EPS: f32 = 1e-6;
 const RMS_EPS: f32 = 1e-5;
-const CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v1";
+const CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v2";
+/// v1 checkpoints were trained on raw play/complete event pairs (label leakage) and are discarded.
+const LEGACY_CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v1";
 
 pub const ACTION_STAR: usize = 0;
 pub const ACTION_PLAYLIST: usize = 1;
@@ -219,11 +222,48 @@ fn l2_normalize_backward(g_unit: &[f32; D_MODEL], unit: &[f32; D_MODEL], norm: f
     g_in
 }
 
+/// Serializes `Vec<f32>` as base64 little-endian bytes: lossless and ~3x smaller than JSON numbers.
+mod f32_b64 {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[f32], s: S) -> Result<S::Ok, S::Error> {
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for x in v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
+        let raw = String::deserialize(d)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        if bytes.len() % 4 != 0 {
+            return Err(serde::de::Error::custom("f32 payload length not a multiple of 4"));
+        }
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct AdamArray {
+    #[serde(with = "f32_b64")]
     w: Vec<f32>,
+    #[serde(with = "f32_b64")]
     m: Vec<f32>,
+    #[serde(with = "f32_b64")]
     v: Vec<f32>,
+}
+
+impl AdamArray {
+    fn shape_ok(&self, len: usize) -> bool {
+        self.w.len() == len && self.m.len() == len && self.v.len() == len
+    }
 }
 
 impl AdamArray {
@@ -770,8 +810,11 @@ impl TransformerBlock {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SparseAdamRow {
+    #[serde(with = "f32_b64")]
     w: Vec<f32>,
+    #[serde(with = "f32_b64")]
     m: Vec<f32>,
+    #[serde(with = "f32_b64")]
     v: Vec<f32>,
     step: u32,
 }
@@ -808,10 +851,74 @@ impl SparseAdamRow {
     }
 }
 
+/// One context token: sparse feature rows, optional continuous scalars, and the action type.
+type SeqItem = (Vec<(usize, f32)>, Option<[f32; 4]>, usize);
+
+/// Minimum number of held-out listens before the evaluation is trusted to gate the blend weight.
+const MIN_EVAL_ITEMS: usize = 6;
+/// Sampled negatives per training example (in-batch negatives are added on top).
+const N_SAMPLED_NEGATIVES: usize = 8;
+/// Random catalog distractors each held-out target is ranked against.
+const EVAL_POOL_NEGATIVES: usize = 99;
+/// Below this many history tokens, the user's stars are prepended as a taste prefix.
+const PROFILE_SHORT_HISTORY: usize = 12;
+const STAR_PREFIX_MAX: usize = 8;
+/// History length used when a seed/query context follows the history (mixes, radio, playlists).
+const CONTEXT_HISTORY_CAP: usize = 16;
+const MAX_SEED_TOKENS: usize = 12;
+const CORPUS_EVENTS_PER_USER: usize = 300;
+const CORPUS_CATALOG_LIMIT: usize = 3600;
+/// Events on the same track this close together belong to one listen (play → complete/skip).
+const LISTEN_MERGE_WINDOW_SECS: i64 = 3 * 3600;
+
+/// Held-out ranking quality of the model versus two simple baselines.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalReport {
+    /// Number of held-out listens evaluated.
+    pub n: usize,
+    pub model_mrr: f32,
+    pub model_recall10: f32,
+    /// Baseline: rank by global popularity (Deezer rank / quality).
+    pub popularity_mrr: f32,
+    /// Baseline: rank by artist/genre overlap with the user's context (content heuristic).
+    pub content_mrr: f32,
+    pub content_recall10: f32,
+    /// `model_mrr / max(popularity_mrr, content_mrr)`.
+    pub lift: f32,
+    /// Smoothed 0.1..1.0 trust score derived from `lift`; scales the blend weight.
+    pub quality: f32,
+    pub evaluated_at: i64,
+}
+
+impl EvalReport {
+    fn trusted(&self) -> bool {
+        self.n >= MIN_EVAL_ITEMS
+    }
+
+    fn compute_lift(&mut self) {
+        let base = self.popularity_mrr.max(self.content_mrr).max(1e-6);
+        self.lift = self.model_mrr / base;
+    }
+
+    /// Folds this run's lift into the smoothed quality score carried over from `prev`.
+    fn with_quality_from(mut self, prev: &EvalReport) -> Self {
+        if self.trusted() {
+            let q = ((self.lift - 0.85) / 0.65).clamp(0.1, 1.0);
+            self.quality = if prev.trusted() { 0.5 * prev.quality + 0.5 * q } else { q };
+        } else {
+            self.quality = prev.quality;
+        }
+        self
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TransformerNet {
+    #[serde(with = "f32_b64")]
     feature_weights: Vec<f32>,
+    #[serde(with = "f32_b64")]
     feature_m: Vec<f32>,
+    #[serde(with = "f32_b64")]
     feature_v: Vec<f32>,
     feature_steps: Vec<u32>,
     user_embs: HashMap<i64, SparseAdamRow>,
@@ -827,6 +934,16 @@ pub struct TransformerNet {
     pub step_count: u64,
     pub avg_loss: f32,
     pub last_trained_at: i64,
+    #[serde(default)]
+    pub eval: EvalReport,
+    #[serde(default)]
+    data_fingerprint: String,
+    #[serde(default)]
+    steps_on_fingerprint: u64,
+    #[serde(default)]
+    step_budget: u64,
+    #[serde(default)]
+    rejected_runs: u64,
 }
 
 impl TransformerNet {
@@ -864,7 +981,41 @@ impl TransformerNet {
             step_count: 0,
             avg_loss: 0.0,
             last_trained_at: 0,
+            eval: EvalReport::default(),
+            data_fingerprint: String::new(),
+            steps_on_fingerprint: 0,
+            step_budget: 0,
+            rejected_runs: 0,
         }
+    }
+
+    fn shapes_ok(&self) -> bool {
+        let dd = D_MODEL * D_MODEL;
+        self.feature_weights.len() == N_FEAT_ROWS * D_MODEL
+            && self.feature_m.len() == N_FEAT_ROWS * D_MODEL
+            && self.feature_v.len() == N_FEAT_ROWS * D_MODEL
+            && self.feature_steps.len() == N_FEAT_ROWS
+            && self.action_emb.shape_ok(N_ACTION_TYPES * D_MODEL)
+            && self.scalar_proj.shape_ok(4 * D_MODEL)
+            && self.final_rms_g.shape_ok(D_MODEL)
+            && self.ctx_proj_w.shape_ok(dd)
+            && self.track_proj_w.shape_ok(dd)
+            && self.user_embs.values().all(|r| r.w.len() == D_MODEL && r.m.len() == D_MODEL && r.v.len() == D_MODEL)
+            && self.blocks.len() == N_LAYERS
+            && self.blocks.iter().all(|b| {
+                b.rms1_g.shape_ok(D_MODEL)
+                    && b.wq.shape_ok(dd)
+                    && b.wk.shape_ok(dd)
+                    && b.wv.shape_ok(dd)
+                    && b.wo.shape_ok(dd)
+                    && b.rms2_g.shape_ok(D_MODEL)
+                    && b.w1.shape_ok(D_MODEL * D_FF)
+                    && b.b1.shape_ok(D_FF)
+                    && b.w_gate.shape_ok(D_MODEL * D_FF)
+                    && b.b_gate.shape_ok(D_FF)
+                    && b.w2.shape_ok(D_FF * D_MODEL)
+                    && b.b2.shape_ok(D_MODEL)
+            })
     }
 
     fn user_row_vec(&self, user_id: i64) -> [f32; D_MODEL] {
@@ -1069,21 +1220,23 @@ impl TransformerNet {
         out
     }
 
-    pub fn encode_track_unit(&self, t: &Track) -> ([f32; D_MODEL], Vec<(usize, f32)>, [f32; 4], [f32; D_MODEL], f32) {
-        let (feats, scalars) = Self::extract_track_features(t);
-        let raw = self.sum_sparse_features(&feats, Some(scalars));
+    /// Track tower on pre-extracted features: returns `(unit, raw, norm)`.
+    fn encode_feats_unit(&self, feats: &[(usize, f32)], scalars: [f32; 4]) -> ([f32; D_MODEL], [f32; D_MODEL], f32) {
+        let raw = self.sum_sparse_features(feats, Some(scalars));
         let mut proj = [0.0f32; D_MODEL];
         matmul_vec_add(&raw, &self.track_proj_w.w, D_MODEL, D_MODEL, &mut proj);
         let (unit, norm) = l2_normalize(&proj);
+        (unit, raw, norm)
+    }
+
+    pub fn encode_track_unit(&self, t: &Track) -> ([f32; D_MODEL], Vec<(usize, f32)>, [f32; 4], [f32; D_MODEL], f32) {
+        let (feats, scalars) = Self::extract_track_features(t);
+        let (unit, raw, norm) = self.encode_feats_unit(&feats, scalars);
         (unit, feats, scalars, raw, norm)
     }
 
     /// Runs the 2-layer RoPE-QKVO + XSA Transformer over a sequence of items ending in `[USER_u]`.
-    fn forward_context(
-        &self,
-        user_id: i64,
-        seq_items: &[(Vec<(usize, f32)>, Option<[f32; 4]>, usize)],
-    ) -> ContextForwardCache {
+    fn forward_context(&self, user_id: i64, seq_items: &[SeqItem]) -> ContextForwardCache {
         let capped_start = seq_items.len().saturating_sub(MAX_SEQ_LEN - 1);
         let items = &seq_items[capped_start..];
         let seq_len = items.len() + 1;
@@ -1147,8 +1300,17 @@ impl TransformerNet {
         }
     }
 
-    fn train_step_examples(&mut self, examples: &[TrainingExample], lr: f32) -> f32 {
-        if examples.is_empty() {
+    /// One AdamW step of sampled-softmax InfoNCE over a batch. Each example ranks its positive
+    /// against its own sampled negatives plus every other example's positive (in-batch negatives),
+    /// skipping in-batch items the user is already known to like.
+    fn train_step(
+        &mut self,
+        batch: &[&TrainingExample],
+        table: &CorpusTable,
+        users: &HashMap<i64, UserPrep>,
+        lr: f32,
+    ) -> f32 {
+        if batch.is_empty() {
             return 0.0;
         }
         let wd = 1e-4f32;
@@ -1163,98 +1325,90 @@ impl TransformerNet {
         let mut g_feats: HashMap<usize, [f32; D_MODEL]> = HashMap::new();
         let mut g_users: HashMap<i64, [f32; D_MODEL]> = HashMap::new();
 
-        let inv_batch = 1.0 / (examples.len() as f32);
+        // Encode every distinct candidate in the batch exactly once.
+        let mut local: HashMap<usize, usize> = HashMap::new();
+        let mut cand_ids: Vec<usize> = Vec::new();
+        for ex in batch {
+            for &i in std::iter::once(&ex.positive).chain(ex.negatives.iter()) {
+                local.entry(i).or_insert_with(|| {
+                    cand_ids.push(i);
+                    cand_ids.len() - 1
+                });
+            }
+        }
+        let mut units = Vec::with_capacity(cand_ids.len());
+        let mut raws = Vec::with_capacity(cand_ids.len());
+        let mut norms = Vec::with_capacity(cand_ids.len());
+        for &i in &cand_ids {
+            let (u, r, n) = self.encode_feats_unit(&table.feats[i], table.scalars[i]);
+            units.push(u);
+            raws.push(r);
+            norms.push(n);
+        }
+        let mut g_units = vec![[0.0f32; D_MODEL]; cand_ids.len()];
+
+        let inv_batch = 1.0 / (batch.len() as f32);
         let mut total_loss = 0.0f32;
 
-        for ex in examples {
+        for (bi, ex) in batch.iter().enumerate() {
             let ctx_cache = self.forward_context(ex.user_id, &ex.context);
-            let n_cands = 1 + ex.negatives.len();
-            let mut cand_units = Vec::with_capacity(n_cands);
-            let mut cand_feats = Vec::with_capacity(n_cands);
-            let mut cand_scalars = Vec::with_capacity(n_cands);
-            let mut cand_raws = Vec::with_capacity(n_cands);
-            let mut cand_norms = Vec::with_capacity(n_cands);
 
-            let (u_pos, f_pos, s_pos, r_pos, n_pos) = self.encode_track_unit(&ex.positive);
-            cand_units.push(u_pos);
-            cand_feats.push(f_pos);
-            cand_scalars.push(s_pos);
-            cand_raws.push(r_pos);
-            cand_norms.push(n_pos);
-
-            for neg in &ex.negatives {
-                let (u_n, f_n, s_n, r_n, n_n) = self.encode_track_unit(neg);
-                cand_units.push(u_n);
-                cand_feats.push(f_n);
-                cand_scalars.push(s_n);
-                cand_raws.push(r_n);
-                cand_norms.push(n_n);
+            let pos_song = table.song[ex.positive];
+            let seen = users.get(&ex.user_id).map(|p| &p.seen_songs);
+            let mut used_songs: HashSet<u64> = HashSet::new();
+            used_songs.insert(pos_song);
+            let mut cl: Vec<usize> = Vec::with_capacity(1 + ex.negatives.len() + batch.len());
+            cl.push(local[&ex.positive]);
+            for &n in &ex.negatives {
+                if used_songs.insert(table.song[n]) {
+                    cl.push(local[&n]);
+                }
+            }
+            for (bj, other) in batch.iter().enumerate() {
+                if bj == bi {
+                    continue;
+                }
+                let s = table.song[other.positive];
+                if seen.map_or(false, |ss| ss.contains(&s)) {
+                    continue;
+                }
+                if used_songs.insert(s) {
+                    cl.push(local[&other.positive]);
+                }
+            }
+            if cl.len() < 2 {
+                continue;
             }
 
-            let mut logits = Vec::with_capacity(n_cands);
-            let mut cosines = Vec::with_capacity(n_cands);
+            let mut cosines = Vec::with_capacity(cl.len());
             let mut max_l = f32::NEG_INFINITY;
-            for cu in &cand_units {
+            for &c in &cl {
                 let mut cos = 0.0f32;
                 for d in 0..D_MODEL {
-                    cos += ctx_cache.ctx_unit[d] * cu[d];
+                    cos += ctx_cache.ctx_unit[d] * units[c][d];
                 }
                 cosines.push(cos);
-                let l = cos * self.logit_scale;
-                logits.push(l);
-                if l > max_l {
-                    max_l = l;
-                }
+                max_l = max_l.max(cos * self.logit_scale);
             }
-
-            let mut sum_exp = 0.0f32;
-            let mut probs = Vec::with_capacity(n_cands);
-            for &l in &logits {
-                let e = (l - max_l).exp();
-                probs.push(e);
-                sum_exp += e;
-            }
+            let mut probs: Vec<f32> = cosines.iter().map(|c| (c * self.logit_scale - max_l).exp()).collect();
+            let sum_exp: f32 = probs.iter().sum::<f32>().max(1e-12);
             for p in &mut probs {
-                *p /= sum_exp.max(1e-12);
+                *p /= sum_exp;
             }
             let ce_loss = -(probs[0].max(1e-12)).ln();
             let ex_w = ex.weight * inv_batch;
             total_loss += ce_loss * ex_w;
 
-            // Gradient of InfoNCE wrt ctx_unit and each candidate unit
             let mut g_ctx_unit = [0.0f32; D_MODEL];
-            for c_idx in 0..n_cands {
-                let target = if c_idx == 0 { 1.0f32 } else { 0.0f32 };
-                let g_logit = (probs[c_idx] - target) * ex_w;
-                g_logit_scale += g_logit * cosines[c_idx];
-
+            for (k, &c) in cl.iter().enumerate() {
+                let target = if k == 0 { 1.0f32 } else { 0.0f32 };
+                let g_logit = (probs[k] - target) * ex_w;
+                g_logit_scale += g_logit * cosines[k];
                 let g_cos = g_logit * self.logit_scale;
                 for d in 0..D_MODEL {
-                    g_ctx_unit[d] += g_cos * cand_units[c_idx][d];
+                    g_ctx_unit[d] += g_cos * units[c][d];
+                    g_units[c][d] += g_cos * ctx_cache.ctx_unit[d];
                 }
-
-                let mut g_cand_unit = [0.0f32; D_MODEL];
-                for d in 0..D_MODEL {
-                    g_cand_unit[d] = g_cos * ctx_cache.ctx_unit[d];
-                }
-                let g_cand_proj = l2_normalize_backward(&g_cand_unit, &cand_units[c_idx], cand_norms[c_idx]);
-                let mut g_cand_raw = [0.0f32; D_MODEL];
-                matmul_backward(
-                    &g_cand_proj,
-                    &cand_raws[c_idx],
-                    &self.track_proj_w.w,
-                    D_MODEL,
-                    D_MODEL,
-                    &mut g_cand_raw,
-                    &mut g_trk_w,
-                );
-                accumulate_sparse_feature_grad(
-                    &cand_feats[c_idx],
-                    Some(cand_scalars[c_idx]),
-                    &g_cand_raw,
-                    &mut g_feats,
-                    &mut g_scalar,
-                );
             }
 
             // Backprop through ctx_proj -> final_rms -> Transformer blocks -> sequence inputs
@@ -1284,12 +1438,7 @@ impl TransformerNet {
 
             let mut g_h = g_h_seq;
             for l in (0..self.blocks.len()).rev() {
-                g_h = self.blocks[l].backward(
-                    &g_h,
-                    &ctx_cache.block_caches[l],
-                    ctx_cache.seq_len,
-                    &mut block_grads[l],
-                );
+                g_h = self.blocks[l].backward(&g_h, &ctx_cache.block_caches[l], ctx_cache.seq_len, &mut block_grads[l]);
             }
 
             for pos in 0..ctx_cache.seq_len {
@@ -1315,37 +1464,52 @@ impl TransformerNet {
             }
         }
 
+        // Backprop the track tower once per distinct candidate.
+        for (c, &ti) in cand_ids.iter().enumerate() {
+            if g_units[c].iter().all(|&g| g == 0.0) {
+                continue;
+            }
+            let g_proj = l2_normalize_backward(&g_units[c], &units[c], norms[c]);
+            let mut g_raw = [0.0f32; D_MODEL];
+            matmul_backward(&g_proj, &raws[c], &self.track_proj_w.w, D_MODEL, D_MODEL, &mut g_raw, &mut g_trk_w);
+            accumulate_sparse_feature_grad(&table.feats[ti], Some(table.scalars[ti]), &g_raw, &mut g_feats, &mut g_scalar);
+        }
+
         // Global gradient norm clipping (max_norm = 1.0)
         let mut sq_norm = 0.0f32;
-        for bg in &block_grads { sq_norm += bg.sq_norm(); }
-        for &v in &g_final_rms_g { sq_norm += v * v; }
-        for &v in &g_ctx_w { sq_norm += v * v; }
-        for &v in &g_trk_w { sq_norm += v * v; }
-        for &v in &g_action { sq_norm += v * v; }
-        for &v in &g_scalar { sq_norm += v * v; }
-        sq_norm += g_logit_scale * g_logit_scale;
-        for g in g_feats.values() {
-            for &v in g { sq_norm += v * v; }
+        for bg in &block_grads {
+            sq_norm += bg.sq_norm();
         }
-        for g in g_users.values() {
-            for &v in g { sq_norm += v * v; }
+        for &v in g_final_rms_g.iter().chain(&g_ctx_w).chain(&g_trk_w).chain(&g_action).chain(&g_scalar) {
+            sq_norm += v * v;
+        }
+        sq_norm += g_logit_scale * g_logit_scale;
+        for g in g_feats.values().chain(g_users.values()) {
+            for &v in g {
+                sq_norm += v * v;
+            }
         }
 
         let grad_norm = sq_norm.sqrt();
         if grad_norm > 1.0 {
             let clip = 1.0 / grad_norm;
-            for bg in &mut block_grads { bg.scale(clip); }
-            for v in &mut g_final_rms_g { *v *= clip; }
-            for v in &mut g_ctx_w { *v *= clip; }
-            for v in &mut g_trk_w { *v *= clip; }
-            for v in &mut g_action { *v *= clip; }
-            for v in &mut g_scalar { *v *= clip; }
-            g_logit_scale *= clip;
-            for g in g_feats.values_mut() {
-                for v in g.iter_mut() { *v *= clip; }
+            for bg in &mut block_grads {
+                bg.scale(clip);
             }
-            for g in g_users.values_mut() {
-                for v in g.iter_mut() { *v *= clip; }
+            for v in g_final_rms_g
+                .iter_mut()
+                .chain(g_ctx_w.iter_mut())
+                .chain(g_trk_w.iter_mut())
+                .chain(g_action.iter_mut())
+                .chain(g_scalar.iter_mut())
+            {
+                *v *= clip;
+            }
+            g_logit_scale *= clip;
+            for g in g_feats.values_mut().chain(g_users.values_mut()) {
+                for v in g.iter_mut() {
+                    *v *= clip;
+                }
             }
         }
 
@@ -1392,7 +1556,7 @@ impl TransformerNet {
         self.logit_scale_v = b2 * self.logit_scale_v + (1.0 - b2) * g_logit_scale * g_logit_scale;
         let mh = self.logit_scale_m / (1.0 - b1.powi(step_u32 as i32));
         let vh = self.logit_scale_v / (1.0 - b2.powi(step_u32 as i32));
-        self.logit_scale = (self.logit_scale - lr * (mh / (vh.sqrt() + eps))).clamp(2.0, 18.0);
+        self.logit_scale = (self.logit_scale - lr * (mh / (vh.sqrt() + eps))).clamp(3.0, 20.0);
 
         if self.step_count == 1 {
             self.avg_loss = total_loss;
@@ -1403,24 +1567,30 @@ impl TransformerNet {
         total_loss
     }
 
+    /// Linear warm-up over the first 40 steps, then inverse-sqrt decay with a floor.
+    fn learning_rate(&self) -> f32 {
+        let s = self.step_count as f32;
+        let warm = ((s + 1.0) / 40.0).min(1.0);
+        (0.004 * warm / (1.0 + s * 0.0004).sqrt()).max(0.0006)
+    }
+
     fn to_checkpoint_str(&self) -> Option<String> {
+        use base64::Engine;
         let json = serde_json::to_vec(self).ok()?;
-        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(&json).ok()?;
         let gz = enc.finish().ok()?;
-        Some(hex::encode(gz))
+        Some(base64::engine::general_purpose::STANDARD.encode(gz))
     }
 
     fn from_checkpoint_str(raw: &str) -> Option<Self> {
-        let bytes = hex::decode(raw.trim()).ok()?;
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(raw.trim()).ok()?;
         let mut dec = GzDecoder::new(&bytes[..]);
         let mut json = Vec::new();
         dec.read_to_end(&mut json).ok()?;
         let net: Self = serde_json::from_slice(&json).ok()?;
-        if net.feature_weights.len() != N_FEAT_ROWS * D_MODEL || net.blocks.len() != N_LAYERS {
-            return None;
-        }
-        Some(net)
+        net.shapes_ok().then_some(net)
     }
 }
 
@@ -1464,13 +1634,748 @@ struct ContextForwardCache {
     ctx_norm: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Listens: raw events collapsed into one outcome per actual listen
+// ---------------------------------------------------------------------------
+
+/// What happened during one listen. Ordered by how strongly it overrides earlier signals
+/// for the same listen (a play that ends in a skip is a skip; a completed track that gets
+/// starred is a save; anything followed by "not interested" is a rejection).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Outcome {
+    /// Playback started but never resolved (still playing, tab closed, or a now-playing ping).
+    Started,
+    /// Picked from search results; explicit intent even if unresolved.
+    Picked,
+    Skipped,
+    Completed,
+    Saved,
+    Rejected,
+}
+
+#[derive(Clone, Debug)]
+struct Listen {
+    track_id: String,
+    outcome: Outcome,
+    action: usize,
+    at: i64,
+}
+
+fn classify_event(kind: &str, value: f64) -> Option<(Outcome, usize)> {
+    match kind {
+        "play" | "mix_play" => Some((Outcome::Started, ACTION_PLAY)),
+        "search_pick" => Some((Outcome::Picked, ACTION_PLAY)),
+        "skip" => Some((Outcome::Skipped, ACTION_SKIP)),
+        "complete" => Some((Outcome::Completed, ACTION_COMPLETE)),
+        "star" => Some((Outcome::Saved, ACTION_STAR)),
+        "playlist_add" => Some((Outcome::Saved, ACTION_PLAYLIST)),
+        "rate" if value >= 4.0 => Some((Outcome::Saved, ACTION_STAR)),
+        "rate" if value > 0.0 && value <= 2.0 => Some((Outcome::Rejected, ACTION_DISLIKE)),
+        "not_interested" | "unstar" | "playlist_remove" => Some((Outcome::Rejected, ACTION_DISLIKE)),
+        _ => None,
+    }
+}
+
+/// Collapses a chronological event stream into listens. The web player and Subsonic clients
+/// emit `play` when a track starts and `complete`/`skip` when it ends; treating those as two
+/// separate interactions taught the old model to "predict" the track it had just been shown,
+/// and counted every skipped track as a positive play.
+fn collapse_events<'a, I>(events: I) -> Vec<Listen>
+where
+    I: IntoIterator<Item = (&'a str, &'a str, f64, i64)>,
+{
+    let mut out: Vec<Listen> = Vec::new();
+    for (tid, kind, value, at) in events {
+        let Some((outcome, action)) = classify_event(kind, value) else {
+            continue;
+        };
+        if let Some(last) = out.last_mut() {
+            let same = last.track_id == tid && (at - last.at).abs() <= LISTEN_MERGE_WINDOW_SECS;
+            let is_start = matches!(outcome, Outcome::Started | Outcome::Picked);
+            let last_open = matches!(last.outcome, Outcome::Started | Outcome::Picked);
+            // A new start after a resolved listen is a replay, not part of the same listen.
+            if same && (!is_start || last_open) {
+                if outcome > last.outcome {
+                    last.outcome = outcome;
+                    last.action = action;
+                }
+                last.at = at;
+                continue;
+            }
+        }
+        out.push(Listen {
+            track_id: tid.to_string(),
+            outcome,
+            action,
+            at,
+        });
+    }
+    out
+}
+
+fn listen_target_weight(o: Outcome) -> Option<f32> {
+    match o {
+        Outcome::Saved => Some(1.3),
+        Outcome::Completed => Some(1.0),
+        Outcome::Picked => Some(0.6),
+        _ => None,
+    }
+}
+
+fn is_positive_outcome(o: Outcome) -> bool {
+    listen_target_weight(o).is_some()
+}
+
+/// Shared sequence policy for training and inference: stars (older side) only when history is
+/// short, then chronological history, capped to `cap` tokens.
+fn assemble_profile_sequence(mut history: Vec<SeqItem>, stars: Vec<SeqItem>, cap: usize) -> Vec<SeqItem> {
+    if history.len() > cap {
+        history.drain(0..history.len() - cap);
+    }
+    let star_budget = if history.len() < PROFILE_SHORT_HISTORY {
+        STAR_PREFIX_MAX.min(cap - history.len())
+    } else {
+        0
+    };
+    let mut seq: Vec<SeqItem> = stars.into_iter().take(star_budget).collect();
+    seq.extend(history);
+    seq
+}
+
+// ---------------------------------------------------------------------------
+// Training corpus
+// ---------------------------------------------------------------------------
+
+/// Pre-extracted features for every track in the corpus, indexed densely.
+struct CorpusTable {
+    ids: Vec<String>,
+    feats: Vec<Vec<(usize, f32)>>,
+    scalars: Vec<[f32; 4]>,
+    song: Vec<u64>,
+    artist: Vec<u64>,
+    genres: Vec<Vec<u64>>,
+    index: HashMap<String, usize>,
+}
+
+impl CorpusTable {
+    fn build(corpus: &NeuralTrainingCorpus) -> Self {
+        let mut ids: Vec<&String> = corpus.tracks.keys().collect();
+        ids.sort();
+        let n = ids.len();
+        let mut tbl = CorpusTable {
+            ids: Vec::with_capacity(n),
+            feats: Vec::with_capacity(n),
+            scalars: Vec::with_capacity(n),
+            song: Vec::with_capacity(n),
+            artist: Vec::with_capacity(n),
+            genres: Vec::with_capacity(n),
+            index: HashMap::with_capacity(n),
+        };
+        for id in ids {
+            let t = &corpus.tracks[id];
+            let (f, s) = TransformerNet::extract_track_features(t);
+            tbl.index.insert(id.clone(), tbl.ids.len());
+            tbl.ids.push(id.clone());
+            tbl.feats.push(f);
+            tbl.scalars.push(s);
+            tbl.song.push(fnv1a_hash(t.song_key().as_bytes()));
+            let pa = slug(&primary_artist(&t.artist));
+            tbl.artist.push(if pa.is_empty() || pa == "unknown-artist" {
+                0
+            } else {
+                fnv1a_hash(pa.as_bytes())
+            });
+            tbl.genres.push(genre_hashes(&t.genre));
+        }
+        tbl
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn idx(&self, id: &str) -> Option<usize> {
+        self.index.get(id).copied()
+    }
+
+    fn item(&self, i: usize, action: usize) -> SeqItem {
+        (self.feats[i].clone(), Some(self.scalars[i]), action)
+    }
+}
+
+fn genre_hashes(genre: &str) -> Vec<u64> {
+    genre
+        .split([',', ';', '/'])
+        .map(|g| g.trim().to_lowercase())
+        .filter(|g| g.len() >= 2)
+        .take(4)
+        .map(|g| fnv1a_hash(g.as_bytes()))
+        .collect()
+}
+
+/// Everything known about one user's taste, in table indices.
+#[derive(Default)]
+struct UserPrep {
+    listens: Vec<(usize, Listen)>,
+    stars: Vec<usize>,
+    high_rated: Vec<usize>,
+    disliked: Vec<usize>,
+    /// Stars, high ratings and manual playlist tracks.
+    explicit_songs: HashSet<u64>,
+    /// Explicit songs plus completed / saved / picked listens.
+    pos_songs: HashSet<u64>,
+    /// Positive songs plus unresolved plays: never used as negatives for this user.
+    seen_songs: HashSet<u64>,
+    pos_list: Vec<usize>,
+}
+
+fn prepare_users(corpus: &NeuralTrainingCorpus, table: &CorpusTable) -> HashMap<i64, UserPrep> {
+    let mut playlist_tracks: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (uid, _, tids) in &corpus.playlists {
+        let e = playlist_tracks.entry(*uid).or_default();
+        e.extend(tids.iter().filter_map(|id| table.idx(id)));
+    }
+
+    let mut out = HashMap::new();
+    for &uid in &corpus.user_ids {
+        let mut p = UserPrep::default();
+        if let Some(evs) = corpus.user_events.get(&uid) {
+            let listens = collapse_events(evs.iter().map(|(tid, kind, v, at)| (tid.as_str(), kind.as_str(), *v, *at)));
+            for l in listens {
+                if let Some(i) = table.idx(&l.track_id) {
+                    p.listens.push((i, l));
+                }
+            }
+        }
+        if let Some(stars) = corpus.user_stars.get(&uid) {
+            p.stars = stars.iter().filter_map(|id| table.idx(id)).collect();
+        }
+        if let Some(ratings) = corpus.user_ratings.get(&uid) {
+            for (id, r) in ratings {
+                if let Some(i) = table.idx(id) {
+                    if *r >= 4 {
+                        p.high_rated.push(i);
+                    } else if *r <= 2 {
+                        p.disliked.push(i);
+                    }
+                }
+            }
+        }
+        if let Some(d) = corpus.user_disliked.get(&uid) {
+            p.disliked.extend(d.iter().filter_map(|id| table.idx(id)));
+        }
+        let pl = playlist_tracks.remove(&uid).unwrap_or_default();
+
+        for &i in p.stars.iter().chain(&p.high_rated).chain(&pl) {
+            p.explicit_songs.insert(table.song[i]);
+        }
+        p.pos_songs = p.explicit_songs.clone();
+        let mut pos_list: Vec<usize> = p.stars.iter().chain(&p.high_rated).chain(&pl).copied().collect();
+        for (i, l) in &p.listens {
+            match l.outcome {
+                o if is_positive_outcome(o) => {
+                    p.pos_songs.insert(table.song[*i]);
+                    pos_list.push(*i);
+                }
+                Outcome::Skipped | Outcome::Rejected => p.disliked.push(*i),
+                _ => {}
+            }
+        }
+        p.seen_songs = p.pos_songs.clone();
+        for (i, l) in &p.listens {
+            if l.outcome == Outcome::Started {
+                p.seen_songs.insert(table.song[*i]);
+            }
+        }
+        let mut seen = HashSet::new();
+        p.pos_list = pos_list.into_iter().filter(|&i| seen.insert(table.song[i])).collect();
+        let mut seen = HashSet::new();
+        let pos_songs = &p.pos_songs;
+        p.disliked.retain(|&i| !pos_songs.contains(&table.song[i]) && seen.insert(table.song[i]));
+        out.insert(uid, p);
+    }
+    out
+}
+
+/// Profile context from the user's first `upto` listens (stars prefixed when history is short).
+fn profile_sequence(p: &UserPrep, table: &CorpusTable, upto: usize, exclude_song: Option<u64>, cap: usize) -> Vec<SeqItem> {
+    let upto = upto.min(p.listens.len());
+    let start = upto.saturating_sub(cap);
+    let window = &p.listens[start..upto];
+    let history: Vec<SeqItem> = window.iter().map(|(i, l)| table.item(*i, l.action)).collect();
+    let stars = if history.len() < PROFILE_SHORT_HISTORY {
+        let hist_songs: HashSet<u64> = window.iter().map(|(i, _)| table.song[*i]).collect();
+        p.stars
+            .iter()
+            .filter(|&&i| !hist_songs.contains(&table.song[i]) && Some(table.song[i]) != exclude_song)
+            .take(STAR_PREFIX_MAX)
+            .map(|&i| table.item(i, ACTION_STAR))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assemble_profile_sequence(history, stars, cap)
+}
+
 #[derive(Clone)]
 struct TrainingExample {
     user_id: i64,
-    context: Vec<(Vec<(usize, f32)>, Option<[f32; 4]>, usize)>,
-    positive: Track,
-    negatives: Vec<Track>,
+    context: Vec<SeqItem>,
+    positive: usize,
+    negatives: Vec<usize>,
     weight: f32,
+}
+
+/// A held-out listen: the model must rank `target` above random catalog tracks given `context`.
+struct EvalItem {
+    user_id: i64,
+    context: Vec<SeqItem>,
+    target: usize,
+}
+
+struct TrainingData {
+    examples: Vec<TrainingExample>,
+    holdouts: Vec<EvalItem>,
+}
+
+struct NegSampler<'a> {
+    table: &'a CorpusTable,
+    users: &'a HashMap<i64, UserPrep>,
+    donor_users: Vec<i64>,
+    genre_index: HashMap<u64, Vec<usize>>,
+}
+
+impl<'a> NegSampler<'a> {
+    fn new(table: &'a CorpusTable, users: &'a HashMap<i64, UserPrep>) -> Self {
+        let mut donor_users: Vec<i64> = users.iter().filter(|(_, p)| !p.pos_list.is_empty()).map(|(u, _)| *u).collect();
+        donor_users.sort();
+        let mut genre_index: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, gs) in table.genres.iter().enumerate() {
+            for &g in gs {
+                genre_index.entry(g).or_default().push(i);
+            }
+        }
+        Self {
+            table,
+            users,
+            donor_users,
+            genre_index,
+        }
+    }
+
+    /// Mix of personalized (the user's skips/dislikes), collaborative (liked by a user with
+    /// disjoint taste), hard (same genre, different artist) and random catalog negatives.
+    fn sample(&self, uid: i64, pos: usize, rng: &mut StdRng) -> Vec<usize> {
+        let t = self.table;
+        let prep = self.users.get(&uid);
+        let is_seen = |s: u64| prep.map_or(false, |p| p.seen_songs.contains(&s));
+        let pos_artist = t.artist[pos];
+        let mut out = Vec::with_capacity(N_SAMPLED_NEGATIVES);
+        let mut used: HashSet<u64> = HashSet::new();
+        used.insert(t.song[pos]);
+        let mut try_push = |i: usize, out: &mut Vec<usize>| {
+            if out.len() < N_SAMPLED_NEGATIVES && used.insert(t.song[i]) {
+                out.push(i);
+            }
+        };
+
+        if let Some(p) = prep {
+            for _ in 0..3 {
+                if out.len() >= 2 || p.disliked.is_empty() {
+                    break;
+                }
+                try_push(p.disliked[rng.gen_range(0..p.disliked.len())], &mut out);
+            }
+        }
+
+        let goal = out.len() + 2;
+        if self.donor_users.len() > 1 {
+            for _ in 0..6 {
+                if out.len() >= goal {
+                    break;
+                }
+                let other = self.donor_users[rng.gen_range(0..self.donor_users.len())];
+                if other == uid {
+                    continue;
+                }
+                let op = &self.users[&other];
+                if prep.map_or(false, |p| !p.pos_songs.is_disjoint(&op.pos_songs)) {
+                    continue;
+                }
+                let i = op.pos_list[rng.gen_range(0..op.pos_list.len())];
+                if !is_seen(t.song[i]) {
+                    try_push(i, &mut out);
+                }
+            }
+        }
+
+        let goal = out.len() + 2;
+        if !t.genres[pos].is_empty() {
+            for _ in 0..10 {
+                if out.len() >= goal {
+                    break;
+                }
+                let g = t.genres[pos][rng.gen_range(0..t.genres[pos].len())];
+                if let Some(bucket) = self.genre_index.get(&g) {
+                    let i = bucket[rng.gen_range(0..bucket.len())];
+                    if t.artist[i] != pos_artist && !is_seen(t.song[i]) {
+                        try_push(i, &mut out);
+                    }
+                }
+            }
+        }
+
+        let mut tries = 0;
+        while out.len() < N_SAMPLED_NEGATIVES && tries < 48 && t.len() > 1 {
+            tries += 1;
+            let i = rng.gen_range(0..t.len());
+            if is_seen(t.song[i]) || (tries < 36 && pos_artist != 0 && t.artist[i] == pos_artist) {
+                continue;
+            }
+            try_push(i, &mut out);
+        }
+        out
+    }
+}
+
+/// Randomly drops ~10% of context tokens (never the last one) for robustness.
+fn token_dropout(seq: Vec<SeqItem>, rng: &mut StdRng) -> Vec<SeqItem> {
+    if seq.len() <= 6 {
+        return seq;
+    }
+    let last = seq.len() - 1;
+    seq.into_iter()
+        .enumerate()
+        .filter(|(k, _)| *k == last || !rng.gen_bool(0.1))
+        .map(|(_, s)| s)
+        .collect()
+}
+
+fn build_training_data(
+    corpus: &NeuralTrainingCorpus,
+    table: &CorpusTable,
+    users: &HashMap<i64, UserPrep>,
+    seed: u64,
+) -> TrainingData {
+    let mut examples = Vec::new();
+    let mut holdouts = Vec::new();
+    if table.len() < 4 {
+        return TrainingData { examples, holdouts };
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let sampler = NegSampler::new(table, users);
+    let mut uids: Vec<i64> = users.keys().copied().collect();
+    uids.sort();
+    let mut holdout_songs: HashMap<i64, u64> = HashMap::new();
+
+    // Task 1: next positive listen given the listens before it (mirrors For You / Discover).
+    for &uid in &uids {
+        let p = &users[&uid];
+        let all_targets: Vec<usize> = (1..p.listens.len()).filter(|&i| is_positive_outcome(p.listens[i].1.outcome)).collect();
+        let targets = &all_targets[all_targets.len().saturating_sub(80)..];
+
+        // Hold out the most recent listen of a track the user discovered by listening (not
+        // starred / rated / playlisted, not heard earlier) to measure real generalization.
+        let holdout_at = if targets.len() >= 4 {
+            targets.iter().rev().copied().find(|&i| {
+                let s = table.song[p.listens[i].0];
+                i >= 3 && !p.explicit_songs.contains(&s) && !p.listens[..i].iter().any(|(j, _)| table.song[*j] == s)
+            })
+        } else {
+            None
+        };
+        if let Some(h) = holdout_at {
+            let tgt = p.listens[h].0;
+            holdout_songs.insert(uid, table.song[tgt]);
+            holdouts.push(EvalItem {
+                user_id: uid,
+                context: profile_sequence(p, table, h, Some(table.song[tgt]), MAX_SEQ_LEN - 1),
+                target: tgt,
+            });
+        }
+
+        for &i in targets {
+            if Some(i) == holdout_at {
+                continue;
+            }
+            let (pos, ref l) = p.listens[i];
+            let pos_song = table.song[pos];
+            let mut w = listen_target_weight(l.outcome).unwrap_or(1.0);
+            if p.listens[..i].iter().any(|(j, _)| table.song[*j] == pos_song) {
+                // Repeat listens are real but trivially predictable; don't let them dominate.
+                w *= 0.35;
+            }
+            // 25%: session/radio-seed variant, the previous positive listen becomes an explicit seed.
+            let seed_k = if rng.gen_bool(0.25) {
+                (0..i)
+                    .rev()
+                    .take(6)
+                    .find(|&k| is_positive_outcome(p.listens[k].1.outcome) && table.song[p.listens[k].0] != pos_song)
+            } else {
+                None
+            };
+            let ctx = match seed_k {
+                Some(k) => {
+                    let mut seq = profile_sequence(p, table, k, Some(pos_song), CONTEXT_HISTORY_CAP);
+                    seq.push(table.item(p.listens[k].0, ACTION_SEED));
+                    seq
+                }
+                None => profile_sequence(p, table, i, Some(pos_song), MAX_SEQ_LEN - 1),
+            };
+            let ctx = token_dropout(ctx, &mut rng);
+            let negs = sampler.sample(uid, pos, &mut rng);
+            if !negs.is_empty() {
+                examples.push(TrainingExample { user_id: uid, context: ctx, positive: pos, negatives: negs, weight: w });
+            }
+        }
+    }
+
+    // Task 2: manual playlist completion (mirrors Playlist DNA: history + seed tracks + name).
+    for (uid, name, tids) in &corpus.playlists {
+        let mut seen_s = HashSet::new();
+        let pl: Vec<usize> = tids.iter().filter_map(|id| table.idx(id)).filter(|&i| seen_s.insert(table.song[i])).collect();
+        if pl.len() < 2 {
+            continue;
+        }
+        let q = TransformerNet::extract_query_features(name, &[], &[]);
+        let mut holds: Vec<usize> = (0..pl.len()).collect();
+        holds.shuffle(&mut rng);
+        holds.truncate(12);
+        for h in holds {
+            let pos = pl[h];
+            let pos_song = table.song[pos];
+            let mut w = 1.1f32;
+            let mut ctx = Vec::new();
+            if let Some(p) = users.get(uid) {
+                if rng.gen_bool(0.5) {
+                    let start = p.listens.len().saturating_sub(CONTEXT_HISTORY_CAP);
+                    if p.listens[start..].iter().any(|(j, _)| table.song[*j] == pos_song) {
+                        w *= 0.5;
+                    }
+                    ctx = profile_sequence(p, table, p.listens.len(), Some(pos_song), CONTEXT_HISTORY_CAP);
+                }
+            }
+            let mut others: Vec<usize> = (0..pl.len()).filter(|&k| k != h).collect();
+            others.sort_by_key(|&k| (k as i64 - h as i64).abs());
+            others.truncate(MAX_SEED_TOKENS);
+            others.sort();
+            for k in others {
+                ctx.push(table.item(pl[k], ACTION_SEED));
+            }
+            if !q.is_empty() && rng.gen_bool(0.7) {
+                ctx.push((q.clone(), None, ACTION_QUERY));
+            }
+            let negs = sampler.sample(*uid, pos, &mut rng);
+            if !negs.is_empty() {
+                examples.push(TrainingExample { user_id: *uid, context: ctx, positive: pos, negatives: negs, weight: w });
+            }
+        }
+    }
+
+    // Task 3: explicit favourites (stars / high ratings) predict each other; covers users with
+    // little listening history, whose inference context is a star prefix.
+    for &uid in &uids {
+        let p = &users[&uid];
+        let mut s = HashSet::new();
+        let positives: Vec<usize> = p.stars.iter().chain(&p.high_rated).copied().filter(|&i| s.insert(table.song[i])).collect();
+        if positives.len() < 2 {
+            continue;
+        }
+        let mut order: Vec<usize> = (0..positives.len()).collect();
+        order.shuffle(&mut rng);
+        for &k in order.iter().take(8) {
+            let pos = positives[k];
+            let mut ctx = Vec::new();
+            if !p.disliked.is_empty() && rng.gen_bool(0.6) {
+                ctx.push(table.item(p.disliked[rng.gen_range(0..p.disliked.len())], ACTION_DISLIKE));
+            }
+            let mut others: Vec<usize> = positives.iter().copied().filter(|&i| i != pos).collect();
+            others.shuffle(&mut rng);
+            others.truncate(10);
+            for i in others {
+                ctx.push(table.item(i, ACTION_STAR));
+            }
+            let negs = sampler.sample(uid, pos, &mut rng);
+            if !negs.is_empty() {
+                examples.push(TrainingExample { user_id: uid, context: ctx, positive: pos, negatives: negs, weight: 1.2 });
+            }
+        }
+    }
+
+    // Task 4: mood / genre query alignment (mirrors Mood, Explore and Instant mixes, including
+    // logged-out use through the shared user-0 embedding).
+    for &uid in &uids {
+        let p = &users[&uid];
+        let hold = holdout_songs.get(&uid).copied();
+        let mut cands: Vec<usize> = p.pos_list.iter().copied().filter(|&i| Some(table.song[i]) != hold).collect();
+        cands.shuffle(&mut rng);
+        cands.truncate(6);
+        for pos in cands {
+            let Some(t) = corpus.tracks.get(&table.ids[pos]) else {
+                continue;
+            };
+            let moods = t.mood_list();
+            let genres: Vec<String> = t
+                .genre
+                .split([',', ';', '/'])
+                .map(|g| g.trim().to_string())
+                .filter(|g| g.len() >= 2)
+                .take(2)
+                .collect();
+            if moods.is_empty() && genres.is_empty() {
+                continue;
+            }
+            let r: f32 = rng.gen();
+            let (q_moods, q_genres): (Vec<Mood>, Vec<String>) = if r < 0.4 && !moods.is_empty() {
+                (moods, Vec::new())
+            } else if r < 0.75 && !genres.is_empty() {
+                (Vec::new(), genres[..1].to_vec())
+            } else {
+                (moods, genres)
+            };
+            let qf = TransformerNet::extract_query_features("", &q_moods, &q_genres);
+            if qf.is_empty() {
+                continue;
+            }
+            let pos_song = table.song[pos];
+            let anonymous = rng.gen_bool(0.25);
+            let mut w = 0.7f32;
+            let mut ctx = if anonymous {
+                Vec::new()
+            } else {
+                let start = p.listens.len().saturating_sub(CONTEXT_HISTORY_CAP);
+                if p.listens[start..].iter().any(|(j, _)| table.song[*j] == pos_song) {
+                    w *= 0.5;
+                }
+                profile_sequence(p, table, p.listens.len(), Some(pos_song), CONTEXT_HISTORY_CAP)
+            };
+            ctx.push((qf, None, ACTION_QUERY));
+            let ctx_user = if anonymous { 0 } else { uid };
+            let negs = sampler.sample(uid, pos, &mut rng);
+            if !negs.is_empty() {
+                examples.push(TrainingExample { user_id: ctx_user, context: ctx, positive: pos, negatives: negs, weight: w });
+            }
+        }
+    }
+
+    // Balance training weights across users so high-volume listeners don't drown out quieter users.
+    let mut per_user_counts: HashMap<i64, usize> = HashMap::new();
+    for ex in &examples {
+        *per_user_counts.entry(ex.user_id).or_insert(0) += 1;
+    }
+    for ex in &mut examples {
+        let cnt = per_user_counts.get(&ex.user_id).copied().unwrap_or(1) as f32;
+        ex.weight *= (12.0 / cnt).sqrt().clamp(0.35, 1.5);
+    }
+
+    TrainingData { examples, holdouts }
+}
+
+fn rank_of_first(scores: &[f32]) -> f32 {
+    let t = scores[0];
+    let mut r = 1.0f32;
+    for &s in &scores[1..] {
+        if s > t {
+            r += 1.0;
+        } else if s == t {
+            r += 0.5;
+        }
+    }
+    r
+}
+
+/// Ranks each held-out listen against random unseen catalog tracks and compares the model
+/// with a popularity baseline and an artist/genre-overlap content baseline.
+fn evaluate(net: &TransformerNet, table: &CorpusTable, users: &HashMap<i64, UserPrep>, items: &[EvalItem], seed: u64) -> EvalReport {
+    let mut rep = EvalReport {
+        evaluated_at: Utc::now().timestamp(),
+        ..Default::default()
+    };
+    if items.is_empty() || table.len() < 30 {
+        return rep;
+    }
+    let mut unit_cache: HashMap<usize, [f32; D_MODEL]> = HashMap::new();
+    let (mut m_rr, mut m_hit, mut p_rr, mut c_rr, mut c_hit) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut n = 0usize;
+    for (k, item) in items.iter().enumerate() {
+        let mut rng = StdRng::seed_from_u64(seed ^ (k as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
+        let seen = users.get(&item.user_id).map(|p| &p.seen_songs);
+        let mut pool = vec![item.target];
+        let mut used: HashSet<u64> = HashSet::from([table.song[item.target]]);
+        let mut tries = 0;
+        while pool.len() <= EVAL_POOL_NEGATIVES && tries < EVAL_POOL_NEGATIVES * 5 {
+            tries += 1;
+            let i = rng.gen_range(0..table.len());
+            let s = table.song[i];
+            if seen.map_or(false, |ss| ss.contains(&s)) {
+                continue;
+            }
+            if used.insert(s) {
+                pool.push(i);
+            }
+        }
+        if pool.len() < 21 {
+            continue;
+        }
+
+        let ctx = net.forward_context(item.user_id, &item.context).ctx_unit;
+        let mut profile_rows: HashMap<usize, f32> = HashMap::new();
+        for (feats, _, act) in &item.context {
+            if *act == ACTION_SKIP || *act == ACTION_DISLIKE {
+                continue;
+            }
+            for &(row, _) in feats {
+                if (ARTIST_OFFSET..TEXT_OFFSET).contains(&row) {
+                    *profile_rows.entry(row).or_insert(0.0) += 2.0;
+                } else if (GENRE_OFFSET..MOOD_OFFSET).contains(&row) {
+                    *profile_rows.entry(row).or_insert(0.0) += 1.0;
+                }
+            }
+        }
+
+        let mut model_s = Vec::with_capacity(pool.len());
+        let mut pop_s = Vec::with_capacity(pool.len());
+        let mut content_s = Vec::with_capacity(pool.len());
+        for &i in &pool {
+            let u = *unit_cache
+                .entry(i)
+                .or_insert_with(|| net.encode_feats_unit(&table.feats[i], table.scalars[i]).0);
+            let mut cos = 0.0f32;
+            for d in 0..D_MODEL {
+                cos += ctx[d] * u[d];
+            }
+            model_s.push(cos);
+            let pop = table.scalars[i][0] + 0.05 * table.scalars[i][1];
+            pop_s.push(pop);
+            let mut c = 0.0f32;
+            for &(row, w) in &table.feats[i] {
+                if let Some(&pw) = profile_rows.get(&row) {
+                    c += pw * w;
+                }
+            }
+            content_s.push(c + 0.01 * pop);
+        }
+        let mr = rank_of_first(&model_s);
+        let pr = rank_of_first(&pop_s);
+        let cr = rank_of_first(&content_s);
+        m_rr += 1.0 / mr as f64;
+        p_rr += 1.0 / pr as f64;
+        c_rr += 1.0 / cr as f64;
+        m_hit += (mr <= 10.0) as u8 as f64;
+        c_hit += (cr <= 10.0) as u8 as f64;
+        n += 1;
+    }
+    if n > 0 {
+        let nf = n as f64;
+        rep.n = n;
+        rep.model_mrr = (m_rr / nf) as f32;
+        rep.model_recall10 = (m_hit / nf) as f32;
+        rep.popularity_mrr = (p_rr / nf) as f32;
+        rep.content_mrr = (c_rr / nf) as f32;
+        rep.content_recall10 = (c_hit / nf) as f32;
+        rep.compute_lift();
+    }
+    rep
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1480,23 +2385,47 @@ pub struct TrainEpochStats {
     pub avg_loss: f32,
     pub examples_used: usize,
     pub distilled_users: usize,
+    /// True when nothing changed since the last run and the step budget was already spent.
+    pub skipped: bool,
+    /// True when the new weights scored worse on held-out listens and were discarded.
+    pub rejected: bool,
+    pub eval: EvalReport,
 }
+
+// ---------------------------------------------------------------------------
+// Engine (inference + background training)
+// ---------------------------------------------------------------------------
 
 pub struct TransformerEngine {
     net: RwLock<TransformerNet>,
-    user_vec_cache: RwLock<HashMap<i64, (i64, [f32; D_MODEL])>>,
+    user_vec_cache: RwLock<HashMap<i64, (i64, u64, [f32; D_MODEL])>>,
+    unit_cache: RwLock<HashMap<u64, [f32; D_MODEL]>>,
     train_lock: std::sync::Mutex<()>,
+}
+
+fn track_cache_key(t: &Track, model_step: u64) -> u64 {
+    let mut h = fnv1a_hash(t.id.as_bytes());
+    for s in [&t.artist, &t.title, &t.album, &t.genre, &t.moods, &t.meta] {
+        h = splitmix64(h ^ fnv1a_hash(s.as_bytes()));
+    }
+    splitmix64(h ^ (t.year as u64) ^ ((t.duration as u64) << 24) ^ model_step.wrapping_mul(0x9e3779b97f4a7c15))
 }
 
 impl TransformerEngine {
     pub fn load_or_new(store: &Store) -> Self {
-        let net = store
-            .kv_get(CHECKPOINT_KV_KEY)
-            .and_then(|raw| TransformerNet::from_checkpoint_str(&raw))
-            .unwrap_or_else(TransformerNet::new);
+        let net = match store.kv_get(CHECKPOINT_KV_KEY) {
+            Some(raw) => TransformerNet::from_checkpoint_str(&raw).unwrap_or_else(|| {
+                warn!("transformer checkpoint unreadable; starting fresh");
+                TransformerNet::new()
+            }),
+            None => TransformerNet::new(),
+        };
+        // v1 weights learned a label-leakage shortcut; free the space and retrain from scratch.
+        store.kv_delete(LEGACY_CHECKPOINT_KV_KEY);
         Self {
             net: RwLock::new(net),
             user_vec_cache: RwLock::new(HashMap::new()),
+            unit_cache: RwLock::new(HashMap::new()),
             train_lock: std::sync::Mutex::new(()),
         }
     }
@@ -1513,6 +2442,8 @@ impl TransformerEngine {
 
     pub fn status_snapshot(&self) -> serde_json::Value {
         let net = self.net.read().unwrap_or_else(|e| e.into_inner());
+        let ev = &net.eval;
+        let r3 = |x: f32| (x * 1000.0).round() / 1000.0;
         serde_json::json!({
             "architecture": "RoPE-QKVO + XSA + GEGLU Transformer",
             "paper": "arXiv:2603.09078",
@@ -1520,13 +2451,67 @@ impl TransformerEngine {
             "layers": N_LAYERS,
             "heads": N_HEADS,
             "steps": net.step_count,
-            "avgLoss": (net.avg_loss * 1000.0).round() / 1000.0,
+            "avgLoss": r3(net.avg_loss),
+            "logitScale": r3(net.logit_scale),
             "usersTracked": net.user_embs.len(),
             "lastTrainedAt": net.last_trained_at,
+            "stepsOnCurrentData": net.steps_on_fingerprint,
+            "stepBudget": net.step_budget,
+            "rejectedRuns": net.rejected_runs,
+            "eval": {
+                "heldOutListens": ev.n,
+                "trusted": ev.trusted(),
+                "modelMrr": r3(ev.model_mrr),
+                "modelRecall10": r3(ev.model_recall10),
+                "popularityMrr": r3(ev.popularity_mrr),
+                "contentMrr": r3(ev.content_mrr),
+                "contentRecall10": r3(ev.content_recall10),
+                "lift": r3(ev.lift),
+                "quality": r3(ev.quality),
+                "evaluatedAt": ev.evaluated_at,
+            },
+            "blendMultiplier": {
+                "newUser": (Self::multiplier_for(&net, 0) * 1000.0).round() / 1000.0,
+                "establishedUser": (Self::multiplier_for(&net, 30) * 1000.0).round() / 1000.0,
+            },
         })
     }
 
-    /// Computes normalized Transformer compatibility scores for `candidates` given:
+    fn track_units(&self, net: &TransformerNet, tracks: &[Track]) -> Vec<[f32; D_MODEL]> {
+        let keys: Vec<u64> = tracks.iter().map(|t| track_cache_key(t, net.step_count)).collect();
+        let mut out = vec![[0.0f32; D_MODEL]; tracks.len()];
+        let mut missing = Vec::new();
+        match self.unit_cache.read() {
+            Ok(cache) => {
+                for (i, k) in keys.iter().enumerate() {
+                    match cache.get(k) {
+                        Some(u) => out[i] = *u,
+                        None => missing.push(i),
+                    }
+                }
+            }
+            Err(_) => missing.extend(0..tracks.len()),
+        }
+        if missing.is_empty() {
+            return out;
+        }
+        let computed: Vec<(usize, [f32; D_MODEL])> =
+            missing.iter().map(|&i| (i, net.encode_track_unit(&tracks[i]).0)).collect();
+        if let Ok(mut cache) = self.unit_cache.write() {
+            if cache.len() + computed.len() > 60_000 {
+                cache.clear();
+            }
+            for &(i, u) in &computed {
+                cache.insert(keys[i], u);
+            }
+        }
+        for (i, u) in computed {
+            out[i] = u;
+        }
+        out
+    }
+
+    /// Computes Transformer compatibility scores for `candidates` given:
     /// - `user_id`: differentiates per-user taste via `u_emb[user_id]` + attention over user history
     /// - `context_tracks`: optional active context (playlist tracks, seed track, recent radio items)
     /// - `query`: optional text/mood/genre intent (Instant Mix, Mood, Explore, Search)
@@ -1547,49 +2532,49 @@ impl TransformerEngine {
         if net.step_count == 0 {
             return vec![0.0; candidates.len()];
         }
-        let confidence = (net.step_count as f32 / 24.0).clamp(0.05, 1.0);
-        let ctx_vec = self.compute_context_vector_locked(
-            &net,
-            store,
-            user_id,
-            context_tracks,
-            query,
-            moods,
-            genres,
-        );
-
-        let mut scores = Vec::with_capacity(candidates.len());
-        for t in candidates {
-            let (t_unit, _, _, _, _) = net.encode_track_unit(t);
-            let mut cos = 0.0f32;
-            for d in 0..D_MODEL {
-                cos += ctx_vec[d] * t_unit[d];
-            }
-            let s = cos * net.logit_scale * confidence;
-            scores.push(if s.is_finite() { s } else { 0.0 });
-        }
-        scores
+        let confidence = (net.step_count as f32 / 40.0).clamp(0.05, 1.0);
+        let ctx_vec = self.compute_context_vector_locked(&net, store, user_id, context_tracks, query, moods, genres);
+        self.track_units(&net, candidates)
+            .iter()
+            .map(|u| {
+                let mut cos = 0.0f32;
+                for d in 0..D_MODEL {
+                    cos += ctx_vec[d] * u[d];
+                }
+                let s = cos * net.logit_scale * confidence;
+                if s.is_finite() {
+                    s
+                } else {
+                    0.0
+                }
+            })
+            .collect()
     }
 
-    /// Confidence-adaptive multiplier in `[0.45, 1.60]` (or `0.0` if untrained) that scales
-    /// the Transformer's influence up as both `step_count` and user `history_count` grow.
-    pub fn adaptive_multiplier(&self, history_count: usize) -> f64 {
-        let steps = self.step_count() as f64;
-        if steps <= 0.0 {
+    fn multiplier_for(net: &TransformerNet, history_count: usize) -> f64 {
+        if net.step_count == 0 {
             return 0.0;
         }
-        let model_factor = 0.55 + 0.80 * (steps / 120.0).clamp(0.0, 1.0);
+        let model_factor = if net.eval.trusted() {
+            // Earned trust: 0.36 when it loses to the baselines, up to 1.35 when it clearly wins.
+            0.25 + 1.10 * net.eval.quality as f64
+        } else {
+            // Not yet measurable (too few held-out listens): stay modest.
+            0.35 + 0.30 * (net.step_count as f64 / 120.0).clamp(0.0, 1.0)
+        };
         let user_factor = 0.75 + 0.45 * ((history_count as f64) / 30.0).clamp(0.0, 1.0);
-        (model_factor * user_factor).clamp(0.45, 1.60)
+        (model_factor * user_factor).clamp(0.05, 1.60)
+    }
+
+    /// Blend multiplier for the Transformer's scores, scaled by its measured held-out quality
+    /// (versus popularity and content baselines) and by how much history the user has.
+    pub fn adaptive_multiplier(&self, history_count: usize) -> f64 {
+        let net = self.net.read().unwrap_or_else(|e| e.into_inner());
+        Self::multiplier_for(&net, history_count)
     }
 
     /// Scores `(artist_name, genres)` pairs against the user's Transformer context vector.
-    pub fn score_artist_candidates(
-        &self,
-        store: &Store,
-        user_id: i64,
-        artists: &[(String, String)],
-    ) -> Vec<f32> {
+    pub fn score_artist_candidates(&self, store: &Store, user_id: i64, artists: &[(String, String)]) -> Vec<f32> {
         if artists.is_empty() {
             return Vec::new();
         }
@@ -1597,7 +2582,7 @@ impl TransformerEngine {
         if net.step_count == 0 {
             return vec![0.0; artists.len()];
         }
-        let confidence = (net.step_count as f32 / 24.0).clamp(0.05, 1.0);
+        let confidence = (net.step_count as f32 / 40.0).clamp(0.05, 1.0);
         let ctx_vec = self.compute_context_vector_locked(&net, store, user_id, &[], None, &[], &[]);
         let mut scores = Vec::with_capacity(artists.len());
         for (name, genres) in artists {
@@ -1625,63 +2610,62 @@ impl TransformerEngine {
         moods: &[Mood],
         genres: &[String],
     ) -> [f32; D_MODEL] {
-        let has_extra_ctx = !context_tracks.is_empty()
-            || query.map_or(false, |q| !q.trim().is_empty())
-            || !moods.is_empty()
-            || !genres.is_empty();
+        let has_query = query.map_or(false, |q| !q.trim().is_empty()) || !moods.is_empty() || !genres.is_empty();
+        let has_extra_ctx = !context_tracks.is_empty() || has_query;
 
         let now = Utc::now().timestamp();
         if !has_extra_ctx && user_id > 0 {
             if let Ok(cache) = self.user_vec_cache.read() {
-                if let Some(&(ts, vec)) = cache.get(&user_id) {
-                    if now - ts < 120 {
+                if let Some(&(ts, step, vec)) = cache.get(&user_id) {
+                    if now - ts < 120 && step == net.step_count {
                         return vec;
                     }
                 }
             }
         }
 
-        let mut seq_items: Vec<(Vec<(usize, f32)>, Option<[f32; 4]>, usize)> = Vec::new();
+        let mut seq_items: Vec<SeqItem> = Vec::new();
         if user_id > 0 {
-            let hist_cap = if has_extra_ctx { 16 } else { MAX_SEQ_LEN - 1 };
-            let mut neg_items = Vec::new();
-            let mut pos_items = Vec::new();
-            let mut seen_ids = HashSet::new();
-            if let Ok(hist) = store.load_user_neural_history(user_id, hist_cap) {
-                for (t, kind, _) in hist {
-                    seen_ids.insert(t.id.clone());
-                    let act = event_kind_to_action(&kind);
-                    let (f, s) = TransformerNet::extract_track_features(&t);
-                    if act == ACTION_SKIP || act == ACTION_DISLIKE {
-                        neg_items.push((f, Some(s), act));
-                    } else {
-                        pos_items.push((f, Some(s), act));
-                    }
-                }
-            }
-            if let Ok(stars) = store.starred_tracks(user_id) {
-                for (t, _) in stars.into_iter().take(12) {
-                    if seen_ids.insert(t.id.clone()) {
+            let hist_cap = if has_extra_ctx { CONTEXT_HISTORY_CAP } else { MAX_SEQ_LEN - 1 };
+            let raw = store.load_user_neural_history(user_id, hist_cap * 3 + 8).unwrap_or_default();
+            let by_id: HashMap<&str, &Track> = raw.iter().map(|(t, _, _, _)| (t.id.as_str(), t)).collect();
+            let listens = collapse_events(raw.iter().map(|(t, k, v, at)| (t.id.as_str(), k.as_str(), *v, *at)));
+            let start = listens.len().saturating_sub(hist_cap);
+            let mut hist_songs = HashSet::new();
+            let history: Vec<SeqItem> = listens[start..]
+                .iter()
+                .filter_map(|l| {
+                    by_id.get(l.track_id.as_str()).map(|t| {
+                        hist_songs.insert(t.song_key());
+                        let (f, s) = TransformerNet::extract_track_features(t);
+                        (f, Some(s), l.action)
+                    })
+                })
+                .collect();
+            let stars: Vec<SeqItem> = if history.len() < PROFILE_SHORT_HISTORY {
+                store
+                    .starred_tracks(user_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(t, _)| !hist_songs.contains(&t.song_key()))
+                    .take(STAR_PREFIX_MAX)
+                    .map(|(t, _)| {
                         let (f, s) = TransformerNet::extract_track_features(&t);
-                        pos_items.push((f, Some(s), ACTION_STAR));
-                    }
-                }
-            }
-            // Place negative feedback earlier in the sequence and positive feedback closest to [USER_u].
-            for item in neg_items.into_iter().take(4) {
-                seq_items.push(item);
-            }
-            for item in pos_items {
-                seq_items.push(item);
-            }
+                        (f, Some(s), ACTION_STAR)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            seq_items = assemble_profile_sequence(history, stars, hist_cap);
         }
 
-        for t in context_tracks.iter().take(12) {
+        for t in context_tracks.iter().take(MAX_SEED_TOKENS) {
             let (f, s) = TransformerNet::extract_track_features(t);
             seq_items.push((f, Some(s), ACTION_SEED));
         }
 
-        if query.map_or(false, |q| !q.trim().is_empty()) || !moods.is_empty() || !genres.is_empty() {
+        if has_query {
             let qf = TransformerNet::extract_query_features(query.unwrap_or(""), moods, genres);
             if !qf.is_empty() {
                 seq_items.push((qf, None, ACTION_QUERY));
@@ -1691,15 +2675,17 @@ impl TransformerEngine {
         let out = net.forward_context(user_id.max(0), &seq_items).ctx_unit;
         if !has_extra_ctx && user_id > 0 {
             if let Ok(mut cache) = self.user_vec_cache.write() {
-                cache.insert(user_id, (now, out));
+                cache.insert(user_id, (now, net.step_count, out));
             }
         }
         out
     }
 
-    /// Runs multi-user background training across all users' listening histories, ratings,
-    /// skips/dislikes, and manual playlists, then distills personalized `neural_track` &
-    /// `neural_artist` discoveries for every user (including inactive users) and checkpoints.
+    /// Background training across all users' listens, ratings, skips/dislikes and manual
+    /// playlists. Only trains when the underlying data has changed (bounded step budget per
+    /// data state, so the model doesn't overfit the same examples forever), evaluates on
+    /// held-out listens before and after, keeps the new weights only if they did not get worse,
+    /// then distills personalized `neural_track` / `neural_artist` links and checkpoints.
     pub fn train_background_epoch(
         &self,
         store: &Store,
@@ -1708,78 +2694,126 @@ impl TransformerEngine {
         distill_users: bool,
     ) -> TrainEpochStats {
         let _train_guard = self.train_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let corpus = match store.load_transformer_corpus(100, 3600) {
+        let fingerprint = store.transformer_data_fingerprint().unwrap_or_default();
+        {
+            let net = self.net.read().unwrap_or_else(|e| e.into_inner());
+            if net.step_count > 0
+                && !fingerprint.is_empty()
+                && net.data_fingerprint == fingerprint
+                && net.steps_on_fingerprint >= net.step_budget
+            {
+                return TrainEpochStats {
+                    total_steps: net.step_count,
+                    avg_loss: net.avg_loss,
+                    skipped: true,
+                    eval: net.eval.clone(),
+                    ..Default::default()
+                };
+            }
+        }
+
+        let corpus = match store.load_transformer_corpus(CORPUS_EVENTS_PER_USER, CORPUS_CATALOG_LIMIT) {
             Ok(c) => c,
             Err(_) => return TrainEpochStats::default(),
         };
-        let examples = build_training_examples(&corpus);
-        if examples.is_empty() {
+        let table = CorpusTable::build(&corpus);
+        let users = prepare_users(&corpus, &table);
+
+        let mut net = self.net.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let data_seed = 0x54524149u64 ^ fnv1a_hash(fingerprint.as_bytes()) ^ net.step_count.wrapping_mul(0x9e3779b97f4a7c15);
+        let data = build_training_data(&corpus, &table, &users, data_seed);
+        let bs = batch_size.clamp(4, 32);
+
+        if net.data_fingerprint != fingerprint || fingerprint.is_empty() {
+            net.data_fingerprint = fingerprint.clone();
+            net.steps_on_fingerprint = 0;
+            // ~4 passes over the examples per data state, bounded.
+            net.step_budget = ((data.examples.len() * 4 + bs - 1) / bs).clamp(24, 600) as u64;
+        }
+        if data.examples.is_empty() {
+            net.step_budget = 0;
+            *self.net.write().unwrap_or_else(|e| e.into_inner()) = net;
             return TrainEpochStats::default();
         }
 
-        let mut rng = StdRng::seed_from_u64(
-            0x54524149u64
-                ^ (corpus.tracks.len() as u64).wrapping_mul(0x517cc1b727220a95)
-                ^ self.step_count().wrapping_mul(0x9e3779b97f4a7c15),
-        );
-        let mut indices: Vec<usize> = (0..examples.len()).collect();
-        indices.shuffle(&mut rng);
+        let remaining = net.step_budget.saturating_sub(net.steps_on_fingerprint) as usize;
+        let steps_target = max_steps.min(remaining);
+        // Fixed eval seed per data state so before/after numbers are comparable.
+        let eval_seed = fnv1a_hash(fingerprint.as_bytes()) ^ 0x4556414c;
+        let can_compare = net.step_count > 0 && data.holdouts.len() >= MIN_EVAL_ITEMS;
+        let before = can_compare.then(|| evaluate(&net, &table, &users, &data.holdouts, eval_seed));
+        let prev_net = can_compare.then(|| net.clone());
 
-        let bs = batch_size.clamp(4, 32);
+        let mut rng = StdRng::seed_from_u64(data_seed ^ 0x5348554646);
+        let mut order: Vec<usize> = (0..data.examples.len()).collect();
         let mut steps_run = 0usize;
-
-        let mut net_clone = self.net.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let lr = (0.0045f32 / (1.0 + (net_clone.step_count as f32) * 0.0005)).max(0.0010);
-
-        for _pass in 0..16 {
-            if steps_run >= max_steps {
-                break;
-            }
-            indices.shuffle(&mut rng);
-            for chunk in indices.chunks(bs) {
-                if steps_run >= max_steps {
-                    break;
+        'outer: while steps_run < steps_target {
+            order.shuffle(&mut rng);
+            for chunk in order.chunks(bs) {
+                if steps_run >= steps_target {
+                    break 'outer;
                 }
-                let batch: Vec<TrainingExample> =
-                    chunk.iter().map(|&i| examples[i].clone()).collect();
-                let _ = net_clone.train_step_examples(&batch, lr);
+                let batch: Vec<&TrainingExample> = chunk.iter().map(|&i| &data.examples[i]).collect();
+                let lr = net.learning_rate();
+                net.train_step(&batch, &table, &users, lr);
                 steps_run += 1;
             }
         }
-        let total_steps = net_clone.step_count;
-        let last_loss = net_clone.avg_loss;
+        net.steps_on_fingerprint += steps_run as u64;
 
-        let checkpoint = if steps_run > 0 {
-            net_clone.to_checkpoint_str()
-        } else {
-            None
+        let after = evaluate(&net, &table, &users, &data.holdouts, eval_seed);
+        let rejected = match (&before, &prev_net) {
+            (Some(b), Some(_)) => after.trusted() && after.model_mrr + 0.015 < b.model_mrr,
+            _ => false,
         };
+        if rejected {
+            let mut restored = prev_net.unwrap();
+            restored.data_fingerprint = net.data_fingerprint.clone();
+            restored.steps_on_fingerprint = net.steps_on_fingerprint;
+            restored.step_budget = net.step_budget;
+            restored.rejected_runs = net.rejected_runs + 1;
+            let prev_eval = restored.eval.clone();
+            restored.eval = before.clone().unwrap().with_quality_from(&prev_eval);
+            info!(
+                before_mrr = restored.eval.model_mrr,
+                after_mrr = after.model_mrr,
+                "transformer update made held-out ranking worse; keeping previous weights"
+            );
+            net = restored;
+        } else {
+            let prev_eval = net.eval.clone();
+            net.eval = after.with_quality_from(&prev_eval);
+        }
 
-        let distilled_users = if distill_users {
-            distill_corpus_users(&net_clone, store, &corpus)
+        let checkpoint = net.to_checkpoint_str();
+        let distilled_users = if distill_users && steps_run > 0 && !rejected {
+            distill_corpus_users(&net, store, &corpus, &table, &users)
         } else {
             0
         };
 
-        // Swap trained weights into live engine and invalidate cached user vectors.
-        {
-            let mut live = self.net.write().unwrap_or_else(|e| e.into_inner());
-            *live = net_clone;
-        }
+        let stats = TrainEpochStats {
+            steps_run,
+            total_steps: net.step_count,
+            avg_loss: net.avg_loss,
+            examples_used: data.examples.len(),
+            distilled_users,
+            skipped: false,
+            rejected,
+            eval: net.eval.clone(),
+        };
+
+        *self.net.write().unwrap_or_else(|e| e.into_inner()) = net;
         if let Ok(mut cache) = self.user_vec_cache.write() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.unit_cache.write() {
             cache.clear();
         }
         if let Some(cp) = checkpoint {
             store.kv_set(CHECKPOINT_KV_KEY, &cp);
         }
-
-        TrainEpochStats {
-            steps_run,
-            total_steps,
-            avg_loss: last_loss,
-            examples_used: examples.len(),
-            distilled_users,
-        }
+        stats
     }
 }
 
@@ -1787,64 +2821,63 @@ fn distill_corpus_users(
     net: &TransformerNet,
     store: &Store,
     corpus: &NeuralTrainingCorpus,
+    table: &CorpusTable,
+    users: &HashMap<i64, UserPrep>,
 ) -> usize {
     if net.step_count < 10 || corpus.catalog_ids.is_empty() {
         return 0;
     }
-    let mut catalog_encoded: Vec<(&Track, [f32; D_MODEL])> = Vec::with_capacity(corpus.catalog_ids.len());
-    for tid in &corpus.catalog_ids {
-        if let Some(t) = corpus.tracks.get(tid) {
-            let (u, _, _, _, _) = net.encode_track_unit(t);
-            catalog_encoded.push((t, u));
-        }
-    }
-    if catalog_encoded.is_empty() {
+    let catalog: Vec<(usize, [f32; D_MODEL])> = corpus
+        .catalog_ids
+        .iter()
+        .filter_map(|id| table.idx(id))
+        .map(|i| (i, net.encode_feats_unit(&table.feats[i], table.scalars[i]).0))
+        .collect();
+    if catalog.is_empty() {
         return 0;
     }
+    // Distilled links feed other taste signals, so scale them by how much the model has earned.
+    let trust = if net.eval.trusted() { 0.4 + 0.6 * net.eval.quality as f64 } else { 0.7 };
 
+    let mut uids: Vec<i64> = users.keys().copied().collect();
+    uids.sort();
     let mut distilled = 0usize;
-    for &uid in &corpus.user_ids {
-        let seq_items = build_user_sequence_from_corpus(uid, corpus, MAX_SEQ_LEN - 1);
-        if seq_items.len() < 2 {
+    for uid in uids {
+        let p = &users[&uid];
+        let seq = profile_sequence(p, table, p.listens.len(), None, MAX_SEQ_LEN - 1);
+        if seq.len() < 2 {
             continue;
         }
-        let ctx = net.forward_context(uid, &seq_items).ctx_unit;
-        let disliked: HashSet<&str> = corpus
-            .user_disliked
-            .get(&uid)
-            .map(|v| v.iter().map(String::as_str).collect())
-            .unwrap_or_default();
-        let disliked_keys: HashSet<String> = disliked
-            .iter()
-            .filter_map(|id| corpus.tracks.get(*id).map(Track::song_key))
-            .collect();
+        let ctx = net.forward_context(uid, &seq).ctx_unit;
+        let disliked: HashSet<u64> = p.disliked.iter().map(|&i| table.song[i]).collect();
 
-        let mut scored_tracks: Vec<(f64, &Track)> = Vec::with_capacity(catalog_encoded.len());
-        for (t, t_unit) in &catalog_encoded {
-            if disliked.contains(t.id.as_str()) || disliked_keys.contains(&t.song_key()) {
+        let mut scored: Vec<(f64, usize)> = Vec::new();
+        for (i, u) in &catalog {
+            if disliked.contains(&table.song[*i]) {
                 continue;
             }
             let mut cos = 0.0f32;
             for d in 0..D_MODEL {
-                cos += ctx[d] * t_unit[d];
+                cos += ctx[d] * u[d];
             }
-            if cos > 0.22 {
-                let w = ((cos as f64) * 3.0).clamp(0.1, 3.5);
-                scored_tracks.push((w, *t));
+            if cos > 0.15 {
+                scored.push((((cos as f64) * 3.0).clamp(0.1, 3.5) * trust, *i));
             }
         }
-        scored_tracks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut track_links = Vec::with_capacity(60);
         let mut artist_scores: HashMap<String, f64> = HashMap::new();
-        for (w, t) in scored_tracks.into_iter().take(60) {
-            track_links.push((t.id.clone(), w));
-            let ak = slug(&primary_artist(&t.artist));
-            if !ak.is_empty() && ak != "unknown-artist" {
-                artist_scores
-                    .entry(ak)
-                    .and_modify(|cur| *cur = (*cur).max(w * 0.85))
-                    .or_insert(w * 0.85);
+        for (w, i) in scored.into_iter().take(60) {
+            track_links.push((table.ids[i].clone(), w));
+            if let Some(t) = corpus.tracks.get(&table.ids[i]) {
+                let ak = slug(&primary_artist(&t.artist));
+                if !ak.is_empty() && ak != "unknown-artist" {
+                    artist_scores
+                        .entry(ak)
+                        .and_modify(|cur| *cur = (*cur).max(w * 0.85))
+                        .or_insert(w * 0.85);
+                }
             }
         }
         let mut artist_links: Vec<(String, f64)> = artist_scores.into_iter().collect();
@@ -1857,359 +2890,6 @@ fn distill_corpus_users(
         }
     }
     distilled
-}
-
-fn build_user_sequence_from_corpus(
-    uid: i64,
-    corpus: &NeuralTrainingCorpus,
-    max_items: usize,
-) -> Vec<(Vec<(usize, f32)>, Option<[f32; 4]>, usize)> {
-    let mut negs = Vec::new();
-    let mut pos = Vec::new();
-    let mut seen_ids = HashSet::new();
-    if let Some(evs) = corpus.user_events.get(&uid) {
-        for (tid, kind, _, _) in evs.iter().rev().take(max_items).rev() {
-            if let Some(t) = corpus.tracks.get(tid) {
-                seen_ids.insert(tid.as_str());
-                let act = event_kind_to_action(kind);
-                let (f, s) = TransformerNet::extract_track_features(t);
-                if act == ACTION_SKIP || act == ACTION_DISLIKE {
-                    negs.push((f, Some(s), act));
-                } else {
-                    pos.push((f, Some(s), act));
-                }
-            }
-        }
-    }
-    if let Some(stars) = corpus.user_stars.get(&uid) {
-        for tid in stars.iter().take(12) {
-            if seen_ids.insert(tid.as_str()) {
-                if let Some(t) = corpus.tracks.get(tid) {
-                    let (f, s) = TransformerNet::extract_track_features(t);
-                    pos.push((f, Some(s), ACTION_STAR));
-                }
-            }
-        }
-    }
-    let mut seq: Vec<_> = negs.into_iter().take(4).chain(pos).collect();
-    if seq.len() < 4 {
-        for (pl_uid, _, tids) in &corpus.playlists {
-            if *pl_uid != uid {
-                continue;
-            }
-            for tid in tids {
-                if seq.len() >= max_items {
-                    break;
-                }
-                if seen_ids.insert(tid.as_str()) {
-                    if let Some(t) = corpus.tracks.get(tid) {
-                        let (f, s) = TransformerNet::extract_track_features(t);
-                        seq.push((f, Some(s), ACTION_PLAYLIST));
-                    }
-                }
-            }
-        }
-    }
-    if seq.len() > max_items {
-        let drop_n = seq.len() - max_items;
-        seq.drain(0..drop_n);
-    }
-    seq
-}
-
-fn build_training_examples(corpus: &NeuralTrainingCorpus) -> Vec<TrainingExample> {
-    if corpus.tracks.len() < 4 {
-        return Vec::new();
-    }
-    let mut rng = StdRng::seed_from_u64(
-        0x42454154 ^ (corpus.tracks.len() as u64) ^ ((corpus.user_ids.len() as u64) << 16),
-    );
-    let mut all_track_ids: Vec<&String> = corpus.tracks.keys().collect();
-    all_track_ids.sort();
-    let mut out = Vec::new();
-
-    // Collect each user's positive set so cross-user negatives explicitly contrast users.
-    let mut user_pos_sets: HashMap<i64, HashSet<String>> = HashMap::new();
-    for &uid in &corpus.user_ids {
-        let mut pset = HashSet::new();
-        if let Some(stars) = corpus.user_stars.get(&uid) {
-            for id in stars { pset.insert(id.clone()); }
-        }
-        if let Some(ratings) = corpus.user_ratings.get(&uid) {
-            for (id, r) in ratings {
-                if *r >= 4 { pset.insert(id.clone()); }
-            }
-        }
-        if let Some(evs) = corpus.user_events.get(&uid) {
-            for (id, kind, _, _) in evs {
-                if is_positive_event_kind(kind) {
-                    pset.insert(id.clone());
-                }
-            }
-        }
-        user_pos_sets.insert(uid, pset);
-    }
-    for (uid, _, tids) in &corpus.playlists {
-        let entry = user_pos_sets.entry(*uid).or_default();
-        for tid in tids {
-            entry.insert(tid.clone());
-        }
-    }
-
-    let sample_negatives = |uid: i64,
-                            pos: &Track,
-                            pos_artist: &str,
-                            rng: &mut StdRng|
-     -> Vec<Track> {
-        let mut negs = Vec::with_capacity(4);
-        let mut seen = HashSet::new();
-        seen.insert(pos.id.clone());
-        let user_pos = user_pos_sets.get(&uid);
-        let pos_genres: HashSet<String> = pos
-            .genre
-            .split([',', ';', '/'])
-            .map(|g| g.trim().to_lowercase())
-            .filter(|g| g.len() >= 2)
-            .collect();
-
-        // 1. User's own skipped/disliked tracks (strong personalized negatives)
-        if let Some(dislikes) = corpus.user_disliked.get(&uid) {
-            for _ in 0..2 {
-                if !dislikes.is_empty() {
-                    let pick = &dislikes[rng.gen_range(0..dislikes.len())];
-                    if seen.insert(pick.clone()) {
-                        if let Some(t) = corpus.tracks.get(pick) {
-                            negs.push(t.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Cross-user negatives: tracks liked by OTHER users but not this user (teaches user differentiation)
-        if corpus.user_ids.len() > 1 {
-            for _ in 0..4 {
-                let other_uid = corpus.user_ids[rng.gen_range(0..corpus.user_ids.len())];
-                if other_uid == uid {
-                    continue;
-                }
-                if let Some(other_pos) = user_pos_sets.get(&other_uid) {
-                    let overlaps_taste = user_pos
-                        .map_or(false, |up| other_pos.iter().any(|id| up.contains(id)));
-                    if !overlaps_taste && !other_pos.is_empty() {
-                        let skip_n = rng.gen_range(0..other_pos.len());
-                        if let Some(cand_id) = other_pos.iter().nth(skip_n) {
-                            if !user_pos.map_or(false, |s| s.contains(cand_id))
-                                && seen.insert(cand_id.clone())
-                            {
-                                if let Some(t) = corpus.tracks.get(cand_id) {
-                                    negs.push(t.clone());
-                                    if negs.len() >= 4 {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Random catalog negatives (preferring different artists and non-overlapping genres)
-        let mut tries = 0usize;
-        while negs.len() < 4 && tries < 28 {
-            tries += 1;
-            let pick = all_track_ids[rng.gen_range(0..all_track_ids.len())];
-            if user_pos.map_or(false, |s| s.contains(pick.as_str())) {
-                continue;
-            }
-            if let Some(t) = corpus.tracks.get(pick.as_str()) {
-                if slug(&primary_artist(&t.artist)) == pos_artist && tries < 24 {
-                    continue;
-                }
-                if tries < 20 && !pos_genres.is_empty() {
-                    let shares_genre = t
-                        .genre
-                        .split([',', ';', '/'])
-                        .map(|g| g.trim().to_lowercase())
-                        .any(|g| pos_genres.contains(&g));
-                    if shares_genre {
-                        continue;
-                    }
-                }
-                if seen.insert(t.id.clone()) {
-                    negs.push(t.clone());
-                }
-            }
-        }
-        negs
-    };
-
-    // Task 1: Sequential next-interaction prediction across all users
-    for &uid in &corpus.user_ids {
-        let Some(evs) = corpus.user_events.get(&uid) else {
-            continue;
-        };
-        let mut seq_tokens: Vec<(Vec<(usize, f32)>, Option<[f32; 4]>, usize, Track, String)> = Vec::new();
-        for (tid, kind, _, _) in evs {
-            if let Some(t) = corpus.tracks.get(tid) {
-                let (f, s) = TransformerNet::extract_track_features(t);
-                seq_tokens.push((f, Some(s), event_kind_to_action(kind), t.clone(), kind.clone()));
-            }
-        }
-        if seq_tokens.len() < 2 {
-            continue;
-        }
-        let step_stride = if seq_tokens.len() > 24 { 2 } else { 1 };
-        for target_idx in (1..seq_tokens.len()).step_by(step_stride) {
-            let target_kind = &seq_tokens[target_idx].4;
-            if !is_positive_event_kind(target_kind) {
-                continue;
-            }
-            let pos = &seq_tokens[target_idx].3;
-            let start = target_idx.saturating_sub(MAX_SEQ_LEN - 1);
-            let ctx: Vec<_> = seq_tokens[start..target_idx]
-                .iter()
-                .map(|(f, s, a, _, _)| (f.clone(), *s, *a))
-                .collect();
-            let pos_art = slug(&primary_artist(&pos.artist));
-            let negs = sample_negatives(uid, pos, &pos_art, &mut rng);
-            if negs.is_empty() {
-                continue;
-            }
-            let w = match target_kind.as_str() {
-                "star" | "playlist_add" => 1.35,
-                "complete" => 1.15,
-                _ => 0.95,
-            };
-            out.push(TrainingExample {
-                user_id: uid,
-                context: ctx,
-                positive: pos.clone(),
-                negatives: negs,
-                weight: w,
-            });
-        }
-    }
-
-    // Task 2: Cross-user manual playlist coherence & query alignment
-    for (uid, pl_name, tids) in &corpus.playlists {
-        let pl_tracks: Vec<&Track> = tids.iter().filter_map(|id| corpus.tracks.get(id)).collect();
-        if pl_tracks.len() < 2 {
-            continue;
-        }
-        let pl_query_feats = TransformerNet::extract_query_features(pl_name, &[], &[]);
-        for (hold_idx, &pos) in pl_tracks.iter().enumerate().take(12) {
-            let mut ctx = Vec::new();
-            for (i, &t) in pl_tracks.iter().enumerate() {
-                if i != hold_idx && ctx.len() < 12 {
-                    let (f, s) = TransformerNet::extract_track_features(t);
-                    ctx.push((f, Some(s), ACTION_PLAYLIST));
-                }
-            }
-            if !pl_query_feats.is_empty() {
-                ctx.push((pl_query_feats.clone(), None, ACTION_QUERY));
-            }
-            let pos_art = slug(&primary_artist(&pos.artist));
-            let negs = sample_negatives(*uid, pos, &pos_art, &mut rng);
-            if negs.is_empty() {
-                continue;
-            }
-            out.push(TrainingExample {
-                user_id: *uid,
-                context: ctx,
-                positive: pos.clone(),
-                negatives: negs,
-                weight: 1.25,
-            });
-        }
-    }
-
-    // Task 3: Explicit stars / high ratings vs dislikes (captures users without dense event logs)
-    for &uid in &corpus.user_ids {
-        let mut positives: Vec<&Track> = Vec::new();
-        if let Some(stars) = corpus.user_stars.get(&uid) {
-            for tid in stars {
-                if let Some(t) = corpus.tracks.get(tid) {
-                    positives.push(t);
-                }
-            }
-        }
-        if let Some(ratings) = corpus.user_ratings.get(&uid) {
-            for (tid, r) in ratings {
-                if *r >= 4 {
-                    if let Some(t) = corpus.tracks.get(tid) {
-                        positives.push(t);
-                    }
-                }
-            }
-        }
-        if positives.len() < 2 {
-            continue;
-        }
-        for (i, &pos) in positives.iter().enumerate().take(8) {
-            let mut ctx = Vec::new();
-            if let Some(dislikes) = corpus.user_disliked.get(&uid) {
-                if let Some(did) = dislikes.get(i % dislikes.len()) {
-                    if let Some(dt) = corpus.tracks.get(did) {
-                        let (f, s) = TransformerNet::extract_track_features(dt);
-                        ctx.push((f, Some(s), ACTION_DISLIKE));
-                    }
-                }
-            }
-            for (j, &t) in positives.iter().enumerate() {
-                if i != j && ctx.len() < 10 {
-                    let (f, s) = TransformerNet::extract_track_features(t);
-                    ctx.push((f, Some(s), ACTION_STAR));
-                }
-            }
-            let pos_art = slug(&primary_artist(&pos.artist));
-            let negs = sample_negatives(uid, pos, &pos_art, &mut rng);
-            if negs.is_empty() {
-                continue;
-            }
-            out.push(TrainingExample {
-                user_id: uid,
-                context: ctx,
-                positive: pos.clone(),
-                negatives: negs,
-                weight: 1.3,
-            });
-        }
-    }
-
-    // Balance training weights across users so high-volume listeners don't drown out quieter users.
-    let mut per_user_counts: HashMap<i64, usize> = HashMap::new();
-    for ex in &out {
-        *per_user_counts.entry(ex.user_id).or_insert(0) += 1;
-    }
-    for ex in &mut out {
-        let cnt = per_user_counts.get(&ex.user_id).copied().unwrap_or(1) as f32;
-        ex.weight *= (3.0 / cnt).sqrt().clamp(0.35, 1.5);
-    }
-
-    out
-}
-
-#[inline]
-fn event_kind_to_action(kind: &str) -> usize {
-    match kind {
-        "star" | "rate" => ACTION_STAR,
-        "playlist_add" => ACTION_PLAYLIST,
-        "complete" => ACTION_COMPLETE,
-        "play" | "search_pick" | "mix_play" => ACTION_PLAY,
-        "skip" => ACTION_SKIP,
-        "not_interested" | "unstar" | "playlist_remove" => ACTION_DISLIKE,
-        _ => ACTION_PLAY,
-    }
-}
-
-#[inline]
-fn is_positive_event_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "star" | "playlist_add" | "complete" | "play" | "search_pick" | "mix_play"
-    )
 }
 
 #[inline]
@@ -2288,13 +2968,7 @@ mod tests {
                 for d in 0..D_HEAD {
                     dot += z[d] * v[d];
                 }
-                assert!(
-                    dot.abs() < 1e-4,
-                    "XSA output not orthogonal to self-value at t={}, h={}: dot={}",
-                    t,
-                    h,
-                    dot
-                );
+                assert!(dot.abs() < 1e-4, "XSA output not orthogonal to self-value at t={}, h={}: dot={}", t, h, dot);
             }
         }
     }
@@ -2310,26 +2984,20 @@ mod tests {
 
         let f1 = TransformerNet::extract_track_features(&t1);
         let f2 = TransformerNet::extract_track_features(&t2);
-        let ex = TrainingExample {
-            user_id: 42,
-            context: vec![(f1.0, Some(f1.1), ACTION_STAR), (f2.0, Some(f2.1), ACTION_COMPLETE)],
-            positive: pos,
-            negatives: vec![neg1, neg2],
-            weight: 1.0,
-        };
+        let user_id = 42i64;
+        let context: Vec<SeqItem> = vec![(f1.0, Some(f1.1), ACTION_STAR), (f2.0, Some(f2.1), ACTION_COMPLETE)];
+        let cand_tracks = [pos, neg1, neg2];
 
         let eval_loss = |n: &TransformerNet| -> f32 {
-            let ctx = n.forward_context(ex.user_id, &ex.context);
-            let mut cands = Vec::new();
-            cands.push(n.encode_track_unit(&ex.positive).0);
-            for neg in &ex.negatives {
-                cands.push(n.encode_track_unit(neg).0);
-            }
-            let logits: Vec<f32> = cands
+            let ctx = n.forward_context(user_id, &context);
+            let logits: Vec<f32> = cand_tracks
                 .iter()
-                .map(|c| {
+                .map(|t| {
+                    let c = n.encode_track_unit(t).0;
                     let mut cos = 0.0f32;
-                    for d in 0..D_MODEL { cos += ctx.ctx_unit[d] * c[d]; }
+                    for d in 0..D_MODEL {
+                        cos += ctx.ctx_unit[d] * c[d];
+                    }
                     cos * n.logit_scale
                 })
                 .collect();
@@ -2338,17 +3006,15 @@ mod tests {
             -(logits[0] - max_l - sum_e.ln())
         };
 
-        // Compute analytical gradients directly without clipping by running one unclipped backward
-        let ctx_cache = net.forward_context(ex.user_id, &ex.context);
-        let (u_pos, _, _, _, _) = net.encode_track_unit(&ex.positive);
-        let (u_n1, _, _, _, _) = net.encode_track_unit(&ex.negatives[0]);
-        let (u_n2, _, _, _, _) = net.encode_track_unit(&ex.negatives[1]);
-        let cands = [u_pos, u_n1, u_n2];
+        let ctx_cache = net.forward_context(user_id, &context);
+        let cands: Vec<[f32; D_MODEL]> = cand_tracks.iter().map(|t| net.encode_track_unit(t).0).collect();
         let logits: Vec<f32> = cands
             .iter()
             .map(|c| {
                 let mut cos = 0.0f32;
-                for d in 0..D_MODEL { cos += ctx_cache.ctx_unit[d] * c[d]; }
+                for d in 0..D_MODEL {
+                    cos += ctx_cache.ctx_unit[d] * c[d];
+                }
                 cos * net.logit_scale
             })
             .collect();
@@ -2381,78 +3047,129 @@ mod tests {
             g_h = net.blocks[l].backward(&g_h, &ctx_cache.block_caches[l], ctx_cache.seq_len, &mut bgs[l]);
         }
 
-        // Finite-difference check on layer 0 Wq, Wv, Wo, W1, and user embedding!
+        let _ = net.get_or_insert_user_row(42);
         let eps = 1e-3f32;
-        for idx in [0usize, 17, 131] {
-            let orig = net.blocks[0].wv.w[idx];
-            net.blocks[0].wv.w[idx] = orig + eps;
+        let mut check = |get: &dyn Fn(&mut TransformerNet) -> &mut f32, an: f32, label: &str| {
+            let orig = *get(&mut net);
+            *get(&mut net) = orig + eps;
             let lp = eval_loss(&net);
-            net.blocks[0].wv.w[idx] = orig - eps;
+            *get(&mut net) = orig - eps;
             let lm = eval_loss(&net);
-            net.blocks[0].wv.w[idx] = orig;
+            *get(&mut net) = orig;
             let fd = (lp - lm) / (2.0 * eps);
-            let an = bgs[0].wv[idx];
-            assert!(
-                (fd - an).abs() < 2e-2,
-                "Wv[{}] grad mismatch: fd={} analytical={}",
-                idx,
-                fd,
-                an
-            );
+            assert!((fd - an).abs() < 2e-2, "{} grad mismatch: fd={} analytical={}", label, fd, an);
+        };
+        for idx in [0usize, 17, 131] {
+            check(&|n| &mut n.blocks[0].wv.w[idx], bgs[0].wv[idx], "Wv");
         }
         for idx in [3usize, 49] {
-            let orig = net.blocks[0].wq.w[idx];
-            net.blocks[0].wq.w[idx] = orig + eps;
-            let lp = eval_loss(&net);
-            net.blocks[0].wq.w[idx] = orig - eps;
-            let lm = eval_loss(&net);
-            net.blocks[0].wq.w[idx] = orig;
-            let fd = (lp - lm) / (2.0 * eps);
-            let an = bgs[0].wq[idx];
-            assert!(
-                (fd - an).abs() < 2e-2,
-                "Wq[{}] grad mismatch: fd={} analytical={}",
-                idx,
-                fd,
-                an
-            );
+            check(&|n| &mut n.blocks[0].wq.w[idx], bgs[0].wq[idx], "Wq");
         }
         for idx in [5usize, 77] {
-            let orig = net.blocks[0].w_gate.w[idx];
-            net.blocks[0].w_gate.w[idx] = orig + eps;
-            let lp = eval_loss(&net);
-            net.blocks[0].w_gate.w[idx] = orig - eps;
-            let lm = eval_loss(&net);
-            net.blocks[0].w_gate.w[idx] = orig;
-            let fd = (lp - lm) / (2.0 * eps);
-            let an = bgs[0].w_gate[idx];
-            assert!(
-                (fd - an).abs() < 2e-2,
-                "W_gate[{}] grad mismatch: fd={} analytical={}",
-                idx,
-                fd,
-                an
-            );
+            check(&|n| &mut n.blocks[0].w_gate.w[idx], bgs[0].w_gate[idx], "W_gate");
         }
-        // Check user embedding gradient backpropagated through both RoPE-QKVO + XSA layers
-        let _ = net.get_or_insert_user_row(42);
         for d in [0usize, 11, 35] {
-            let orig = net.user_embs.get(&42).unwrap().w[d];
-            net.user_embs.get_mut(&42).unwrap().w[d] = orig + eps;
-            let lp = eval_loss(&net);
-            net.user_embs.get_mut(&42).unwrap().w[d] = orig - eps;
-            let lm = eval_loss(&net);
-            net.user_embs.get_mut(&42).unwrap().w[d] = orig;
-            let fd = (lp - lm) / (2.0 * eps);
             let an = g_h[u_pos_idx * D_MODEL + d];
-            assert!(
-                (fd - an).abs() < 2e-2,
-                "UserEmb[{}] grad mismatch: fd={} analytical={}",
-                d,
-                fd,
-                an
-            );
+            check(&|n| &mut n.user_embs.get_mut(&42).unwrap().w[d], an, "UserEmb");
         }
+    }
+
+    #[test]
+    fn collapse_merges_play_with_its_outcome_and_separates_replays() {
+        let evs = [
+            ("a", "play", 1.0, 100),
+            ("a", "complete", 1.0, 300),
+            ("b", "play", 1.0, 310),
+            ("b", "skip", 1.0, 320),
+            ("a", "play", 1.0, 330),     // replay of a: new listen
+            ("a", "complete", 1.0, 500),
+            ("a", "star", 1.0, 510),     // starred during/after that listen: upgrade
+            ("c", "search_pick", 1.0, 600),
+            ("c", "play", 1.0, 601),     // duplicate start ping merges
+            ("d", "rate", 2.0, 700),     // low rating = rejection
+            ("e", "rate", 3.0, 710),     // neutral rating ignored
+            ("f", "play", 1.0, 800),     // unresolved
+        ];
+        let ls = collapse_events(evs.iter().map(|(t, k, v, at)| (*t, *k, *v, *at)));
+        let got: Vec<(&str, Outcome)> = ls.iter().map(|l| (l.track_id.as_str(), l.outcome)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a", Outcome::Completed),
+                ("b", Outcome::Skipped),
+                ("a", Outcome::Saved),
+                ("c", Outcome::Picked),
+                ("d", Outcome::Rejected),
+                ("f", Outcome::Started),
+            ]
+        );
+        assert_eq!(ls[1].action, ACTION_SKIP);
+        assert_eq!(ls[2].action, ACTION_STAR);
+    }
+
+    fn genre_tracks() -> Vec<Track> {
+        let mut out = Vec::new();
+        let genres = [
+            ("rock", "Rock, Alternative", "rock_indie,energy"),
+            ("pop", "Synthpop, Dance Pop", "upbeat,party"),
+            ("jazz", "Jazz, Bebop", "groove,chill"),
+            ("metal", "Metal, Thrash", "energy"),
+        ];
+        for (g, genre, moods) in genres {
+            for i in 0..12 {
+                let mut t = mk_track(
+                    &format!("{}{}", g, i),
+                    &format!("{} Song {}", g, i),
+                    &format!("{} Artist {}", g, i % 4),
+                    genre,
+                    moods,
+                    1990 + i,
+                );
+                t.meta = format!("rank={}", 100_000 + (i as i64 * 37_000) % 400_000);
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    fn listen(store: &Store, uid: i64, tid: &str, done: bool) {
+        store.record_event(uid, tid, "play", 1.0).unwrap();
+        store.record_event(uid, tid, if done { "complete" } else { "skip" }, 1.0).unwrap();
+    }
+
+    #[test]
+    fn training_never_uses_the_just_played_track_or_skips_as_positives() {
+        let store = Store::open_memory().unwrap();
+        let u = store.create_user("listener", "pw123").unwrap();
+        let tracks = genre_tracks();
+        store.upsert_tracks(&tracks).unwrap();
+        for i in 0..10 {
+            listen(&store, u.id, &format!("rock{}", i), true);
+            listen(&store, u.id, &format!("pop{}", i), false);
+        }
+        let corpus = store.load_transformer_corpus(CORPUS_EVENTS_PER_USER, CORPUS_CATALOG_LIMIT).unwrap();
+        let table = CorpusTable::build(&corpus);
+        let users = prepare_users(&corpus, &table);
+        let p = &users[&u.id];
+        assert_eq!(p.listens.len(), 20, "each play+outcome pair must collapse into one listen");
+
+        let data = build_training_data(&corpus, &table, &users, 7);
+        assert!(!data.examples.is_empty());
+        for ex in &data.examples {
+            let id = &table.ids[ex.positive];
+            assert!(!id.starts_with("pop"), "skipped track {} used as a positive", id);
+            if let Some((last_feats, _, act)) = ex.context.last() {
+                if *act != ACTION_QUERY {
+                    assert!(
+                        *last_feats != table.feats[ex.positive],
+                        "positive {} is the last context token (label leakage)",
+                        id
+                    );
+                }
+            }
+        }
+        assert_eq!(data.holdouts.len(), 1);
+        assert!(table.ids[data.holdouts[0].target].starts_with("rock"));
     }
 
     #[test]
@@ -2478,77 +3195,57 @@ mod tests {
         ];
         store.upsert_tracks(&tracks).unwrap();
 
-        // User 1 loves rock & skips pop
         store.star_track(u_rock.id, "r1").unwrap();
         store.star_track(u_rock.id, "r2").unwrap();
-        store.record_event(u_rock.id, "r1", "complete", 1.0).unwrap();
-        store.record_event(u_rock.id, "r2", "complete", 1.0).unwrap();
-        store.record_event(u_rock.id, "p1", "skip", 1.0).unwrap();
-        store.record_event(u_rock.id, "p2", "skip", 1.0).unwrap();
+        listen(&store, u_rock.id, "r1", true);
+        listen(&store, u_rock.id, "r2", true);
+        listen(&store, u_rock.id, "p1", false);
+        listen(&store, u_rock.id, "p2", false);
         store.set_rating(u_rock.id, "p1", 1).unwrap();
 
-        // User 2 loves synthpop & skips rock
         store.star_track(u_pop.id, "p1").unwrap();
         store.star_track(u_pop.id, "p2").unwrap();
         store.star_track(u_pop.id, "p4").unwrap();
-        store.record_event(u_pop.id, "p1", "complete", 1.0).unwrap();
-        store.record_event(u_pop.id, "p2", "complete", 1.0).unwrap();
-        store.record_event(u_pop.id, "p4", "complete", 1.0).unwrap();
-        store.record_event(u_pop.id, "r1", "skip", 1.0).unwrap();
-        store.record_event(u_pop.id, "r2", "skip", 1.0).unwrap();
+        listen(&store, u_pop.id, "p1", true);
+        listen(&store, u_pop.id, "p2", true);
+        listen(&store, u_pop.id, "p4", true);
+        listen(&store, u_pop.id, "r1", false);
+        listen(&store, u_pop.id, "r2", false);
         store.set_rating(u_pop.id, "r1", 1).unwrap();
 
-        // User 3 (another user!) curates a playlist bridging Nirvana (r2) with unseen shoegaze (r3, r4)
+        // Another user curates a playlist bridging Nirvana (r2) with unseen shoegaze (r3, r4).
         store
-            .create_playlist(
-                u_curator.id,
-                "90s Alt & Shoegaze",
-                "",
-                false,
-                &["r2".into(), "r3".into(), "r4".into()],
-            )
+            .create_playlist(u_curator.id, "90s Alt & Shoegaze", "", false, &["r2".into(), "r3".into(), "r4".into()])
             .unwrap();
 
         let engine = TransformerEngine::load_or_new(&store);
-        let stats = engine.train_background_epoch(&store, 28, 6, true);
-        assert!(stats.steps_run >= 10);
+        let stats = engine.train_background_epoch(&store, 60, 6, true);
+        assert!(stats.steps_run >= 10, "steps_run={}", stats.steps_run);
         assert!(stats.distilled_users >= 2);
 
-        // Score unseen tracks r3 (shoegaze bridged by User 3) vs p3 (synthpop) for User 1 vs User 2
         let test_cands = vec![tracks[2].clone(), tracks[6].clone()]; // r3, p3
         let rock_scores = engine.score_candidates(&store, u_rock.id, &[], None, &[], &[], &test_cands);
         let pop_scores = engine.score_candidates(&store, u_pop.id, &[], None, &[], &[], &test_cands);
+        assert!(rock_scores[0] > rock_scores[1], "rock user: r3={} p3={}", rock_scores[0], rock_scores[1]);
+        assert!(pop_scores[1] > pop_scores[0], "pop user: p3={} r3={}", pop_scores[1], pop_scores[0]);
 
-        assert!(
-            rock_scores[0] > rock_scores[1],
-            "Rock user should prefer cross-user shoegaze track r3 ({}) over synthpop p3 ({})",
-            rock_scores[0],
-            rock_scores[1]
-        );
-        assert!(
-            pop_scores[1] > pop_scores[0],
-            "Pop user should prefer synthpop p3 ({}) over shoegaze r3 ({})",
-            pop_scores[1],
-            pop_scores[0]
-        );
+        // Cached scoring path returns identical results.
+        let again = engine.score_candidates(&store, u_rock.id, &[], None, &[], &[], &test_cands);
+        assert_eq!(rock_scores, again);
 
-        // Verify checkpoint roundtrip preserves exact scoring
+        // Checkpoint roundtrip preserves exact scoring and training state.
         let reloaded = TransformerEngine::load_or_new(&store);
         assert_eq!(reloaded.step_count(), engine.step_count());
-        let rock_scores_reloaded =
-            reloaded.score_candidates(&store, u_rock.id, &[], None, &[], &[], &test_cands);
-        assert!((rock_scores[0] - rock_scores_reloaded[0]).abs() < 1e-4);
+        let rock_scores_reloaded = reloaded.score_candidates(&store, u_rock.id, &[], None, &[], &[], &test_cands);
+        assert!((rock_scores[0] - rock_scores_reloaded[0]).abs() < 1e-5);
 
-        // Verify adaptive_multiplier scales with history_count
         let low_hist = engine.adaptive_multiplier(0);
         let high_hist = engine.adaptive_multiplier(40);
         assert!(low_hist > 0.0 && high_hist > low_hist);
 
-        // Verify distilled neural_artist links are queryable
         let neural_artists = store.load_neural_artist_links(u_rock.id, 10).unwrap();
         assert!(!neural_artists.is_empty());
 
-        // Verify score_artist_candidates differentiates rock vs pop artists for u_rock
         let art_scores = engine.score_artist_candidates(
             &store,
             u_rock.id,
@@ -2557,12 +3254,67 @@ mod tests {
                 ("Dua Lipa".to_string(), "Dance Pop, Disco".to_string()),
             ],
         );
+        assert!(art_scores[0] > art_scores[1], "Slowdive={} Dua Lipa={}", art_scores[0], art_scores[1]);
+    }
+
+    #[test]
+    fn training_is_gated_on_data_changes_and_evaluated_against_baselines() {
+        let store = Store::open_memory().unwrap();
+        let tracks = genre_tracks();
+        store.upsert_tracks(&tracks).unwrap();
+        let prefs = ["rock", "pop", "jazz", "metal", "rock", "jazz", "pop", "metal"];
+        let mut ids = Vec::new();
+        for (k, g) in prefs.iter().enumerate() {
+            let u = store.create_user(&format!("user{}", k), "pw123").unwrap();
+            ids.push(u.id);
+            for i in 0..9 {
+                let n = (i * 5 + k * 3) % 12;
+                listen(&store, u.id, &format!("{}{}", g, n), true);
+                if i % 3 == 0 {
+                    let other = prefs[(k + 1) % prefs.len()];
+                    listen(&store, u.id, &format!("{}{}", other, n), false);
+                }
+            }
+        }
+
+        let engine = TransformerEngine::load_or_new(&store);
+        let mut total = 0usize;
+        let mut last = TrainEpochStats::default();
+        for _ in 0..40 {
+            last = engine.train_background_epoch(&store, 50, 16, false);
+            if last.skipped {
+                break;
+            }
+            total += last.steps_run;
+        }
+        assert!(last.skipped, "training must stop once the step budget for unchanged data is spent");
+        assert!(total > 0);
+
+        let ev = &last.eval;
+        assert!(ev.n >= MIN_EVAL_ITEMS, "expected held-out listens, got {}", ev.n);
         assert!(
-            art_scores[0] > art_scores[1],
-            "Rock user should score Slowdive ({}) higher than Dua Lipa ({})",
-            art_scores[0],
-            art_scores[1]
+            ev.model_mrr > ev.popularity_mrr && ev.model_mrr >= ev.content_mrr,
+            "model should beat both baselines on genre-separable users: {:?}",
+            ev
         );
+        assert!(ev.quality > 0.5 && engine.adaptive_multiplier(30) > 1.0, "{:?}", ev);
+
+        // New data re-opens training.
+        listen(&store, ids[0], "rock11", true);
+        let resumed = engine.train_background_epoch(&store, 10, 16, false);
+        assert!(!resumed.skipped && resumed.steps_run > 0);
+
+        let snap = engine.status_snapshot();
+        assert!(snap["eval"]["heldOutListens"].as_u64().unwrap() >= MIN_EVAL_ITEMS as u64);
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_and_shape_validation() {
+        let net = TransformerNet::new();
+        let cp = net.to_checkpoint_str().unwrap();
+        let back = TransformerNet::from_checkpoint_str(&cp).expect("roundtrip");
+        assert_eq!(back.feature_weights, net.feature_weights);
+        assert!(TransformerNet::from_checkpoint_str("not a checkpoint").is_none());
     }
 
     #[test]
@@ -2571,29 +3323,11 @@ mod tests {
         let engine = TransformerEngine::load_or_new(&store);
         assert_eq!(engine.adaptive_multiplier(10), 0.0);
 
-        let collab = mk_track(
-            "x1",
-            "Midnight Acoustic Ballad",
-            "Daft Punk feat. Julian Casablancas",
-            "Indie Rock",
-            "",
-            2013,
-        );
+        let collab = mk_track("x1", "Midnight Acoustic Ballad", "Daft Punk feat. Julian Casablancas", "Indie Rock", "", 2013);
         let (feats, _) = TransformerNet::extract_track_features(&collab);
-        let has_artist = feats
-            .iter()
-            .filter(|(idx, _)| *idx >= ARTIST_OFFSET && *idx < TEXT_OFFSET)
-            .count();
-        let has_genre = feats
-            .iter()
-            .filter(|(idx, _)| *idx >= GENRE_OFFSET && *idx < MOOD_OFFSET)
-            .count();
-        let has_mood = feats
-            .iter()
-            .filter(|(idx, _)| *idx >= MOOD_OFFSET && *idx < ERA_OFFSET)
-            .count();
-        assert!(has_artist >= 2, "expected primary + featured artist buckets");
-        assert!(has_genre >= 3, "expected full + sub-genre buckets");
-        assert!(has_mood >= 1, "expected inferred mood buckets when moods is empty");
+        let count = |lo: usize, hi: usize| feats.iter().filter(|(idx, _)| *idx >= lo && *idx < hi).count();
+        assert!(count(ARTIST_OFFSET, TEXT_OFFSET) >= 2, "expected primary + featured artist buckets");
+        assert!(count(GENRE_OFFSET, MOOD_OFFSET) >= 3, "expected full + sub-genre buckets");
+        assert!(count(MOOD_OFFSET, ERA_OFFSET) >= 1, "expected inferred mood buckets when moods is empty");
     }
 }

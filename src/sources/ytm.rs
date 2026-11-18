@@ -14,6 +14,17 @@ use tracing::warn;
 const INNERTUBE_SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const INNERTUBE_NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
 const YTM_SONGS_PARAMS: &str = "EgWKAQIIAWoKEAMQBBAJEAoQBQ%3D%3D";
+/// Search filter: playlists curated by YouTube Music itself ("Anime Hits", "Top J-Rock"...).
+const YTM_FEATURED_PLAYLISTS_PARAMS: &str = "EgeKAQQoADgBagwQDhAKEAMQBRAJEAQ%3D";
+/// Search filter: user-made playlists. Noisier; only used when no featured playlist fits.
+const YTM_COMMUNITY_PLAYLISTS_PARAMS: &str = "EgeKAQQoAEABagoQAxAEEAoQCRAF";
+
+#[derive(Debug, Clone)]
+pub struct YtmPlaylistHit {
+    pub playlist_id: String,
+    pub title: String,
+    pub song_count: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolvedStream {
@@ -120,6 +131,52 @@ impl YtmSource {
         self.search_innertube_checked(query, songs_only, limit)
             .await
             .unwrap_or_default()
+    }
+
+    /// Search YouTube Music playlists: featured (editorial) ones, or user-made ones.
+    pub async fn search_playlists(&self, query: &str, featured: bool, limit: usize) -> Vec<YtmPlaylistHit> {
+        let q = query.trim();
+        if q.is_empty() {
+            return vec![];
+        }
+        let params = if featured {
+            YTM_FEATURED_PLAYLISTS_PARAMS
+        } else {
+            YTM_COMMUNITY_PLAYLISTS_PARAMS
+        };
+        let body = serde_json::json!({
+            "context": innertube_client_context(),
+            "query": q,
+            "params": params,
+        });
+        let Some(val) = self.innertube_post(INNERTUBE_SEARCH_URL, body).await else {
+            return vec![];
+        };
+        let mut out = parse_playlist_search_results(&val);
+        out.truncate(limit);
+        out
+    }
+
+    /// Fetch the tracks of a YouTube Music playlist (first page, ~25 tracks).
+    pub async fn fetch_playlist_tracks(&self, playlist_id: &str, limit: usize) -> Vec<Track> {
+        let pid = playlist_id.trim().trim_start_matches("VL");
+        if pid.is_empty() {
+            return vec![];
+        }
+        let body = serde_json::json!({
+            "context": innertube_client_context(),
+            "playlistId": pid,
+            "isAudioOnly": true
+        });
+        let Some(val) = self.innertube_post(INNERTUBE_NEXT_URL, body).await else {
+            return vec![];
+        };
+        let now = Utc::now().timestamp();
+        parse_innertube_radio_results(&val, "")
+            .into_iter()
+            .filter_map(|c| candidate_to_track(c, now))
+            .take(limit)
+            .collect()
     }
 
     /// Fetch official YouTube Music "Up Next" / Track Radio mix tracks seeded by `video_id`.
@@ -479,6 +536,55 @@ pub fn parse_innertube_results(root: &Value) -> Vec<YtmCandidate> {
     out
 }
 
+fn parse_playlist_search_results(root: &Value) -> Vec<YtmPlaylistHit> {
+    let mut items = Vec::new();
+    collect_objects_by_key(root, "musicResponsiveListItemRenderer", &mut items);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        let Some(browse_id) = item
+            .pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(|b| b.as_str())
+        else {
+            continue;
+        };
+        if !browse_id.starts_with("VL") {
+            continue;
+        }
+        let column_text = |idx: usize| {
+            item.pointer(&format!(
+                "/flexColumns/{}/musicResponsiveListItemFlexColumnRenderer/text/runs",
+                idx
+            ))
+            .and_then(join_runs_text)
+            .unwrap_or_default()
+        };
+        let title = column_text(0);
+        if title.trim().is_empty() {
+            continue;
+        }
+        // Subtitle looks like "YouTube Music • 50 songs" (featured) or "Owner • 1.2M views".
+        let song_count = column_text(1)
+            .split('•')
+            .find_map(|part| {
+                let p = part.trim().to_lowercase();
+                p.strip_suffix(" songs")
+                    .or_else(|| p.strip_suffix(" song"))
+                    .and_then(|n| n.replace(',', "").trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let playlist_id = browse_id.trim_start_matches("VL").to_string();
+        if seen.insert(playlist_id.clone()) {
+            out.push(YtmPlaylistHit {
+                playlist_id,
+                title,
+                song_count,
+            });
+        }
+    }
+    out
+}
+
 fn parse_innertube_radio_results(root: &Value, seed_video_id: &str) -> Vec<YtmCandidate> {
     let mut raw_renderers = Vec::new();
     collect_objects_by_key(root, "playlistPanelVideoRenderer", &mut raw_renderers);
@@ -612,6 +718,7 @@ fn extract_panel_candidate(item: &Value, seed_video_id: &str) -> Option<YtmCandi
                 || low == "video"
                 || low.ends_with("plays")
                 || low.ends_with("views")
+                || low.ends_with("likes")
             {
                 continue;
             }
@@ -723,6 +830,7 @@ fn extract_candidate(item: &Value) -> Option<YtmCandidate> {
                 || low == "ep"
                 || low.ends_with("plays")
                 || low.ends_with("views")
+                || low.ends_with("likes")
             {
                 continue;
             }

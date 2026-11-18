@@ -2442,11 +2442,9 @@ pub async fn instant_mix(
         }
         if !intent.is_theme_mix && !force_topic {
             // Fetch curated playlists in parallel for evidence-based topic vs entity routing.
-            let dz = state.sources.deezer.clone();
-            let q_owned = base_query.clone();
             let curated = tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                dz.fetch_curated_mix_tracks(&q_owned, 2, 24),
+                std::time::Duration::from_secs(5),
+                state.sources.fetch_curated_mix_tracks(&base_query, 2, 24),
             )
             .await
             .unwrap_or_default();
@@ -2564,10 +2562,9 @@ pub async fn instant_mix(
                 },
                 async {
                     tokio::time::timeout(
-                        std::time::Duration::from_millis(3000),
+                        std::time::Duration::from_millis(4000),
                         state
                             .sources
-                            .deezer
                             .fetch_curated_mix_tracks(&format!("{} music", query), 3, 24),
                     )
                     .await
@@ -3038,12 +3035,12 @@ async fn fetch_topic_mix_inputs(
     let genre_hints = fetch_intent.deezer_genre_hints();
 
     let pl_futs = pl_queries.iter().map(|pq| {
-        let dz = state.sources.deezer.clone();
+        let sources = state.sources.clone();
         let pq_owned = pq.clone();
         async move {
             tokio::time::timeout(
                 std::time::Duration::from_secs(6),
-                dz.fetch_curated_mix_tracks(&pq_owned, 3, 40),
+                sources.fetch_curated_mix_tracks(&pq_owned, 3, 40),
             )
             .await
             .unwrap_or_default()

@@ -878,7 +878,7 @@ impl TasteEngine {
 
     pub fn train_and_distill_background(&self, max_steps: usize) -> crate::transformer::TrainEpochStats {
         self.neural
-            .train_background_epoch(&self.store, max_steps, 8, true)
+            .train_background_epoch(&self.store, max_steps, 16, true)
     }
 
     fn should_probe_slsk(&self, cache_key: &str) -> bool {
@@ -2134,7 +2134,7 @@ impl TasteEngine {
         }
 
         let train_engine = self.clone();
-        let train_stats = tokio::task::spawn_blocking(move || train_engine.train_and_distill_background(14))
+        let train_stats = tokio::task::spawn_blocking(move || train_engine.train_and_distill_background(48))
             .await
             .unwrap_or_default();
 
@@ -2268,10 +2268,10 @@ impl TasteEngine {
         // expand taste graphs & auto-playlists in preparation.
         let train_engine = self.clone();
         let train_stats =
-            tokio::task::spawn_blocking(move || train_engine.train_and_distill_background(18))
+            tokio::task::spawn_blocking(move || train_engine.train_and_distill_background(48))
                 .await
                 .unwrap_or_default();
-        if train_stats.steps_run > 0 {
+        if train_stats.steps_run > 0 && !train_stats.skipped {
             info!(
                 tick = tick,
                 steps_run = train_stats.steps_run,
@@ -2279,6 +2279,12 @@ impl TasteEngine {
                 avg_loss = train_stats.avg_loss,
                 examples = train_stats.examples_used,
                 distilled_users = train_stats.distilled_users,
+                rejected = train_stats.rejected,
+                heldout = train_stats.eval.n,
+                model_mrr = train_stats.eval.model_mrr,
+                popularity_mrr = train_stats.eval.popularity_mrr,
+                content_mrr = train_stats.eval.content_mrr,
+                quality = train_stats.eval.quality,
                 "transformer background training & distillation tick complete"
             );
         }
@@ -2533,7 +2539,7 @@ impl TasteEngine {
 
         let mut curated_batches = Vec::new();
         for pq in &pl_queries {
-            let batches = self.sources.deezer.fetch_curated_mix_tracks(pq, 3, 25).await;
+            let batches = self.sources.fetch_curated_mix_tracks(pq, 3, 25).await;
             for (pl_title, batch) in batches {
                 if !batch.is_empty() {
                     curated_batches.push((pl_title, batch));
@@ -3975,7 +3981,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         let genre_names = mood_deezer_genre_names(mood);
         let pl_futs = queries
             .iter()
-            .map(|q| self.sources.deezer.fetch_curated_mix_tracks(q, 3, 25));
+            .map(|q| self.sources.fetch_curated_mix_tracks(q, 3, 25));
         let genres_fut = async {
             if genre_names.is_empty() {
                 Vec::new()
@@ -4149,7 +4155,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             .collect();
         let futs = queries
             .iter()
-            .map(|q| self.sources.deezer.fetch_curated_mix_tracks(q, 2, 20));
+            .map(|q| self.sources.fetch_curated_mix_tracks(q, 2, 20));
         let Ok(batches) = tokio::time::timeout(
             std::time::Duration::from_secs(4),
             futures::future::join_all(futs),

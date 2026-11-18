@@ -2631,11 +2631,6 @@
       <form onsubmit="App.submitInstantMixModal(event)" style="display:flex;flex-direction:column;gap:12px">
         <p style="font-size:13px;color:var(--text-muted)">Generate an on-demand mix from any artist, song, genre, era, or mood.</p>
         <input id="instant-mix-modal-input" type="text" value="${esc(defaultVal)}" placeholder="e.g. 80s hits, Daft Punk, late night chill..." required autofocus />
-        <div class="instant-mix-suggestions">
-          ${['80s hits', '90s rock', 'Chill synthwave', 'Workout energy']
-            .map((sg) => `<button type="button" class="refine-query-pill" onclick="App.closeModal();App.navigate('mix?q=${encodeURIComponent(sg)}')">${esc(sg)}</button>`)
-            .join('')}
-        </div>
         <button type="submit" class="btn-primary">Create Instant Mix</button>
       </form>
     `);

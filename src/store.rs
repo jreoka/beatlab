@@ -4098,13 +4098,13 @@ impl Store {
         &self,
         user_id: i64,
         limit: usize,
-    ) -> AppResult<Vec<(Track, String, i64)>> {
+    ) -> AppResult<Vec<(Track, String, f64, i64)>> {
         if user_id <= 0 || limit == 0 {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         let sql = format!(
-            "SELECT {}, e.kind, e.at
+            "SELECT {}, e.kind, e.value, e.at
              FROM events e
              JOIN tracks t ON t.id = e.track_id
              WHERE e.user_id = ?1
@@ -4117,12 +4117,45 @@ impl Store {
             .query_map(params![user_id, limit as i64], |r| {
                 let t = row_to_track(r)?;
                 let kind: String = r.get(21)?;
-                let at: i64 = r.get(22)?;
-                Ok((t, kind, at))
+                let value: f64 = r.get(22)?;
+                let at: i64 = r.get(23)?;
+                Ok((t, kind, value, at))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.reverse();
         Ok(rows)
+    }
+
+    /// Cheap summary of everything the Transformer trains on. It changes whenever a user
+    /// listens, stars, rates, hides or edits a manual playlist, so the trainer can skip
+    /// epochs when nothing new has happened instead of overfitting the same data.
+    pub fn transformer_data_fingerprint(&self) -> AppResult<String> {
+        let conn = self.lock();
+        let fp = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM users),
+                    (SELECT COALESCE(MAX(id), 0) FROM events),
+                    (SELECT COUNT(*) FROM events),
+                    (SELECT COUNT(*) FROM stars),
+                    (SELECT COUNT(*) FROM ratings),
+                    (SELECT COALESCE(SUM(rating), 0) FROM ratings),
+                    (SELECT COUNT(*) FROM playlist_tracks),
+                    (SELECT COUNT(*) FROM hidden_tracks)",
+            [],
+            |r| {
+                Ok(format!(
+                    "u{}-e{}.{}-s{}-r{}.{}-p{}-h{}",
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            },
+        )?;
+        Ok(fp)
     }
 
     /// Loads multi-user training sequences, manual playlists, positive/negative signals,
@@ -4163,7 +4196,7 @@ impl Store {
                 corpus.user_events.insert(uid, evs);
             }
 
-            let mut sstmt = conn.prepare("SELECT track_id FROM stars WHERE user_id = ?1")?;
+            let mut sstmt = conn.prepare("SELECT track_id FROM stars WHERE user_id = ?1 ORDER BY at DESC")?;
             let stars: Vec<String> = sstmt
                 .query_map(params![uid], |r| r.get::<_, String>(0))?
                 .flatten()
@@ -5034,6 +5067,11 @@ impl Store {
             .optional()
             .ok()
             .flatten()
+    }
+
+    pub fn kv_delete(&self, key: &str) {
+        let conn = self.lock();
+        let _ = conn.execute("DELETE FROM kv WHERE key = ?1", params![key]);
     }
 
     pub fn kv_set(&self, key: &str, value: &str) {
