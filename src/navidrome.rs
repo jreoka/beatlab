@@ -1114,14 +1114,12 @@ mod tests {
                 ..Default::default()
             }])
             .unwrap();
-        let quality_hunter = crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone());
         AppState {
             store,
             sources,
             engine,
             taste,
             now_playing: Arc::new(Mutex::new(HashMap::new())),
-            quality_hunter,
         }
     }
 

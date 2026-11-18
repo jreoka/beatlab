@@ -110,11 +110,11 @@
 
     <div id="panel" class="hidden">
       <div class="tabs">
-        <button class="tab active" data-tab="overview" onclick="showTab('overview')">◈ Overview</button>
-        <button class="tab" data-tab="users" onclick="showTab('users')">◉ Users</button>
-        <button class="tab" data-tab="cache" onclick="showTab('cache')">⬡ Cache &amp; Quality</button>
-        <button class="tab" data-tab="events" onclick="showTab('events')">⛨ Security Events</button>
-        <button class="tab" data-tab="config" onclick="showTab('config')">⚙ Configuration</button>
+        <a class="tab active" href="/admin/overview" data-tab="overview">◈ Overview</a>
+        <a class="tab" href="/admin/users" data-tab="users">◉ Users</a>
+        <a class="tab" href="/admin/cache" data-tab="cache">⬡ Cache</a>
+        <a class="tab" href="/admin/events" data-tab="events">⛨ Security Events</a>
+        <a class="tab" href="/admin/config" data-tab="config">⚙ Configuration</a>
       </div>
 
       <section id="tab-overview">
@@ -132,8 +132,6 @@
       <section id="tab-cache" class="hidden">
         <div class="subhead"><h2>Storage tiers</h2><span id="cache-summary" class="muted"></span></div>
         <div id="cache-box" class="panel-grid"></div>
-        <div class="subhead"><h2>Quality hunter</h2><span id="hunter-status" class="pill"></span></div>
-        <div id="hunter-box" class="panel-grid"></div>
       </section>
 
       <section id="tab-events" class="hidden">
@@ -210,7 +208,6 @@
         ['Tracks', o.tracks, 'in library'],
         ['Hot cache', Math.round(o.localCacheBytes / 1048576) + ' MB', o.localCacheEntries + ' files / ' + Math.round(o.cacheMaxBytes / 1073741824) + ' GB cap'],
         ['Cool cache', o.remoteCacheEnabled ? Math.round(o.remoteCacheBytes / 1048576) + ' MB' : 'Off', o.remoteCacheEnabled ? o.remoteCacheObjects + ' objects' : 'configure S3/R2 to enable'],
-        ['Quality upgrades', (o.qualityHunter && o.qualityHunter.installed) || 0, (o.qualityHunter && o.qualityHunter.enabled ? 'hunter running' : 'hunter disabled')],
         ['2FA users', o.totpUsers, o.passkeys + ' passkeys'],
         ['Recovery codes', o.recoveryCodes, 'unused'],
         ['Playlists', o.playlists, 'across accounts'],
@@ -318,11 +315,27 @@
       } catch (e) { toast(e.message); }
     };
 
-    window.showTab = (tab) => {
+    const TABS = ['overview','users','cache','events','config'];
+    function tabFromPath() {
+      const part = location.pathname.replace(/\/+$/, '').split('/').pop();
+      return TABS.includes(part) ? part : 'overview';
+    }
+    function showTab(tab, push = true) {
+      if (!TABS.includes(tab)) tab = 'overview';
       state.tab = tab;
-      document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-      ['overview','users','cache','events','config'].forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
-    };
+      document.querySelectorAll('.tab').forEach((b) => {
+        const active = b.dataset.tab === tab;
+        b.classList.toggle('active', active);
+        if (active) b.setAttribute('aria-current', 'page');
+        else b.removeAttribute('aria-current');
+      });
+      TABS.forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
+      if (push) {
+        const path = '/admin/' + tab;
+        if (location.pathname !== path) history.pushState({ tab }, '', path);
+      }
+    }
+    window.showTab = showTab;
 
     window.backfillCache = async () => {
       if (!confirm('Upload all locally cached tracks to the cool cache now?')) return;
@@ -377,32 +390,6 @@
       $('cache-summary').textContent = o.localCacheEntries + ' hot files · ' + (o.remoteCacheEnabled ? o.remoteCacheObjects + ' cool objects' : 'cool tier off');
     }
 
-    function renderHunter(o) {
-      const h = o.qualityHunter || {};
-      const status = $('hunter-status');
-      status.textContent = h.enabled ? 'Running' : 'Disabled';
-      status.className = 'pill ' + (h.enabled ? 'on' : 'off');
-      let activity = '<div class="card">';
-      activity += '<div class="k">Hunt activity</div><div class="v">' + (h.installed || 0) + '</div>';
-      activity += '<div class="muted" style="font-size:11px">higher-quality versions installed</div>';
-      activity += statRow('Tracks probed', h.probes || 0);
-      activity += statRow('Candidates found', h.candidates || 0);
-      activity += statRow('Downloads started', h.downloads || 0);
-      activity += statRow('Failures', h.failures || 0);
-      activity += statRow('Bytes acquired', mb(h.bytesUpgraded));
-      activity += '</div>';
-      let recency = '<div class="card">';
-      recency += '<div class="k">Latest upgrade</div><div class="v" style="font-size:17px">' + esc(h.lastTrack || '—') + '</div>';
-      recency += statRow('Last scan', ago(h.lastTick));
-      recency += statRow('Last upgrade', ago(h.lastUpgrade));
-      recency += '<h3 style="margin:14px 0 2px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">Settings</h3>';
-      recency += statRow('Scan interval', (h.intervalSecs || 0) + 's');
-      recency += statRow('Tracks per scan', h.batch || 0);
-      recency += statRow('Retry cooldown', Math.round((h.cooldownSecs || 0) / 3600) + 'h');
-      recency += '</div>';
-      $('hunter-box').innerHTML = activity + recency;
-    }
-
     async function load() {
       try {
         const data = await api('/api/admin/overview');
@@ -416,7 +403,6 @@
         state.events = events.events || [];
         renderOverview();
         renderCache(data);
-        renderHunter(data);
         renderUsers();
         $('all-events').innerHTML = state.events.length ? state.events.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
         $('config-box').innerHTML = Object.entries(config).map(([k,v]) => {
@@ -440,6 +426,14 @@
       state.token = '';
       gate('Signed out', 'Sign in to the Beatlab player, then reopen this page.');
     };
+
+    // Tab navigation is backed by real URL paths (/admin/<tab>) so tabs can be
+    // bookmarked and the browser's back/forward buttons work as expected.
+    showTab(tabFromPath(), false);
+    document.querySelectorAll('.tab').forEach((a) => {
+      a.addEventListener('click', (e) => { e.preventDefault(); showTab(a.dataset.tab); });
+    });
+    window.addEventListener('popstate', () => showTab(tabFromPath(), false));
     boot();
   })();
   </script>

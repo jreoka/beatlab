@@ -171,7 +171,6 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 .map(|(kind, objects, bytes)| json!({ "kind": kind, "objects": objects, "bytes": bytes }))
                 .collect::<Vec<_>>(),
             "maxTrackBytes": state.engine.max_track_bytes,
-            "qualityHunter": state.quality_hunter.stats_json(),
         })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

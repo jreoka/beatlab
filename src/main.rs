@@ -3,7 +3,6 @@ mod auth;
 mod engine;
 mod models;
 mod navidrome;
-mod quality_hunter;
 mod remote_cache;
 mod share_page;
 mod sources;
@@ -165,10 +164,6 @@ async fn main() -> models::AppResult<()> {
         remote_cache.clone().map(Arc::new),
     ));
     let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
-    let quality_hunter = crate::quality_hunter::QualityHunter::new(
-        store.clone(),
-        (*engine).clone(),
-    );
 
     let state = AppState {
         store: store.clone(),
@@ -176,7 +171,6 @@ async fn main() -> models::AppResult<()> {
         engine,
         taste: taste.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
-        quality_hunter,
     };
 
     // Fast startup catalog warming + continuous RoPE-QKVO/XSA/GEGLU Transformer training & curation
@@ -192,21 +186,6 @@ async fn main() -> models::AppResult<()> {
             tick = tick.wrapping_add(1);
         }
     });
-
-    // Slowly hunt for higher-quality versions of catalog tracks in the
-    // background. The installed file replaces the cached audio under the same
-    // track ID, so artwork and metadata remain those of the original.
-    let hunter = state.quality_hunter.clone();
-    if hunter.enabled() {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(hunter.interval());
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                hunter.run_tick().await;
-            }
-        });
-    }
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -396,7 +375,14 @@ async fn main() -> models::AppResult<()> {
         .route("/api/user/{id}", put(navidrome::update_user))
         .route("/api/keepalive/keepalive", get(navidrome::keepalive))
         // Administrator panel (gated by ADMIN_USERNAME at the API layer).
+        // Every tab has its own path so it can be bookmarked, shared and
+        // navigated with the browser's back/forward buttons.
         .route("/admin", get(admin::serve_admin))
+        .route("/admin/overview", get(admin::serve_admin))
+        .route("/admin/users", get(admin::serve_admin))
+        .route("/admin/cache", get(admin::serve_admin))
+        .route("/admin/events", get(admin::serve_admin))
+        .route("/admin/config", get(admin::serve_admin))
         .route("/api/admin/session", get(admin::session))
         .route("/api/admin/overview", get(admin::overview))
         .route("/api/admin/config", get(admin::config))
