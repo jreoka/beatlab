@@ -932,9 +932,6 @@
   // ---------------------------------------------------------------------------
   // Authentication & Session Bootstrap
   // ---------------------------------------------------------------------------
-  const AUTH_DESC_SIGNIN = 'Sign in with your username &amp; password, or with a passkey. For <strong>Subsonic</strong> &amp; <strong>Navidrome</strong> apps, use the API key from <strong>Settings &rarr; Apps &amp; API</strong> as the password &mdash; account passwords no longer work in music clients.';
-  const AUTH_DESC_SIGNUP = 'Create your Beatlab account with a username and password. Enter the password twice to confirm it.';
-
   function setAuthMode(mode) {
     const signup = mode === 'signup';
     state.authMode = signup ? 'signup' : 'signin';
@@ -959,8 +956,6 @@
     if (passwordInput) passwordInput.autocomplete = signup ? 'new-password' : 'current-password';
     const submit = $('auth-submit');
     if (submit) submit.textContent = signup ? 'Create account' : 'Sign in';
-    const desc = $('auth-desc');
-    if (desc) desc.innerHTML = signup ? AUTH_DESC_SIGNUP : AUTH_DESC_SIGNIN;
     const passkeyBtn = $('auth-passkey-btn');
     if (passkeyBtn) passkeyBtn.classList.toggle('hidden', signup);
   }

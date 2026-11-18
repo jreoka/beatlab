@@ -182,12 +182,6 @@ a {
   font-weight: 600;
 }
 
-.auth-desc {
-  color: var(--text-muted);
-  font-size: 13.5px;
-  margin-bottom: 22px;
-}
-
 .auth-form {
   display: flex;
   flex-direction: column;
