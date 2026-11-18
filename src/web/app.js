@@ -9,8 +9,11 @@
   let vizData = null;
   let vizStream = null;
   let vizBoundTrack = null;
+  let vizSink = null;
   let vizMode = '';
   let vizUnavailable = false;
+  let vizSignalAt = 0;
+  let vizLastCaptureAt = 0;
 
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
@@ -742,9 +745,15 @@
     icon.innerHTML = state.muted || state.volume === 0 ? ICONS.volMuted : ICONS.volOn;
   }
 
+  function vizCtxNeedsResume() {
+    // iOS also reports the transient 'interrupted' state (e.g. after a system
+    // sound or route change); without resuming it the analyser goes silent.
+    return vizCtx && (vizCtx.state === 'suspended' || vizCtx.state === 'interrupted');
+  }
+
   function ensureVisualizerAnalyser() {
     if (vizUnavailable || !audio) return;
-    if (vizCtx && vizCtx.state === 'suspended' && !audio.paused) {
+    if (vizCtxNeedsResume() && !audio.paused) {
       vizCtx.resume().catch(() => {});
     }
     if (vizAnalyser && vizMode === 'element') {
@@ -760,12 +769,12 @@
       if (!vizCtx) {
         vizCtx = new AC();
         audio.addEventListener('play', () => {
-          if (vizCtx && vizCtx.state === 'suspended') {
+          if (vizCtxNeedsResume()) {
             vizCtx.resume().catch(() => {});
           }
         });
       }
-      if (vizCtx.state === 'suspended') {
+      if (vizCtxNeedsResume()) {
         vizCtx.resume().catch(() => {});
       }
       if (!vizAnalyser) {
@@ -798,12 +807,34 @@
         }
         return;
       }
-      let liveTrack =
-        vizStream && vizStream.getAudioTracks().find((t) => t.readyState === 'live');
+      // A captured media-element track can end or go muted when playback
+      // stalls or the element briefly pauses between tracks. Only a live,
+      // unmuted track actually feeds the analyser, so re-capture when needed.
+      const usableTrack = (s) =>
+        s && typeof s.getAudioTracks === 'function'
+          ? s.getAudioTracks().find((t) => t.readyState === 'live' && !t.muted) || null
+          : null;
+      let liveTrack = usableTrack(vizStream);
       if (!liveTrack) {
-        vizStream = capture();
-        liveTrack =
-          vizStream && vizStream.getAudioTracks().find((t) => t.readyState === 'live');
+        const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (!vizLastCaptureAt || nowMs - vizLastCaptureAt > 400) {
+          vizLastCaptureAt = nowMs;
+          const nextStream = capture();
+          const nextTrack = usableTrack(nextStream);
+          if (nextTrack) {
+            if (
+              vizStream &&
+              vizStream !== nextStream &&
+              typeof vizStream.getTracks === 'function'
+            ) {
+              vizStream.getTracks().forEach((t) => {
+                try { t.stop(); } catch {}
+              });
+            }
+            vizStream = nextStream;
+            liveTrack = nextTrack;
+          }
+        }
       }
       if (!liveTrack) {
         return;
@@ -819,8 +850,13 @@
       vizSource = vizCtx.createMediaStreamSource(vizStream);
       vizBoundTrack = liveTrack;
       vizMode = 'stream';
+      if (vizSink) {
+        try { vizAnalyser.disconnect(vizSink); } catch {}
+        try { vizSink.disconnect(); } catch {}
+      }
       const silentGain = vizCtx.createGain();
       silentGain.gain.value = 0;
+      vizSink = silentGain;
       vizSource.connect(vizAnalyser);
       vizAnalyser.connect(silentGain);
       silentGain.connect(vizCtx.destination);
@@ -846,8 +882,23 @@
       if (playing && audio.readyState >= 2) {
         ensureVisualizerAnalyser();
       }
+      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      let hasSignal = false;
       if (playing && vizAnalyser && vizData) {
         vizAnalyser.getByteFrequencyData(vizData);
+        for (let k = 0; k < vizData.length; k++) {
+          if (vizData[k] > 0) {
+            hasSignal = true;
+            break;
+          }
+        }
+        if (hasSignal) vizSignalAt = nowMs;
+      }
+      // On some mobile browsers the analyser only receives audio briefly (the
+      // captured track ends or goes muted). Rather than collapsing into a flat
+      // line for the rest of the song, fall back to an animated waveform.
+      const useAnalyser = playing && nowMs - vizSignalAt < 300;
+      if (useAnalyser) {
         const usableBins = Math.max(1, Math.floor(vizData.length * 0.65));
         for (let i = 0; i < bars; i++) {
           const bin = Math.min(
@@ -856,6 +907,16 @@
           );
           const amp = vizData[bin] / 255;
           const h = Math.min(canvas.height, Math.max(3, (0.06 + amp * 0.9) * canvas.height));
+          ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
+        }
+      } else if (playing) {
+        const t = nowMs / 1000;
+        for (let i = 0; i < bars; i++) {
+          const wave =
+            0.18 +
+            0.45 * Math.abs(Math.sin(t * 2.1 + i * 0.42)) +
+            0.25 * Math.abs(Math.sin(t * 3.6 - i * 0.27));
+          const h = Math.min(canvas.height, Math.max(3, wave * canvas.height * 0.9));
           ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
         }
       } else {

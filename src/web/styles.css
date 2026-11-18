@@ -6057,9 +6057,29 @@ html, body {
 @media (max-width: 780px) {
   .topbar {
     background: var(--bg);
+    /* The flat-makeover .topbar rule above resets height/padding after the
+       responsive two-row header rules. Re-assert them here (this is the last
+       mobile media query) so the search box stays inside the header instead
+       of overflowing onto the greeting and content below. */
+    height: auto;
+    padding: calc(8px + env(safe-area-inset-top)) 12px 10px;
+  }
+  html.is-standalone .topbar {
+    padding-top: max(10px, env(safe-area-inset-top));
   }
   .search-box input {
     border-radius: var(--radius-sm);
+    /* Keep the intended mobile input size (the flat rule above shrank it).
+       16px also prevents iOS Safari from zooming when the field is focused. */
+    font-size: 16px;
+    padding: 9px 38px;
+  }
+  /* Tapping a song should play it. The artist/album text under the title has
+     inline navigation links that are far too easy to hit by accident on a
+     phone, so ignore taps on them and let the row's play handler win.
+     Long-press still exposes "Go to Artist"/"Go to Album" in the menu. */
+  .track-row .tr-sub .clickable {
+    pointer-events: none;
   }
   .mobile-nav {
     background: var(--bg);
