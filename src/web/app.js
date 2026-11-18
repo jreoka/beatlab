@@ -1580,11 +1580,51 @@
       navigate(`search?q=${encodeURIComponent(q)}`);
     };
 
-    // Search is submit-only now: typing just updates the clear button.
-    // Navigation happens on Enter or when the search button is pressed.
     const handleSearchBoxEdit = (rawVal) => {
       const val = String(rawVal || '');
       $('clear-search-btn').classList.toggle('hidden', !val);
+      clearTimeout(state.searchTimer);
+      state.searchTimer = null;
+
+      const trimmed = val.trim();
+      if (!trimmed) {
+        if (state.searchFetchingQuery || state.searchLoadingUi) {
+          abortActiveViewRequest();
+          // Clearing the box must never jump to a different tab.
+          if (isSearchHash(location.hash.replace(/^#/, ''))) {
+            if (state.searchState) {
+              renderSearchView();
+            } else {
+              renderSearch('');
+            }
+          }
+        }
+        return;
+      }
+
+      if (state.searchFetchingQuery && state.searchFetchingQuery !== trimmed) {
+        abortActiveViewRequest();
+        state.searchLoadingUi = true;
+        setMainLoading(`Searching "${trimmed}"...`);
+      } else if (!state.searchComposing) {
+        state.searchLoadingUi = true;
+        setMainLoading(`Searching "${trimmed}"...`);
+      }
+
+      state.searchTimer = setTimeout(() => {
+        state.searchTimer = null;
+        const liveQ = (globalSearch.value || '').trim();
+        if (!liveQ) return;
+        const currentHash = location.hash.replace(/^#/, '');
+        const targetHash = `search?q=${encodeURIComponent(liveQ)}`;
+        if (
+          currentHash === targetHash &&
+          (state.searchFetchingQuery === liveQ || (!state.searchLoadingUi && state.searchState?.query === liveQ))
+        ) {
+          return;
+        }
+        triggerSearchFromInput(liveQ);
+      }, 320);
     };
 
     globalSearch.addEventListener('compositionstart', () => {
@@ -1925,7 +1965,7 @@
       if (mixedForYou.length > 0) {
         html += `<section class="section">
           <div class="section-head">
-            <h2>Daily Mixes</h2>
+            <h2>Mixed for you</h2>
           </div>
           <div class="mixed-for-you-grid">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;
@@ -2020,7 +2060,7 @@
     const artHtml = covers.length
       ? `<div class="mixfor-collage${covers.length < 4 ? ' sparse' : ''}">${covers.slice(0, 4).map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`
       : `<div class="mixfor-fallback"></div>`;
-    const sub = `${m.trackCount || 0} tracks`;
+    const sub = `${m.trackCount || 0} tracks · ${m.subtitle || ''}`;
     return `<div class="mixfor-card" data-share-kind="playlist" data-share-id="${esc(m.id)}" data-share-title="${esc(m.title)}" data-share-sub="${esc(sub)}" onclick="App.navigate('playlist/${encodeURIComponent(m.id)}')">
       <div class="mixfor-art" style="--mix-c1:${esc(m.c1)};--mix-c2:${esc(m.c2)}">
         ${artHtml}
@@ -2030,6 +2070,7 @@
       </div>
       <div class="mixfor-info">
         <div class="mixfor-name">${esc(m.title)}</div>
+        <div class="mixfor-artists">${esc(m.subtitle || '')}</div>
       </div>
     </div>`;
   }
@@ -2697,7 +2738,6 @@
       const albums = d.albums || [];
       const related = d.related || [];
       const relatedTracks = cacheTracks(d.relatedTracks || []);
-      const curatedSimilar = d.curatedSimilar || [];
       const idsJson = esc(JSON.stringify(top.map((t) => t.id)));
       state.artistView = { top, expanded: false };
 
@@ -2741,12 +2781,6 @@
         html += `<section class="section">
           <div class="section-head"><h2>Fans Also Like</h2></div>
           <div class="card-grid">${related.map(renderArtistCard).join('')}</div>
-        </section>`;
-      }
-      if (curatedSimilar.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>✦ Curated Similar Artists</h2><span class="muted" style="font-size:12px">Picked and explained by your AI curator</span></div>
-          <div class="card-grid">${curatedSimilar.map(renderCuratedArtistCard).join('')}</div>
         </section>`;
       }
 
@@ -4226,16 +4260,6 @@
     </div>`;
   }
 
-  function renderCuratedArtistCard(a) {
-    return `<div class="media-card curated-artist-card" data-share-kind="artist" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="Curated similar artist" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('artist/${encodeURIComponent(a.id)}')">
-      <div class="card-art-wrap round">
-        <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
-      </div>
-      <div class="card-title" style="text-align:center">${esc(a.name)}</div>
-      <div class="card-sub" style="text-align:center">✦ ${esc(a.reason || 'Curated for your taste')}</div>
-    </div>`;
-  }
-
   function renderPlaylistCard(p) {
     const sub = `${p.trackCount} tracks · ${p.ownerName}`;
     const pinned = isPlaylistPinned(p.id);
@@ -5390,22 +5414,6 @@
         }
       });
     }
-  }
-
-  function scrollActiveLyricIntoView(behavior = 'smooth') {
-    if (state.activeLyricIdx < 0) return;
-    // Wait a frame so a just-unhidden panel has a layout before scrolling.
-    requestAnimationFrame(() => {
-      const targets = [
-        ['lyrics-container', $('rp-lyrics-body') && !$('rp-lyrics-body').classList.contains('hidden')],
-        ['fs-lyrics-body', $('fullscreen-player').classList.contains('open') && state.fsTab === 'lyrics'],
-      ];
-      for (const [containerId, visible] of targets) {
-        if (!visible) continue;
-        const el = $(containerId)?.querySelector(`.lyric-line[data-lidx="${state.activeLyricIdx}"]`);
-        if (el) el.scrollIntoView({ behavior, block: 'center' });
-      }
-    });
   }
 
   // ---------------------------------------------------------------------------
@@ -7271,7 +7279,6 @@
     closeUserMenu,
     goCommunity,
     goSettings,
-    submitGlobalSearch: () => triggerSearchFromInput($('global-search')?.value || ''),
     focusSearch: () => {
       haptic('tap');
       setExpandedPlayer(false);
@@ -7404,7 +7411,6 @@
       $('tab-lyrics').classList.toggle('active', tab === 'lyrics');
       $('rp-queue-body').classList.toggle('hidden', tab !== 'queue');
       $('rp-lyrics-body').classList.toggle('hidden', tab !== 'lyrics');
-      if (tab === 'lyrics') scrollActiveLyricIntoView();
     },
     setFsMobileView,
     setFsTab: (tab, silent = false) => {
@@ -7416,7 +7422,10 @@
       $('fs-lyrics-panel').classList.toggle('hidden', tab !== 'lyrics');
       if ($('fs-tab-mobile-queue')) $('fs-tab-mobile-queue').classList.toggle('active', state.fsMobileView === 'queue');
       if ($('fs-tab-mobile-lyrics')) $('fs-tab-mobile-lyrics').classList.toggle('active', state.fsMobileView === 'lyrics');
-      if (tab === 'lyrics') scrollActiveLyricIntoView();
+      if (tab === 'lyrics' && state.activeLyricIdx >= 0) {
+        const activeLine = $('fs-lyrics-body')?.querySelector(`.lyric-line[data-lidx="${state.activeLyricIdx}"]`);
+        if (activeLine) activeLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
     },
     toggleRightPanel: (show) => {
       const rp = $('right-panel');

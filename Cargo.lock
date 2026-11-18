@@ -212,14 +212,11 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "rusqlite",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
  "tokio",
- "tokio-rustls",
  "tokio-util",
  "tower-http",
  "tracing",
@@ -229,7 +226,6 @@ dependencies = [
  "uuid",
  "walkdir",
  "webauthn-rs",
- "webpki-roots",
 ]
 
 [[package]]

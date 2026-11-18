@@ -1899,6 +1899,27 @@ impl Store {
         Ok(rows)
     }
 
+    /// Updates only the fields describing the audio bytes. Used by the quality
+    /// hunter when a better file is installed under an existing track ID: all
+    /// metadata (title, artist, artwork, ids, moods, …) stays untouched.
+    pub fn update_track_audio_quality(
+        &self,
+        track_id: &str,
+        format: &str,
+        bitrate: i32,
+        sample_rate: i32,
+        bit_depth: i32,
+        size: i64,
+    ) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE tracks SET format = ?1, bitrate = ?2, sample_rate = ?3,
+                    bit_depth = ?4, size = ?5 WHERE id = ?6",
+            params![format, bitrate, sample_rate, bit_depth, size, track_id],
+        )?;
+        Ok(())
+    }
+
     /// Returns user-affinity tracks (starred, manual playlists, played, rated, expanded radio links,
     /// same-artist/local/same-genre catalog matches) unioned with recent catalog tracks so personalized
     /// mixes never lose taste candidates past recent-insert offset limits.
@@ -3531,32 +3552,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Slug-based variant used for AI-invented moods that have no enum value.
-    pub fn tracks_by_mood_slug(
-        &self,
-        slug: &str,
-        limit: usize,
-        offset: usize,
-    ) -> AppResult<Vec<Track>> {
-        let conn = self.lock();
-        let pat = format!("%,{},%", slug.trim().to_ascii_lowercase());
-        let sql = format!(
-            "SELECT {} FROM tracks
-             WHERE (',' || lower(moods) || ',') LIKE ?1
-             ORDER BY
-               (CASE WHEN trim(genre) != '' THEN 2 ELSE 0 END)
-               + (CASE WHEN source = 'local' THEN 2 WHEN deezer_id != '' THEN 1 ELSE 0 END) DESC,
-               created DESC
-             LIMIT ?2 OFFSET ?3",
-            TRACK_COLS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![pat, limit as i64, offset as i64], row_to_track)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
     /// Returns up to `limit` distinct tracks from a user's listening history that are missing
     /// `genre` or `year`, ordered by most recently played so stats enrichment can hydrate them.
     pub fn user_tracks_missing_metadata(&self, user_id: i64, limit: usize) -> AppResult<Vec<Track>> {
@@ -3580,32 +3575,6 @@ impl Store {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![user_id, limit as i64], row_to_track)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Returns up to `limit` catalog tracks missing `genre` or `year`, so the
-    /// background AI curator can hydrate metadata without touching the live
-    /// search path. Prefers tracks that are actually referenced by events so
-    /// user-visible music gets enriched first.
-    pub fn tracks_missing_metadata(&self, limit: usize) -> AppResult<Vec<Track>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock();
-        let sql = format!(
-            "SELECT {}
-             FROM tracks t
-             WHERE trim(t.genre) = '' OR t.year <= 0
-             ORDER BY
-               CASE WHEN EXISTS (SELECT 1 FROM events e WHERE e.track_id = t.id) THEN 0 ELSE 1 END,
-               t.created DESC
-             LIMIT ?1",
-            prefixed_track_cols("t")
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![limit as i64], row_to_track)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -4401,40 +4370,6 @@ impl Store {
         Ok(())
     }
 
-    /// One-time cleanup for Daily Mix playlists created before the rename:
-    /// their stored names still used the old mood-based branding.
-    pub fn normalize_daily_mix_names(&self) -> usize {
-        let conn = self.lock();
-        let rows: Vec<(String, String)> = conn
-            .prepare("SELECT id, kind FROM playlists WHERE kind LIKE 'mixed_for_you:%'")
-            .and_then(|mut stmt| {
-                stmt
-                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_default();
-        let mut changed = 0usize;
-        for (id, kind) in rows {
-            let part = kind.split(':').nth(2).unwrap_or("");
-            let name = if part == "supermix" {
-                "Daily Supermix".to_string()
-            } else {
-                format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
-            };
-            if conn
-                .execute(
-                    "UPDATE playlists SET name = ?1 WHERE id = ?2 AND name <> ?1",
-                    params![name, id],
-                )
-                .unwrap_or(0)
-                > 0
-            {
-                changed += 1;
-            }
-        }
-        changed
-    }
-
     pub fn get_playlist(&self, id: &str) -> AppResult<Option<Playlist>> {
         let conn = self.lock();
         Ok(conn
@@ -5131,80 +5066,6 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         );
-    }
-
-    pub fn kv_count_prefix(&self, prefix: &str) -> i64 {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT COUNT(*) FROM kv WHERE key LIKE ?1",
-            params![format!("{prefix}%")],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
-    }
-
-    fn mood_catalog_key(user_id: i64) -> String {
-        if user_id > 0 {
-            format!("moods:catalog:v1:u{user_id}")
-        } else {
-            "moods:catalog:v1".to_string()
-        }
-    }
-
-    /// Loads a user's personalized Moods & Vibes catalog. Falls back to the
-    /// global catalog, then the built-in defaults, when no user catalog exists.
-    pub fn load_mood_catalog(&self) -> Vec<crate::models::MoodDef> {
-        self.load_mood_catalog_for(0)
-    }
-
-    pub fn load_mood_catalog_for(&self, user_id: i64) -> Vec<crate::models::MoodDef> {
-        if let Some(raw) = self.kv_get(&Self::mood_catalog_key(user_id)) {
-            if let Ok(defs) = serde_json::from_str::<Vec<crate::models::MoodDef>>(&raw) {
-                if !defs.is_empty() {
-                    return defs;
-                }
-            }
-        }
-        if user_id > 0 {
-            // Seed a new user from the global catalog (or defaults).
-            let base = self.load_mood_catalog_for(0);
-            self.save_mood_catalog_for(user_id, &base);
-            return base;
-        }
-        let defs: Vec<crate::models::MoodDef> = Mood::ALL
-            .iter()
-            .enumerate()
-            .map(|(i, m)| crate::models::MoodDef::from_builtin(*m, i))
-            .collect();
-        self.save_mood_catalog(&defs);
-        defs
-    }
-
-    pub fn save_mood_catalog(&self, defs: &[crate::models::MoodDef]) {
-        self.save_mood_catalog_for(0, defs);
-    }
-
-    pub fn save_mood_catalog_for(&self, user_id: i64, defs: &[crate::models::MoodDef]) {
-        if let Ok(raw) = serde_json::to_string(defs) {
-            self.kv_set(&Self::mood_catalog_key(user_id), &raw);
-        }
-    }
-
-    pub fn user_ids_with_mood_catalog(&self) -> Vec<i64> {
-        let conn = self.lock();
-        let mut stmt = match conn.prepare("SELECT key FROM kv WHERE key LIKE 'moods:catalog:v1:u%'") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .filter_map(|key| key.strip_prefix("moods:catalog:v1:u")?.parse::<i64>().ok())
-            .collect();
-        rows
     }
 
     // -------------------------------------------------------------------------

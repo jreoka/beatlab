@@ -1806,12 +1806,6 @@ async fn build_new_releases(
     saved: &HashSet<String>,
 ) -> (Vec<Value>, usize, i64) {
     let new_releases = collect_new_releases(state, uid, 12).await;
-    let new_releases = state.taste.llm_rank_items(
-        "new_releases",
-        &uid.to_string(),
-        new_releases,
-        |a| a.id.clone(),
-    );
     for a in &new_releases {
         let _ = state.store.upsert_album_meta(a);
     }
@@ -1862,38 +1856,6 @@ async fn build_new_releases(
     (items, unseen.len(), Utc::now().timestamp())
 }
 
-/// Moods & Vibes tiles come from the AI-curated catalog, not the hardcoded
-/// enum, so renames/new moods/removals show up everywhere immediately.
-fn mood_catalog_tiles(state: &AppState, uid: i64) -> Vec<Value> {
-    let mut catalog: Vec<crate::models::MoodDef> = state
-        .store
-        .load_mood_catalog_for(uid)
-        .into_iter()
-        .filter(|d| d.enabled)
-        .collect();
-    catalog.sort_by_key(|d| d.order);
-    catalog
-        .into_iter()
-        .map(|d| {
-            let (track_count, covers) = state.taste.curated_mood_preview_for_slug(&d.slug);
-            let mood_subtitle = state
-                .taste
-                .llm_plan_text("mood", &format!("{}:{}", uid, d.slug))
-                .and_then(|(_, s)| (!s.trim().is_empty()).then(|| s.trim().to_string()))
-                .unwrap_or_else(|| d.subtitle.clone());
-            json!({
-                "slug": d.slug,
-                "label": d.label,
-                "subtitle": mood_subtitle,
-                "c1": d.c1,
-                "c2": d.c2,
-                "trackCount": track_count,
-                "covers": covers,
-            })
-        })
-        .collect()
-}
-
 pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
@@ -1904,7 +1866,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     // Ensure auto-mixes exist and refresh cleanly whenever user feedback/playlists changed them.
     if state.store.count_tracks().unwrap_or(0) > 0 {
         // Mixed-for-you first: rebuilding generic auto mixes clears the dirty flag.
-        state.taste.refresh_mixed_for_you_if_stale_async(uid, crate::taste::TasteEngine::DAILY_MIX_REFRESH_SECS).await;
+        state.taste.refresh_mixed_for_you_if_stale_async(uid, 900).await;
         state.taste.refresh_auto_playlists_if_stale_async(uid, 900).await;
     }
     let playlists = state.store.list_playlists(uid, false).unwrap_or_default();
@@ -1970,10 +1932,6 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
             .collect()
     };
     let artists = resolve_featured_artists(&state, chart_artists, 12);
-    // AI-curated preference plans (cache reads only) shape every Home rail.
-    let trending_tracks = state.taste.llm_rank_cached("explore", "charts", trending_tracks);
-    let albums = state.taste.llm_rank_items_cached("explore", "albums", albums, |a| a.id.clone());
-    let artists = state.taste.llm_rank_items_cached("explore", "artists", artists, |a| a.id.clone());
 
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
@@ -1981,7 +1939,22 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     let (new_releases_json, new_release_unseen, new_release_checked_at) =
         build_new_releases(&state, uid, &saved).await;
 
-    let moods = mood_catalog_tiles(&state, uid);
+    let moods: Vec<Value> = Mood::ALL
+        .iter()
+        .map(|m| {
+            let (c1, c2) = m.gradient();
+            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
+            json!({
+                "slug": m.slug(),
+                "label": m.label(),
+                "subtitle": m.subtitle(),
+                "c1": c1,
+                "c2": c2,
+                "trackCount": track_count,
+                "covers": covers,
+            })
+        })
+        .collect();
 
     let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
     let recommended_artists = state.taste.recommended_artists_for_user(uid, 12);
@@ -2026,7 +1999,22 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         let _ = state.store.upsert_artist_meta(ar);
     }
 
-    let moods = mood_catalog_tiles(&state, uid);
+    let moods: Vec<Value> = Mood::ALL
+        .iter()
+        .map(|m| {
+            let (c1, c2) = m.gradient();
+            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
+            json!({
+                "slug": m.slug(),
+                "label": m.label(),
+                "subtitle": m.subtitle(),
+                "c1": c1,
+                "c2": c2,
+                "trackCount": track_count,
+                "covers": covers,
+            })
+        })
+        .collect();
 
     let mut decades: Vec<Value> = Vec::new();
     for spec in crate::taste::EXPLORE_MIX_SPECS {
@@ -2034,16 +2022,11 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
             continue;
         }
         let (track_count, covers) = state.taste.curated_explore_preview(spec);
-        let decade_subtitle = state
-            .taste
-            .llm_plan_text("explore_mix", spec.key)
-            .and_then(|(_, s)| (!s.trim().is_empty()).then(|| s.trim().to_string()))
-            .unwrap_or_else(|| spec.subtitle.to_string());
         decades.push(json!({
             "key": spec.key,
             "kind": spec.kind,
             "title": spec.title,
-            "subtitle": decade_subtitle,
+            "subtitle": spec.subtitle,
             "query": spec.query,
             "c1": spec.c1,
             "c2": spec.c2,
@@ -2063,9 +2046,6 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
             })
         })
         .collect();
-    let genres = state.taste.llm_rank_items_cached("explore", "genres", genres, |g| {
-        g["name"].as_str().unwrap_or("").to_string()
-    });
 
     let discovery_raw = {
         let mut d = state.taste.discover_weekly(uid, 12);
@@ -2094,8 +2074,6 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
             .collect()
     };
     let artists = resolve_featured_artists(&state, chart_artists, 14);
-    let albums = state.taste.llm_rank_items_cached("explore", "albums", albums, |a| a.id.clone());
-    let artists = state.taste.llm_rank_items_cached("explore", "artists", artists, |a| a.id.clone());
 
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
@@ -2113,7 +2091,6 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
             }
         },
     );
-    let visible_charts = state.taste.llm_rank_cached("explore", "charts", visible_charts);
 
     let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
     let recommended_artists = state.taste.recommended_artists_for_user(uid, 14);
@@ -2202,17 +2179,12 @@ pub async fn explore_mix(
     let tracks = filter_visible_tracks(&state, user.id, raw_tracks);
     let total_duration: i32 = tracks.iter().map(|t| t.duration.max(0)).sum();
     let match_ids = personal_match_ids(&state, user.id);
-    let decade_subtitle = state
-        .taste
-        .llm_plan_text("explore_mix", spec.key)
-        .and_then(|(_, s)| (!s.trim().is_empty()).then(|| s.trim().to_string()))
-        .unwrap_or_else(|| spec.subtitle.to_string());
     json_res(json!({
         "mix": {
             "key": spec.key,
             "kind": spec.kind,
             "title": spec.title,
-            "subtitle": decade_subtitle,
+            "subtitle": spec.subtitle,
             "query": spec.query,
             "c1": spec.c1,
             "c2": spec.c2,
@@ -2231,27 +2203,19 @@ pub async fn mood_mix(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let def = state
-        .store
-        .load_mood_catalog_for(user.id)
-        .into_iter()
-        .find(|d| d.enabled && d.slug == slug_str.to_ascii_lowercase().replace('-', "_"));
-    let Some(def) = def else {
+    let Some(mood) = Mood::from_slug(&slug_str) else {
         return err_res(StatusCode::NOT_FOUND, "Mood not found");
     };
-    let tracks = if let Some(builtin) = Mood::from_slug(&def.slug) {
-        state.taste.mood_mix_tracks(user.id, builtin, 35).await
-    } else {
-        state.taste.mood_mix_tracks_by_slug(user.id, &def.slug, 35).await
-    };
+    let tracks = state.taste.mood_mix_tracks(user.id, mood, 35).await;
+    let (c1, c2) = mood.gradient();
     let match_ids = personal_match_ids(&state, user.id);
     json_res(json!({
         "mood": {
-            "slug": def.slug,
-            "label": def.label,
-            "subtitle": def.subtitle,
-            "c1": def.c1,
-            "c2": def.c2,
+            "slug": mood.slug(),
+            "label": mood.label(),
+            "subtitle": mood.subtitle(),
+            "c1": c1,
+            "c2": c2,
         },
         "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
     }))
@@ -2283,9 +2247,6 @@ pub async fn genre_detail(
     }
     let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
     let visible_tracks = filter_visible_tracks(&state, user.id, tracks);
-    let visible_tracks =
-        state.taste.llm_rank_tracks("genre", &format!("{}:{}", user.id, decoded), visible_tracks);
-    let artists = state.taste.llm_rank_items("genre_artists", &decoded, artists, |a| a.id.clone());
     json_res(json!({
         "genre": decoded,
         "tracks": to_web_tracks(&state, user.id, &visible_tracks),
@@ -2325,14 +2286,6 @@ pub async fn search(
         .as_deref()
         .unwrap_or(&query)
         .to_string();
-
-    // AI-assisted search is strictly background / cached: queue the query for
-    // later model work and fold in any pool the curator already prepared.
-    // The live path only touches local SQLite, never an HTTP model call.
-    let llm = state.taste.llm.clone();
-    let llm_query = intent.normalized.clone();
-    tokio::spawn(async move { llm.queue_query(&llm_query); });
-    let llm_curated = state.taste.load_curated_query_tracks(&intent.normalized);
 
     if phase.as_deref() == Some("slow") {
         let slow_tracks = state.sources.search_slow(&base_query, 20).await;
@@ -2379,7 +2332,7 @@ pub async fn search(
             raw_radio_fut,
         );
 
-    let mut combined = [all_tracks, raw_tracks_extra, llm_curated].concat();
+    let mut combined = [all_tracks, raw_tracks_extra].concat();
     crate::sources::disambiguate_batch_tracks(&mut combined, &dz_artists);
     if !dz_albums.is_empty() {
         for t in &mut combined {
@@ -2483,71 +2436,6 @@ pub async fn instant_mix(
     let force_topic = mode_override.as_deref() == Some("topic");
     let force_entity = mode_override.as_deref() == Some("entity");
 
-    // Let the background AI curator learn this mix theme for future requests.
-    let llm_queue = state.taste.llm.clone();
-    let llm_query = query.clone();
-    tokio::spawn(async move { llm_queue.queue_query(&llm_query); });
-
-    // -----------------------------------------------------------------------
-    // Instant Mix v2 — deterministic first, AI as an optional layer.
-    //
-    // The old design asked the model to PICK tracks, which meant every failure
-    // mode (bad model, dead endpoint, poisoned candidate pool) produced a bad
-    // mix. Now the pipeline is:
-    //   1. Resolve the query to real artists/genres (Deezer editorial data).
-    //   2. Build a candidate pool from that artist's catalogue + genre charts.
-    //   3. Filter spam, dedupe, rank by editorial + taste signals.
-    //   4. If an AI mix is cached, use its ordering/copy. Otherwise ship the
-    //      deterministic mix immediately — no "building…" placeholder.
-    // -----------------------------------------------------------------------
-    let editorial = state
-        .taste
-        .build_editorial_mix(&query, &intent, user.id, force_entity)
-        .await;
-    if !editorial.is_empty() {
-        let tracks = filter_visible_tracks(&state, user.id, editorial);
-        if tracks.len() >= 4 {
-            let mut title = format!("{} Mix", query);
-            let mut subtitle = String::new();
-            let mut ai_note: Option<String> = None;
-
-            if let Some(verified) = state.taste.llm.cached_verified_mix(&query) {
-                if !verified.title.trim().is_empty() {
-                    title = verified.title.clone();
-                }
-                if !verified.subtitle.trim().is_empty() {
-                    subtitle = verified.subtitle.clone();
-                }
-                ai_note = Some(verified.note.clone());
-            } else {
-                // Kick off background AI naming/ordering; next visit uses it.
-                let llm = state.taste.llm.clone();
-                let q = query.clone();
-                let candidates = tracks.clone();
-                tokio::spawn(async move {
-                    let _ = llm.curate_verified_mix(&q, &candidates).await;
-                });
-            }
-
-            let match_ids = personal_match_ids(&state, user.id);
-            let instant = json!({
-                "title": title,
-                "subtitle": subtitle,
-                "query": query,
-                "isThemeMix": true,
-                "prominent": true,
-                "totalDuration": tracks.iter().map(|t| t.duration.max(0)).sum::<i32>(),
-                "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
-            });
-            return json_res(json!({
-                "query": query,
-                "instantMix": instant,
-                "refinements": { "detectedIntent": ai_note.unwrap_or_default() },
-            }));
-        }
-    }
-    // Fall through to the legacy pipeline below if editorial resolution failed.
-
     let mix_future = async {
         if force_entity {
             return (Vec::new(), Vec::new());
@@ -2606,23 +2494,11 @@ pub async fn instant_mix(
         let _ = state.store.upsert_artist_meta(ar);
     }
 
-    if intent.is_theme_mix {
+    if intent.is_theme_mix && curated_batches.is_empty() {
         let pre_curated = state.taste.load_curated_query_tracks(&intent.normalized);
-        if state.taste.has_verified_query_pool(&query) && pre_curated.len() >= 8 {
-            // Once the assistant has verified an on-theme pool, use ONLY that.
-            // Generic playlist/YTM search is what keeps injecting junk.
-            curated_batches.clear();
-            curated_batches.push((query.clone(), pre_curated.clone()));
-            combined = pre_curated;
-        } else if pre_curated.len() >= 5 {
-            curated_batches.insert(0, (query.clone(), pre_curated));
+        if pre_curated.len() >= 5 {
+            curated_batches.push((query.clone(), pre_curated));
         }
-    }
-    // Drop YouTube/clickbait spam before any scoring sees it.
-    let q_low = query.to_ascii_lowercase();
-    combined.retain(|t| !crate::taste::is_mix_clutter_track(t, &q_low));
-    for (_, batch) in curated_batches.iter_mut() {
-        batch.retain(|t| !crate::taste::is_mix_clutter_track(t, &q_low));
     }
 
     // Remote (Deezer) search & playlist tracks carry no genre metadata. Without it the
@@ -3005,50 +2881,26 @@ async fn build_search_response_with_options(
     uid: i64,
     query: String,
     catalog_query: String,
-    combined: Vec<Track>,
+    mut combined: Vec<Track>,
     curated_batches: Vec<(String, Vec<Track>)>,
     mix_ctx: crate::taste::SearchMixContext,
     dz_albums: Vec<AlbumSummary>,
     dz_artists: Vec<ArtistSummary>,
     include_instant_mix: bool,
 ) -> Response {
-    let mut refined = {
-        let taste = state.taste.clone();
-        let q_clone = query.clone();
-        tokio::task::spawn_blocking(move || {
-            taste.search_and_refine_with_context(
-                uid,
-                &q_clone,
-                combined,
-                curated_batches,
-                mix_ctx,
-            )
-        })
-        .await
-        .unwrap_or_else(|_| state.taste.search_and_refine(uid, &query, vec![], vec![]))
-    };
-    // Search never calls the model. If a background plan exists for this
-    // query, apply it as a fast in-memory re-rank; otherwise return as-is.
-    refined.tracks = state
-        .taste
-        .llm_rank_cached("search", &query, std::mem::take(&mut refined.tracks));
-    // If the assistant resolved a descriptive/lyrical query to a concrete
-    // song or artist, pin those matches at the top (cached read only).
-    if let Some(answer) = state.taste.llm.cached_search_answer(&query) {
-        refined.tracks = state
-            .taste
-            .apply_search_answer(&answer, std::mem::take(&mut refined.tracks));
-    }
-    // The assistant also writes the search UI copy — suggestions are the
-    // alternate queries it produced while warming this search in background.
-    if let Some(plan) = state.taste.llm.cached_plan("search", &query) {
-        if !plan.extra_queries.is_empty() {
-            refined.refinements.query_suggestions = plan.extra_queries;
-        }
-        if refined.refinements.detected_intent.is_empty() && !plan.subtitle.is_empty() {
-            refined.refinements.detected_intent = plan.subtitle;
-        }
-    }
+    let taste = state.taste.clone();
+    let q_clone = query.clone();
+    let refined = tokio::task::spawn_blocking(move || {
+        taste.search_and_refine_with_context(
+            uid,
+            &q_clone,
+            std::mem::take(&mut combined),
+            curated_batches,
+            mix_ctx,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| state.taste.search_and_refine(uid, &query, vec![], vec![]));
 
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
@@ -3338,16 +3190,8 @@ fn format_instant_mix_response(
     combined_len: usize,
     curated_len: usize,
     radio_len: usize,
-    mut refined: crate::taste::SearchMixResult,
+    refined: crate::taste::SearchMixResult,
 ) -> Response {
-    maybe_apply_llm_mix(state, query, &mut refined);
-    if let Some(mix) = refined.instant_mix.as_mut() {
-        // A tight mix beats a padded one — never ship 40+ filler tracks.
-        if mix.tracks.len() > 24 {
-            mix.tracks.truncate(24);
-            mix.total_duration = mix.tracks.iter().map(|t| t.duration.max(0)).sum();
-        }
-    }
     if let Some(ref mix) = refined.instant_mix {
         if mix.is_theme_mix && curated_len > 0 && mix.tracks.len() >= 8 {
             state
@@ -3382,82 +3226,6 @@ fn format_instant_mix_response(
         "instantMix": instant_mix_json,
         "refinements": refined.refinements,
     }))
-}
-
-/// Applies a previously computed LLM mix plan when one is cached; otherwise
-/// kicks off a background task to compute it for the next request. This keeps
-/// the response path free of model latency while still letting the assistant
-/// drive instant mixes once it has had a moment to work.
-/// The exact candidate set used to BUILD a mix plan must also be used to APPLY
-/// it. If those differ, the plan's track ids won't match and it does nothing —
-/// which is why an "AI-curated" mix could look identical to the old one.
-fn llm_mix_candidates(state: &AppState, query: &str, mix_tracks: &[Track]) -> Vec<Track> {
-    let normalized = crate::models::slug(query);
-    let q_low = query.to_ascii_lowercase();
-    let spam_free: Vec<Track> = mix_tracks
-        .iter()
-        .filter(|t| !crate::taste::is_mix_clutter_track(t, &q_low))
-        .cloned()
-        .collect();
-    let mut candidates: Vec<Track> = state
-        .taste
-        .load_curated_query_tracks(&normalized)
-        .into_iter()
-        .chain(state.store.search_tracks(query, 40, 0).unwrap_or_default())
-        .filter(|t| !crate::taste::is_mix_clutter_track(t, &q_low))
-        .collect();
-    for t in spam_free {
-        if !candidates.iter().any(|existing| existing.id == t.id) {
-            candidates.push(t);
-        }
-    }
-    candidates.truncate(48);
-    candidates
-}
-
-fn maybe_apply_llm_mix(
-    state: &AppState,
-    query: &str,
-    refined: &mut crate::taste::SearchMixResult,
-) {
-    let llm = &state.taste.llm;
-    if !llm.enabled() {
-        return;
-    }
-    let Some(mix) = refined.instant_mix.as_mut() else {
-        return;
-    };
-    let candidates = llm_mix_candidates(state, query, &mix.tracks);
-    if candidates.len() < 4 {
-        return;
-    }
-    if let Some(plan) = llm.cached_mix(query) {
-        let before: Vec<String> = mix.tracks.iter().map(|t| t.id.clone()).collect();
-        let tracks = crate::llm::apply_mix_plan(&plan, candidates);
-        let after: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
-        let changed = before != after;
-        if !plan.title.trim().is_empty() {
-            mix.title = plan.title.trim().to_string();
-        }
-        if !plan.subtitle.trim().is_empty() {
-            mix.subtitle = plan.subtitle.trim().to_string();
-        }
-        mix.total_duration = tracks.iter().map(|t| t.duration.max(0)).sum();
-        mix.tracks = tracks;
-        // Only claim AI curation when the plan actually changed the selection.
-        if changed {
-            mix.subtitle = format!("✦ AI-curated · {}", mix.subtitle);
-        }
-        for extra in plan.extra_queries {
-            llm.queue_query(&extra);
-        }
-        return;
-    }
-    let llm = llm.clone();
-    let q = query.to_string();
-    tokio::spawn(async move {
-        let _ = llm.enhance_mix(&q, &candidates).await;
-    });
 }
 
 #[cfg(test)]
@@ -3543,21 +3311,6 @@ pub async fn artist_detail(
             .artist_related_tracks(&artist, &related, &top_tracks, 12)
             .await,
     );
-    let top_tracks = state.taste.llm_rank_tracks(
-        "artist_top",
-        &artist.id,
-        top_tracks,
-    );
-    let albums = state.taste.llm_rank_items("artist_albums", &artist.id, albums, |a| a.id.clone());
-    let related = state.taste.llm_rank_items("artist_related", &artist.id, related, |a| a.id.clone());
-    let related_tracks = state.taste.llm_rank_tracks(
-        "artist_related_tracks",
-        &artist.id,
-        related_tracks,
-    );
-    let curated_similar = state
-        .taste
-        .curated_similar_artists(user.id, &artist, &related, 12);
     let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
     let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
     json_res(json!({
@@ -3566,13 +3319,6 @@ pub async fn artist_detail(
         "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "related": related.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "relatedTracks": to_web_tracks(&state, user.id, &related_tracks),
-        "curatedSimilar": curated_similar.iter().map(|(a, reason)| {
-            let mut value = artist_json(a, followed.contains(&a.id));
-            if let Value::Object(map) = &mut value {
-                map.insert("reason".to_string(), json!(reason));
-            }
-            value
-        }).collect::<Vec<_>>(),
     }))
 }
 
@@ -3810,7 +3556,7 @@ pub async fn get_playlist(
     }
     let pl = if pl.is_auto && pl.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
         if pl.kind.starts_with("mixed_for_you:") {
-            state.taste.refresh_mixed_for_you_if_stale_async(user.id, crate::taste::TasteEngine::DAILY_MIX_REFRESH_SECS).await;
+            state.taste.refresh_mixed_for_you_if_stale_async(user.id, 900).await;
         }
         state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
         state.store.get_playlist(&id).ok().flatten().unwrap_or(pl)
@@ -5596,6 +5342,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -5696,6 +5443,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -6045,6 +5793,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
 
         // Unauthenticated fails
@@ -6185,6 +5934,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
 
         let mut h1 = HeaderMap::new();
@@ -6358,12 +6108,14 @@ mod tests {
             &tmp,
             1.0,
         ));
+        let quality_hunter = crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone());
         let state = AppState {
             store: store.clone(),
             sources: sources.clone(),
             engine,
             taste: std::sync::Arc::new(crate::taste::TasteEngine::new(store, sources)),
             now_playing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            quality_hunter,
         };
 
         let mut hdr = HeaderMap::new();
@@ -6475,6 +6227,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -6600,6 +6353,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            quality_hunter: crate::quality_hunter::QualityHunter::new(store.clone(), (*engine).clone()),
         };
         let (u, _) = store.authenticate_or_create_user("avataruser", "pw").unwrap();
         let tok = store.create_session(u.id, "web").unwrap();

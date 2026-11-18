@@ -113,7 +113,6 @@
         <button class="tab active" data-tab="overview" onclick="showTab('overview')">◈ Overview</button>
         <button class="tab" data-tab="users" onclick="showTab('users')">◉ Users</button>
         <button class="tab" data-tab="cache" onclick="showTab('cache')">⬡ Cache &amp; Quality</button>
-        <button class="tab" data-tab="ai" onclick="showTab('ai')">✦ AI Curator</button>
         <button class="tab" data-tab="events" onclick="showTab('events')">⛨ Security Events</button>
         <button class="tab" data-tab="config" onclick="showTab('config')">⚙ Configuration</button>
       </div>
@@ -133,19 +132,8 @@
       <section id="tab-cache" class="hidden">
         <div class="subhead"><h2>Storage tiers</h2><span id="cache-summary" class="muted"></span></div>
         <div id="cache-box" class="panel-grid"></div>
-      </section>
-
-      <section id="tab-ai" class="hidden">
-        <div class="subhead"><h2>AI assistant</h2><span id="ai-status" class="pill"></span></div>
-        <div id="ai-cards" class="cards"></div>
-        <h2 class="section">Configuration</h2>
-        <div id="ai-config" class="card"></div>
-        <h2 class="section">Moods &amp; Vibes catalog</h2>
-        <div id="ai-moods" class="card"></div>
-        <h2 class="section">Work by task</h2>
-        <div id="ai-tasks" class="card"></div>
-        <h2 class="section">Recent calls</h2>
-        <div id="ai-recent"></div>
+        <div class="subhead"><h2>Quality hunter</h2><span id="hunter-status" class="pill"></span></div>
+        <div id="hunter-box" class="panel-grid"></div>
       </section>
 
       <section id="tab-events" class="hidden">
@@ -170,7 +158,7 @@
   (() => {
     const $ = (id) => document.getElementById(id);
     const USERS_PER_PAGE = 10;
-    const state = { token: localStorage.getItem('beatlab_token') || '', users: [], overview: null, events: [], config: null, tab: 'overview', userPage: 1 };
+    const state = { token: localStorage.getItem('beatlab_token') || '', users: [], overview: null, events: [], tab: 'overview', userPage: 1 };
     window.state = state;
 
     const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -222,7 +210,9 @@
         ['Tracks', o.tracks, 'in library'],
         ['Hot cache', Math.round(o.localCacheBytes / 1048576) + ' MB', o.localCacheEntries + ' files / ' + Math.round(o.cacheMaxBytes / 1073741824) + ' GB cap'],
         ['Cool cache', o.remoteCacheEnabled ? Math.round(o.remoteCacheBytes / 1048576) + ' MB' : 'Off', o.remoteCacheEnabled ? o.remoteCacheObjects + ' objects' : 'configure S3/R2 to enable'],
+        ['Quality upgrades', (o.qualityHunter && o.qualityHunter.installed) || 0, (o.qualityHunter && o.qualityHunter.enabled ? 'hunter running' : 'hunter disabled')],
         ['2FA users', o.totpUsers, o.passkeys + ' passkeys'],
+        ['Recovery codes', o.recoveryCodes, 'unused'],
         ['Playlists', o.playlists, 'across accounts'],
         ['Security events', o.securityEvents, 'recorded'],
       ];
@@ -328,24 +318,11 @@
       } catch (e) { toast(e.message); }
     };
 
-    const ADMIN_TABS = ['overview','users','cache','ai','events','config'];
-    const pathTab = () => {
-      const match = location.pathname.match(/^\/admin\/([^/]+)\/?$/);
-      const tab = match ? decodeURIComponent(match[1]).toLowerCase() : 'overview';
-      return ADMIN_TABS.includes(tab) ? tab : 'overview';
-    };
-    window.showTab = (tab, push = true) => {
-      if (!ADMIN_TABS.includes(tab)) tab = 'overview';
+    window.showTab = (tab) => {
       state.tab = tab;
       document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-      ADMIN_TABS.forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
-      const path = tab === 'overview' ? '/admin' : '/admin/' + tab;
-      if (location.pathname !== path) {
-        if (push) history.pushState({ tab }, '', path);
-        else history.replaceState({ tab }, '', path);
-      }
+      ['overview','users','cache','events','config'].forEach((t) => $('tab-' + t).classList.toggle('hidden', t !== tab));
     };
-    window.addEventListener('popstate', () => showTab(pathTab(), false));
 
     window.backfillCache = async () => {
       if (!confirm('Upload all locally cached tracks to the cool cache now?')) return;
@@ -363,18 +340,6 @@
     const statRow = (k, v) => '<div class="stat-row"><span class="label">' + k + '</span><span class="value">' + esc(v) + '</span></div>';
     const mb = (n) => ((n || 0) / 1048576).toFixed(1) + ' MB';
     const gb = (n) => ((n || 0) / 1073741824).toFixed(1) + ' GB';
-    const compact = (n) => {
-      const v = Number(n) || 0;
-      if (Math.abs(v) < 1000) return String(v);
-      for (const [size, suffix] of [[1e12,'T'], [1e9,'B'], [1e6,'M'], [1e3,'K']]) {
-        if (Math.abs(v) >= size) {
-          const scaled = v / size;
-          const text = Math.abs(scaled) < 10 ? scaled.toFixed(1) : Math.round(scaled).toString();
-          return text.replace(/\.0$/, '') + suffix;
-        }
-      }
-      return String(v);
-    };
 
     function renderCache(o) {
       const hotPct = pctOf(o.localCacheBytes, o.cacheMaxBytes);
@@ -412,51 +377,30 @@
       $('cache-summary').textContent = o.localCacheEntries + ' hot files · ' + (o.remoteCacheEnabled ? o.remoteCacheObjects + ' cool objects' : 'cool tier off');
     }
 
-    function renderAi(o) {
-      const a = o.llm || {};
-      const cfg = (state.config && state.config.llm) || a.config || {};
-      const status = $('ai-status');
-      status.textContent = a.enabled ? 'Enabled' : 'Disabled';
-      status.className = 'pill ' + (a.enabled ? 'on' : 'off');
-      const cards = [
-        ['Model calls', compact(a.callsTotal), compact(a.callsOk) + ' ok · ' + compact(a.callsFailed) + ' failed'],
-        ['Success rate', (a.successRate || 0) + '%', 'across all tasks'],
-        ['Tokens used', compact(a.totalTokens), compact(a.promptTokens) + ' in · ' + compact(a.completionTokens) + ' out'],
-        ['Avg latency', (a.avgLatencyMs || 0) + ' ms', 'last ' + (a.lastLatencyMs || 0) + ' ms'],
-        ['Cache writes', compact(a.cacheWrites), 'mix plans, pools & metadata'],
-        ['Web research', compact(a.researchCalls), compact(a.researchCacheHits) + ' cached · ' + compact(a.researchFailures) + ' failed'],
-        ['Verified mixes', a.verifiedMixes || 0, 'ready instant mixes'],
-        ['Search plans', a.searchPlans || 0, 'cached search answers'],
-        ['Pending queries', a.pendingQueries || 0, 'waiting for curation'],
-        ['Last call', ago(a.lastCallAt), a.lastOkAt ? 'last success ' + ago(a.lastOkAt) : 'no successful call yet'],
-      ];
-      $('ai-cards').innerHTML = cards.map(([k, v, s]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="muted" style="font-size:11px">' + esc(s) + '</div></div>').join('');
-      $('ai-config').innerHTML = [
-        statRow('Status', cfg.enabled ? 'enabled' : 'disabled'),
-        statRow('Endpoint', cfg.baseUrl || '—'),
-        statRow('Model', cfg.model || '—'),
-        statRow('API key', cfg.apiKeySet ? (cfg.apiKeyMasked || 'set') : 'not set'),
-        statRow('Timeout', (cfg.timeoutMs || 0) + ' ms'),
-        statRow('Max tokens', cfg.maxTokens ? cfg.maxTokens : 'uncapped'),
-        statRow('Web research', cfg.researchEnabled ? 'enabled' : 'disabled'),
-        statRow('Search endpoint', cfg.searchUrl || '—'),
-        statRow('Catalog change cached', a.catalogChangeCached ? 'yes' : 'no'),
-        statRow('Personalized catalogs', state.config && state.config.personalizedMoodCatalogs || 0),
-      ].join('');
-      const moods = (state.config && state.config.moodCatalog) || [];
-      $('ai-moods').innerHTML = moods.length
-        ? '<table><thead><tr><th>Slug</th><th>Label</th><th>Source</th></tr></thead><tbody>' +
-          moods.map((m) => '<tr><td>' + esc(m.slug) + '</td><td>' + esc(m.label) + '</td><td>' + (m.builtIn ? 'built-in' : 'AI-made') + '</td></tr>').join('') +
-          '</tbody></table>'
-        : '<p class="muted">No Moods & Vibes catalog yet.</p>';
-      const tasks = a.byTask || [];
-      $('ai-tasks').innerHTML = tasks.length ? tasks.map((t) => statRow(t.task, compact(t.calls) + ' calls')).join('') : '<div class="muted">No assistant calls yet.</div>';
-      const recent = a.recent || [];
-      $('ai-recent').innerHTML = recent.length
-        ? '<table><thead><tr><th>When</th><th>Task</th><th>Result</th><th>Time</th><th>Detail</th></tr></thead><tbody>' +
-          recent.map((r) => '<tr><td>' + esc(ago(r.at)) + '</td><td>' + esc(r.task) + '</td><td><span class="pill ' + (r.ok ? 'on' : 'del') + '">' + (r.ok ? 'ok' : 'failed') + '</span></td><td>' + (r.ms || 0) + ' ms</td><td>' + esc(r.error || '—') + '</td></tr>').join('') +
-          '</table>'
-        : '<p class="muted">No calls recorded yet. Set BEATLAB_LLM_API_KEY (and optionally BEATLAB_LLM_BASE_URL / BEATLAB_LLM_MODEL) to enable the AI curator.</p>';
+    function renderHunter(o) {
+      const h = o.qualityHunter || {};
+      const status = $('hunter-status');
+      status.textContent = h.enabled ? 'Running' : 'Disabled';
+      status.className = 'pill ' + (h.enabled ? 'on' : 'off');
+      let activity = '<div class="card">';
+      activity += '<div class="k">Hunt activity</div><div class="v">' + (h.installed || 0) + '</div>';
+      activity += '<div class="muted" style="font-size:11px">higher-quality versions installed</div>';
+      activity += statRow('Tracks probed', h.probes || 0);
+      activity += statRow('Candidates found', h.candidates || 0);
+      activity += statRow('Downloads started', h.downloads || 0);
+      activity += statRow('Failures', h.failures || 0);
+      activity += statRow('Bytes acquired', mb(h.bytesUpgraded));
+      activity += '</div>';
+      let recency = '<div class="card">';
+      recency += '<div class="k">Latest upgrade</div><div class="v" style="font-size:17px">' + esc(h.lastTrack || '—') + '</div>';
+      recency += statRow('Last scan', ago(h.lastTick));
+      recency += statRow('Last upgrade', ago(h.lastUpgrade));
+      recency += '<h3 style="margin:14px 0 2px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">Settings</h3>';
+      recency += statRow('Scan interval', (h.intervalSecs || 0) + 's');
+      recency += statRow('Tracks per scan', h.batch || 0);
+      recency += statRow('Retry cooldown', Math.round((h.cooldownSecs || 0) / 3600) + 'h');
+      recency += '</div>';
+      $('hunter-box').innerHTML = activity + recency;
     }
 
     async function load() {
@@ -470,22 +414,19 @@
         ]);
         state.users = users.users || [];
         state.events = events.events || [];
-        state.config = config;
         renderOverview();
         renderCache(data);
-        renderAi(data);
+        renderHunter(data);
         renderUsers();
         $('all-events').innerHTML = state.events.length ? state.events.map(eventRow).join('') : '<p class="muted">No security events yet.</p>';
         $('config-box').innerHTML = Object.entries(config).map(([k,v]) => {
           const label = k.replace(/([A-Z])/g,' $1').replace(/^./, (c) => c.toUpperCase());
-          const shown = Array.isArray(v) ? (v.join(', ') || '—') : (v && typeof v === 'object' ? JSON.stringify(v) : v);
-          return '<div class="kv"><span>' + esc(label) + '</span><span>' + esc(shown) + '</span></div>';
+          return '<div class="kv"><span>' + esc(label) + '</span><span>' + esc(Array.isArray(v) ? v.join(', ') || '—' : v) + '</span></div>';
         }).join('');
       } catch (e) { toast(e.message); }
     }
 
     async function boot() {
-      showTab(pathTab(), false);
       if (!state.token) { gate('Sign in required', 'Sign in to the Beatlab player first, then open this page.'); return; }
       try {
         const s = await api('/api/admin/session');

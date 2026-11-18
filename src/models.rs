@@ -170,48 +170,25 @@ impl Mood {
         }
     }
 
+    /// Short, card-friendly name used by the personalized "Mixed for you" mixes.
+    pub fn mix_name(&self) -> &'static str {
+        match self {
+            Mood::Chill => "Chill",
+            Mood::Focus => "Focus",
+            Mood::Energy => "Energy",
+            Mood::LateNight => "Late Night",
+            Mood::Upbeat => "Feel Good",
+            Mood::Melancholy => "Melancholy",
+            Mood::Party => "Party",
+            Mood::Acoustic => "Acoustic",
+            Mood::Groove => "Groove",
+            Mood::RockIndie => "Indie Rock",
+        }
+    }
+
     pub fn from_slug(s: &str) -> Option<Mood> {
         let low = s.trim().to_lowercase().replace('-', "_");
         Self::ALL.iter().copied().find(|m| m.slug() == low)
-    }
-}
-
-/// A user-visible mood/vibe definition. The built-in enum stays the internal
-/// classifier; this catalog controls which moods are shown and how they look,
-/// and lets the AI curator rename, add and retire moods dynamically.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MoodDef {
-    pub slug: String,
-    pub label: String,
-    pub subtitle: String,
-    pub c1: String,
-    pub c2: String,
-    #[serde(default)]
-    pub built_in: Option<String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub order: usize,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl MoodDef {
-    pub fn from_builtin(mood: Mood, order: usize) -> Self {
-        let (c1, c2) = mood.gradient();
-        Self {
-            slug: mood.slug().to_string(),
-            label: mood.label().to_string(),
-            subtitle: mood.subtitle().to_string(),
-            c1: c1.to_string(),
-            c2: c2.to_string(),
-            built_in: Some(mood.slug().to_string()),
-            enabled: true,
-            order,
-        }
     }
 }
 
