@@ -2488,61 +2488,65 @@ pub async fn instant_mix(
     let llm_query = query.clone();
     tokio::spawn(async move { llm_queue.queue_query(&llm_query); });
 
-    // Theme mixes are built from editorial sources with AI verification —
-    // never from keyword search. On the first request we build it on demand
-    // (bounded); later requests just read the cache. No "come back later".
-    let use_verified = !force_entity
-        && (intent.is_theme_mix
-            || (intent.entity_query.is_none() && query.split_whitespace().count() <= 3));
-    if use_verified {
-        let verified = match state.taste.llm.cached_verified_mix(&query) {
-            Some(v) => Some(v),
-            None => {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(12),
-                    state.taste.build_verified_mix(&query),
-                )
-                .await
-                .ok()
-                .flatten()
-            }
-        };
-        if let Some(verified) = verified {
-            let tracks = state
-                .store
-                .get_tracks_by_ids(&verified.track_ids)
-                .unwrap_or_default();
-            if tracks.len() >= 8 {
-                let match_ids = personal_match_ids(&state, user.id);
-                let title = if verified.title.trim().is_empty() {
-                    format!("{} Mix", query)
-                } else {
-                    verified.title.clone()
-                };
-                let subtitle = if verified.subtitle.trim().is_empty() {
-                    verified.note.clone()
-                } else {
-                    verified.subtitle.clone()
-                };
-                let instant = json!({
-                    "title": title,
-                    "subtitle": format!("✦ AI-verified · {}", subtitle),
-                    "query": query,
-                    "isThemeMix": true,
-                    "prominent": true,
-                    "totalDuration": tracks.iter().map(|t| t.duration.max(0)).sum::<i32>(),
-                    "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
+    // -----------------------------------------------------------------------
+    // Instant Mix v2 — deterministic first, AI as an optional layer.
+    //
+    // The old design asked the model to PICK tracks, which meant every failure
+    // mode (bad model, dead endpoint, poisoned candidate pool) produced a bad
+    // mix. Now the pipeline is:
+    //   1. Resolve the query to real artists/genres (Deezer editorial data).
+    //   2. Build a candidate pool from that artist's catalogue + genre charts.
+    //   3. Filter spam, dedupe, rank by editorial + taste signals.
+    //   4. If an AI mix is cached, use its ordering/copy. Otherwise ship the
+    //      deterministic mix immediately — no "building…" placeholder.
+    // -----------------------------------------------------------------------
+    let editorial = state
+        .taste
+        .build_editorial_mix(&query, &intent, user.id, force_entity)
+        .await;
+    if !editorial.is_empty() {
+        let tracks = filter_visible_tracks(&state, user.id, editorial);
+        if tracks.len() >= 4 {
+            let mut title = format!("{} Mix", query);
+            let mut subtitle = String::new();
+            let mut ai_note: Option<String> = None;
+
+            if let Some(verified) = state.taste.llm.cached_verified_mix(&query) {
+                if !verified.title.trim().is_empty() {
+                    title = verified.title.clone();
+                }
+                if !verified.subtitle.trim().is_empty() {
+                    subtitle = verified.subtitle.clone();
+                }
+                ai_note = Some(verified.note.clone());
+            } else {
+                // Kick off background AI naming/ordering; next visit uses it.
+                let llm = state.taste.llm.clone();
+                let q = query.clone();
+                let candidates = tracks.clone();
+                tokio::spawn(async move {
+                    let _ = llm.curate_verified_mix(&q, &candidates).await;
                 });
-                return json_res(json!({
-                    "query": query,
-                    "instantMix": instant,
-                    "refinements": { "detectedIntent": verified.note },
-                }));
             }
+
+            let match_ids = personal_match_ids(&state, user.id);
+            let instant = json!({
+                "title": title,
+                "subtitle": subtitle,
+                "query": query,
+                "isThemeMix": true,
+                "prominent": true,
+                "totalDuration": tracks.iter().map(|t| t.duration.max(0)).sum::<i32>(),
+                "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
+            });
+            return json_res(json!({
+                "query": query,
+                "instantMix": instant,
+                "refinements": { "detectedIntent": ai_note.unwrap_or_default() },
+            }));
         }
-        // AI build failed — fall through to the deterministic path rather than
-        // showing a "building" placeholder.
     }
+    // Fall through to the legacy pipeline below if editorial resolution failed.
 
     let mix_future = async {
         if force_entity {

@@ -440,6 +440,9 @@ pub struct LlmClient {
     config: Arc<LlmConfig>,
     store: Store,
     http: reqwest::Client,
+    /// HTTP/1.1-only fallback with keep-alive disabled, used when the primary
+    /// client fails to read a body (broken chunking / premature close by a proxy).
+    http1: reqwest::Client,
     research_http: reqwest::Client,
     stats: Arc<Mutex<LlmStats>>,
 }
@@ -457,6 +460,26 @@ impl LlmClient {
                 h.insert(
                     reqwest::header::ACCEPT_ENCODING,
                     reqwest::header::HeaderValue::from_static("identity"),
+                );
+                h
+            })
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        // HTTP/1.1-only fallback: some proxies mishandle HTTP/2 body framing
+        // and keep-alive reuse, producing "error decoding response body".
+        let http1 = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .default_headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                h.insert(
+                    reqwest::header::ACCEPT_ENCODING,
+                    reqwest::header::HeaderValue::from_static("identity"),
+                );
+                h.insert(
+                    reqwest::header::CONNECTION,
+                    reqwest::header::HeaderValue::from_static("close"),
                 );
                 h
             })
@@ -489,6 +512,7 @@ impl LlmClient {
             config,
             store,
             http,
+            http1,
             research_http,
             stats: Arc::new(Mutex::new(stats)),
         }
@@ -593,7 +617,7 @@ impl LlmClient {
             s.last_ok_at = now;
         } else {
             s.calls_failed += 1;
-            s.last_error = error.chars().take(300).collect();
+            s.last_error = error.chars().take(600).collect();
             s.last_error_at = now;
         }
         s.prompt_tokens += prompt_tokens;
@@ -609,7 +633,7 @@ impl LlmClient {
                 ok,
                 ms,
                 at: now,
-                error: error.chars().take(200).collect(),
+                error: error.chars().take(600).collect(),
             },
         );
         s.recent.truncate(20);
@@ -697,17 +721,33 @@ impl LlmClient {
             body["response_format"] = json!({ "type": "json_object" });
         }
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
-        let result = self
-            .http
-            .post(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.config.api_key.trim()),
-            )
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await;
+        let send = |client: &reqwest::Client| {
+            client
+                .post(&url)
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", self.config.api_key.trim()),
+                )
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+        };
+
+        // Preferred path: our own HTTP/1.1 client with a lenient chunked parser.
+        // This avoids hyper's decoder entirely, which is what has been failing.
+        let request_started = std::time::Instant::now();
+        match raw_http_post(&self.config, &url, &body).await {
+            Ok(text) if !text.trim().is_empty() => {
+                let elapsed = request_started.elapsed().as_millis() as u64;
+                return self.finish_response(task, &text, elapsed, json_mode, allow_retry, system, user);
+            }
+            Ok(_) => {}
+            Err(raw_err) => {
+                warn!(task = %task, error = %raw_err, "raw HTTP attempt failed; falling back");
+            }
+        }
+
+        let result = send(&self.http).await;
 
         let elapsed = started.elapsed().as_millis() as u64;
         let response = match result {
@@ -719,15 +759,60 @@ impl LlmClient {
             }
         };
         let status = response.status();
-        let body_result = response.text().await;
-        let raw = match body_result {
-            Ok(text) => text,
-            Err(e) => {
-                let err = format!("response body read failed: {e}");
-                warn!(task = %task, error = %err, "AI curator call failed");
-                self.record_call(task, false, elapsed, 0, 0, &err);
-                return None;
+        let describe = describe_response(&response);
+        // Partial-body salvage: many proxies send a short JSON error object
+        // and then close without the terminating zero-length chunk. hyper
+        // reports that as "error decoding response body", but the payload is
+        // already in our buffer — keep it and surface the real API message.
+        let (raw, partial_err) = match read_response_body(response).await {
+            Ok(text) => (text, None),
+            Err(primary) if !primary.text.trim().is_empty() => (primary.text, Some(primary.error)),
+            Err(primary) => {
+                // Nothing salvageable — retry once over HTTP/1.1 with
+                // keep-alive disabled to rule out connection reuse.
+                match send(&self.http1).await {
+                    Ok(retry) => match read_response_body(retry).await {
+                        Ok(text) => (text, None),
+                        Err(second) if !second.text.trim().is_empty() => {
+                            (second.text, Some(second.error))
+                        }
+                        Err(second) => {
+                            let detail = format!("body read failed: primary={} | http1={} | {describe}",
+                primary.error, second.error);
+                            warn!(task = %task, error = %detail, "AI curator call failed");
+                            self.record_call(task, false, elapsed, 0, 0, &detail);
+                            return None;
+                        }
+                    },
+                    Err(e) => {
+                        let detail = format!(
+                            "body read failed: primary={} | http1 send failed: {e} | {describe}",
+                            primary.error
+                        );
+                        warn!(task = %task, error = %detail, "AI curator call failed");
+                        self.record_call(task, false, elapsed, 0, 0, &detail);
+                        return None;
+                    }
+                }
             }
+        };
+        if let Some(err) = partial_err {
+            // Put the body FIRST: the admin UI truncates details, and the body
+            // is the single most useful piece of evidence.
+            let preview: String = raw.trim().chars().take(200).collect();
+            let detail = if preview.is_empty() {
+                format!("body unreadable: {err}")
+            } else {
+                match extract_api_error(&raw) {
+                    Some(provider_msg) => {
+                        format!("body={preview} || provider error: {provider_msg}")
+                    }
+                    None => format!("body={preview} || {err}"),
+                }
+            };
+            warn!(task = %task, error = %detail, "AI curator call failed");
+            self.record_call(task, false, elapsed, 0, 0, &detail);
+            return None;
         };
         if raw.trim().is_empty() {
             // An empty 200 usually means the endpoint rejected response_format
@@ -825,30 +910,109 @@ impl LlmClient {
         }
     }
 
-    /// Queues a normalized search query for later background LLM processing.
-    /// Never performs I/O beyond a tiny SQLite write.
+    /// Shared tail for both transports: validate the body, parse the OpenAI
+    /// envelope, extract the JSON object, and record the outcome.
+    fn finish_response(
+        &self,
+        task: &str,
+        raw: &str,
+        elapsed: u64,
+        json_mode: bool,
+        _allow_retry: bool,
+        _system: &str,
+        _user: &str,
+    ) -> Option<Value> {
+        let raw = raw.to_string();
+        if raw.trim().is_empty() {
+            let err = format!("empty response body (jsonMode={json_mode})");
+            warn!(task = %task, error = %err, "AI curator returned empty body");
+            self.record_call(task, false, elapsed, 0, 0, &err);
+            return None;
+        }
+        let parsed: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = format!(
+                    "invalid response: {e}; body: {}",
+                    truncate(&raw, 200)
+                );
+                self.record_call(task, false, elapsed, 0, 0, &err);
+                return None;
+            }
+        };
+        if let Some(api_err) = extract_api_error(&raw) {
+            let err = format!("provider error: {api_err}");
+            warn!(task = %task, error = %err, "AI curator request rejected");
+            self.record_call(task, false, elapsed, 0, 0, &err);
+            return None;
+        }
+        let (prompt_tokens, completion_tokens) = parsed
+            .get("usage")
+            .map(|u| {
+                (
+                    u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    u.get("completion_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        let content = message_text(&parsed);
+        match extract_json_object(&content) {
+            Some(obj) => {
+                self.record_call(
+                    task,
+                    true,
+                    elapsed,
+                    prompt_tokens,
+                    completion_tokens,
+                    "",
+                );
+                Some(obj)
+            }
+            None => {
+                let err = format!("not JSON: {}", truncate(&content, 200));
+                warn!(task = %task, detail = %err, "AI curator response could not be parsed");
+                self.record_call(
+                    task,
+                    false,
+                    elapsed,
+                    prompt_tokens,
+                    completion_tokens,
+                    &err,
+                );
+                None
+            }
+        }
+    }
+    /// Queue a query for the slow background path, and also fire an immediate
+    /// background call so the user sees the AI engage on this very search
+    /// instead of waiting for the next curator tick.
     pub fn queue_query(&self, normalized: &str) {
         if !self.enabled() || normalized.len() < 2 || normalized.len() > 80 {
             return;
         }
+        let query = normalized.trim().to_string();
         let mut list: Vec<String> = self
             .store
             .kv_get(PENDING_Q_KV_KEY)
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
-        if list
-            .iter()
-            .any(|q| q.eq_ignore_ascii_case(normalized.trim()))
-        {
-            return;
+        if !list.iter().any(|q| q.eq_ignore_ascii_case(&query)) {
+            list.push(query.clone());
+            if list.len() > 64 {
+                list.remove(0);
+            }
+            if let Ok(raw) = serde_json::to_string(&list) {
+                self.store.kv_set(PENDING_Q_KV_KEY, &raw);
+            }
         }
-        list.push(normalized.trim().to_string());
-        if list.len() > 64 {
-            list.remove(0);
-        }
-        if let Ok(raw) = serde_json::to_string(&list) {
-            self.store.kv_set(PENDING_Q_KV_KEY, &raw);
-        }
+        // Immediate, detached background work: resolve intent + build a mix.
+        let client = self.clone();
+        tokio::spawn(async move {
+            let _ = client.resolve_search_intent(&query).await;
+            let _ = client.discover_seed_artists(&query).await;
+        });
     }
 
     pub fn take_pending_queries(&self, n: usize) -> Vec<String> {
@@ -1822,6 +1986,318 @@ fn mask_key(key: &str) -> String {
     format!("{}…{}", &k[..4], &k[k.len() - 4..])
 }
 
+/// Split a URL into (is_tls, host, port, path).
+fn parse_http_url(url: &str) -> Result<(bool, String, u16, String), String> {
+    let (is_tls, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err(format!("unsupported URL: {url}"));
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), p.parse::<u16>().unwrap_or(if is_tls { 443 } else { 80 }))
+        }
+        _ => (
+            authority.to_string(),
+            if is_tls { 443 } else { 80 },
+        ),
+    };
+    Ok((is_tls, host, port, path.to_string()))
+}
+
+/// Decode a chunked body leniently. Tolerates missing/extra whitespace around
+/// chunk sizes, chunk extensions, and a missing terminating zero-length chunk —
+/// all of which make strict decoders (like hyper's) fail.
+fn decode_chunked(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        // Find end of the chunk-size line.
+        let line_end = match find_crlf(buf, pos) {
+            Some(idx) => idx,
+            None => break,
+        };
+        let size_line = String::from_utf8_lossy(&buf[pos..line_end]);
+        let size_token = size_line
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        let size = match usize::from_str_radix(size_token, 16) {
+            Ok(s) => s,
+            Err(_) => break, // not chunked after all
+        };
+        pos = line_end + 2;
+        if size == 0 {
+            break; // terminal chunk
+        }
+        let end = (pos + size).min(buf.len());
+        out.extend_from_slice(&buf[pos..end]);
+        pos = end;
+        // Skip the CRLF that follows chunk data (may be absent if truncated).
+        if pos < buf.len() && buf[pos] == b'\r' {
+            pos += 1;
+            if pos < buf.len() && buf[pos] == b'\n' {
+                pos += 1;
+            }
+        } else if pos < buf.len() && buf[pos] == b'\n' {
+            pos += 1;
+        }
+        // Stop if we've consumed everything without a terminal chunk.
+        if pos >= buf.len() {
+            break;
+        }
+    }
+    out
+}
+
+fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Raw HTTPS POST with a hand-rolled HTTP/1.1 + chunked reader.
+///
+/// This exists because some providers (notably behind Cloudflare) return
+/// `Transfer-Encoding: chunked` bodies that hyper rejects with
+/// "error decoding response body". Speaking HTTP/1.1 directly and parsing the
+/// framing leniently sidesteps that entire class of failure.
+async fn raw_http_post(
+    config: &LlmConfig,
+    url: &str,
+    body: &Value,
+) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (is_tls, host, port, path) = parse_http_url(url)?;
+    let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
+
+    let mut request = String::new();
+    request.push_str(&format!("POST {path} HTTP/1.1\r\n"));
+    request.push_str(&format!("Host: {host}\r\n"));
+    request.push_str("User-Agent: Beatlab/0.3\r\n");
+    request.push_str("Content-Type: application/json\r\n");
+    request.push_str("Accept: application/json\r\n");
+    request.push_str("Accept-Encoding: identity\r\n");
+    request.push_str("Connection: close\r\n");
+    request.push_str(&format!(
+        "Authorization: Bearer {}\r\n",
+        config.api_key.trim()
+    ));
+    request.push_str(&format!("Content-Length: {}\r\n", payload.len()));
+    request.push_str("\r\n");
+    request.push_str(&payload);
+
+    let mut raw: Vec<u8> = Vec::new();
+    if is_tls {
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(|e| format!("tcp connect failed: {e}"))?;
+        let connector = tls_connector()?;
+        let server_name: rustls_pki_types::ServerName<'static> =
+            rustls_pki_types::ServerName::try_from(host.to_string())
+                .map_err(|_| format!("invalid host: {host}"))?;
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| format!("tls handshake failed: {e}"))?;
+        tls.write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("tls write failed: {e}"))?;
+        tls.flush().await.map_err(|e| format!("tls flush failed: {e}"))?;
+        tls.read_to_end(&mut raw)
+            .await
+            .map_err(|e| format!("tls read failed after {} bytes: {e}", raw.len()))?;
+    } else {
+        let mut tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(|e| format!("tcp connect failed: {e}"))?;
+        tcp.write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("write failed: {e}"))?;
+        tcp.read_to_end(&mut raw)
+            .await
+            .map_err(|e| format!("read failed after {} bytes: {e}", raw.len()))?;
+    }
+
+    parse_http_response(&raw)
+}
+
+fn tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    use rustls::RootCertStore;
+    let mut roots = RootCertStore::empty();
+    // webpki-roots provides `TrustAnchor`s, which RootCertStore accepts directly.
+    roots.extend(
+        webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .map(|ta| ta.to_owned()),
+    );
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        config,
+    )))
+}
+
+/// Parse a raw HTTP/1.1 response into its body text.
+fn parse_http_response(raw: &[u8]) -> Result<String, String> {
+    let header_end = find_subslice(raw, b"\r\n\r\n")
+        .ok_or_else(|| "response has no header terminator".to_string())?;
+    let head = String::from_utf8_lossy(&raw[..header_end]);
+    let body = &raw[header_end + 4..];
+
+    let mut chunked = false;
+    for line in head.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
+            }
+        }
+    }
+    let decoded;
+    let body: &[u8] = if chunked {
+        decoded = decode_chunked(body);
+        &decoded
+    } else {
+        body
+    };
+    Ok(String::from_utf8_lossy(body).into_owned())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Describes the response framing so a failed read is actually diagnosable
+/// instead of showing a generic "error decoding response body".
+fn describe_response(response: &reqwest::Response) -> String {
+    let hdr = |name: reqwest::header::HeaderName| {
+        response
+            .headers()
+            .get(&name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .chars()
+            .take(40)
+            .collect::<String>()
+    };
+    format!(
+        "status={} ver={:?} content-encoding={} content-length={} transfer-encoding={} content-type={} server={}",
+        response.status(),
+        response.version(),
+        hdr(reqwest::header::CONTENT_ENCODING),
+        hdr(reqwest::header::CONTENT_LENGTH),
+        hdr(reqwest::header::TRANSFER_ENCODING),
+        hdr(reqwest::header::CONTENT_TYPE),
+        hdr(reqwest::header::SERVER),
+    )
+}
+
+/// A body plus the transport error that interrupted it, if any. Keeping both
+/// lets us surface a provider error message instead of a generic decode error.
+struct PartialBody {
+    text: String,
+    error: String,
+}
+
+/// Pull a human-readable message out of a provider error payload.
+fn extract_api_error(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let error = value.get("error")?;
+    if let Some(msg) = error.as_str() {
+        return Some(truncate(msg, 200));
+    }
+    let msg = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .unwrap_or("");
+    if msg.is_empty() {
+        None
+    } else {
+        Some(truncate(msg, 200))
+    }
+}
+
+/// Read a response body as raw bytes and decode it ourselves.
+///
+/// Streams the body chunk-by-chunk instead of using `.bytes()`, so a proxy that
+/// closes the connection early still yields whatever JSON arrived rather than
+/// discarding the whole response with "error decoding response body".
+async fn read_response_body(response: reqwest::Response) -> Result<String, PartialBody> {
+    use futures::StreamExt;
+    use std::io::Read;
+
+    let describe = describe_response(&response);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream_error: Option<String> = None;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => buf.extend_from_slice(&bytes),
+            Err(e) => {
+                // Keep what we already have; a complete JSON object may still
+                // be present before the truncation point.
+                stream_error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    if buf.is_empty() {
+        return Err(PartialBody {
+            text: String::new(),
+            error: match stream_error {
+                Some(err) => format!("{err} ({describe})"),
+                None => format!("no bytes received ({describe})"),
+            },
+        });
+    }
+    // Defensively gunzip if a proxy compressed anyway (0x1f 0x8b magic).
+    if buf.len() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b {
+        let mut decoder = flate2::read::GzDecoder::new(&buf[..]);
+        let mut decoded = Vec::new();
+        match decoder.read_to_end(&mut decoded) {
+            Ok(_) => buf = decoded,
+            Err(e) => {
+                return Err(PartialBody {
+                    text: String::new(),
+                    error: format!("gzip decode failed: {e} ({describe})"),
+                })
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    match stream_error {
+        Some(err) => Err(PartialBody {
+            text,
+            error: format!(
+                "stream failed after {} bytes: {err} ({describe})",
+                buf.len()
+            ),
+        }),
+        None => Ok(text),
+    }
+}
+
 /// Pull the model's text out of the many response shapes used by compatible
 /// endpoints (plain string, array of content parts, completion-style `text`).
 fn text_from_content(value: Option<&Value>) -> String {
@@ -2052,6 +2528,33 @@ mod tests {
         assert!(!c.base_url.is_empty());
         assert!(!c.model.is_empty());
         assert!(c.timeout_ms > 0);
+    }
+
+    #[test]
+    fn lenient_chunked_decoder_handles_missing_terminator_and_extensions() {
+        // Chunked with an extension and NO terminating zero-length chunk —
+        // the framing that makes strict decoders fail.
+        // Chunk 1: "4;foo=bar" -> 4 bytes `{"a"` ; Chunk 2: "6" -> 6 bytes `: 1}\r\n`
+        let body = b"4;foo=bar\r\n{\"a\"\r\n6\r\n: 1}\r\n";
+        let decoded = decode_chunked(body);
+        assert_eq!(String::from_utf8_lossy(&decoded), "{\"a\": 1}\r\n");
+
+        // Well-formed chunked body with terminator still works.
+        let ok = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(String::from_utf8_lossy(&decode_chunked(ok)), "hello world");
+    }
+
+    #[test]
+    fn parses_http_response_with_chunked_framing() {
+        // Chunk sizes are exact: 8 bytes `{"choice` + 5 bytes `s":1}` = 13 bytes.
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Content-Type: application/json\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    Server: cloudflare\r\n\r\n\
+                    8\r\n{\"choice\r\n\
+                    5\r\ns\":1}\r\n";
+        let body = parse_http_response(raw).expect("chunked response parses");
+        assert_eq!(body, "{\"choices\":1}", "body was: {body}");
     }
 
     #[test]

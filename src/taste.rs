@@ -2815,8 +2815,165 @@ impl TasteEngine {
         }
     }
 
+    /// Deterministic Instant Mix v2.
+    ///
+    /// Resolves the query to real artists / genres using Deezer's editorial
+    /// data, then builds a ranked pool from those catalogues. The LLM is never
+    /// asked to invent tracks — it can only reorder/name afterwards. This means
+    /// a mix is good even when the model is down, slow, or hallucinating.
+    pub async fn build_editorial_mix(
+        &self,
+        query: &str,
+        intent: &crate::taste::SearchIntent,
+        user_id: i64,
+        force_entity: bool,
+    ) -> Vec<Track> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let q_low = q.to_ascii_lowercase();
+        let artist_name = intent
+            .entity_query
+            .clone()
+            .unwrap_or_else(|| q.to_string());
+        let artist_slug = slug(&primary_artist(&artist_name));
+        let looks_like_artist = !artist_slug.is_empty()
+            && (force_entity || !intent.is_theme_mix);
+
+        let mut pool: Vec<Track> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let push = |tracks: Vec<Track>, pool: &mut Vec<Track>, seen: &mut HashSet<String>| {
+            for t in tracks {
+                if seen.insert(t.id.clone()) && !is_mix_clutter_track(&t, &q_low) {
+                    pool.push(t);
+                }
+            }
+        };
+
+        if looks_like_artist {
+            // 1. Resolve the artist on Deezer and pull their real catalogue.
+            let artists = self.sources.deezer.search_artists(&artist_name, 6).await;
+            let matched = artists
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&artist_name))
+                .or_else(|| artists.iter().find(|a| slug(&a.name) == artist_slug));
+            if let Some(artist) = matched {
+                let top = self
+                    .sources
+                    .deezer
+                    .fetch_artist_top_tracks(&artist.deezer_id, 30)
+                    .await;
+                push(top, &mut pool, &mut seen);
+                let radio = self
+                    .sources
+                    .deezer
+                    .fetch_artist_radio(&artist.deezer_id)
+                    .await;
+                push(radio, &mut pool, &mut seen);
+            }
+        }
+
+        // 2. Genre / theme charts are always valid supporting material.
+        let genre_tracks = self.deezer_genre_tracks_for_query(&artist_name).await;
+        push(genre_tracks, &mut pool, &mut seen);
+
+        // 3. Curated playlists matching the theme.
+        for query_text in [artist_name.clone(), q.to_string()] {
+            let batches = tokio::time::timeout(
+                std::time::Duration::from_secs(6),
+                self.sources
+                    .deezer
+                    .fetch_curated_mix_tracks(&query_text, 2, 20),
+            )
+            .await
+            .unwrap_or_default();
+            for (_, batch) in batches {
+                push(batch, &mut pool, &mut seen);
+            }
+        }
+
+        // 4. The listener's own catalog, for artists they already know.
+        if user_id > 0 {
+            let store = self.store.clone();
+            let local = tokio::task::spawn_blocking(move || {
+                store
+                    .candidate_tracks_for_user(user_id, 400)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            let filtered: Vec<Track> = local
+                .into_iter()
+                .filter(|t| {
+                    let hay = format!("{} {}", t.title, t.artist).to_ascii_lowercase();
+                    artist_slug.is_empty() || hay.contains(&artist_slug)
+                })
+                .collect();
+            push(filtered, &mut pool, &mut seen);
+        }
+
+        if pool.len() < 4 {
+            return Vec::new();
+        }
+
+        // 5. Persist and rank with the existing deterministic scorer.
+        {
+            let store = self.store.clone();
+            let to_save = pool.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = store.upsert_tracks(&to_save);
+            })
+            .await;
+        }
+        let ranked = self.rank_editorial_pool(user_id, &artist_slug, pool);
+        dedup_and_interleave(ranked, 30, 2)
+    }
+
+    /// Scores an editorial pool: exact-artist matches first, then taste fit,
+    /// then editorial quality. Deterministic — no model involved.
+    fn rank_editorial_pool(
+        &self,
+        user_id: i64,
+        artist_slug: &str,
+        pool: Vec<Track>,
+    ) -> Vec<Track> {
+        let sctx = self.build_scoring_context(user_id);
+        let has_taste = !sctx.stats.is_empty() || profile_has_taste(&sctx.prof);
+        let n_scores = if has_taste && user_id > 0 {
+            self.neural_scores(user_id, &[], None, &[], &[], &pool)
+        } else {
+            Vec::new()
+        };
+        let n_w = self.neural_blend_weight(0.7, &sctx);
+
+        let mut scored: Vec<(f64, Track)> = pool
+            .into_iter()
+            .enumerate()
+            .map(|(idx, t)| {
+                let pa = slug(&primary_artist(&t.artist));
+                let same_artist = !artist_slug.is_empty() && pa == artist_slug;
+                // Exact artist dominates; everything else is supporting material.
+                let artist_score = if same_artist { 100.0 } else { 0.0 };
+                let quality = t.quality_score() as f64 / 12.0;
+                let taste = if user_id > 0 && has_taste {
+                    score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix)
+                } else {
+                    0.0
+                };
+                let neural = n_scores.get(idx).copied().unwrap_or(0.0) * n_w;
+                let disliked = is_strongly_disliked(&t, &sctx.prof, &sctx.stats);
+                let score = artist_score + quality + taste + neural - if disliked { 50.0 } else { 0.0 };
+                (score, t)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().map(|(_, t)| t).collect()
+    }
+
     /// Build a verified mix on demand for the first request of a query, so the
     /// user never sees a "come back later" placeholder. Bounded by the caller.
+    #[allow(dead_code)]
     pub async fn build_verified_mix(&self, query: &str) -> Option<crate::llm::VerifiedMix> {
         let mut pool = self.deezer_genre_tracks_for_query(query).await;
         if pool.len() < 8 {

@@ -20,7 +20,7 @@ primary_region = "ord"
   # Optional OpenAI-compatible AI curator (mixes, metadata, search warmth — all background):
   # BEATLAB_LLM_API_KEY = "..."
   BEATLAB_LLM_BASE_URL = "https://openrouter.ai/api/v1"
-  BEATLAB_LLM_MODEL = "inclusionai/ling-3.2-flash:free"
+  BEATLAB_LLM_MODEL = "baidu/ernie-5.5-flash-preview:free"
   BEATLAB_LLM_ENABLED = "1"
   BEATLAB_LLM_TIMEOUT_MS = "15000"
   BEATLAB_LLM_RESEARCH_TIMEOUT_MS = "8000"
