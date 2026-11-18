@@ -2430,6 +2430,7 @@ impl TransformerEngine {
         }
     }
 
+    #[cfg(test)]
     pub fn step_count(&self) -> u64 {
         self.net.read().unwrap_or_else(|e| e.into_inner()).step_count
     }
