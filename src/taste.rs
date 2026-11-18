@@ -1799,7 +1799,38 @@ impl TasteEngine {
     /// The mood the user leans into most, from both listening history and their
     /// own playlists. Cold users get an upbeat starter theme.
     fn featured_mixed_for_you_mood(&self, user_id: i64) -> Mood {
-        let prof = self.user_profile(user_id);
+        let sctx = self.build_scoring_context(user_id);
+        let prof = &sctx.prof;
+
+        // Tracks from sources without genre tags (e.g. YouTube Music) add nothing to
+        // `mood_affinity`, so a library made mostly of them would be judged by its few
+        // tagged songs. Borrow the artist's genres from the catalog for those tracks.
+        let mut untagged_moods: HashMap<Mood, f64> = HashMap::new();
+        let untagged: Vec<Track> = self
+            .store
+            .candidate_tracks_for_user(user_id, 600)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| {
+                t.genre.trim().is_empty()
+                    && t.mood_list().is_empty()
+                    && is_familiar_track(t, prof, &sctx.stats)
+                    && !is_strongly_disliked(t, prof, &sctx.stats)
+            })
+            .collect();
+        if !untagged.is_empty() {
+            let artists: Vec<String> = untagged.iter().map(|t| t.artist.clone()).collect();
+            let artist_genres = self.store.known_artist_genres_for(&artists).unwrap_or_default();
+            for t in &untagged {
+                let Some(ag) = artist_genres.get(&primary_artist(&t.artist).to_lowercase()) else {
+                    continue;
+                };
+                for m in classify_moods("", "", ag, "") {
+                    *untagged_moods.entry(m).or_insert(0.0) += 0.5;
+                }
+            }
+        }
+
         let mut best: Option<(f64, Mood)> = None;
         for &mood in Mood::ALL.iter() {
             let affinity = prof.mood_affinity.get(&mood).copied().unwrap_or(0.0)
@@ -1808,7 +1839,8 @@ impl TasteEngine {
                     .get(&mood)
                     .copied()
                     .unwrap_or(0.0)
-                    * 1.25;
+                    * 1.25
+                + untagged_moods.get(&mood).copied().unwrap_or(0.0);
             if !affinity.is_finite() || affinity <= 0.0 {
                 continue;
             }
@@ -1830,7 +1862,7 @@ impl TasteEngine {
             .unwrap_or(false);
         let last_rebuilt = self
             .store
-            .kv_get(&format!("mix4u:rebuilt_at:{user_id}"))
+            .kv_get(&format!("mix4u:v2:rebuilt_at:{user_id}"))
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
         let has_mixes = self
@@ -1871,6 +1903,7 @@ impl TasteEngine {
         if pool.len() < 12 {
             return;
         }
+        let pool = self.personalize_mixed_for_you_pool(user_id, mood, pool);
         let pool = dedup_and_interleave(pool, 96, 2);
         if pool.len() < 12 {
             return;
@@ -1917,9 +1950,127 @@ impl TasteEngine {
         self.store
             .kv_set(&format!("mix4u:mood:{user_id}"), slug);
         self.store.kv_set(
-            &format!("mix4u:rebuilt_at:{user_id}"),
+            &format!("mix4u:v2:rebuilt_at:{user_id}"),
             &Utc::now().timestamp().to_string(),
         );
+    }
+
+    /// Mixed for you is the listener's own rail, so their world leads and the global mood
+    /// pool only seasons it. Moods & Vibes stay strict (taste alone never admits a track,
+    /// or every mood would collapse into one favourites list), but this rail covers a single
+    /// featured mood, so the listener's own untagged music — e.g. YouTube Music tracks that
+    /// carry no genre at all — is welcome here as long as nothing marks it as off-mood.
+    fn personalize_mixed_for_you_pool(&self, user_id: i64, mood: Mood, pool: Vec<Track>) -> Vec<Track> {
+        let sctx = self.build_scoring_context(user_id);
+        let is_personal = |t: &Track| {
+            if user_realm_score(t, &sctx.prof, &sctx.stats) > 0.0 {
+                return true;
+            }
+            let fctx = build_track_affinities(t, &sctx.prof);
+            let align = compute_taste_alignment(t, &sctx.prof, &fctx);
+            align.rel_a > 0.0 || align.rel_t > 0.0
+        };
+
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        // (has verified mood evidence, track)
+        let mut personal: Vec<(bool, Track)> = Vec::new();
+        let mut generic: Vec<Track> = Vec::new();
+        for t in pool {
+            if !seen_keys.insert(t.song_key()) {
+                continue;
+            }
+            if is_personal(&t) {
+                personal.push((true, t));
+            } else {
+                generic.push(t);
+            }
+        }
+
+        // The listener's own tracks the mood ranker could not judge: no track genre and no
+        // known artist genre. Only strongly personal ones (played, starred, in a playlist,
+        // a well-loved artist, or a Transformer/related-graph pick) qualify.
+        let user_cands = self
+            .store
+            .candidate_tracks_for_user(user_id, 900)
+            .unwrap_or_default();
+        let cand_artists: Vec<String> = user_cands.iter().map(|t| t.artist.clone()).collect();
+        let artist_genres = self.store.known_artist_genres_for(&cand_artists).unwrap_or_default();
+        for t in user_cands {
+            if !t.genre.trim().is_empty()
+                || artist_genres.contains_key(&primary_artist(&t.artist).to_lowercase())
+                || seen_keys.contains(&t.song_key())
+            {
+                continue;
+            }
+            // A stored mood tag for a different mood is evidence against this one.
+            let tagged = t.mood_list();
+            if !tagged.is_empty() && !tagged.contains(&mood) {
+                continue;
+            }
+            if is_hidden_track(&t, &sctx.prof)
+                || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                || is_mood_clutter_track(&t)
+                || is_mood_title_trap(&t, mood)
+                || track_matches_topic(&t, "christmas")
+                || track_matches_topic(&t, "halloween")
+            {
+                continue;
+            }
+            let realm = user_realm_score(&t, &sctx.prof, &sctx.stats);
+            let fctx = build_track_affinities(&t, &sctx.prof);
+            let align = compute_taste_alignment(&t, &sctx.prof, &fctx);
+            if realm >= 1.0 || align.rel_t > 0.0 || align.rel_a > 0.3 {
+                seen_keys.insert(t.song_key());
+                personal.push((false, t));
+            }
+        }
+
+        if personal.is_empty() {
+            return generic;
+        }
+
+        let personal_tracks: Vec<Track> = personal.iter().map(|(_, t)| t.clone()).collect();
+        let n_scores = self.neural_scores(user_id, &[], None, &[mood], &[], &personal_tracks);
+        let n_w = self.neural_blend_weight(0.75, &sctx);
+        let mut scored: Vec<(f64, Track)> = personal
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (verified, t))| {
+                let s = score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix) * 0.6
+                    + user_realm_score(&t, &sctx.prof, &sctx.stats) * 1.2
+                    + n_scores.get(idx).copied().unwrap_or(0.0) * n_w
+                    // Tracks the mood ranker verified for this mood lead unknown ones.
+                    + if verified { 2.0 } else { 0.0 };
+                (s, t)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let personal: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+
+        // A little discovery from the global pool, more only when the listener's own
+        // world is too small to fill the mixes.
+        const MIN_POOL: usize = 36;
+        let generic_allowed = (personal.len() / 4).max(MIN_POOL.saturating_sub(personal.len()));
+        generic.truncate(generic_allowed);
+
+        // Spread the generic picks evenly so Mix 1/2/3 share the same personal/discovery balance.
+        let mut out = Vec::with_capacity(personal.len() + generic.len());
+        let every = if generic.is_empty() {
+            usize::MAX
+        } else {
+            (personal.len() / generic.len()).max(1)
+        };
+        let mut generic_iter = generic.into_iter();
+        for (i, t) in personal.into_iter().enumerate() {
+            out.push(t);
+            if (i + 1) % every == 0 {
+                if let Some(g) = generic_iter.next() {
+                    out.push(g);
+                }
+            }
+        }
+        out.extend(generic_iter);
+        out
     }
 
     pub async fn refresh_mixed_for_you_if_stale_async(&self, user_id: i64, max_age_secs: i64) {
@@ -5351,6 +5502,7 @@ impl TasteEngine {
             &HashMap::new(),
             &HashMap::new(),
             &sctx,
+            &HashMap::new(),
         );
         let top_track = evals
             .iter()
@@ -5591,12 +5743,49 @@ impl TasteEngine {
             .known_artist_genres_for(&search_artists)
             .unwrap_or_default();
 
+        // Transformer opinion on every candidate (search hits + mix feeds), keyed by song so the
+        // instant-mix composer can use it for feed tracks too. Pre-weighted by model trust.
+        let neural_by_key: HashMap<String, f64> = if user_id > 0 {
+            let mut cands: Vec<Track> = deduped_search.clone();
+            let mut seen_keys: HashSet<String> = cands.iter().map(Track::song_key).collect();
+            for feed in [
+                &mix_ctx.ytm_radio,
+                &mix_ctx.dz_artist_top,
+                &mix_ctx.dz_artist_radio,
+                &mix_ctx.dz_related_tracks,
+            ] {
+                for t in feed {
+                    if seen_keys.insert(t.song_key()) {
+                        cands.push(t.clone());
+                    }
+                }
+            }
+            let n_w = self.neural_blend_weight(0.6, &sctx);
+            let scores = self.neural_scores(
+                user_id,
+                &[],
+                Some(query),
+                &intent.moods,
+                &intent.genres,
+                &cands,
+            );
+            cands
+                .iter()
+                .zip(scores)
+                .filter(|(_, s)| *s != 0.0)
+                .map(|(t, s)| (t.song_key(), (s * n_w).clamp(-4.0, 4.0)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         let evals = evaluate_search_candidates(
             &intent,
             deduped_search,
             &curated_prior_by_key,
             &artist_genres,
             &sctx,
+            &neural_by_key,
         );
 
         let mut taste_match_ids = HashSet::new();
@@ -5625,6 +5814,7 @@ impl TasteEngine {
                 &evals,
                 &artist_genres,
                 &sctx,
+                &neural_by_key,
                 None,
                 has_user_taste,
             )
@@ -5718,6 +5908,7 @@ impl TasteEngine {
                     &evals,
                     &artist_genres,
                     &sctx,
+                    &neural_by_key,
                     Some(&anchor),
                     has_user_taste,
                 )
@@ -5919,6 +6110,7 @@ fn compose_coherent_mix(
     evals: &[EvaluatedSearchTrack],
     artist_genres: &HashMap<String, String>,
     sctx: &ScoringContext,
+    neural_by_key: &HashMap<String, f64>,
     anchor: Option<&MixAnchor>,
     has_user_taste: bool,
 ) -> Option<InstantMix> {
@@ -6142,9 +6334,11 @@ fn compose_coherent_mix(
             + if sctx.prof.starred.contains(&t.id) { 0.4 } else { 0.0 })
         .clamp(-1.0, 1.0);
         let stats = sctx.stats.get(&t.id).copied().unwrap_or_default();
+        let neural = neural_by_key.get(&t.song_key()).copied().unwrap_or(0.0);
         let tie = similarity
             + (parse_rank_bonus(&t.meta) * 0.012).min(0.06)
             + taste * 0.03
+            + neural * 0.012
             + ((t.quality_score() as f64 / 800.0) * 0.01).min(0.02)
             - (stats.skip_count as f64) * 0.15;
         neighbours.push((tie, t));
@@ -6235,6 +6429,7 @@ fn evaluate_search_candidates(
     curated_prior_by_key: &HashMap<String, f64>,
     artist_genres: &HashMap<String, String>,
     sctx: &ScoringContext,
+    neural_by_key: &HashMap<String, f64>,
 ) -> Vec<EvaluatedSearchTrack> {
     let lex_query = intent.entity_query.as_deref().unwrap_or(&intent.normalized);
     let lex_query_low = lex_query.to_lowercase();
@@ -6280,6 +6475,13 @@ fn evaluate_search_candidates(
             + if fctx.followed_artist { 1.4 } else { 0.0 }
             + if fctx.saved_album { 0.9 } else { 0.0 }
             + if sctx.prof.starred.contains(&t.id) { 1.8 } else { 0.0 };
+        // Already scaled by model trust and clamped to ±4, so it can reorder within a
+        // lexical tier but never lift a loose hit above an exact song/artist match.
+        let neural_term = if disliked {
+            0.0
+        } else {
+            neural_by_key.get(&t.song_key()).copied().unwrap_or(0.0)
+        };
         let pop_bonus = parse_rank_bonus(&t.meta);
         let quality_bonus = (t.quality_score() as f64) / 360.0;
         let skip_penalty = if disliked {
@@ -6340,6 +6542,7 @@ fn evaluate_search_candidates(
                 era_match * 1.5 + theme_match * 1.5 + curated_prior * 0.6 + pop_bonus * 0.55
             }
             + taste_aff
+            + neural_term
             + quality_bonus
             - skip_penalty
             - junk_penalty;
@@ -10914,6 +11117,75 @@ mod tests {
             .filter(|p| p.is_auto && !p.kind.starts_with("mixed_for_you:"))
             .count();
         assert_eq!(generic_auto, 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_for_you_keeps_untagged_ytm_listener_music_over_global_pool() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jpopytm", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: String, source: &str, artist: String, genre: &str, moods: &str| Track {
+            id: id.clone(),
+            source: source.into(),
+            title: format!("Song {id}"),
+            artist,
+            album: "Album".into(),
+            genre: genre.into(),
+            moods: moods.into(),
+            cover_url: format!("https://example.com/{id}.jpg"),
+            duration: 220,
+            bitrate: 256,
+            stream_url: id,
+            ..Default::default()
+        };
+        // Global, popular Upbeat pool the curator would cache.
+        let global: Vec<Track> = (0..40)
+            .map(|i| mk(format!("dz:pop{i}"), "deezer", format!("Chart Star {i}"), "Pop", "upbeat"))
+            .collect();
+        // A few J-pop tracks with tags, and lots of untagged YouTube Music listening.
+        let tagged: Vec<Track> = (0..12)
+            .map(|i| mk(format!("dz:jp{i}"), "deezer", format!("JP Artist {i}"), "J-Pop", "upbeat"))
+            .collect();
+        let untagged: Vec<Track> = (0..20)
+            .map(|i| mk(format!("ytm:jp{i}"), "ytm", format!("YTM JP Artist {i}"), "", ""))
+            .collect();
+        store.upsert_tracks(&global).unwrap();
+        store.upsert_tracks(&tagged).unwrap();
+        store.upsert_tracks(&untagged).unwrap();
+        for t in tagged.iter().chain(untagged.iter()) {
+            let _ = store.record_event(u.id, &t.id, "play", 1.0);
+            let _ = store.record_event(u.id, &t.id, "complete", 1.0);
+        }
+        let ids: Vec<String> = global.iter().map(|t| t.id.clone()).collect();
+        taste.save_curated_pool(&mood_cache_key(Mood::Upbeat), &ids);
+
+        taste.rebuild_mixed_for_you(u.id).await;
+
+        let cards = taste.mixed_for_you_cards(u.id);
+        assert_eq!(cards.len(), 4);
+        assert_eq!(cards[0].title, "Feel Good Mix 1");
+        let mut all_ids: Vec<String> = Vec::new();
+        for c in &cards {
+            all_ids.extend(store.playlist_tracks(&c.id).unwrap().into_iter().map(|t| t.id));
+        }
+        let ytm = all_ids.iter().filter(|id| id.starts_with("ytm:jp")).count();
+        let jp = all_ids.iter().filter(|id| id.starts_with("dz:jp")).count();
+        let pop = all_ids.iter().filter(|id| id.starts_with("dz:pop")).count();
+        assert!(ytm > 0, "untagged listener tracks missing: {:?}", all_ids);
+        assert!(jp > 0, "tagged listener tracks missing: {:?}", all_ids);
+        assert!(
+            pop * 3 < ytm + jp,
+            "global pool dominates: pop={pop} ytm={ytm} jp={jp} {:?}",
+            all_ids
+        );
     }
 
     #[test]
