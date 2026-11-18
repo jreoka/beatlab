@@ -3,12 +3,14 @@
 //! There is no separate admin password or role table — the named account(s)
 //! become administrators once signed in through the normal web flow.
 
-use crate::auth::hash_token;
+use crate::auth::{hash_token, random_bytes};
 use crate::models::User;
 use crate::subsonic::{client_ip, AppState};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 
@@ -325,6 +327,75 @@ pub async fn revoke_sessions(
         }
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+const TEMP_PASSWORD_ALPHABET: &[u8] =
+    b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+
+fn generate_temp_password() -> String {
+    random_bytes(16)
+        .into_iter()
+        .map(|b| TEMP_PASSWORD_ALPHABET[b as usize % TEMP_PASSWORD_ALPHABET.len()] as char)
+        .collect()
+}
+
+#[derive(Deserialize, Default)]
+pub struct ResetPasswordReq {
+    #[serde(rename = "newPassword", default)]
+    pub new_password: Option<String>,
+    #[serde(rename = "revokeSessions", default)]
+    pub revoke_sessions: Option<bool>,
+}
+
+pub async fn reset_password(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(req): Json<ResetPasswordReq>,
+) -> Response {
+    let admin = match require_admin(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let target = match target_user(&state, id) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = prevent_self(&admin, &target) {
+        return r;
+    }
+    let (new_password, generated) = match req.new_password {
+        Some(pw) => (pw, false),
+        None => (generate_temp_password(), true),
+    };
+    if let Err(e) = state.store.change_password(id, &new_password) {
+        return err_res(StatusCode::BAD_REQUEST, &e.to_string());
+    }
+    let revoke = req.revoke_sessions.unwrap_or(true);
+    let revoked = if revoke {
+        state.store.delete_all_sessions_for_user(id).unwrap_or(0)
+    } else {
+        0
+    };
+    admin_event(
+        &state,
+        &admin,
+        "admin_password_reset",
+        &format!("Reset password for {}", target.username),
+        &headers,
+    );
+    state.store.record_security_event(
+        target.id,
+        "password_reset_by_admin",
+        "Account password reset by administrator",
+        &client_ip(&headers),
+    );
+    json_res(json!({
+        "ok": true,
+        "password": new_password,
+        "generated": generated,
+        "revokedSessions": revoked,
+    }))
 }
 
 pub async fn reset_2fa(

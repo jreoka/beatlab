@@ -389,6 +389,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/admin/users/{id}", get(admin::user_detail))
         .route("/api/admin/cache/backfill", post(admin::backfill_cache))
         .route("/api/admin/users/{id}/sessions/revoke", post(admin::revoke_sessions))
+        .route("/api/admin/users/{id}/password/reset", post(admin::reset_password))
         .route("/api/admin/users/{id}/2fa/reset", post(admin::reset_2fa))
         .route("/api/admin/users/{id}/api-key/regenerate", post(admin::regenerate_key))
         .route("/api/admin/users/{id}/delete", post(admin::delete_user))
