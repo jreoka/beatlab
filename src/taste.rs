@@ -873,6 +873,9 @@ impl TasteEngine {
     fn neural_blend_weight(&self, base: f64, sctx: &ScoringContext) -> f64 {
         let hist_len =
             sctx.stats.len() + sctx.prof.starred.len() + sctx.prof.manual_playlist_ids.len();
+        if hist_len == 0 && !profile_has_taste(&sctx.prof) {
+            return 0.0;
+        }
         base * self.neural.adaptive_multiplier(hist_len)
     }
 
@@ -1467,13 +1470,12 @@ impl TasteEngine {
             || !sctx.prof.genre_affinity.is_empty();
         if !has_taste {
             // Fresh accounts only see artists from the external Deezer charts,
-            // never local/cached artists that happen to exist in the catalog.
+            // never local/cached artists from other users' searches or listens.
             return self
                 .store
-                .featured_artist_summaries(limit * 3)
-                .unwrap_or_default()
+                .popular_chart_artists(limit.saturating_mul(2).max(limit))
                 .into_iter()
-                .filter(|a| !a.deezer_id.trim().is_empty() && !followed.contains(&a.id))
+                .filter(|a| !followed.contains(&a.id))
                 .take(limit)
                 .collect();
         }
@@ -2179,10 +2181,12 @@ impl TasteEngine {
             return;
         }
         let dz = &self.sources.deezer;
-        let (global, pop, hiphop) = tokio::join!(
+        let (global, pop, hiphop, chart_albums, chart_artists) = tokio::join!(
             dz.fetch_chart_tracks(50),
             dz.fetch_genre_chart_tracks(132, "Pop", 20),
             dz.fetch_genre_chart_tracks(116, "Hip-Hop", 20),
+            dz.fetch_chart_albums(18),
+            dz.fetch_chart_artists(24),
         );
         let mut all = global.clone();
         all.extend(pop.iter().cloned());
@@ -2198,6 +2202,14 @@ impl TasteEngine {
         if !genre.is_empty() {
             let _ = self.store.record_chart_tracks(&genre, 1000);
         }
+        for alb in &chart_albums {
+            let _ = self.store.upsert_album_meta(alb);
+        }
+        self.store.record_chart_albums(&chart_albums);
+        for art in &chart_artists {
+            let _ = self.store.upsert_artist_meta(art);
+        }
+        self.store.record_chart_artists(&chart_artists);
         // Rebuild from the clean, chart-only slate produced above.
         self.rebuild_auto_playlists(user_id);
         // Bounded so a cold catalog never slows down account creation.
@@ -2258,9 +2270,11 @@ impl TasteEngine {
         for alb in &chart_albums {
             let _ = self.store.upsert_album_meta(alb);
         }
+        self.store.record_chart_albums(&chart_albums);
         for art in &chart_artists {
             let _ = self.store.upsert_artist_meta(art);
         }
+        self.store.record_chart_artists(&chart_artists);
 
         // Warm any unpopulated Moods and core Explore mixes gently at startup.
         for &mood in Mood::ALL.iter() {
@@ -2347,9 +2361,11 @@ impl TasteEngine {
             for alb in &chart_albums {
                 let _ = self.store.upsert_album_meta(alb);
             }
+            self.store.record_chart_albums(&chart_albums);
             for art in &chart_artists {
                 let _ = self.store.upsert_artist_meta(art);
             }
+            self.store.record_chart_artists(&chart_artists);
         }
 
         // 2. Curate 2 moods per cycle, prioritizing missing/oldest pools first.
@@ -2536,11 +2552,8 @@ impl TasteEngine {
                 }
             }
         }
-        let base = self.curated_mood_preview(mood);
-        if base.0 >= 12 || user_id <= 0 {
-            return base;
-        }
-
+        let is_fresh_user =
+            user_id > 0 && !self.store.has_listening_history(user_id).unwrap_or(false);
         let cached_curated_ids = self.load_curated_pool_ids(&mood_cache_key(mood), 24 * 3600);
         let cached_curated_tracks = if !cached_curated_ids.is_empty() {
             self.store
@@ -2549,7 +2562,20 @@ impl TasteEngine {
         } else {
             Vec::new()
         };
-        let local_mood = self.store.tracks_by_mood(mood, 60, 0).unwrap_or_default();
+        let base = if is_fresh_user {
+            Self::preview_from_tracks(&cached_curated_tracks)
+        } else {
+            self.curated_mood_preview(mood)
+        };
+        if base.0 >= 12 || user_id <= 0 {
+            return base;
+        }
+
+        let local_mood = if is_fresh_user {
+            Vec::new()
+        } else {
+            self.store.tracks_by_mood(mood, 60, 0).unwrap_or_default()
+        };
         let user_pool = self
             .store
             .candidate_tracks_for_user(user_id, 400)
@@ -2872,15 +2898,19 @@ impl TasteEngine {
                 mood_cues.push(m);
             }
         }
-        let n_scores = self.neural_scores(
-            user_id,
-            &[],
-            Some(spec.query),
-            &mood_cues,
-            &intent.genres,
-            &pool_tracks,
-        );
         let n_w = self.neural_blend_weight(0.75, &sctx);
+        let n_scores = if n_w > 0.0 {
+            self.neural_scores(
+                user_id,
+                &[],
+                Some(spec.query),
+                &mood_cues,
+                &intent.genres,
+                &pool_tracks,
+            )
+        } else {
+            Vec::new()
+        };
         let all_artists: Vec<String> = pool.iter().map(|(_, t)| t.artist.clone()).collect();
         let all_artist_genres = self
             .store
@@ -4233,10 +4263,19 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             }
         }
 
-        // Preserve any previously verified local/catalog matches if remote returned sparse results,
+        // Preserve any previously verified chart/catalog matches if remote returned sparse results,
         // and only persist the curated pool when we have a solid verified set.
         if curated_tracks.len() < 6 {
-            for t in self.store.tracks_by_mood(mood, 60, 0).unwrap_or_default() {
+            let chart_fallback = self
+                .store
+                .popular_chart_tracks_for_new_user(80)
+                .unwrap_or_default();
+            let fallback_pool: Vec<Track> = if !chart_fallback.is_empty() {
+                chart_fallback
+            } else {
+                self.store.tracks_by_mood(mood, 60, 0).unwrap_or_default()
+            };
+            for t in fallback_pool {
                 if is_mood_clutter_track(&t)
                     || is_mood_title_trap(&t, mood)
                     || track_matches_topic(&t, "christmas")
@@ -4358,7 +4397,13 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         } else {
             Vec::new()
         };
-        let local_mood = self.store.tracks_by_mood(mood, 140, 0).unwrap_or_default();
+        let is_fresh_user =
+            user_id > 0 && !self.store.has_listening_history(user_id).unwrap_or(false);
+        let local_mood = if is_fresh_user {
+            Vec::new()
+        } else {
+            self.store.tracks_by_mood(mood, 140, 0).unwrap_or_default()
+        };
         let user_pool = if user_id > 0 {
             self.store
                 .candidate_tracks_for_user(user_id, 900)
@@ -4524,8 +4569,13 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         }
 
         let eligible_tracks: Vec<Track> = eligible.iter().map(|(t, _, _, _, _)| t.clone()).collect();
-        let n_scores = self.neural_scores(user_id, &[], None, &[mood], &[], &eligible_tracks);
+        let has_user_taste = !sctx.stats.is_empty() || profile_has_taste(&sctx.prof);
         let n_w = self.neural_blend_weight(0.65, &sctx);
+        let n_scores = if has_user_taste && n_w > 0.0 {
+            self.neural_scores(user_id, &[], None, &[mood], &[], &eligible_tracks)
+        } else {
+            Vec::new()
+        };
 
         let mut scored: Vec<(f64, Track)> = eligible
             .into_iter()
@@ -4559,10 +4609,14 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
 
                 let mut score = taste_s * 0.6 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w * 0.6;
                 score += evidence + realm * 1.2;
-                if t.source == "local" && realm == 0.0 {
-                    score += 0.6;
+                if has_user_taste {
+                    if t.source == "local" && realm == 0.0 {
+                        score += 0.6;
+                    }
+                    score += (t.quality_score() as f64 / 120.0) + parse_rank_bonus(&t.meta) * 0.12;
+                } else {
+                    score += parse_rank_bonus(&t.meta) * 0.25;
                 }
-                score += (t.quality_score() as f64 / 120.0) + parse_rank_bonus(&t.meta) * 0.12;
 
                 (score, t)
             })
@@ -5213,12 +5267,12 @@ impl TasteEngine {
                     }
                 }
                 let total = eligible.len().max(1) as f64;
-                let n_scores = if user_id > 0 {
+                let n_w = self.neural_blend_weight(0.55, &sctx);
+                let n_scores = if user_id > 0 && n_w > 0.0 {
                     self.neural_scores(user_id, &[s.clone()], None, &[], &[], &eligible)
                 } else {
                     Vec::new()
                 };
-                let n_w = self.neural_blend_weight(0.55, &sctx);
                 let score_mode = match mode {
                     RadioMode::Discover => ScoreMode::Discover,
                     RadioMode::Default | RadioMode::Familiar => ScoreMode::Supermix,
@@ -5745,7 +5799,8 @@ impl TasteEngine {
 
         // Transformer opinion on every candidate (search hits + mix feeds), keyed by song so the
         // instant-mix composer can use it for feed tracks too. Pre-weighted by model trust.
-        let neural_by_key: HashMap<String, f64> = if user_id > 0 {
+        let n_w = self.neural_blend_weight(0.6, &sctx);
+        let neural_by_key: HashMap<String, f64> = if user_id > 0 && n_w > 0.0 {
             let mut cands: Vec<Track> = deduped_search.clone();
             let mut seen_keys: HashSet<String> = cands.iter().map(Track::song_key).collect();
             for feed in [
@@ -5760,7 +5815,6 @@ impl TasteEngine {
                     }
                 }
             }
-            let n_w = self.neural_blend_weight(0.6, &sctx);
             let scores = self.neural_scores(
                 user_id,
                 &[],
@@ -11865,5 +11919,177 @@ mod tests {
         ];
         assert_eq!(artist_album_ids(&albums, 2), vec!["10", "22"]);
         assert_eq!(artist_album_ids(&albums, 10), vec!["10", "22", "33"]);
+    }
+
+    #[tokio::test]
+    async fn fresh_account_is_isolated_from_cache_and_other_users() {
+        let store = Store::open_memory().unwrap();
+        let (veteran, _) = store.authenticate_or_create_user("veteran", "pw").unwrap();
+        let (fresh, _) = store.authenticate_or_create_user("fresh_test", "pw").unwrap();
+
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        // 1. Seed external Deezer charts (tracks + artists + curated mood pool).
+        let mut chart_tracks = Vec::new();
+        let mut chart_artists = Vec::new();
+        for i in 0..20 {
+            chart_tracks.push(Track {
+                id: format!("dz:chart_{i}"),
+                source: "deezer".into(),
+                title: format!("Popular Hit {i}"),
+                artist: format!("Chart Star {i}"),
+                album: format!("Top Album {i}"),
+                genre: "Pop".into(),
+                moods: "upbeat".into(),
+                cover_url: format!("https://example.com/chart_{i}.jpg"),
+                duration: 200,
+                bitrate: 256,
+                stream_url: format!("resolve:ytm:Chart Star {i}|Popular Hit {i}|200"),
+                meta: format!(r#"{{"rank":{},"deezer_artist_id":{}}}"#, 900_000 - i * 1000, 100 + i),
+                ..Default::default()
+            });
+            chart_artists.push(ArtistSummary {
+                id: format!("ar:dz:{}", 100 + i),
+                name: format!("Chart Star {i}"),
+                cover_url: format!("https://example.com/artist_{i}.jpg"),
+                bio: "500000 fans on Deezer".into(),
+                deezer_id: format!("{}", 100 + i),
+                album_count: 1,
+                song_count: 1,
+            });
+        }
+        store.upsert_tracks(&chart_tracks).unwrap();
+        store.record_chart_tracks(&chart_tracks, 1).unwrap();
+        for a in &chart_artists {
+            store.upsert_artist_meta(a).unwrap();
+        }
+        store.record_chart_artists(&chart_artists);
+
+        // External curated Energy pool (separate from veteran's cached rock/metal tracks).
+        let curated_energy: Vec<Track> = (0..18)
+            .map(|i| Track {
+                id: format!("dz:cur_energy_{i}"),
+                source: "deezer".into(),
+                title: format!("Anthem {i}"),
+                artist: format!("Stadium Band {i}"),
+                album: "Anthems".into(),
+                genre: "Rock".into(),
+                moods: "energy".into(),
+                cover_url: format!("https://example.com/cur_e_{i}.jpg"),
+                duration: 210,
+                bitrate: 256,
+                stream_url: format!("dz:cur_energy_{i}"),
+                meta: format!(r#"{{"rank":{}}}"#, 800_000 - i * 1000),
+                ..Default::default()
+            })
+            .collect();
+        store.upsert_tracks(&curated_energy).unwrap();
+        let curated_energy_ids: Vec<String> = curated_energy.iter().map(|t| t.id.clone()).collect();
+        taste.save_curated_pool(&mood_cache_key(Mood::Energy), &curated_energy_ids);
+
+        // 2. Veteran user heavily listens to & caches niche local/Deezer tracks and hydrates an artist
+        //    with lots of songs/albums (which previously dominated featured_artist_summaries & tracks_by_mood).
+        let veteran_artist = ArtistSummary {
+            id: "ar:dz:999999".into(),
+            name: "Veteran Niche Metal Act".into(),
+            cover_url: "https://example.com/vet_artist.jpg".into(),
+            bio: "9000000 fans on Deezer".into(),
+            deezer_id: "999999".into(),
+            album_count: 12,
+            song_count: 30,
+        };
+        store.upsert_artist_meta(&veteran_artist).unwrap();
+        let mut veteran_tracks = Vec::new();
+        for i in 0..25 {
+            let t = Track {
+                id: format!("local:vet_{i}"),
+                source: "local".into(),
+                title: format!("Niche Riff {i}"),
+                artist: "Veteran Niche Metal Act".into(),
+                album: format!("Niche Album {}", i % 10),
+                genre: "Heavy Metal, Rock".into(),
+                moods: "energy".into(),
+                cover_url: format!("https://example.com/vet_{i}.jpg"),
+                duration: 240,
+                bitrate: 1411,
+                format: "flac".into(),
+                stream_url: format!("file:/music/vet_{i}.flac"),
+                meta: r#"{"deezer_artist_id":999999,"rank":999999}"#.into(),
+                created: 999_999 + i as i64,
+                ..Default::default()
+            };
+            veteran_tracks.push(t);
+        }
+        store.upsert_tracks(&veteran_tracks).unwrap();
+        for t in &veteran_tracks {
+            store.record_event(veteran.id, &t.id, "play", 1.0).unwrap();
+            store.record_event(veteran.id, &t.id, "complete", 1.0).unwrap();
+        }
+        // Train the shared neural model on the veteran user's history.
+        let _ = taste.train_and_distill_background(12);
+
+        // 3. Verify fresh account is completely isolated from cache & veteran user's preferences.
+        assert!(!store.has_listening_history(fresh.id).unwrap());
+
+        // 3a. Neural blend weight must be 0 for a fresh account.
+        let fresh_sctx = taste.build_scoring_context(fresh.id);
+        assert_eq!(taste.neural_blend_weight(0.85, &fresh_sctx), 0.0);
+
+        // 3b. Recommended artists must come strictly from external charts, never the veteran's hydrated artist.
+        let rec_artists = taste.recommended_artists_for_user(fresh.id, 12);
+        assert!(!rec_artists.is_empty());
+        assert!(
+            !rec_artists.iter().any(|a| a.id == veteran_artist.id || a.name == veteran_artist.name),
+            "fresh account recommended_artists leaked veteran's cached artist: {:?}",
+            rec_artists.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+
+        // 3c. Mood mix & Mixed for you must never pull veteran's cached local/tracks_by_mood items.
+        let energy_mix = taste.mood_mix_tracks(fresh.id, Mood::Energy, 30).await;
+        assert!(!energy_mix.is_empty());
+        assert!(
+            !energy_mix.iter().any(|t| t.id.starts_with("local:vet_")),
+            "fresh account mood_mix_tracks leaked veteran's cached tracks: {:?}",
+            energy_mix.iter().map(|t| &t.id).collect::<Vec<_>>()
+        );
+
+        taste.rebuild_mixed_for_you(fresh.id).await;
+        let cards = taste.mixed_for_you_cards(fresh.id);
+        assert!(!cards.is_empty());
+        for card in &cards {
+            let tracks = store.playlist_tracks(&card.id).unwrap();
+            assert!(
+                !tracks.iter().any(|t| t.id.starts_with("local:vet_")),
+                "fresh account Mixed for you ({}) leaked veteran's cached tracks",
+                card.title
+            );
+        }
+
+        // 3d. Mood preview for a mood without a curated pool must not leak cached tracks_by_mood.
+        let (preview_cnt, preview_covers) =
+            taste.curated_mood_preview_for_user(fresh.id, Mood::LateNight);
+        assert_eq!(preview_cnt, 0);
+        assert!(preview_covers.is_empty());
+
+        // 3e. Quick picks, Discover Weekly, Related Tracks must only return popular chart tracks.
+        for list in [
+            taste.quick_picks(fresh.id, 12),
+            taste.discover_weekly(fresh.id, 12),
+            taste.related_tracks_for_user(fresh.id, 12),
+        ] {
+            assert!(!list.is_empty());
+            assert!(
+                list.iter().all(|t| t.id.starts_with("dz:chart_")),
+                "fresh account feed leaked non-chart tracks: {:?}",
+                list.iter().map(|t| &t.id).collect::<Vec<_>>()
+            );
+        }
     }
 }

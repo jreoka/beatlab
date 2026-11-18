@@ -2226,6 +2226,120 @@ impl Store {
         Ok(rows)
     }
 
+    /// Persists the latest external Deezer chart artists so fresh accounts and
+    /// cold fallbacks only ever see chart-popular artists, never cached artists
+    /// from other users' searches or listens.
+    pub fn record_chart_artists(&self, artists: &[ArtistSummary]) {
+        if artists.is_empty() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "ts": Utc::now().timestamp(),
+            "artists": artists,
+        });
+        self.kv_set("explore:chart_artists_v1", &payload.to_string());
+    }
+
+    /// Returns external chart artists only (from the persisted chart snapshot,
+    /// or derived strictly from `chart_catalog` Deezer tracks if no snapshot
+    /// has been saved yet). Never reads arbitrary cached tracks or artists.
+    pub fn popular_chart_artists(&self, limit: usize) -> Vec<ArtistSummary> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        if let Some(raw) = self.kv_get("explore:chart_artists_v1") {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(arr) = val.get("artists").cloned() {
+                    if let Ok(cached) = serde_json::from_value::<Vec<ArtistSummary>>(arr) {
+                        if !cached.is_empty() {
+                            return cached.into_iter().take(limit).collect();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: derive artists strictly from external Deezer chart tracks.
+        let chart_tracks = self
+            .popular_chart_tracks_for_new_user(limit.saturating_mul(4).max(40))
+            .unwrap_or_default();
+        if chart_tracks.is_empty() {
+            return Vec::new();
+        }
+        let metas = self.all_artist_metas_map().unwrap_or_default();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for t in chart_tracks {
+            let name = primary_artist(&t.artist);
+            if name.trim().is_empty() || is_junk_featured_artist_name(&name) {
+                continue;
+            }
+            let dz_id = t.deezer_artist_id().unwrap_or_default();
+            let id = if !dz_id.is_empty() {
+                format!("ar:dz:{}", dz_id)
+            } else {
+                t.artist_id()
+            };
+            let key = slug(&name);
+            if key.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            let meta = metas.get(&id).or_else(|| metas.get(&t.artist_id()));
+            out.push(ArtistSummary {
+                id: id.clone(),
+                name: meta
+                    .map(|m| m.name.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(name),
+                cover_url: meta
+                    .map(|m| m.cover_url.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(t.cover_url),
+                bio: meta.map(|m| m.bio.clone()).unwrap_or_default(),
+                deezer_id: meta
+                    .map(|m| m.deezer_id.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(dz_id),
+                album_count: 1,
+                song_count: 1,
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Persists the latest external Deezer chart albums for cold-start / fallback use.
+    pub fn record_chart_albums(&self, albums: &[AlbumSummary]) {
+        if albums.is_empty() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "ts": Utc::now().timestamp(),
+            "albums": albums,
+        });
+        self.kv_set("explore:chart_albums_v1", &payload.to_string());
+    }
+
+    pub fn popular_chart_albums(&self, limit: usize) -> Vec<AlbumSummary> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        if let Some(raw) = self.kv_get("explore:chart_albums_v1") {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(arr) = val.get("albums").cloned() {
+                    if let Ok(cached) = serde_json::from_value::<Vec<AlbumSummary>>(arr) {
+                        if !cached.is_empty() {
+                            return cached.into_iter().take(limit).collect();
+                        }
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
     pub fn newest_tracks(&self, limit: usize, offset: usize) -> AppResult<Vec<Track>> {
         self.all_tracks(limit, offset)
     }
