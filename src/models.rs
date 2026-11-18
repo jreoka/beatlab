@@ -85,7 +85,6 @@ pub struct PublicUser {
 #[serde(rename_all = "snake_case")]
 pub enum Mood {
     Chill,
-    Focus,
     Energy,
     LateNight,
     Upbeat,
@@ -97,9 +96,8 @@ pub enum Mood {
 }
 
 impl Mood {
-    pub const ALL: [Mood; 10] = [
+    pub const ALL: [Mood; 9] = [
         Mood::Chill,
-        Mood::Focus,
         Mood::Energy,
         Mood::LateNight,
         Mood::Upbeat,
@@ -113,7 +111,6 @@ impl Mood {
     pub fn slug(&self) -> &'static str {
         match self {
             Mood::Chill => "chill",
-            Mood::Focus => "focus",
             Mood::Energy => "energy",
             Mood::LateNight => "late_night",
             Mood::Upbeat => "upbeat",
@@ -128,7 +125,6 @@ impl Mood {
     pub fn label(&self) -> &'static str {
         match self {
             Mood::Chill => "Chill & Lo-Fi",
-            Mood::Focus => "Deep Focus",
             Mood::Energy => "High Energy",
             Mood::LateNight => "Late Night",
             Mood::Upbeat => "Feel Good",
@@ -143,7 +139,6 @@ impl Mood {
     pub fn subtitle(&self) -> &'static str {
         match self {
             Mood::Chill => "Laid-back beats, dream pop & soft vibes",
-            Mood::Focus => "Ambient, instrumental & flow-state music",
             Mood::Energy => "Adrenaline, workout & heavy rhythms",
             Mood::LateNight => "Atmospheric, moody & after-hours tracks",
             Mood::Upbeat => "Bright hooks, pop anthems & sunshine",
@@ -158,7 +153,6 @@ impl Mood {
     pub fn gradient(&self) -> (&'static str, &'static str) {
         match self {
             Mood::Chill => ("#0ea5e9", "#1e3a8a"),
-            Mood::Focus => ("#14b8a6", "#115e59"),
             Mood::Energy => ("#ef4444", "#7f1d1d"),
             Mood::LateNight => ("#6366f1", "#1e1b4b"),
             Mood::Upbeat => ("#f59e0b", "#b45309"),
@@ -174,7 +168,6 @@ impl Mood {
     pub fn mix_name(&self) -> &'static str {
         match self {
             Mood::Chill => "Chill",
-            Mood::Focus => "Focus",
             Mood::Energy => "Energy",
             Mood::LateNight => "Late Night",
             Mood::Upbeat => "Feel Good",

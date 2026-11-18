@@ -106,35 +106,6 @@ const MOOD_META_RULES: &[(Mood, &[&str])] = &[
         ],
     ),
     (
-        Mood::Focus,
-        &[
-            "ambient",
-            "instrumental",
-            "study",
-            "piano",
-            "classical",
-            "minimal",
-            "minimalism",
-            "minimalist",
-            "neoclassical",
-            "neo-classical",
-            "modern classical",
-            "new age",
-            "soundscape",
-            "soundtrack",
-            "soundtracks",
-            "films/games",
-            "film score",
-            "video game",
-            "post-rock",
-            "post rock",
-            "score",
-            "drone",
-            "focus",
-            "meditation",
-        ],
-    ),
-    (
         Mood::Energy,
         &[
             "rock",
@@ -345,21 +316,6 @@ const MOOD_TITLE_RULES: &[(Mood, &[&str])] = &[
         &["lofi", "lo-fi", "chillout", "chillwave", "downtempo", "bossa nova", "chillhop", "dream pop"],
     ),
     (
-        Mood::Focus,
-        &[
-            "ambient",
-            "soundscape",
-            "neoclassical",
-            "neo-classical",
-            "modern classical",
-            "meditation",
-            "solo piano",
-            "piano sonata",
-            "study beats",
-            "classical",
-        ],
-    ),
-    (
         Mood::Energy,
         &["phonk", "hardstyle", "dubstep", "metalcore", "drum and bass", "thrash"],
     ),
@@ -387,45 +343,6 @@ const MOOD_TITLE_RULES: &[(Mood, &[&str])] = &[
     ),
 ];
 
-fn has_focus_clash(meta_low: &str) -> bool {
-    let explicit_focus_meta = [
-        "ambient",
-        "classical",
-        "instrumental",
-        "neoclassical",
-        "neo-classical",
-        "modern classical",
-        "new age",
-        "study",
-        "lofi",
-        "lo-fi",
-        "meditation",
-    ]
-    .iter()
-    .any(|k| contains_term(meta_low, k));
-    if explicit_focus_meta {
-        return false;
-    }
-    [
-        "hip-hop",
-        "hip hop",
-        "rap",
-        "trap",
-        "metal",
-        "heavy metal",
-        "death metal",
-        "punk",
-        "hardcore",
-        "reggaeton",
-        "country",
-        "phonk",
-        "hardstyle",
-        "grunge",
-    ]
-    .iter()
-    .any(|k| contains_term(meta_low, k))
-}
-
 pub fn classify_moods_str(title: &str, album: &str, genre: &str, tags: &str) -> String {
     classify_moods(title, album, genre, tags)
         .into_iter()
@@ -443,9 +360,6 @@ pub fn classify_moods(title: &str, album: &str, genre: &str, tags: &str) -> Vec<
 
     let mut moods = Vec::new();
     let push_mood = |out: &mut Vec<Mood>, m: Mood| {
-        if m == Mood::Focus && has_focus_clash(&meta_hay) {
-            return;
-        }
         if !out.contains(&m) {
             out.push(m);
         }
@@ -4216,7 +4130,6 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         }
         let hint = match mood {
             Mood::Chill => "chill",
-            Mood::Focus => "instrumental",
             Mood::Energy => "workout",
             Mood::LateNight => "late night",
             Mood::Upbeat => "upbeat",
@@ -4436,12 +4349,8 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             if !meta_match && !is_familiar && is_mood_title_trap(&t, mood) {
                 continue;
             }
-            // Familiarity is a tie-breaker for Focus, never a substitute for category fit;
-            // for other moods, compatible music in the listener's own taste realm is welcome.
-            let realm_compatible = user_id > 0
-                && realm >= 0.5
-                && mood != Mood::Focus
-                && !is_mood_title_trap(&t, mood);
+            // Compatible music in the listener's own taste realm is welcome.
+            let realm_compatible = user_id > 0 && realm >= 0.5 && !is_mood_title_trap(&t, mood);
             if !is_curated && !meta_match && !clean_match && !realm_compatible {
                 continue;
             }
@@ -5679,744 +5588,123 @@ impl TasteEngine {
         }
         let ranked_tracks: Vec<Track> = evals.iter().map(|e| e.track.clone()).collect();
 
-        if intent.is_theme_mix {
-            let mut mix_pool: Vec<(f64, Track)> = evals
-                .iter()
-                .filter(|e| {
-                    if e.is_junk
-                        || e.disliked
-                        || is_mix_clutter_track(&e.track, &intent.normalized)
-                    {
-                        return false;
-                    }
-                    let ag = artist_genres
-                        .get(&primary_artist(&e.track.artist).to_lowercase())
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    if !intent.moods.is_empty()
-                        && !intent
-                            .moods
-                            .iter()
-                            .all(|m| is_track_compatible_with_mood(&e.track, ag, *m))
-                    {
-                        return false;
-                    }
-                    if !intent.genres.is_empty()
-                        && has_genre_clash(&e.track, ag, &intent.genres)
-                    {
-                        return false;
-                    }
-                    if intent.year_range.is_some() {
-                        if e.era_match <= -0.65 {
-                            return false;
-                        }
-                        if e.era_match <= 0.0 && e.curated_prior == 0.0 {
-                            return false;
-                        }
-                    }
-                    if !intent.themes.is_empty()
-                        && e.theme_match < 0.35
-                        && e.curated_prior == 0.0
-                    {
-                        return false;
-                    }
-                    if e.curated_prior == 0.0 && e.era_match <= 0.0 && e.theme_match < 0.25 {
-                        return false;
-                    }
-                    true
-                })
-                .map(|e| (e.mix_score, e.track.clone()))
-                .collect();
-
-            // Pad thin mixes, not just empty ones. A 2-track single-artist result
-            // is not a mix; it should pull in verified radio/search candidates.
-            if mix_pool.len() < 8 {
-                let mut seen_fallback_keys: HashSet<String> = mix_pool
-                    .iter()
-                    .map(|(_, t)| t.song_key())
-                    .collect();
-                let all_decades = ["50s", "60s", "70s", "80s", "90s", "00s", "10s", "20s"];
-                let has_conflicting_decade = |t: &Track| -> bool {
-                    let Some(want_dec) = intent.decade_label else {
-                        return false;
-                    };
-                    let hay = format!("{} {}", t.title, t.album)
-                        .to_lowercase()
-                        .replace("'s", "s")
-                        .replace("1950s", "50s")
-                        .replace("1960s", "60s")
-                        .replace("1970s", "70s")
-                        .replace("1980s", "80s")
-                        .replace("1990s", "90s")
-                        .replace("2000s", "00s")
-                        .replace("2010s", "10s")
-                        .replace("2020s", "20s");
-                    let mentions_other = all_decades
-                        .iter()
-                        .any(|&d| d != want_dec && contains_term(&hay, d));
-                    mentions_other && !contains_term(&hay, want_dec)
-                };
-                let e_genre_or_theme_needed = |q_norm: &str, t: &Track, ag: &str, theme_m: f64| -> bool {
-                    if theme_m >= 0.25 {
-                        return false;
-                    }
-                    let g_low = format!("{} {}", t.genre, ag).to_lowercase();
-                    !q_norm.is_empty() && !contains_term(&g_low, q_norm) && mix_ctx.ytm_radio.is_empty() && t.source != "ytm"
-                };
-                let is_fallback_compatible = |t: &Track, ag: &str, era_m: f64, theme_m: f64| -> bool {
-                    if is_junk_track_for_query(t, &intent.normalized)
-                        || is_strongly_disliked(t, &sctx.prof, &sctx.stats)
-                        || is_mix_clutter_track(t, &intent.normalized)
-                        || has_conflicting_decade(t)
-                    {
-                        return false;
-                    }
-                    if intent.year_range.is_some() && era_m < 0.0 {
-                        return false;
-                    }
-                    if !intent.moods.is_empty()
-                        && !intent
-                            .moods
-                            .iter()
-                            .all(|m| is_track_compatible_with_mood(t, ag, *m))
-                    {
-                        return false;
-                    }
-                    if !intent.genres.is_empty() && has_genre_clash(t, ag, &intent.genres) {
-                        return false;
-                    }
-                    if !intent.themes.is_empty() && theme_m < 0.35 && mix_ctx.ytm_radio.is_empty() {
-                        return false;
-                    }
-                    if promoted_topic
-                        && e_genre_or_theme_needed(&intent.normalized, t, ag, theme_m)
-                    {
-                        return false;
-                    }
-                    true
-                };
-
-                let has_verified_era_radio = intent.year_range.is_some()
-                    && mix_ctx
-                        .ytm_radio
-                        .iter()
-                        .filter(|t| compute_query_era_match(t, &intent) > 0.0)
-                        .count()
-                        >= 8;
-
-                for (idx, t) in mix_ctx.ytm_radio.iter().enumerate() {
-                    if is_hidden_track(t, &sctx.prof) {
-                        continue;
-                    }
-                    let ag = artist_genres
-                        .get(&primary_artist(&t.artist).to_lowercase())
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    let era_m = compute_query_era_match(t, &intent);
-                    if has_verified_era_radio && era_m <= 0.0 {
-                        continue;
-                    }
-                    let theme_m = compute_query_theme_match_with_artist(t, ag, &intent);
-                    if !is_fallback_compatible(t, ag, era_m, theme_m) {
-                        continue;
-                    }
-                    if seen_fallback_keys.insert(t.song_key()) {
-                        let slot = (idx % 22) as f64;
-                        let pop = parse_rank_bonus(&t.meta) * 0.4;
-                        let radio_score =
-                            3.6 - slot * 0.08 + era_m.max(0.0) * 4.0 + theme_m * 2.0 + pop;
-                        mix_pool.push((radio_score, t.clone()));
-                    }
-                }
-
-                if mix_pool.len() < 8 {
-                    for e in &evals {
-                        if e.is_junk || e.disliked {
-                            continue;
-                        }
-                        if has_verified_era_radio && e.era_match <= 0.0 {
-                            continue;
-                        }
-                        let ag = artist_genres
-                            .get(&primary_artist(&e.track.artist).to_lowercase())
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        if !is_fallback_compatible(&e.track, ag, e.era_match, e.theme_match) {
-                            continue;
-                        }
-                        // A thematic mix may only be padded with tracks that carry some
-                        // verifiable link to the query. Without this, a degraded run
-                        // (no curated playlists / no radio, e.g. Deezer timed out) falls
-                        // back to generic popular tracks and then labels them as the
-                        // requested genre/mood ("jrock" -> unrelated rap hits).
-                        if intent.is_theme_mix {
-                            let meta_low = format!("{} {}", e.track.genre, ag).to_lowercase();
-                            let genre_confirmed = !intent.genres.is_empty()
-                                && intent
-                                    .genres
-                                    .iter()
-                                    .any(|g| genre_matches_text(&meta_low, g));
-                            // Origin alone is weak evidence. For decade/vibe
-                            // queries a YTM radio hit is usable, but for a pure
-                            // genre query ("classic rock") it can be a modern
-                            // J-Rock upload, so require real genre/era evidence.
-                            let genre_only = intent.is_theme_mix
-                                && !intent.genres.is_empty()
-                                && intent.themes.is_empty()
-                                && intent.moods.is_empty()
-                                && intent.year_range.is_none();
-                            let ytm_backed = !genre_only
-                                && (e.track.source == "ytm" || e.track.id.starts_with("ytm:"));
-                            let has_evidence = e.curated_prior > 0.0
-                                || e.theme_match >= 0.25
-                                || e.era_match > 0.0
-                                || genre_confirmed
-                                || ytm_backed;
-                            if !has_evidence {
-                                continue;
-                            }
-                        }
-                        // For genre/era queries without curated playlists, avoid letting
-                        // user taste or general popularity lift unverified tracks over relevant hits.
-                        if seen_fallback_keys.insert(e.track.song_key()) {
-                            let s = if e.curated_prior > 0.0
-                                || e.theme_match > 0.0
-                                || e.era_match > 0.0
-                            {
-                                e.mix_score + (e.lex / 220.0).min(2.0)
-                            } else {
-                                (if e.track.source == "ytm" { 1.0 } else { 0.0 })
-                                    + (e.lex / 220.0).min(0.5)
-                            };
-                            mix_pool.push((s, e.track.clone()));
-                        }
-                    }
-                }
-            }
-
-            if !mix_pool.is_empty() && user_id > 0 {
-                let mix_only: Vec<Track> = mix_pool.iter().map(|(_, t)| t.clone()).collect();
-                let n_scores = self.neural_scores(
-                    user_id,
-                    &[],
-                    Some(&intent.normalized),
-                    &intent.moods,
-                    &intent.genres,
-                    &mix_only,
-                );
-                let n_w = self.neural_blend_weight(0.45, &sctx);
-                for (i, (s, _)) in mix_pool.iter_mut().enumerate() {
-                    *s += n_scores.get(i).copied().unwrap_or(0.0) * n_w;
-                }
-            }
-
-            mix_pool.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let mix_ranked: Vec<Track> = mix_pool.into_iter().map(|(_, t)| t).collect();
-            let mut mix_tracks = dedup_and_interleave(mix_ranked, 25, 2);
-
-            // Two tracks by one artist is a coincidence, not a mix. Padding has
-            // already been attempted above, so reject it instead of presenting
-            // a misleading "Classic Rock Mix" made of one J-Rock artist.
-            if mix_tracks.len() < 5 {
-                let distinct_artists: HashSet<String> = mix_tracks
-                    .iter()
-                    .map(|t| primary_artist(&t.artist).to_lowercase())
-                    .collect();
-                if distinct_artists.len() < 2 {
-                    mix_tracks.clear();
-                }
-            }
-
-            // A pure genre mix needs at least a couple of tracks whose own metadata confirms
-            // the genre. Playlist-title provenance alone is not enough: a mis-tagged
-            // "jrock" playlist full of unrelated tracks must never be labelled a J-Rock Mix.
-            let pure_genre_query = intent.is_theme_mix
-                && !intent.genres.is_empty()
-                && intent.themes.is_empty()
-                && intent.moods.is_empty()
-                && intent.year_range.is_none();
-            if pure_genre_query && !mix_tracks.is_empty() {
-                let confirmed = mix_tracks
-                    .iter()
-                    .filter(|t| {
-                        let ag = artist_genres
-                            .get(&primary_artist(&t.artist).to_lowercase())
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        let meta = format!("{} {}", t.genre, ag).to_lowercase();
-                        if intent.genres.iter().any(|g| genre_matches_text(&meta, g)) {
-                            return true;
-                        }
-                        // A YTM/Deezer track with no genre metadata must not be
-                        // auto-approved just because of where it came from. A
-                        // strong era signal is verifiable evidence instead.
-                        intent.wants_classic && compute_query_era_match(t, &intent) >= 0.6
-                    })
-                    .count();
-                if confirmed < 2 {
-                    mix_tracks.clear();
-                }
-            }
-
-            let instant_mix = if mix_tracks.len() >= 2 {
-                let (title, subtitle) = build_instant_mix_title(
-                    &intent,
-                    &mix_tracks,
-                    has_user_taste,
-                    None,
-                    None,
-                    false,
-                );
-                let total_duration = mix_tracks.iter().map(|t| t.duration.max(0)).sum();
-                Some(InstantMix {
-                    title,
-                    subtitle,
-                    query: intent.raw.clone(),
-                    is_theme_mix: true,
-                    prominent: true,
-                    tracks: mix_tracks,
-                    total_duration,
-                })
-            } else {
-                None
-            };
-
-            let refinements = build_search_refinements(
+        // ---------------------------------------------------------------------
+        // Instant mix composition.
+        //
+        // A mix is built from a small set of tracks that verifiably match the
+        // query ("seeds"), then expanded only with tracks that are musically
+        // similar to those seeds. Source rank, playlist provenance and personal
+        // taste are tie-breakers: none of them can make an unrelated track
+        // eligible. A small eligible pool produces a small mix — it is never
+        // padded with generic filler just to reach an arbitrary track count.
+        // ---------------------------------------------------------------------
+        let mut entity_anchor_name: Option<String> = None;
+        let instant_mix = if intent.is_theme_mix {
+            compose_coherent_mix(
                 &intent,
-                &ranked_tracks,
-                &taste_match_ids,
+                &mix_ctx,
+                &evals,
+                &artist_genres,
                 &sctx,
                 None,
-            );
-
-            return SearchMixResult {
-                tracks: ranked_tracks,
-                instant_mix,
-                refinements,
-                taste_match_ids,
-            };
-        }
-
-        // Entity / Artist / Track Instant Mix:
-        // Build ONLY from verified anchor tracks + real YTM/Deezer radio & related-artist tracks
-        // (never raw keyword-search collisions like "Dynamite" for "DYNA MIND").
-        let entity_q = intent
-            .entity_query
-            .as_deref()
-            .unwrap_or(&intent.raw)
-            .trim();
-        let entity_slug = slug(entity_q);
-
-        let entity_low = entity_q.to_lowercase();
-        let fallback_anchor_track = ranked_tracks.iter().find_map(|t| {
-            if let Some(ref want_dz) = mix_ctx.anchor_deezer_artist_id {
-                if !want_dz.is_empty() {
-                    if let Some(ref t_dz) = t.deezer_artist_id() {
-                        if t_dz != want_dz {
-                            return None;
-                        }
-                    }
-                }
-            }
-            if is_mix_clutter_track(t, &intent.normalized) {
-                return None;
-            }
-            // When plan_entity_mix_anchor already ran and returned None (anchor_artist is None),
-            // only accept an exact artist match or a strong non-obscure exact title match.
-            let exact_art = !entity_slug.is_empty() && slug(&primary_artist(&t.artist)) == entity_slug;
-            let exact_title = t.title.to_lowercase() == entity_low
-                || (!entity_slug.is_empty()
-                    && slug(&crate::models::core_song_title(&t.title)) == entity_slug);
-            if mix_ctx.anchor_artist.is_some() || force_entity {
-                let lex = search_match_score(t, entity_q);
-                let slug_match = !entity_slug.is_empty()
-                    && slug(&format!("{} {}", t.artist, t.title)).contains(&entity_slug);
-                if lex > 0 || slug_match {
-                    return Some(t.clone());
-                }
-            } else if exact_art {
-                return Some(t.clone());
-            } else if exact_title && !has_cat_genre {
-                let is_single_word = entity_low.split_whitespace().count() == 1;
-                let has_conj = entity_low.contains(" and ") || entity_low.contains(" & ");
-                let is_local_slsk = t.source == "local" || t.source == "soulseek";
-                let user_knows = sctx.prof.starred.contains(&t.id)
-                    || sctx.prof.manual_playlist_ids.contains(&t.id);
-                if user_knows
-                    || parse_rank_bonus(&t.meta) >= 1.2
-                    || (!is_single_word && !is_local_slsk && !has_conj)
-                {
-                    return Some(t.clone());
-                }
-            }
-            None
-        });
-
-        let anchor_artist = mix_ctx
-            .anchor_artist
-            .clone()
-            .filter(|a| !a.trim().is_empty() && !a.eq_ignore_ascii_case("Unknown Artist"))
-            .or_else(|| {
-                fallback_anchor_track
-                    .as_ref()
-                    .map(|t| primary_artist(&t.artist))
-                    .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("Unknown Artist"))
-            });
-
-        let anchor_dz_id = mix_ctx
-            .anchor_deezer_artist_id
-            .clone()
-            .filter(|id| !id.trim().is_empty())
-            .or_else(|| {
-                fallback_anchor_track
-                    .as_ref()
-                    .and_then(Track::deezer_artist_id)
-            })
-            .or_else(|| {
-                mix_ctx
-                    .dz_artist_top
-                    .iter()
-                    .find_map(Track::deezer_artist_id)
-            });
-
-        let matches_anchor_artist = |t: &Track, anchor_art: &str| -> bool {
-            if !is_same_or_featured_artist(&t.artist, anchor_art) {
-                return false;
-            }
-            if let (Some(ref want_dz), Some(ref track_dz)) = (&anchor_dz_id, &t.deezer_artist_id())
-            {
-                if want_dz != track_dz {
-                    return false;
-                }
-            }
-            true
-        };
-
-        let anchor_track_key = mix_ctx
-            .anchor_track_key
-            .clone()
-            .or_else(|| fallback_anchor_track.as_ref().map(|t| t.song_key()))
-            .or_else(|| {
-                anchor_artist.as_ref().and_then(|art| {
-                    mix_ctx
-                        .dz_artist_top
-                        .iter()
-                        .find(|t| matches_anchor_artist(t, art))
-                        .map(Track::song_key)
-                })
-            });
-
-        let instant_mix = if let Some(ref anchor_art) = anchor_artist {
-            let mut anchor_genres: HashSet<String> = mix_ctx
-                .anchor_genres
-                .iter()
-                .flat_map(|g| split_genres(g))
-                .collect();
-            if let Some(ref seed) = fallback_anchor_track {
-                if matches_anchor_artist(seed, anchor_art) {
-                    for g in split_genres(&seed.genre) {
-                        anchor_genres.insert(g);
-                    }
-                }
-            }
-            for t in mix_ctx.dz_artist_top.iter().chain(ranked_tracks.iter()) {
-                if matches_anchor_artist(t, anchor_art) {
-                    for g in split_genres(&t.genre) {
-                        anchor_genres.insert(g);
-                    }
-                }
-            }
-            if anchor_genres.is_empty() && anchor_dz_id.is_none() {
-                let known_anchor_g = self
-                    .store
-                    .known_artist_genres_for(&[anchor_art.clone()])
-                    .unwrap_or_default();
-                if let Some(g_str) = known_anchor_g.get(&primary_artist(anchor_art).to_lowercase()) {
-                    for g in split_genres(g_str) {
-                        anchor_genres.insert(g);
-                    }
-                }
-            }
-
-            #[derive(Default)]
-            struct MixEntry {
-                track: Option<Track>,
-                ytm_prior: f64,
-                dz_radio_prior: f64,
-                dz_rel_prior: f64,
-                anchor_prior: f64,
-                genre_cat_prior: f64,
-                source_hits: u8,
-            }
-
-            let mut by_key: HashMap<String, MixEntry> = HashMap::new();
-            let merge_into = |map: &mut HashMap<String, MixEntry>,
-                              t: Track,
-                              apply: &dyn Fn(&mut MixEntry, &Track)| {
-                if is_mix_clutter_track(&t, &intent.normalized)
-                    || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
-                {
-                    return;
-                }
-                let base_k = t.song_key();
-                let k = match map.get(&base_k).and_then(|e| e.track.as_ref()) {
-                    Some(existing) if crate::models::tracks_conflict_artist(existing, &t) => {
-                        format!("{}|{}", base_k, t.artist_id())
-                    }
-                    _ => base_k,
-                };
-                let entry = map.entry(k).or_default();
-                apply(entry, &t);
-                match &mut entry.track {
-                    Some(existing) => {
-                        if t.quality_score() > existing.quality_score() {
-                            let mut winner = t;
-                            merge_track_metadata(&mut winner, existing);
-                            *existing = winner;
-                        } else {
-                            merge_track_metadata(existing, &t);
-                        }
-                    }
-                    None => {
-                        entry.track = Some(t);
-                    }
-                }
-            };
-
-            let ytm_len = mix_ctx.ytm_radio.len().max(1) as f64;
-            for (idx, t) in mix_ctx.ytm_radio.iter().cloned().enumerate() {
-                let prior = 5.5 * (1.0 - (idx as f64 / ytm_len) * 0.65);
-                merge_into(&mut by_key, t, &|e, _| {
-                    if e.ytm_prior == 0.0 {
-                        e.source_hits = e.source_hits.saturating_add(1);
-                    }
-                    if prior > e.ytm_prior {
-                        e.ytm_prior = prior;
-                    }
-                });
-            }
-
-            let dzr_len = mix_ctx.dz_artist_radio.len().max(1) as f64;
-            for (idx, t) in mix_ctx.dz_artist_radio.iter().cloned().enumerate() {
-                let prior = 4.8 * (1.0 - (idx as f64 / dzr_len) * 0.60);
-                merge_into(&mut by_key, t, &|e, _| {
-                    if e.dz_radio_prior == 0.0 {
-                        e.source_hits = e.source_hits.saturating_add(1);
-                    }
-                    if prior > e.dz_radio_prior {
-                        e.dz_radio_prior = prior;
-                    }
-                });
-            }
-
-            let rel_len = mix_ctx.dz_related_tracks.len().max(1) as f64;
-            for (idx, t) in mix_ctx.dz_related_tracks.iter().cloned().enumerate() {
-                let prior = 4.3 * (1.0 - (idx as f64 / rel_len) * 0.55);
-                merge_into(&mut by_key, t, &|e, _| {
-                    if e.dz_rel_prior == 0.0 {
-                        e.source_hits = e.source_hits.saturating_add(1);
-                    }
-                    if prior > e.dz_rel_prior {
-                        e.dz_rel_prior = prior;
-                    }
-                });
-            }
-
-            for t in mix_ctx.dz_artist_top.iter().cloned() {
-                if matches_anchor_artist(&t, anchor_art) {
-                    let pop = parse_rank_bonus(&t.meta);
-                    let prior = 4.4 + pop * 0.25;
-                    merge_into(&mut by_key, t, &|e, _| {
-                        if prior > e.anchor_prior {
-                            e.anchor_prior = prior;
-                        }
-                    });
-                }
-            }
-
-            // Include anchor track and same-artist tracks from ranked_tracks (never unrelated search noise!).
-            for t in &ranked_tracks {
-                let is_anchor_art = matches_anchor_artist(t, anchor_art);
-                let is_anchor_key = anchor_track_key.as_deref() == Some(t.song_key().as_str())
-                    && anchor_dz_id.as_ref().map_or(true, |want_dz| {
-                        t.deezer_artist_id()
-                            .as_ref()
-                            .map_or(true, |tid| tid == want_dz)
-                    });
-                if is_anchor_key || is_anchor_art {
-                    let pop = parse_rank_bonus(&t.meta);
-                    let prior = if is_anchor_key { 10.0 } else { 4.2 + pop * 0.25 };
-                    merge_into(&mut by_key, t.clone(), &|e, _| {
-                        if prior > e.anchor_prior {
-                            e.anchor_prior = prior;
-                        }
-                    });
-                }
-            }
-
-            // Offline / radio-sparse fallback ONLY: add catalog tracks by the anchor artist, or sharing
-            // an explicit non-empty genre with the anchor if radio returned too few candidates.
-            let radio_count = by_key.len();
-            if radio_count < 10 {
-                let cat = self.store.all_tracks(1000, 0).unwrap_or_default();
-                for t in cat {
-                    if matches_anchor_artist(&t, anchor_art) {
-                        let prior = 3.8 + parse_rank_bonus(&t.meta) * 0.2;
-                        merge_into(&mut by_key, t, &|e, _| {
-                            if prior > e.anchor_prior {
-                                e.anchor_prior = prior;
+                has_user_taste,
+            )
+        } else {
+            let entity_q = intent
+                .entity_query
+                .as_deref()
+                .unwrap_or(&intent.raw)
+                .trim();
+            let entity_slug = slug(entity_q);
+            let entity_low = entity_q.to_lowercase();
+            let fallback_anchor = ranked_tracks.iter().find_map(|t| {
+                if let Some(ref want_dz) = mix_ctx.anchor_deezer_artist_id {
+                    if !want_dz.is_empty() {
+                        if let Some(ref t_dz) = t.deezer_artist_id() {
+                            if t_dz != want_dz {
+                                return None;
                             }
-                        });
-                    } else if !is_same_or_featured_artist(&t.artist, anchor_art)
-                        && !anchor_genres.is_empty()
-                        && split_genres(&t.genre).iter().any(|g| anchor_genres.contains(g))
+                        }
+                    }
+                }
+                if is_mix_clutter_track(t, &intent.normalized) {
+                    return None;
+                }
+                let exact_art =
+                    !entity_slug.is_empty() && slug(&primary_artist(&t.artist)) == entity_slug;
+                let exact_title = t.title.to_lowercase() == entity_low
+                    || (!entity_slug.is_empty()
+                        && slug(&crate::models::core_song_title(&t.title)) == entity_slug);
+                if mix_ctx.anchor_artist.is_some() || force_entity {
+                    let lex = search_match_score(t, entity_q);
+                    let slug_match = !entity_slug.is_empty()
+                        && slug(&format!("{} {}", t.artist, t.title)).contains(&entity_slug);
+                    if lex > 0 || slug_match {
+                        return Some(t.clone());
+                    }
+                } else if exact_art {
+                    return Some(t.clone());
+                } else if exact_title && !has_cat_genre {
+                    let is_single_word = entity_low.split_whitespace().count() == 1;
+                    let has_conj = entity_low.contains(" and ") || entity_low.contains(" & ");
+                    let is_local_slsk = t.source == "local" || t.source == "soulseek";
+                    let user_knows = sctx.prof.starred.contains(&t.id)
+                        || sctx.prof.manual_playlist_ids.contains(&t.id);
+                    if user_knows
+                        || parse_rank_bonus(&t.meta) >= 1.2
+                        || (!is_single_word && !is_local_slsk && !has_conj)
                     {
-                        let prior = 2.6 + parse_rank_bonus(&t.meta) * 0.2;
-                        merge_into(&mut by_key, t, &|e, _| {
-                            if prior > e.genre_cat_prior {
-                                e.genre_cat_prior = prior;
-                            }
-                        });
+                        return Some(t.clone());
                     }
                 }
-            }
-
-            let mut pinned_seed: Option<Track> = None;
-            let mut scored_mix: Vec<(f64, Track)> = Vec::with_capacity(by_key.len());
-
-            for (key, entry) in by_key {
-                let Some(t) = entry.track else { continue };
-                let is_seed_track = anchor_track_key.as_deref() == Some(key.as_str())
-                    && anchor_dz_id.as_ref().map_or(true, |want_dz| {
-                        t.deezer_artist_id()
-                            .as_ref()
-                            .map_or(true, |tid| tid == want_dz)
-                    });
-                if is_seed_track {
-                    pinned_seed = Some(t);
-                    continue;
-                }
-
-                let sim_base = entry
-                    .ytm_prior
-                    .max(entry.dz_radio_prior)
-                    .max(entry.dz_rel_prior)
-                    .max(entry.anchor_prior)
-                    .max(entry.genre_cat_prior);
-                let consensus = if entry.source_hits >= 2 { 1.4 } else { 0.0 };
-
-                let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
-                let fctx = build_track_affinities(&t, &sctx.prof);
-
-                let genre_coherence = if !anchor_genres.is_empty() {
-                    let tg = split_genres(&t.genre);
-                    if tg.iter().any(|g| anchor_genres.contains(g)) {
-                        0.75
-                    } else if !tg.is_empty() && !matches_anchor_artist(&t, anchor_art) {
-                        -1.0
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                };
-
-                let taste_nudge = (fctx.artist_affinity * 0.25
-                    + fctx.genre_affinity * 0.25
-                    + fctx.mood_affinity * 0.2
-                    + if fctx.followed_artist { 0.5 } else { 0.0 }
-                    + if sctx.prof.starred.contains(&t.id) { 0.8 } else { 0.0 })
-                    .clamp(-2.0, 2.0);
-                let pop_tiebreak = parse_rank_bonus(&t.meta) * 0.25;
-                let qual_tiebreak = (t.quality_score() as f64) / 800.0;
-                let skip_pen = (st.skip_count as f64) * 2.0;
-
-                let s = sim_base
-                    + consensus
-                    + genre_coherence
-                    + taste_nudge
-                    + pop_tiebreak
-                    + qual_tiebreak
-                    - skip_pen;
-                scored_mix.push((s, t));
-            }
-
-            if !scored_mix.is_empty() && user_id > 0 {
-                let mix_only: Vec<Track> = scored_mix.iter().map(|(_, t)| t.clone()).collect();
-                let seed_ctx: Vec<Track> = pinned_seed.iter().cloned().collect();
-                let n_scores = self.neural_scores(
-                    user_id,
-                    &seed_ctx,
-                    Some(anchor_art),
-                    &[],
-                    &[],
-                    &mix_only,
-                );
-                let n_w = self.neural_blend_weight(0.45, &sctx);
-                for (i, (s, _)) in scored_mix.iter_mut().enumerate() {
-                    *s += n_scores.get(i).copied().unwrap_or(0.0) * n_w;
-                }
-            }
-
-            scored_mix.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let mut ordered: Vec<Track> = Vec::with_capacity(scored_mix.len() + 1);
-            if let Some(seed) = pinned_seed {
-                ordered.push(seed);
-            }
-            ordered.extend(scored_mix.into_iter().map(|(_, t)| t));
-
-            let anchor_slug = slug(&primary_artist(anchor_art));
-            let has_other_artists = ordered
-                .iter()
-                .any(|t| {
-                    let s = slug(&primary_artist(&t.artist));
-                    !s.is_empty() && s != anchor_slug
+                None
+            });
+            let anchor_artist = mix_ctx
+                .anchor_artist
+                .clone()
+                .filter(|a| !a.trim().is_empty() && !a.eq_ignore_ascii_case("Unknown Artist"))
+                .or_else(|| {
+                    fallback_anchor
+                        .as_ref()
+                        .map(|t| primary_artist(&t.artist))
+                        .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("Unknown Artist"))
                 });
-            let anchor_cap = if !has_other_artists {
-                15
-            } else if mix_ctx.is_artist_query {
-                4
-            } else {
-                3
-            };
-            let mix_tracks =
-                dedup_and_interleave_with_anchor(ordered, 25, 2, Some((&anchor_slug, anchor_cap)));
-
-            if mix_tracks.len() >= 5 {
-                let unique_artists: HashSet<String> = mix_tracks
-                    .iter()
-                    .map(|t| slug(&primary_artist(&t.artist)))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let single_artist_only = unique_artists.len() <= 1;
-                let seed_title = if !mix_ctx.is_artist_query {
-                    mix_tracks.first().map(|t| t.title.as_str())
-                } else {
-                    None
+            if let Some(art) = anchor_artist {
+                entity_anchor_name = Some(art.clone());
+                let anchor_dz_id = mix_ctx
+                    .anchor_deezer_artist_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .or_else(|| fallback_anchor.as_ref().and_then(Track::deezer_artist_id))
+                    .or_else(|| {
+                        mix_ctx
+                            .dz_artist_top
+                            .iter()
+                            .find_map(Track::deezer_artist_id)
+                    });
+                let anchor_track_key = mix_ctx
+                    .anchor_track_key
+                    .clone()
+                    .or_else(|| fallback_anchor.as_ref().map(Track::song_key));
+                let anchor = MixAnchor {
+                    artist: art,
+                    deezer_id: anchor_dz_id,
+                    track_key: anchor_track_key,
+                    genres: mix_ctx.anchor_genres.clone(),
+                    is_artist_query: mix_ctx.is_artist_query,
                 };
-                let (title, subtitle) = build_instant_mix_title(
+                compose_coherent_mix(
                     &intent,
-                    &mix_tracks,
+                    &mix_ctx,
+                    &evals,
+                    &artist_genres,
+                    &sctx,
+                    Some(&anchor),
                     has_user_taste,
-                    Some(anchor_art.as_str()),
-                    seed_title,
-                    single_artist_only,
-                );
-                let total_duration = mix_tracks.iter().map(|t| t.duration.max(0)).sum();
-                Some(InstantMix {
-                    title,
-                    subtitle,
-                    query: intent.raw.clone(),
-                    is_theme_mix: false,
-                    prominent: intent.explicit_mix_word,
-                    tracks: mix_tracks,
-                    total_duration,
-                })
+                )
             } else {
                 None
             }
-        } else {
-            None
         };
 
         let refinements = build_search_refinements(
@@ -6424,7 +5712,7 @@ impl TasteEngine {
             &ranked_tracks,
             &taste_match_ids,
             &sctx,
-            anchor_artist.as_deref(),
+            entity_anchor_name.as_deref(),
         );
 
         SearchMixResult {
@@ -6436,12 +5724,444 @@ impl TasteEngine {
     }
 }
 
+/// Resolved identity of an artist/song mix anchor. Kept separate from
+/// `SearchMixContext` so the composer can treat entity and theme mixes
+/// through one code path.
+#[derive(Clone, Default)]
+struct MixAnchor {
+    artist: String,
+    deezer_id: Option<String>,
+    track_key: Option<String>,
+    genres: Vec<String>,
+    is_artist_query: bool,
+}
+
+fn mix_artist_matches(t: &Track, anchor: &MixAnchor) -> bool {
+    if let Some(ref want_dz) = anchor.deezer_id {
+        if !want_dz.is_empty() {
+            if let Some(t_dz) = t.deezer_artist_id() {
+                if t_dz != *want_dz {
+                    return false;
+                }
+            }
+        }
+    }
+    is_same_or_featured_artist(&t.artist, &anchor.artist)
+}
+
+fn mix_artist_genres<'a>(
+    t: &Track,
+    artist_genres: &'a HashMap<String, String>,
+) -> &'a str {
+    artist_genres
+        .get(&primary_artist(&t.artist).to_lowercase())
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+/// Content-based evidence that a track really matches the query. Source rank
+/// is never consulted; a theme's own curated playlists may contribute weak
+/// evidence, but every other filter (junk, genre clash, era, dislikes) still
+/// applies to those tracks.
+fn mix_query_evidence(
+    t: &Track,
+    intent: &SearchIntent,
+    artist_genres: &HashMap<String, String>,
+    curated_prior: f64,
+) -> f64 {
+    let ag = mix_artist_genres(t, artist_genres);
+    let meta_low = format!("{} {}", t.genre, ag).to_lowercase();
+    let mut ev = 0.0f64;
+
+    if !intent.genres.is_empty() {
+        if intent
+            .genres
+            .iter()
+            .any(|g| genre_matches_text(&meta_low, g))
+        {
+            ev += 0.55;
+        } else if has_genre_clash(t, ag, &intent.genres) {
+            return 0.0;
+        }
+    }
+    if !intent.moods.is_empty()
+        && intent
+            .moods
+            .iter()
+            .all(|m| is_track_compatible_with_mood(t, ag, *m))
+    {
+        ev += 0.45;
+    }
+    if let Some((lo, hi)) = intent.year_range {
+        if t.year > 0 {
+            if t.year >= lo && t.year <= hi {
+                ev += 0.55;
+            } else {
+                return 0.0;
+            }
+        }
+    }
+    if !intent.themes.is_empty() {
+        let theme = compute_query_theme_match_with_artist(t, ag, intent);
+        if theme >= 0.35 {
+            ev += 0.4 + theme * 0.4;
+        }
+    }
+    // An exact title match is only meaningful for entity queries. For theme
+    // queries it is a known trap ("praise and worship" by an obscure local
+    // artist, "Christian's Inferno" for "christian"), so it is ignored here.
+    if !intent.is_theme_mix {
+        let q = intent.entity_query.as_deref().unwrap_or(&intent.normalized);
+        let q_slug = slug(q);
+        if !q_slug.is_empty() {
+            let a_slug = slug(&primary_artist(&t.artist));
+            let t_slug = slug(&crate::models::core_song_title(&t.title));
+            if a_slug == q_slug || t_slug == q_slug {
+                ev += 0.7;
+            }
+        }
+    }
+    if curated_prior > 0.0 {
+        ev += (curated_prior * 0.3).min(0.9);
+    }
+    ev
+}
+
+/// Musical similarity between a candidate and one seed. Only content and
+/// artist identity contribute; popularity and personal taste are applied later
+/// as tie-breakers and cannot make an unrelated track eligible.
+fn mix_track_similarity(
+    c: &Track,
+    seed: &Track,
+    intent: &SearchIntent,
+    anchor: Option<&MixAnchor>,
+    artist_genres: &HashMap<String, String>,
+    candidate_curated_prior: f64,
+    related_feed: bool,
+) -> f64 {
+    if c.song_key() == seed.song_key() {
+        return 1.0;
+    }
+    let c_artist = slug(&primary_artist(&c.artist));
+    let s_artist = slug(&primary_artist(&seed.artist));
+    if !c_artist.is_empty() && c_artist == s_artist {
+        return 0.85;
+    }
+    if let Some(a) = anchor {
+        if mix_artist_matches(c, a) {
+            return 0.95;
+        }
+        if mix_artist_matches(seed, a) && related_feed {
+            return 0.6;
+        }
+    }
+
+    let mut sim = 0.0f64;
+    let cg = split_genres(&c.genre);
+    let sg = split_genres(&seed.genre);
+    let genre_overlap = cg.iter().any(|g| {
+        sg.iter()
+            .any(|s| g == s || (genre_family(g).is_some() && genre_family(g) == genre_family(s)))
+    });
+    if genre_overlap {
+        sim += 0.4;
+    } else if !cg.is_empty() && !sg.is_empty() {
+        sim -= 0.12;
+    }
+    let cm = c.mood_list();
+    if !cm.is_empty() && cm.iter().any(|m| seed.mood_list().contains(m)) {
+        sim += 0.18;
+    }
+    if c.year > 0 && seed.year > 0 && (c.year - seed.year).abs() <= 12 {
+        sim += 0.18;
+    }
+    sim += (mix_query_evidence(c, intent, artist_genres, candidate_curated_prior) * 0.45).min(0.6);
+    if related_feed {
+        sim += if anchor.is_some() { 0.45 } else { 0.12 };
+    }
+    sim
+}
+
+/// Builds an instant mix from verified seeds plus strictly similar neighbours.
+fn compose_coherent_mix(
+    intent: &SearchIntent,
+    mix_ctx: &SearchMixContext,
+    evals: &[EvaluatedSearchTrack],
+    artist_genres: &HashMap<String, String>,
+    sctx: &ScoringContext,
+    anchor: Option<&MixAnchor>,
+    has_user_taste: bool,
+) -> Option<InstantMix> {
+    let is_entity = anchor.is_some();
+
+    let curated_priors: HashMap<String, f64> = evals
+        .iter()
+        .filter(|e| e.curated_prior > 0.0)
+        .map(|e| (e.track.song_key(), e.curated_prior))
+        .collect();
+
+    // Gather every candidate we were given, keyed by (song, artist) so two
+    // different artists with the same song title are never collapsed.
+    let mut all: Vec<Track> = evals.iter().map(|e| e.track.clone()).collect();
+    for feed in [
+        &mix_ctx.ytm_radio,
+        &mix_ctx.dz_artist_top,
+        &mix_ctx.dz_artist_radio,
+        &mix_ctx.dz_related_tracks,
+    ] {
+        all.extend(feed.iter().cloned());
+    }
+    let mut by_identity: HashMap<(String, String), Track> = HashMap::new();
+    for mut t in all {
+        if !is_entity && !intent.genres.is_empty() {
+            normalize_scene_genre(&mut t, intent);
+        }
+        let key = (t.song_key(), t.artist_id());
+        match by_identity.get_mut(&key) {
+            Some(existing) if t.quality_score() > existing.quality_score() => {
+                let mut winner = t;
+                merge_track_metadata(&mut winner, existing);
+                *existing = winner;
+            }
+            Some(existing) => merge_track_metadata(existing, &t),
+            None => {
+                by_identity.insert(key, t);
+            }
+        }
+    }
+    let mut pool: Vec<Track> = by_identity.into_values().collect();
+
+    // A track is only allowed into a mix if it belongs to a trusted related
+    // feed for entity mixes; for theme mixes content evidence is mandatory.
+    let mut related_keys: HashSet<String> = HashSet::new();
+    for feed in [
+        &mix_ctx.ytm_radio,
+        &mix_ctx.dz_artist_radio,
+        &mix_ctx.dz_related_tracks,
+    ] {
+        for t in feed {
+            related_keys.insert(t.song_key());
+        }
+    }
+    let mut top_keys: HashSet<String> = HashSet::new();
+    for t in &mix_ctx.dz_artist_top {
+        top_keys.insert(t.song_key());
+    }
+
+    // Tracks returned by a query-targeted YTM search/radio are legitimate (if
+    // weak) evidence for a theme when they carry no parseable metadata.
+    let mut ytm_query_keys: HashSet<String> = mix_ctx
+        .ytm_radio
+        .iter()
+        .map(Track::song_key)
+        .collect();
+    for e in evals {
+        if e.track.source == "ytm" {
+            ytm_query_keys.insert(e.track.song_key());
+        }
+    }
+
+    pool.retain(|t| {
+        if is_hidden_track(t, &sctx.prof) || is_strongly_disliked(t, &sctx.prof, &sctx.stats) {
+            return false;
+        }
+        if is_junk_track_for_query(t, &intent.normalized)
+            || is_mix_clutter_track(t, &intent.normalized)
+        {
+            return false;
+        }
+        if let Some((lo, hi)) = intent.year_range {
+            if t.year > 0 && (t.year < lo || t.year > hi) {
+                return false;
+            }
+        }
+        // "Classic"/"retro" queries reject definitely-modern tracks even when
+        // no explicit decade was given.
+        if !is_entity && compute_query_era_match(t, intent) <= -0.35 {
+            return false;
+        }
+        // A decade mix cannot be padded with tracks whose era is unknown unless
+        // they carry independent query evidence (curated batch or YTM radio).
+        if !is_entity && intent.year_range.is_some() && t.year == 0 {
+            let prior = curated_priors.get(&t.song_key()).copied().unwrap_or(0.0);
+            let ag_unknown = mix_artist_genres(t, artist_genres);
+            let theme = compute_query_theme_match_with_artist(t, ag_unknown, intent);
+            if prior <= 0.0 && theme < 0.35 && !ytm_query_keys.contains(&t.song_key()) {
+                return false;
+            }
+        }
+        let ag = mix_artist_genres(t, artist_genres);
+        if !intent.genres.is_empty() && has_genre_clash(t, ag, &intent.genres) {
+            return false;
+        }
+        if let Some(a) = anchor {
+            // Two artists with the same display name but different external
+            // identities must never share a mix (LISA vs LiSA).
+            if slug(&primary_artist(&t.artist)) == slug(&primary_artist(&a.artist))
+                && !mix_artist_matches(t, a)
+            {
+                return false;
+            }
+            if !a.genres.is_empty() && has_genre_clash(t, ag, &a.genres) {
+                return false;
+            }
+        }
+        true
+    });
+
+    let mut scored: Vec<(f64, Track)> = pool
+        .into_iter()
+        .map(|t| {
+            let key = t.song_key();
+            let prior = curated_priors.get(&key).copied().unwrap_or(0.0);
+            let mut evidence = mix_query_evidence(&t, intent, artist_genres, prior);
+            if evidence <= 0.0 && !is_entity && ytm_query_keys.contains(&key) {
+                evidence = 0.45;
+            }
+            (evidence, t)
+        })
+        .collect();
+
+    // Pick seeds: exact anchor artist/song for entity mixes, verified content
+    // matches for theme mixes. These define what the mix is *about*.
+    let mut seeds: Vec<Track> = Vec::new();
+    if let Some(a) = anchor {
+        if let Some(ref key) = a.track_key {
+            if let Some(pos) = scored
+                .iter()
+                .position(|(_, t)| &t.song_key() == key && mix_artist_matches(t, a))
+            {
+                seeds.push(scored.remove(pos).1);
+            }
+        }
+        let mut idx = 0;
+        while seeds.len() < 8 && idx < scored.len() {
+            if mix_artist_matches(&scored[idx].1, a) {
+                seeds.push(scored.remove(idx).1);
+            } else {
+                idx += 1;
+            }
+        }
+    } else {
+        scored.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut idx = 0;
+        while seeds.len() < 8 && idx < scored.len() {
+            if scored[idx].0 >= 0.4 {
+                seeds.push(scored.remove(idx).1);
+            } else {
+                idx += 1;
+            }
+        }
+    }
+    if seeds.is_empty() || (!is_entity && seeds.len() < 2) {
+        return None;
+    }
+
+    let threshold = if is_entity { 0.35 } else { 0.4 };
+    let mut neighbours: Vec<(f64, Track)> = Vec::new();
+    for (_, t) in scored {
+        let related = related_keys.contains(&t.song_key())
+            || (is_entity && top_keys.contains(&t.song_key()));
+        let similarity = seeds
+            .iter()
+            .map(|s| {
+                let prior = curated_priors.get(&t.song_key()).copied().unwrap_or(0.0);
+                mix_track_similarity(&t, s, intent, anchor, artist_genres, prior, related)
+            })
+            .fold(0.0f64, f64::max);
+        if similarity < threshold {
+            continue;
+        }
+
+        // Tie-breakers: they rank eligible tracks, they never grant eligibility.
+        let aff = build_track_affinities(&t, &sctx.prof);
+        let taste = (aff.artist_affinity * 0.3
+            + aff.genre_affinity * 0.3
+            + aff.mood_affinity * 0.2
+            + if aff.followed_artist { 0.3 } else { 0.0 }
+            + if sctx.prof.starred.contains(&t.id) { 0.4 } else { 0.0 })
+        .clamp(-1.0, 1.0);
+        let stats = sctx.stats.get(&t.id).copied().unwrap_or_default();
+        let tie = similarity
+            + (parse_rank_bonus(&t.meta) * 0.012).min(0.06)
+            + taste * 0.03
+            + ((t.quality_score() as f64 / 800.0) * 0.01).min(0.02)
+            - (stats.skip_count as f64) * 0.15;
+        neighbours.push((tie, t));
+    }
+    neighbours.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut ordered = seeds;
+    ordered.extend(neighbours.into_iter().map(|(_, t)| t));
+
+    let (anchor_slug, cap) = match anchor {
+        Some(a) => (
+            slug(&primary_artist(&a.artist)),
+            if a.is_artist_query { 15 } else { 4 },
+        ),
+        None => (String::new(), 3),
+    };
+    let mut mix_tracks = if anchor.is_some() {
+        dedup_and_interleave_with_anchor(ordered, 20, 3, Some((&anchor_slug, cap)))
+    } else {
+        dedup_and_interleave(ordered, 20, 3)
+    };
+
+    // An entity mix always opens with the track that seeded it.
+    if let Some(a) = anchor {
+        if let Some(ref key) = a.track_key {
+            if let Some(pos) = mix_tracks.iter().position(|t| &t.song_key() == key) {
+                let seed = mix_tracks.remove(pos);
+                mix_tracks.insert(0, seed);
+            }
+        }
+    }
+
+    let min_tracks = if is_entity { 3 } else { 2 };
+    if mix_tracks.len() < min_tracks {
+        return None;
+    }
+
+    let seed_title = if is_entity && !anchor.unwrap().is_artist_query {
+        mix_tracks.first().map(|t| t.title.as_str())
+    } else {
+        None
+    };
+    let single_artist_only = is_entity
+        && mix_tracks
+            .iter()
+            .map(|t| slug(&primary_artist(&t.artist)))
+            .filter(|s| !s.is_empty())
+            .collect::<HashSet<_>>()
+            .len()
+            <= 1;
+    let (title, subtitle) = build_instant_mix_title(
+        intent,
+        &mix_tracks,
+        has_user_taste,
+        anchor.map(|a| a.artist.as_str()),
+        seed_title,
+        single_artist_only,
+    );
+    let total_duration = mix_tracks.iter().map(|t| t.duration.max(0)).sum();
+    Some(InstantMix {
+        title,
+        subtitle,
+        query: intent.raw.clone(),
+        is_theme_mix: !is_entity,
+        prominent: if is_entity {
+            intent.explicit_mix_word
+        } else {
+            true
+        },
+        tracks: mix_tracks,
+        total_duration,
+    })
+}
+
 struct EvaluatedSearchTrack {
     track: Track,
     search_score: f64,
-    mix_score: f64,
-    era_match: f64,
-    theme_match: f64,
     curated_prior: f64,
     lex: f64,
     is_taste_match: bool,
@@ -6564,24 +6284,9 @@ fn evaluate_search_candidates(
             - skip_penalty
             - junk_penalty;
 
-        let mix_score = era_match * 5.2
-            + theme_match * 5.5
-            + curated_prior * 2.4
-            + (if intent.wants_hits || intent.is_theme_mix {
-                pop_bonus * 1.1
-            } else {
-                pop_bonus * 0.55
-            })
-            + taste_aff * 0.85
-            + quality_bonus * 0.7
-            - (st.skip_count as f64) * 1.8;
-
         evals.push(EvaluatedSearchTrack {
             track: t,
             search_score: if search_score.is_finite() { search_score } else { 0.0 },
-            mix_score: if mix_score.is_finite() { mix_score } else { 0.0 },
-            era_match,
-            theme_match,
             curated_prior,
             lex,
             is_taste_match,
@@ -6809,15 +6514,6 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
             },
         ),
         (
-            &["study", "studying", "focus", "coding", "homework"],
-            ThemeSpec {
-                key: "focus",
-                label: "Focus & Study",
-                keywords: &["ambient", "instrumental", "piano", "study", "lofi", "lo-fi", "chill", "focus"],
-                search_boost: "lofi study beats",
-            },
-        ),
-        (
             &["sleep", "bedtime", "rainy", "cozy"],
             ThemeSpec {
                 key: "sleep",
@@ -6934,8 +6630,6 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         ("lofi", Mood::Chill),
         ("lo-fi", Mood::Chill),
         ("relax", Mood::Chill),
-        ("focus", Mood::Focus),
-        ("study", Mood::Focus),
         ("energy", Mood::Energy),
         ("workout", Mood::Energy),
         ("hype", Mood::Energy),
@@ -6966,14 +6660,13 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         if clean_norm.contains("feel good") {
             moods.push(Mood::Upbeat);
         }
-        if clean_norm.contains("deep focus") {
-            moods.push(Mood::Focus);
-        }
         if clean_norm.contains("rainy day") {
             moods.push(Mood::Melancholy);
         }
         if clean_norm.contains("road trip") {
-            themes.push(theme_catalog[6].1.clone());
+            if let Some(roadtrip) = theme_catalog.iter().find(|(keys, _)| keys.contains(&"roadtrip")) {
+                themes.push(roadtrip.1.clone());
+            }
         }
 
         // Check multi-word genre phrases first so e.g. "city pop" or "pop punk"
@@ -7055,13 +6748,12 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
         if clean_norm.contains("late night")
             || clean_norm.contains("feel good")
             || clean_norm.contains("road trip")
-            || clean_norm.contains("deep focus")
             || clean_norm.contains("rainy day")
         {
             for (idx, tok) in tokens.iter().enumerate() {
                 if matches!(
                     tok.as_str(),
-                    "late" | "night" | "feel" | "good" | "road" | "trip" | "deep" | "focus" | "rainy" | "day"
+                    "late" | "night" | "feel" | "good" | "road" | "trip" | "rainy" | "day"
                 ) {
                     matched_token_flags[idx] = true;
                 }
@@ -7137,7 +6829,6 @@ pub fn parse_search_intent(raw: &str) -> SearchIntent {
     for th in &themes {
         match th.key {
             "workout" if !moods.contains(&Mood::Energy) => moods.push(Mood::Energy),
-            "focus" if !moods.contains(&Mood::Focus) => moods.push(Mood::Focus),
             "sleep" if !moods.contains(&Mood::Chill) => moods.push(Mood::Chill),
             _ => {}
         }
@@ -7470,9 +7161,6 @@ pub(crate) fn playlist_token_matches(pl_norm: &str, tok: &str) -> bool {
         "workout" => ["workout", "gym", "fitness", "cardio", "running"]
             .iter()
             .any(|s| contains_term(pl_norm, s)),
-        "focus" | "study" => ["focus", "study", "ambient", "instrumental", "classical", "piano"]
-            .iter()
-            .any(|s| contains_term(pl_norm, s)),
         "sleep" => ["sleep", "ambient", "calm", "relax", "rain"]
             .iter()
             .any(|s| contains_term(pl_norm, s)),
@@ -7592,18 +7280,12 @@ fn curated_playlist_title_score(pl_title: &str, intent: &SearchIntent) -> Option
         }
     }
 
-    if !intent.moods.is_empty() {
-        let clashes_focus = intent.moods.contains(&Mood::Focus)
-            && ["party", "workout", "gym", "metal", "rap", "club"]
-                .iter()
-                .any(|w| contains_term(&pl_norm, w));
-        let clashes_sleep = intent.moods.contains(&Mood::Chill)
-            && ["metal", "workout", "gym", "party", "hardstyle"]
-                .iter()
-                .any(|w| contains_term(&pl_norm, w));
-        if clashes_focus || clashes_sleep {
-            return None;
-        }
+    if intent.moods.contains(&Mood::Chill)
+        && ["metal", "workout", "gym", "party", "hardstyle"]
+            .iter()
+            .any(|w| contains_term(&pl_norm, w))
+    {
+        return None;
     }
 
     if !intent.genres.is_empty() {
@@ -7950,7 +7632,6 @@ fn compute_taste_alignment(
 pub fn mood_playlist_queries(mood: Mood) -> &'static [&'static str] {
     match mood {
         Mood::Chill => &["lofi chill", "chill vibes"],
-        Mood::Focus => &["deep focus", "ambient instrumental"],
         Mood::Energy => &["workout motivation", "high energy rock"],
         Mood::LateNight => &["late night vibes", "after hours"],
         Mood::Upbeat => &["feel good pop", "upbeat hits"],
@@ -7965,7 +7646,6 @@ pub fn mood_playlist_queries(mood: Mood) -> &'static [&'static str] {
 pub fn mood_deezer_genre_names(mood: Mood) -> &'static [&'static str] {
     match mood {
         Mood::Chill => &["chill", "lofi", "ambient", "jazz"],
-        Mood::Focus => &["classical", "ambient", "new age"],
         Mood::Energy => &["rock", "metal", "rap"],
         Mood::LateNight => &["electro", "r&b", "jazz"],
         Mood::Upbeat => &["pop", "dance"],
@@ -8005,7 +7685,6 @@ pub fn is_curated_playlist_for_mood(playlist_title: &str, mood: Mood) -> bool {
 
     let clash_hints: &[&str] = match mood {
         Mood::Chill => &["workout", "gym", "metal", "hardstyle", "party", "club", "rave"],
-        Mood::Focus => &["workout", "gym", "party", "club", "sleep", "sleeping", "metal"],
         Mood::Energy => &["sleep", "lullaby", "meditation", "sad", "acoustic"],
         Mood::LateNight => &["workout", "gym", "kids", "happy", "morning"],
         Mood::Upbeat => &["sad", "melancholy", "heartbreak", "cry", "gloom", "funeral"],
@@ -8021,21 +7700,6 @@ pub fn is_curated_playlist_for_mood(playlist_title: &str, mood: Mood) -> bool {
 
     let hints: &[&str] = match mood {
         Mood::Chill => &["chill", "lofi", "lo-fi", "downtempo", "relax", "dream pop", "bossa", "evening"],
-        Mood::Focus => &[
-            "focus",
-            "ambient",
-            "instrumental",
-            "instrumentals",
-            "study",
-            "classical",
-            "piano",
-            "minimal",
-            "concentration",
-            "meditation",
-            "flow",
-            "reading",
-            "coding",
-        ],
         Mood::Energy => &["energy", "workout", "gym", "power", "rock", "metal", "cardio", "running", "hype"],
         Mood::LateNight => &["late night", "late-night", "midnight", "after hours", "afterhours", "night", "noir", "synthwave", "dark"],
         Mood::Upbeat => &["feel good", "upbeat", "happy", "summer", "sunshine", "pop", "good vibes"],
@@ -8082,9 +7746,6 @@ pub fn has_mood_meta_match(meta_low: &str, mood: Mood) -> bool {
     if meta_low.trim().is_empty() {
         return false;
     }
-    if mood == Mood::Focus && has_focus_clash(meta_low) {
-        return false;
-    }
     MOOD_META_RULES
         .iter()
         .find(|(m, _)| *m == mood)
@@ -8103,24 +7764,6 @@ pub fn is_track_compatible_with_mood(t: &Track, artist_genres: &str, mood: Mood)
         return true;
     }
     let clashes: &[&str] = match mood {
-        Mood::Focus => &[
-            "hip-hop",
-            "hip hop",
-            "rap",
-            "trap",
-            "metal",
-            "heavy metal",
-            "death metal",
-            "punk",
-            "hardcore",
-            "reggaeton",
-            "country",
-            "phonk",
-            "hardstyle",
-            "grunge",
-            "dance",
-            "edm",
-        ],
         Mood::Chill => &[
             "metal",
             "heavy metal",
@@ -8176,7 +7819,6 @@ fn is_mood_title_trap(t: &Track, mood: Mood) -> bool {
     let tl = crate::models::core_song_title(&t.title).to_lowercase();
     let traps: &[&str] = match mood {
         Mood::Chill => &["chill vibes", "lofi chill", "chill music"],
-        Mood::Focus => &["deep focus", "focus music", "study beats", "study music"],
         Mood::Energy => &["workout", "workout hits", "high energy", "gym motivation"],
         Mood::LateNight => &["late night", "late night vibes", "late-night vibes", "after hours"],
         Mood::Upbeat => &["feel good", "upbeat hits", "happy hits"],
@@ -9408,6 +9050,90 @@ mod tests {
     }
 
     #[test]
+    fn instant_mix_never_pads_with_popular_or_starred_unrelated_tracks() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store
+            .authenticate_or_create_user("coherence", "pw")
+            .unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str, artist: &str, genre: &str, year: i32, rank: u64| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: format!("{} Album", title),
+            genre: genre.into(),
+            year,
+            duration: 220,
+            bitrate: 320,
+            meta: format!(r#"{{"rank":{}}}"#, rank),
+            ..Default::default()
+        };
+
+        // Three genuinely 80s tracks from a title-matching curated playlist.
+        let s1 = mk("s1", "Take On Me", "a-ha", "Synthpop", 1985, 900_000);
+        let s2 = mk("s2", "Billie Jean", "Michael Jackson", "Pop", 1982, 950_000);
+        let s3 = mk("s3", "Sweet Dreams", "Eurythmics", "Synthpop", 1983, 880_000);
+        // Unrelated modern chart hits with no year metadata, one of which the
+        // listener has starred and replayed heavily.
+        let filler_starred = mk("f1", "Blinding Lights", "The Weeknd", "Pop", 0, 1_200_000);
+        let filler_popular = mk("f2", "As It Was", "Harry Styles", "Pop", 0, 1_100_000);
+
+        store
+            .upsert_tracks(&[
+                s1.clone(),
+                s2.clone(),
+                s3.clone(),
+                filler_starred.clone(),
+                filler_popular.clone(),
+            ])
+            .unwrap();
+        store.star_track(u.id, &filler_starred.id).unwrap();
+        for _ in 0..6 {
+            taste.record_event(u.id, &filler_starred.id, "complete", 1.0);
+        }
+
+        let res = taste.search_and_refine_with_context(
+            u.id,
+            "80s hits",
+            vec![filler_starred.clone(), filler_popular.clone()],
+            vec![("80s Hits".into(), vec![s1.clone(), s2.clone(), s3.clone()])],
+            SearchMixContext::default(),
+        );
+        let mix = res
+            .instant_mix
+            .expect("three verified 80s tracks should still build a mix");
+        let ids: Vec<&str> = mix.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&s1.id.as_str()));
+        assert!(ids.contains(&s2.id.as_str()));
+        assert!(ids.contains(&s3.id.as_str()));
+        assert!(
+            !ids.contains(&filler_starred.id.as_str()),
+            "starred but unrelated track must not buy membership: {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&filler_popular.id.as_str()),
+            "popular but unrelated track must not buy membership: {:?}",
+            ids
+        );
+        assert_eq!(
+            mix.tracks.len(),
+            3,
+            "an honest small mix beats padded filler: {:?}",
+            ids
+        );
+    }
+
+    #[test]
     fn taste_engine_reranks_search_results_while_pinning_exact_matches() {
         let store = Store::open_memory().unwrap();
         let (u, _) = store.authenticate_or_create_user("searchlearner", "pw").unwrap();
@@ -9711,81 +9437,10 @@ mod tests {
         assert!(classify_moods("Bohemian Rhapsody (Instrumental)", "Hits", "", "").is_empty());
         assert!(classify_moods("Afterlife Warehouse", "Pop Smoke", "", "").is_empty());
 
-        let focus_amb = classify_moods("Weightless", "Ambient 1", "Ambient", "");
-        assert!(focus_amb.contains(&Mood::Focus), "{:?}", focus_amb);
-        let focus_cls = classify_moods("Clair de Lune", "Debussy", "Classical", "");
-        assert!(focus_cls.contains(&Mood::Focus), "{:?}", focus_cls);
+        let chill_lounge = classify_moods("Sunset Lounge", "", "Lounge", "");
+        assert!(chill_lounge.contains(&Mood::Chill), "{:?}", chill_lounge);
         let chill_lofi = classify_moods("Midnight Study", "Lofi Hip Hop Beats", "", "");
         assert!(chill_lofi.contains(&Mood::Chill), "{:?}", chill_lofi);
-        let focus_clash = classify_moods("Piano Solo", "Beats", "Hip-Hop", "");
-        assert!(!focus_clash.contains(&Mood::Focus), "{:?}", focus_clash);
-    }
-
-    #[test]
-    fn rank_mood_mix_rejects_searched_junk_and_prioritizes_verified_focus() {
-        let store = Store::open_memory().unwrap();
-        let (u, _) = store.authenticate_or_create_user("focususer", "pw").unwrap();
-        let sources = SourceRegistry::new(
-            crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
-            crate::sources::archive::ArchiveSource::new(),
-            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
-            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
-        );
-        let taste = TasteEngine::new(store.clone(), sources);
-
-        let mk = |id: &str, source: &str, title: &str, artist: &str, genre: &str, moods: &str| Track {
-            id: id.into(),
-            source: source.into(),
-            title: title.into(),
-            artist: artist.into(),
-            album: "Test".into(),
-            genre: genre.into(),
-            moods: moods.into(),
-            duration: 210,
-            bitrate: 256,
-            stream_url: id.into(),
-            created: 5000,
-            ..Default::default()
-        };
-
-        let rap_ref = mk("dz:rapref", "deezer", "Hit", "Trap Guy", "Hip-Hop", "groove");
-        let bad_title = mk("ytm:deepfocus", "ytm", "Deep Focus", "Trap Guy", "", "focus");
-        let bad_inst = mk("ytm:inst", "ytm", "Pop Song (Instrumental)", "Cover Band", "", "focus");
-        let bad_piano = mk("ytm:piano", "ytm", "Anime Op (Piano Cover)", "YouTuber", "", "focus");
-        let good_amb = mk("loc:amb", "local", "Music for Airports", "Brian Eno", "Ambient", "focus");
-        let good_cls = mk("dz:cls", "deezer", "On the Nature of Daylight", "Max Richter", "Classical", "focus");
-        let curated_nils = mk("dz:nils", "deezer", "Says", "Nils Frahm", "", "focus");
-
-        store
-            .upsert_tracks(&[
-                rap_ref,
-                bad_title.clone(),
-                bad_inst.clone(),
-                bad_piano.clone(),
-                good_amb.clone(),
-                good_cls.clone(),
-                curated_nils.clone(),
-            ])
-            .unwrap();
-
-        let mut curated_ids = HashSet::new();
-        curated_ids.insert(curated_nils.id.clone());
-
-        let ranked = taste.rank_mood_mix(
-            u.id,
-            Mood::Focus,
-            vec![bad_title, bad_inst, bad_piano, good_amb, good_cls, curated_nils],
-            &curated_ids,
-            20,
-        );
-        let ids: Vec<&str> = ranked.iter().map(|t| t.id.as_str()).collect();
-        assert!(!ids.contains(&"ytm:deepfocus"), "ids={:?}", ids);
-        assert!(!ids.contains(&"ytm:inst"), "ids={:?}", ids);
-        assert!(!ids.contains(&"ytm:piano"), "ids={:?}", ids);
-        assert!(ids.contains(&"loc:amb"), "ids={:?}", ids);
-        assert!(ids.contains(&"dz:cls"), "ids={:?}", ids);
-        assert!(ids.contains(&"dz:nils"), "ids={:?}", ids);
     }
 
     #[test]
@@ -10966,7 +10621,7 @@ mod tests {
         let snap = taste.curator_status_snapshot();
         assert_eq!(snap["active"], true);
         assert_eq!(snap["readyMoods"], 1);
-        assert_eq!(snap["totalMoods"], 10);
+        assert_eq!(snap["totalMoods"], 9);
     }
 
     #[tokio::test]

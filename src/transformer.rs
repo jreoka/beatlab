@@ -964,7 +964,6 @@ impl TransformerNet {
             let inferred: &[(&[&str], Mood)] = &[
                 (&["chill", "lofi", "lo-fi", "ambient", "downtempo", "relax"], Mood::Chill),
                 (&["workout", "metal", "punk", "hardcore", "energy", "trap"], Mood::Energy),
-                (&["focus", "instrumental", "classical", "study", "piano"], Mood::Focus),
                 (&["dance", "house", "disco", "edm", "club", "party", "techno"], Mood::Party),
                 (&["sad", "ballad", "melanchol", "blues", "heartbreak"], Mood::Melancholy),
                 (&["acoustic", "unplugged", "folk", "singer-songwriter"], Mood::Acoustic),
@@ -2217,15 +2216,14 @@ fn is_positive_event_kind(kind: &str) -> bool {
 fn mood_to_idx(m: Mood) -> usize {
     match m {
         Mood::Chill => 0,
-        Mood::Focus => 1,
-        Mood::Energy => 2,
-        Mood::LateNight => 3,
-        Mood::Upbeat => 4,
-        Mood::Melancholy => 5,
-        Mood::Party => 6,
-        Mood::Acoustic => 7,
-        Mood::Groove => 8,
-        Mood::RockIndie => 9,
+        Mood::Energy => 1,
+        Mood::LateNight => 2,
+        Mood::Upbeat => 3,
+        Mood::Melancholy => 4,
+        Mood::Party => 5,
+        Mood::Acoustic => 6,
+        Mood::Groove => 7,
+        Mood::RockIndie => 8,
     }
 }
 

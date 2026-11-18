@@ -153,7 +153,6 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "tracks": o.tracks,
             "passkeys": o.passkeys,
             "totpUsers": o.totp_users,
-            "recoveryCodes": o.recovery_codes,
             "playlists": o.playlists,
             "securityEvents": o.security_events,
             "admins": admin_names(),

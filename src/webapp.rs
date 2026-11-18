@@ -5827,7 +5827,7 @@ mod tests {
         assert_eq!(b1["topTracks"][0]["track"]["id"], "loc:st1");
         assert!(b1["hourly"].as_array().unwrap().len() == 24);
         assert!(b1["weekdays"].as_array().unwrap().len() == 7);
-        assert!(b1["moods"].as_array().unwrap().len() == 10);
+        assert!(b1["moods"].as_array().unwrap().len() == 9);
         assert!(b1["timeline"]["points"].as_array().unwrap().len() == 30);
         assert!(b1.get("qualityTiers").is_none());
         assert!(b1.get("formats").is_none());

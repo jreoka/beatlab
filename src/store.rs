@@ -113,7 +113,6 @@ pub struct AdminOverview {
     pub tracks: usize,
     pub passkeys: usize,
     pub totp_users: usize,
-    pub recovery_codes: usize,
     pub playlists: usize,
     pub security_events: usize,
 }
@@ -1370,7 +1369,6 @@ impl Store {
             tracks: count("SELECT COUNT(*) FROM tracks")?,
             passkeys: count("SELECT COUNT(*) FROM passkeys")?,
             totp_users: count("SELECT COUNT(*) FROM totp_secrets WHERE enabled = 1")?,
-            recovery_codes: count("SELECT COUNT(*) FROM recovery_codes WHERE used = 0")?,
             playlists: count("SELECT COUNT(*) FROM playlists")?,
             security_events: count("SELECT COUNT(*) FROM security_events")?,
         })
@@ -6340,13 +6338,13 @@ mod tests {
 
             let mut cover = sample_track("ytm:cover", "Hit Song (Instrumental)", "Covers", "Pop");
             cover.genre = String::new();
-            cover.moods = "focus".into();
+            cover.moods = "chill".into();
 
             let mut eno_known = sample_track("dz:eno1", "An Ending (Ascent)", "Brian Eno", "Apollo");
-            eno_known.genre = "Ambient".into();
+            eno_known.genre = "Lo-Fi".into();
             eno_known.moods = "".into();
 
-            let mut eno_ytm = sample_track("ytm:eno2", "1/1", "Brian Eno", "Music for Airports");
+            let mut eno_ytm = sample_track("ytm:eno2", "1/1", "Brian Eno", "Lofi Chill Beats");
             eno_ytm.genre = String::new();
             eno_ytm.moods = "upbeat,chill".into();
 
@@ -6371,7 +6369,7 @@ mod tests {
                 .unwrap()
                 .moods
                 .split(',')
-                .any(|m| m == "focus")
+                .any(|m| m == "chill")
         );
         assert!(
             reopened
@@ -6380,14 +6378,14 @@ mod tests {
                 .unwrap()
                 .moods
                 .split(',')
-                .any(|m| m == "focus")
+                .any(|m| m == "chill")
         );
 
-        let by_focus = reopened.tracks_by_mood(Mood::Focus, 20, 0).unwrap();
-        let focus_ids: Vec<&str> = by_focus.iter().map(|t| t.id.as_str()).collect();
-        assert!(focus_ids.contains(&"dz:eno1"), "{:?}", focus_ids);
-        assert!(focus_ids.contains(&"ytm:eno2"), "{:?}", focus_ids);
-        assert!(!focus_ids.contains(&"ytm:cover"), "{:?}", focus_ids);
+        let by_chill = reopened.tracks_by_mood(Mood::Chill, 20, 0).unwrap();
+        let chill_ids: Vec<&str> = by_chill.iter().map(|t| t.id.as_str()).collect();
+        assert!(chill_ids.contains(&"dz:eno1"), "{:?}", chill_ids);
+        assert!(chill_ids.contains(&"ytm:eno2"), "{:?}", chill_ids);
+        assert!(!chill_ids.contains(&"ytm:cover"), "{:?}", chill_ids);
 
         drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);

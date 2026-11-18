@@ -1893,7 +1893,7 @@ mod tests {
             ("Electronic", "party"),
             ("Rock", ""),
             ("Jazz", "groove"),
-            ("Classical", "focus"),
+            ("Classical", "melancholy"),
             ("Folk", "acoustic"),
             ("Pop", "upbeat"),
             ("Reggae", "chill"),
@@ -1956,7 +1956,7 @@ mod tests {
         assert!(active.contains(&"party"));
         assert!(active.contains(&"rock_indie"));
         assert!(active.contains(&"groove"));
-        assert!(active.contains(&"focus"));
+        assert!(active.contains(&"melancholy"));
     }
 
     #[test]
@@ -1969,7 +1969,7 @@ mod tests {
         assert_eq!(stats.streaks.current_days, 0);
         assert_eq!(stats.hourly.len(), 24);
         assert_eq!(stats.weekdays.len(), 7);
-        assert_eq!(stats.moods.len(), 10);
+        assert_eq!(stats.moods.len(), 9);
         assert_eq!(stats.persona.title, "Fresh Turntable");
     }
 

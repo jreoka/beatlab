@@ -784,6 +784,18 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         "asmr",
         "tantric",
         "massage",
+        "meditation",
+        "meditate",
+        "zen ",
+        "spa ",
+        "sound bath",
+        "sound healing",
+        "singing bowl",
+        "mindfulness",
+        "new age",
+        "reiki",
+        "chakra",
+        "yoga",
         "setlist",
     ] {
         if title_low.contains(bad) && !query_low.contains(bad) {
@@ -798,7 +810,6 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
     }
     if crate::taste::contains_term(&title_low, "instrumental")
         && !query_low.contains("instrumental")
-        && !query_low.contains("focus")
         && !query_low.contains("ambient")
         && !query_low.contains("study")
     {
@@ -1302,7 +1313,7 @@ mod tests {
             nb_tracks,
         };
         assert!(!is_usable_mix_playlist(&mk("Sad Covers", 60), "sad songs"));
-        assert!(!is_usable_mix_playlist(&mk("Piano lullabies", 40), "deep focus"));
+        assert!(!is_usable_mix_playlist(&mk("Piano lullabies", 40), "ambient"));
         assert!(!is_usable_mix_playlist(
             &mk("BAISE Stimulation Tantric Pure Massage Sex ChillOut DownTempo", 68),
             "chillout downtempo"
