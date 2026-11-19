@@ -1864,7 +1864,7 @@ impl TasteEngine {
             .unwrap_or(false);
         let last_rebuilt = self
             .store
-            .kv_get(&format!("mix4u:v2:rebuilt_at:{user_id}"))
+            .kv_get(&format!("mix4u:v3:rebuilt_at:{user_id}"))
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
         let has_mixes = self
@@ -1952,26 +1952,20 @@ impl TasteEngine {
         self.store
             .kv_set(&format!("mix4u:mood:{user_id}"), slug);
         self.store.kv_set(
-            &format!("mix4u:v2:rebuilt_at:{user_id}"),
+            &format!("mix4u:v3:rebuilt_at:{user_id}"),
             &Utc::now().timestamp().to_string(),
         );
     }
 
     /// Mixed for you is the listener's own rail, so their world leads and the global mood
-    /// pool only seasons it. Moods & Vibes stay strict (taste alone never admits a track,
-    /// or every mood would collapse into one favourites list), but this rail covers a single
-    /// featured mood, so the listener's own untagged music — e.g. YouTube Music tracks that
-    /// carry no genre at all — is welcome here as long as nothing marks it as off-mood.
+    /// pool only backfills when their own library + related graph is still small. Moods &
+    /// Vibes stay strict (taste alone never admits a track, or every mood would collapse
+    /// into one favourites list), but this rail covers a single featured mood, so the
+    /// listener's own untagged music — e.g. YouTube Music tracks that carry no genre at
+    /// all — is welcome here as long as nothing marks it as off-mood.
     fn personalize_mixed_for_you_pool(&self, user_id: i64, mood: Mood, pool: Vec<Track>) -> Vec<Track> {
         let sctx = self.build_scoring_context(user_id);
-        let is_personal = |t: &Track| {
-            if user_realm_score(t, &sctx.prof, &sctx.stats) > 0.0 {
-                return true;
-            }
-            let fctx = build_track_affinities(t, &sctx.prof);
-            let align = compute_taste_alignment(t, &sctx.prof, &fctx);
-            align.rel_a > 0.0 || align.rel_t > 0.0
-        };
+        let is_personal = |t: &Track| is_personal_mix_track(t, &sctx.prof, &sctx.stats);
 
         let mut seen_keys: HashSet<String> = HashSet::new();
         // (has verified mood evidence, track)
@@ -2049,10 +2043,11 @@ impl TasteEngine {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let personal: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
 
-        // A little discovery from the global pool, more only when the listener's own
-        // world is too small to fill the mixes.
+        // Only borrow from the global mood pool when the listener's own world
+        // (played/saved tracks, artists, and related-artist graph) is too small
+        // to fill the mixes.
         const MIN_POOL: usize = 36;
-        let generic_allowed = (personal.len() / 4).max(MIN_POOL.saturating_sub(personal.len()));
+        let generic_allowed = MIN_POOL.saturating_sub(personal.len());
         generic.truncate(generic_allowed);
 
         // Spread the generic picks evenly so Mix 1/2/3 share the same personal/discovery balance.
@@ -4324,7 +4319,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             .map(|(g, v)| (g.clone(), *v))
             .collect();
         genres.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_genres: Vec<String> = genres.into_iter().take(2).map(|(g, _)| g).collect();
+        let top_genres = pick_user_mood_query_genres(&genres);
         if top_genres.is_empty() {
             return Vec::new();
         }
@@ -4431,7 +4426,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             !sctx.prof.genre_affinity.is_empty()
                 && initial
                     .iter()
-                    .filter(|t| user_realm_score(t, &sctx.prof, &sctx.stats) > 0.0)
+                    .filter(|t| is_personal_mix_track(t, &sctx.prof, &sctx.stats))
                     .count()
                     < count.min(10)
         } else {
@@ -8462,6 +8457,81 @@ fn user_realm_score(t: &Track, prof: &TasteProfile, stats: &HashMap<String, User
     score
 }
 
+/// True only when a track actually belongs to the listener's personal world
+/// (familiar track, listened/followed/playlist artist, saved album, or
+/// related-artist/related-track graph). Broad genre overlap alone (e.g. a
+/// global Western "Pop" chart track matching a J-Pop listener's incidental
+/// "pop" tag) does NOT qualify.
+fn is_personal_mix_track(
+    t: &Track,
+    prof: &TasteProfile,
+    stats: &HashMap<String, UserTrackStats>,
+) -> bool {
+    if is_familiar_track(t, prof, stats) {
+        return true;
+    }
+    let fctx = build_track_affinities(t, prof);
+    if fctx.artist_affinity > 0.15
+        || fctx.playlist_artist_affinity > 0.15
+        || fctx.followed_artist
+        || fctx.saved_album
+    {
+        return true;
+    }
+    let align = compute_taste_alignment(t, prof, &fctx);
+    align.rel_a > 0.0 || align.rel_t > 0.0
+}
+
+/// Picks up to two mood-curation query genres from a listener's affinity-sorted
+/// genres, suppressing overly broad umbrella labels ("pop", "rock", "asian music")
+/// when the listener has specific scene genres (e.g. "j-pop", "j-rock", "k-pop").
+fn pick_user_mood_query_genres(genres: &[(String, f64)]) -> Vec<String> {
+    const SCENE_POP: &[&str] = &[
+        "j-pop",
+        "jpop",
+        "city pop",
+        "k-pop",
+        "kpop",
+        "c-pop",
+        "cpop",
+        "mandopop",
+        "cantopop",
+        "anime",
+        "japanese music",
+        "korean music",
+    ];
+    const SCENE_ROCK: &[&str] = &["j-rock", "jrock", "k-rock", "krock"];
+
+    let has_scene_pop = genres
+        .iter()
+        .any(|(g, _)| SCENE_POP.contains(&g.as_str()));
+    let has_scene_rock = genres
+        .iter()
+        .any(|(g, _)| SCENE_ROCK.contains(&g.as_str()));
+
+    let filtered: Vec<String> = genres
+        .iter()
+        .filter(|(g, _)| {
+            let gl = g.as_str();
+            if has_scene_pop && matches!(gl, "pop" | "asian music") {
+                return false;
+            }
+            if has_scene_rock && matches!(gl, "rock" | "asian music") {
+                return false;
+            }
+            true
+        })
+        .take(2)
+        .map(|(g, _)| g.clone())
+        .collect();
+
+    if !filtered.is_empty() {
+        filtered
+    } else {
+        genres.iter().take(2).map(|(g, _)| g.clone()).collect()
+    }
+}
+
 fn score_track_core(
     t: &Track,
     prof: &TasteProfile,
@@ -11239,6 +11309,96 @@ mod tests {
             pop * 3 < ytm + jp,
             "global pool dominates: pop={pop} ytm={ytm} jp={jp} {:?}",
             all_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_for_you_does_not_leak_western_pop_into_jpop_feel_good_mixes() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jpop_only", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: String, artist: String, genre: &str| Track {
+            id: id.clone(),
+            source: "deezer".into(),
+            title: format!("Song {id}"),
+            artist,
+            album: "Album".into(),
+            genre: genre.into(),
+            moods: "upbeat".into(),
+            cover_url: format!("https://example.com/{id}.jpg"),
+            duration: 210,
+            bitrate: 256,
+            stream_url: id,
+            ..Default::default()
+        };
+
+        // Global Western Pop chart pool (e.g. Dua Lipa, Justin Bieber).
+        let western_pop: Vec<Track> = (0..30)
+            .map(|i| mk(format!("dz:west{i}"), format!("Western Pop Star {i}"), "Pop"))
+            .collect();
+        // Listener's Japanese tracks, tagged "Pop, J-Pop" (which builds genre_affinity["pop"] > 0.4).
+        let jpop: Vec<Track> = (0..40)
+            .map(|i| mk(format!("dz:jp{i}"), format!("JP Artist {i}"), "Pop, J-Pop"))
+            .collect();
+        store.upsert_tracks(&western_pop).unwrap();
+        store.upsert_tracks(&jpop).unwrap();
+        for t in &jpop {
+            let _ = store.record_event(u.id, &t.id, "play", 1.0);
+            let _ = store.record_event(u.id, &t.id, "complete", 1.0);
+        }
+        let ids: Vec<String> = western_pop.iter().map(|t| t.id.clone()).collect();
+        taste.save_curated_pool(&mood_cache_key(Mood::Upbeat), &ids);
+
+        taste.rebuild_mixed_for_you(u.id).await;
+
+        let cards = taste.mixed_for_you_cards(u.id);
+        assert_eq!(cards.len(), 4);
+        assert_eq!(cards[0].title, "Feel Good Mix 1");
+        for c in &cards {
+            let tracks = store.playlist_tracks(&c.id).unwrap();
+            assert!(!tracks.is_empty());
+            let leaked: Vec<&str> = tracks
+                .iter()
+                .filter(|t| t.id.starts_with("dz:west"))
+                .map(|t| t.id.as_str())
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "Western pop leaked into {}: {:?}",
+                c.title,
+                leaked
+            );
+        }
+    }
+
+    #[test]
+    fn pick_user_mood_query_genres_prefers_scene_genres_over_broad_pop() {
+        let jpop_user = vec![
+            ("pop".to_string(), 14.0),
+            ("j-pop".to_string(), 11.0),
+            ("asian music".to_string(), 9.0),
+            ("j-rock".to_string(), 5.0),
+        ];
+        assert_eq!(
+            pick_user_mood_query_genres(&jpop_user),
+            vec!["j-pop".to_string(), "j-rock".to_string()]
+        );
+
+        let mainstream_pop_user = vec![
+            ("pop".to_string(), 12.0),
+            ("dance".to_string(), 6.0),
+        ];
+        assert_eq!(
+            pick_user_mood_query_genres(&mainstream_pop_user),
+            vec!["pop".to_string(), "dance".to_string()]
         );
     }
 
