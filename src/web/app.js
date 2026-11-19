@@ -14,6 +14,9 @@
   let vizUnavailable = false;
   let vizSignalAt = 0;
   let vizLastCaptureAt = 0;
+  let vizSilentSince = 0;
+  let vizRecaptureAttempts = 0;
+  let vizTrackSrc = '';
 
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
@@ -97,6 +100,12 @@
     radioLoading: false,
     radioInFlight: null,
     compatAttemptedId: '',
+    isSwitchingTrack: false,
+    networkRetryTimer: null,
+    networkRetryCount: 0,
+    pendingNetworkResume: null,
+    stallTimer: null,
+    lastPositionStateAt: 0,
     volume: parseFloat(localStorage.getItem('beatlab_vol') || '0.9'),
     muted: false,
     seeking: false,
@@ -387,6 +396,7 @@
       state.hasViewNetworkError = false;
       renderCurrentHash();
     }
+    resumePendingNetworkPlayback();
   }
 
   function checkServerHealth() {
@@ -486,12 +496,31 @@
     });
 
     window.addEventListener('online', () => {
-      checkServerHealth();
+      checkServerHealth().then((ok) => {
+        if (ok) resumePendingNetworkPlayback();
+      });
     });
 
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'hidden') {
+        // Detach captureStream() and suspend the mobile visualizer AudioContext
+        // while locked or backgrounded so Android Chrome keeps native <audio>
+        // playback uninterrupted.
+        teardownStreamVisualizer(true);
+      } else if (document.visibilityState === 'visible') {
         checkServerHealth();
+        if (vizCtxNeedsResume() && !audio.paused) {
+          vizCtx.resume().catch(() => {});
+        }
+        const fs = $('fullscreen-player');
+        if (fs && fs.classList.contains('open') && !rafVisualizer) {
+          vizSilentSince = 0;
+          vizRecaptureAttempts = 0;
+          drawVisualizer();
+        }
+        if (state.pendingNetworkResume && navigator.onLine !== false) {
+          resumePendingNetworkPlayback();
+        }
       }
     });
 
@@ -660,6 +689,24 @@
     } catch {}
   }
 
+  function updateMediaPositionState(force = false) {
+    if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setPositionState !== 'function') return;
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (!force && nowMs - state.lastPositionStateAt < 4000) return;
+    const cur = currentTrack();
+    const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
+    const position = Number.isFinite(audio.currentTime) && audio.currentTime >= 0 ? audio.currentTime : 0;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    try {
+      navigator.mediaSession.setPositionState({
+        duration,
+        playbackRate: Number.isFinite(audio.playbackRate) && audio.playbackRate > 0 ? audio.playbackRate : 1,
+        position: Math.min(position, duration),
+      });
+      state.lastPositionStateAt = nowMs;
+    } catch {}
+  }
+
   function setExpandedPlayer(open) {
     const fs = $('fullscreen-player');
     if (!fs) return;
@@ -678,8 +725,14 @@
       btn.classList.toggle('active', next);
       btn.title = next ? 'Collapse player' : 'Expand player';
     }
-    if (next && !rafVisualizer) {
-      drawVisualizer();
+    if (!next) {
+      teardownStreamVisualizer(true);
+    } else {
+      vizSilentSince = 0;
+      vizRecaptureAttempts = 0;
+      if (!rafVisualizer && document.visibilityState !== 'hidden') {
+        drawVisualizer();
+      }
     }
     if (next) {
       const cur = currentTrack();
@@ -751,8 +804,39 @@
     return vizCtx && (vizCtx.state === 'suspended' || vizCtx.state === 'interrupted');
   }
 
-  function ensureVisualizerAnalyser() {
+  function teardownStreamVisualizer(suspendCtx = false) {
+    // Never touch desktop 'element' mode, which routes audible output through vizCtx.
+    if (vizMode === 'stream') {
+      if (vizSource) {
+        try { vizSource.disconnect(); } catch {}
+        vizSource = null;
+      }
+      if (vizSink) {
+        try { vizAnalyser && vizAnalyser.disconnect(vizSink); } catch {}
+        try { vizSink.disconnect(); } catch {}
+        vizSink = null;
+      }
+      if (vizStream && typeof vizStream.getTracks === 'function') {
+        vizStream.getTracks().forEach((t) => {
+          try { t.stop(); } catch {}
+        });
+      }
+      vizStream = null;
+      vizBoundTrack = null;
+      vizTrackSrc = '';
+      vizMode = '';
+      vizSilentSince = 0;
+    }
+    if (suspendCtx && vizMode !== 'element' && vizCtx && vizCtx.state === 'running') {
+      vizCtx.suspend().catch(() => {});
+    }
+  }
+
+  function ensureVisualizerAnalyser(forceRecapture = false) {
     if (vizUnavailable || !audio) return;
+    if (document.visibilityState === 'hidden') return;
+    const fs = $('fullscreen-player');
+    if (!fs || !fs.classList.contains('open')) return;
     if (vizCtxNeedsResume() && !audio.paused) {
       vizCtx.resume().catch(() => {});
     }
@@ -769,7 +853,7 @@
       if (!vizCtx) {
         vizCtx = new AC();
         audio.addEventListener('play', () => {
-          if (vizCtxNeedsResume()) {
+          if (vizCtxNeedsResume() && document.visibilityState !== 'hidden') {
             vizCtx.resume().catch(() => {});
           }
         });
@@ -807,9 +891,13 @@
         }
         return;
       }
-      // A captured media-element track can end or go muted when playback
-      // stalls or the element briefly pauses between tracks. Only a live,
-      // unmuted track actually feeds the analyser, so re-capture when needed.
+      const activeSrc = audio.currentSrc || audio.src || '';
+      if (forceRecapture || (vizMode === 'stream' && vizTrackSrc && activeSrc && vizTrackSrc !== activeSrc)) {
+        teardownStreamVisualizer(false);
+        if (forceRecapture) vizLastCaptureAt = 0;
+      }
+      // A captured media-element track can end, go muted, or silently stall when
+      // tracks change sample rate/codec or playback pauses. Re-capture when needed.
       const usableTrack = (s) =>
         s && typeof s.getAudioTracks === 'function'
           ? s.getAudioTracks().find((t) => t.readyState === 'live' && !t.muted) || null
@@ -849,6 +937,7 @@
       }
       vizSource = vizCtx.createMediaStreamSource(vizStream);
       vizBoundTrack = liveTrack;
+      vizTrackSrc = activeSrc;
       vizMode = 'stream';
       if (vizSink) {
         try { vizAnalyser.disconnect(vizSink); } catch {}
@@ -861,13 +950,14 @@
       vizAnalyser.connect(silentGain);
       silentGain.connect(vizCtx.destination);
     } catch {
-      vizUnavailable = true;
+      // Transient captureStream() errors (e.g. while switching sources) shouldn't
+      // permanently disable the visualizer for the rest of the session.
     }
   }
 
   function drawVisualizer() {
     const fs = $('fullscreen-player');
-    if (!fs.classList.contains('open')) {
+    if (!fs || !fs.classList.contains('open') || document.visibilityState === 'hidden') {
       rafVisualizer = null;
       return;
     }
@@ -892,7 +982,29 @@
             break;
           }
         }
-        if (hasSignal) vizSignalAt = nowMs;
+        if (hasSignal) {
+          vizSignalAt = nowMs;
+          vizSilentSince = 0;
+          vizRecaptureAttempts = 0;
+        } else if (
+          vizMode === 'stream' &&
+          !audio.muted &&
+          audio.volume > 0 &&
+          audio.readyState >= 2
+        ) {
+          // On Android Chrome, a captureStream() track can stay readyState==='live'
+          // yet deliver all zeros after a codec/sample-rate switch or route change.
+          if (!vizSilentSince) vizSilentSince = nowMs;
+          if (
+            nowMs - vizSilentSince > 1200 &&
+            nowMs - vizLastCaptureAt > 1500 &&
+            vizRecaptureAttempts < 4
+          ) {
+            vizRecaptureAttempts++;
+            vizSilentSince = nowMs;
+            ensureVisualizerAnalyser(true);
+          }
+        }
       }
       // On some mobile browsers the analyser only receives audio briefly (the
       // captured track ends or goes muted). Rather than collapsing into a flat
@@ -1002,6 +1114,8 @@
   }
 
   function resetPlayerAndSessionUI() {
+    clearPlaybackRecovery();
+    teardownStreamVisualizer(true);
     audio.pause();
     audio.removeAttribute('src');
     audio.load();
@@ -4495,16 +4609,115 @@
     return mimes.some((m) => audio.canPlayType(m) !== '');
   }
 
-  function buildStreamUrl(track, forceCompat = false, offsetSec = 0) {
+  function buildStreamUrl(track, forceCompat = false, offsetSec = 0, retryAttempt = 0) {
     const trackId = typeof track === 'string' ? track : track.id;
     const needCompat = forceCompat || (typeof track === 'object' && track && !canBrowserPlayFormat(track.format));
     let url = `/api/web/stream/${encodeURIComponent(trackId)}?token=${encodeURIComponent(state.token)}`;
     if (needCompat) url += '&compat=1';
     if (offsetSec > 0.5) url += `&t=${encodeURIComponent(offsetSec.toFixed(2))}`;
+    if (retryAttempt > 0) url += `&retry=${retryAttempt}`;
     return url;
   }
 
+  function clearPlaybackRecovery() {
+    if (state.networkRetryTimer) {
+      clearTimeout(state.networkRetryTimer);
+      state.networkRetryTimer = null;
+    }
+    if (state.stallTimer) {
+      clearTimeout(state.stallTimer);
+      state.stallTimer = null;
+    }
+    state.networkRetryCount = 0;
+    state.pendingNetworkResume = null;
+  }
+
+  function scheduleNetworkRetry(errToken, track, resumePos = 0, fromStall = false) {
+    if (!track || errToken !== state.activeAudioToken) return false;
+    const cur = currentTrack();
+    if (!cur || cur.id !== track.id) return false;
+    const safePos = Number.isFinite(resumePos) && resumePos > 0.5 ? resumePos : 0;
+
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      state.pendingNetworkResume = { trackId: track.id, pos: safePos, token: errToken };
+      return true;
+    }
+
+    if (state.networkRetryCount >= 3) {
+      state.pendingNetworkResume = { trackId: track.id, pos: safePos, token: errToken };
+      return false;
+    }
+
+    if (state.networkRetryTimer) {
+      clearTimeout(state.networkRetryTimer);
+      state.networkRetryTimer = null;
+    }
+
+    const attempt = ++state.networkRetryCount;
+    const delayMs = fromStall ? 400 : Math.min(8000, 1500 * Math.pow(2, attempt - 1));
+    state.networkRetryTimer = setTimeout(() => {
+      state.networkRetryTimer = null;
+      if (errToken !== state.activeAudioToken) return;
+      const nowCur = currentTrack();
+      if (!nowCur || nowCur.id !== track.id) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        state.pendingNetworkResume = { trackId: track.id, pos: safePos, token: errToken };
+        return;
+      }
+      state.pendingSeekSec = safePos;
+      state.isSwitchingTrack = true;
+      try {
+        audio.src = buildStreamUrl(nowCur, state.compatAttemptedId === nowCur.id, 0, attempt);
+        audio.play().catch((e) => {
+          if (errToken !== state.activeAudioToken) return;
+          if (e && e.name === 'AbortError') return;
+          if (e && e.name !== 'NotAllowedError') {
+            scheduleNetworkRetry(errToken, nowCur, safePos, false);
+          } else {
+            updatePlayButton(false);
+          }
+        });
+      } finally {
+        state.isSwitchingTrack = false;
+      }
+    }, delayMs);
+    return true;
+  }
+
+  function resumePendingNetworkPlayback() {
+    const pending = state.pendingNetworkResume;
+    if (!pending) return;
+    if (pending.token !== state.activeAudioToken) {
+      state.pendingNetworkResume = null;
+      return;
+    }
+    const cur = currentTrack();
+    if (!cur || cur.id !== pending.trackId) {
+      state.pendingNetworkResume = null;
+      return;
+    }
+    if (!audio.paused && !audio.ended && audio.readyState >= 3) {
+      state.pendingNetworkResume = null;
+      return;
+    }
+    state.pendingNetworkResume = null;
+    state.networkRetryCount = 0;
+    state.pendingSeekSec = pending.pos > 0.5 ? pending.pos : 0;
+    state.isSwitchingTrack = true;
+    try {
+      audio.src = buildStreamUrl(cur, state.compatAttemptedId === cur.id, 0, Date.now() % 10000);
+      audio.play().catch((e) => {
+        if (pending.token !== state.activeAudioToken) return;
+        if (e && e.name === 'AbortError') return;
+        updatePlayButton(false);
+      });
+    } finally {
+      state.isSwitchingTrack = false;
+    }
+  }
+
   function cancelPendingPlaybackWork() {
+    clearPlaybackRecovery();
     if (state.playCommitTimer) {
       clearTimeout(state.playCommitTimer);
       state.playCommitTimer = null;
@@ -4541,17 +4754,29 @@
     const cur = currentTrack();
     if (!cur || cur.id !== track.id) return;
 
+    clearPlaybackRecovery();
+    // Release any previous captureStream() before swapping src so Android Chrome
+    // re-captures cleanly if the new track uses a different sample rate or codec.
+    teardownStreamVisualizer(false);
+    vizSilentSince = 0;
+    vizRecaptureAttempts = 0;
+
     applyCommittedMediaUI(track);
+    state.isSwitchingTrack = true;
     try {
-      if (!audio.paused) audio.pause();
-    } catch {}
-    audio.src = buildStreamUrl(track);
-    audio.play().catch((e) => {
-      if (loadToken !== state.activeAudioToken) return;
-      if (e && e.name === 'AbortError') return;
-      updatePlayButton(false);
-      console.warn('Playback prevented or error:', e);
-    });
+      audio.src = buildStreamUrl(track);
+      audio.play().catch((e) => {
+        if (loadToken !== state.activeAudioToken) return;
+        if (e && e.name === 'AbortError') return;
+        if (e && e.name !== 'NotAllowedError') {
+          if (scheduleNetworkRetry(loadToken, track, 0, false)) return;
+        }
+        updatePlayButton(false);
+        console.warn('Playback prevented or error:', e);
+      });
+    } finally {
+      state.isSwitchingTrack = false;
+    }
 
     loadLyricsForTrack(track.id);
     state.lastCommittedTrackId = track.id;
@@ -4720,15 +4945,17 @@
           album: track.album,
           artwork: [{ src: `${location.origin}${track.coverUrl}`, sizes: '512x512', type: 'image/jpeg' }],
         });
-        navigator.mediaSession.setActionHandler('play', () => togglePlay());
-        navigator.mediaSession.setActionHandler('pause', () => togglePlay());
+        navigator.mediaSession.setActionHandler('play', () => playCurrent());
+        navigator.mediaSession.setActionHandler('pause', () => pauseCurrent());
         navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
         navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(true));
         navigator.mediaSession.setActionHandler('seekto', (details) => {
           if (details.seekTime != null && Number.isFinite(audio.duration)) {
             audio.currentTime = details.seekTime;
+            updateMediaPositionState(true);
           }
         });
+        updateMediaPositionState(true);
       } catch {
         // unsupported in some browsers
       }
@@ -5211,10 +5438,10 @@
     return run;
   }
 
-  function togglePlay() {
+  function playCurrent() {
     const cur = currentTrack();
     if (!cur) return;
-    haptic('medium');
+    clearPlaybackRecovery();
     if (!audio.getAttribute('src')) {
       audio.src = buildStreamUrl(cur);
     }
@@ -5222,8 +5449,24 @@
       audio.play().catch(() => {
         updatePlayButton(false);
       });
-    } else {
+    }
+  }
+
+  function pauseCurrent() {
+    clearPlaybackRecovery();
+    if (!audio.paused) {
       audio.pause();
+    }
+  }
+
+  function togglePlay() {
+    const cur = currentTrack();
+    if (!cur) return;
+    haptic('medium');
+    if (audio.paused) {
+      playCurrent();
+    } else {
+      pauseCurrent();
     }
   }
 
@@ -5252,7 +5495,11 @@
       state.lastCommittedTrackId = '';
       sendTrackEvent(cur.id, 'skip', 1);
     }
-    if (!state.queue.length) return;
+    if (!state.queue.length) {
+      updatePlayButton(false);
+      setMediaPlaybackState('none');
+      return;
+    }
 
     if (state.queueIndex + 1 < state.queue.length) {
       const next = state.queueIndex + 1;
@@ -5273,26 +5520,76 @@
       return playQueueAt(0);
     }
     if (state.autoplay && cur) {
-      if (state.radioLoading || state.radioInFlight) return;
       const idxBefore = state.queueIndex;
-      const added = await appendRadioTracks(cur.id);
-      if (added > 0 && state.queueIndex === idxBefore && state.queueIndex + 1 < state.queue.length) {
+      const inFlight = state.radioInFlight;
+      if (inFlight) {
+        await inFlight;
+      } else {
+        await appendRadioTracks(cur.id);
+      }
+      if (state.queueIndex === idxBefore && state.queueIndex + 1 < state.queue.length) {
         return playQueueAt(state.queueIndex + 1);
       }
+      updatePlayButton(false);
+      setMediaPlaybackState('none');
       return;
     }
     updatePlayButton(false);
+    setMediaPlaybackState('none');
   }
 
   function wireAudioEvents() {
+    const clearStallWatch = () => {
+      if (state.stallTimer) {
+        clearTimeout(state.stallTimer);
+        state.stallTimer = null;
+      }
+    };
+    const armStallWatch = () => {
+      if (state.stallTimer || audio.paused || audio.ended || state.playCommitTimer || !audio.getAttribute('src')) {
+        return;
+      }
+      const watchToken = state.activeAudioToken;
+      const watchPos = audio.currentTime || 0;
+      state.stallTimer = setTimeout(() => {
+        state.stallTimer = null;
+        if (watchToken !== state.activeAudioToken) return;
+        if (audio.paused || audio.ended || state.playCommitTimer) return;
+        const cur = currentTrack();
+        if (!cur) return;
+        const nowPos = audio.currentTime || 0;
+        // Only intervene if playback genuinely hasn't progressed for 15s.
+        if (Math.abs(nowPos - watchPos) < 0.25 && audio.readyState < 3) {
+          scheduleNetworkRetry(watchToken, cur, nowPos, true);
+        }
+      }, 15000);
+    };
+
     audio.addEventListener('play', () => {
+      clearStallWatch();
       updatePlayButton(true);
       setMediaPlaybackState('playing');
+      updateMediaPositionState(true);
+    });
+    audio.addEventListener('playing', () => {
+      clearStallWatch();
+      state.networkRetryCount = 0;
+      state.pendingNetworkResume = null;
+      updatePlayButton(true);
+      setMediaPlaybackState('playing');
+      updateMediaPositionState(true);
+      const activeSrc = audio.currentSrc || audio.src || '';
+      if (vizMode === 'stream' && vizTrackSrc && activeSrc && vizTrackSrc !== activeSrc) {
+        teardownStreamVisualizer(false);
+      }
     });
     audio.addEventListener('pause', () => {
+      clearStallWatch();
+      if (state.isSwitchingTrack || audio.ended) return;
       updatePlayButton(false);
-      setMediaPlaybackState(audio.ended ? 'none' : 'paused');
-      if (!audio.ended && state.queue.length) saveServerQueue();
+      setMediaPlaybackState('paused');
+      updateMediaPositionState(true);
+      if (state.queue.length) saveServerQueue();
     });
     audio.addEventListener('loadedmetadata', () => {
       if (state.pendingSeekSec > 0) {
@@ -5303,33 +5600,53 @@
           audio.currentTime = Math.max(0, Math.min(target, maxDur));
         } catch {}
       }
+      updateMediaPositionState(true);
     });
+    audio.addEventListener('seeked', () => {
+      updateMediaPositionState(true);
+    });
+    audio.addEventListener('waiting', armStallWatch);
+    audio.addEventListener('stalled', armStallWatch);
     audio.addEventListener('error', () => {
+      clearStallWatch();
       if (state.playCommitTimer) return;
       const cur = currentTrack();
       if (!cur || !audio.error || !audio.getAttribute('src')) return;
       const errToken = state.activeAudioToken;
       const code = audio.error.code;
+      const pos = audio.currentTime || 0;
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
       if (
+        !isOffline &&
         (code === 3 || code === 4) &&
         state.compatAttemptedId !== cur.id &&
         !audio.src.includes('compat=1')
       ) {
         state.compatAttemptedId = cur.id;
-        const pos = audio.currentTime || 0;
-        audio.src = buildStreamUrl(cur, true, pos);
-        audio.play().catch(() => {
-          if (errToken !== state.activeAudioToken) return;
-          updatePlayButton(false);
-        });
+        state.isSwitchingTrack = true;
+        try {
+          audio.src = buildStreamUrl(cur, true, pos);
+          audio.play().catch(() => {
+            if (errToken !== state.activeAudioToken) return;
+            updatePlayButton(false);
+          });
+        } finally {
+          state.isSwitchingTrack = false;
+        }
         return;
+      }
+      if (code === 2 || isOffline || code === 4) {
+        if (scheduleNetworkRetry(errToken, cur, pos, false)) {
+          checkServerHealth();
+          return;
+        }
       }
       updatePlayButton(false);
       checkServerHealth();
       showToast(`Unable to play "${cur.title}" right now`);
     });
     audio.addEventListener('ended', () => {
-      setMediaPlaybackState('none');
+      clearStallWatch();
       if (state.playCommitTimer) return;
       const cur = currentTrack();
       if (state.repeat === 'one') {
@@ -5344,7 +5661,21 @@
       nextTrack(false);
     });
 
+    const fsEl = $('fullscreen-player');
+    if (fsEl) {
+      fsEl.addEventListener(
+        'pointerdown',
+        () => {
+          if (vizCtxNeedsResume() && !audio.paused && document.visibilityState !== 'hidden') {
+            vizCtx.resume().catch(() => {});
+          }
+        },
+        { passive: true }
+      );
+    }
+
     audio.addEventListener('timeupdate', () => {
+      clearStallWatch();
       if (state.seeking) return;
       const cur = currentTrack();
       const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
@@ -5361,6 +5692,7 @@
         if ($('fs-seek')) $('fs-seek').value = String(pct);
         if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = `${pct.toFixed(2)}%`;
       }
+      updateMediaPositionState(false);
       if (cur && total > 20 && pos / total >= 0.75 && state.lastScrobbleCompleteId !== cur.id) {
         state.lastScrobbleCompleteId = cur.id;
         sendTrackEvent(cur.id, 'complete', 1);
