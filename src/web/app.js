@@ -2492,7 +2492,7 @@
         </div>
       </div>
       <div class="track-table instant-mix-tracks">
-        ${renderTrackRows(mix.tracks.slice(0, previewCount), mix.tracks, null, false, query)}
+        ${renderTrackRows(mix.tracks.slice(0, previewCount), mix.tracks, null, false, query, false, true)}
       </div>
       ${
         mix.tracks.length > 6
@@ -4408,7 +4408,8 @@
     editablePlaylistId = null,
     singleRadio = false,
     searchQuery = '',
-    useTrackNo = false
+    useTrackNo = false,
+    useInstantMix = false
   ) {
     const queueList = fullContext || tracks;
     const idsJson = singleRadio ? '' : esc(JSON.stringify(queueList.map((t) => t.id)));
@@ -4422,10 +4423,10 @@
             : i;
         const isCur = cur && cur.id === t.id;
         let playClick;
-        if (searchQuery) {
-          playClick = singleRadio
-            ? `App.playSearchTrack(${esc(JSON.stringify(t.id))})`
-            : `App.playInstantMixAt(${ctxIdx})`;
+        if (useInstantMix) {
+          playClick = `App.playInstantMixAt(${ctxIdx})`;
+        } else if (searchQuery && singleRadio) {
+          playClick = `App.playSearchTrack(${esc(JSON.stringify(t.id))})`;
         } else {
           playClick = singleRadio
             ? `App.playSingle(${esc(JSON.stringify(t.id))})`
