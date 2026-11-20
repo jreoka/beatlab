@@ -6894,3 +6894,47 @@ body:not(.audio-playing) .fs-player .fs-cover {
     transform: none;
   }
 }
+
+/* ---------------- Buffering: spinner until the tapped track actually starts ---------------- */
+body.audio-loading .qp-tile.playing .qp-wave span,
+body.audio-loading .track-row.playing .tr-idx svg,
+body.audio-loading #btn-play svg,
+body.audio-loading #fs-play svg {
+  display: none;
+}
+body.audio-loading .qp-tile.playing .qp-wave::after,
+body.audio-loading .track-row.playing .tr-idx::after,
+body.audio-loading #btn-play::after,
+body.audio-loading #fs-play::after {
+  content: '';
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-top-color: var(--accent);
+  animation: beatlab-spin 0.78s linear infinite;
+}
+body.audio-loading .track-row.playing .tr-idx::after {
+  width: 15px;
+  height: 15px;
+  border-color: var(--surface-3);
+  border-top-color: var(--accent);
+}
+body.audio-loading #btn-play::after,
+body.audio-loading #fs-play::after {
+  width: 45%;
+  height: 45%;
+  border-color: currentColor;
+  border-top-color: transparent;
+  opacity: 0.85;
+}
+@media (max-width: 780px) {
+  body.audio-loading .qp-pager .qp-tile.playing .qp-wave::after { width: 26px; height: 26px; border-width: 3px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  body.audio-loading .qp-tile.playing .qp-wave::after,
+  body.audio-loading .track-row.playing .tr-idx::after,
+  body.audio-loading #btn-play::after,
+  body.audio-loading #fs-play::after { animation-duration: 1.6s; }
+}

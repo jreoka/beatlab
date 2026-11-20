@@ -4964,6 +4964,7 @@
     state.lastScrobbleCompleteId = '';
     state.compatAttemptedId = '';
 
+    setAudioLoading(true);
     updateNowPlayingUI(track, true, isBurst);
     renderQueuePanel();
     saveServerQueue();
@@ -5085,7 +5086,13 @@
     }
   }
 
+  // Spinner while a tapped track is still connecting/buffering (e.g. slow mobile data).
+  function setAudioLoading(on) {
+    document.body.classList.toggle('audio-loading', !!on);
+  }
+
   function updatePlayButton(playing) {
+    if (!playing) setAudioLoading(false);
     const svgHtml = playing
       ? '<path d="M6.5 4.5h4v15h-4zm7 0h4v15h-4z"/>'
       : '<path d="M8 4.5v15l12-7.5z"/>';
@@ -5646,6 +5653,7 @@
     });
     audio.addEventListener('playing', () => {
       clearStallWatch();
+      setAudioLoading(false);
       state.networkRetryCount = 0;
       state.pendingNetworkResume = null;
       updatePlayButton(true);
@@ -5658,7 +5666,7 @@
     });
     audio.addEventListener('pause', () => {
       clearStallWatch();
-      if (state.isSwitchingTrack || audio.ended) return;
+      if (state.isSwitchingTrack || audio.ended || state.playCommitTimer) return;
       updatePlayButton(false);
       setMediaPlaybackState('paused');
       updateMediaPositionState(true);
@@ -5678,7 +5686,10 @@
     audio.addEventListener('seeked', () => {
       updateMediaPositionState(true);
     });
-    audio.addEventListener('waiting', armStallWatch);
+    audio.addEventListener('waiting', () => {
+      if (!audio.paused) setAudioLoading(true);
+      armStallWatch();
+    });
     audio.addEventListener('stalled', armStallWatch);
     audio.addEventListener('error', () => {
       clearStallWatch();
@@ -5749,6 +5760,9 @@
 
     audio.addEventListener('timeupdate', () => {
       clearStallWatch();
+      if (!audio.paused && audio.readyState >= 3 && document.body.classList.contains('audio-loading')) {
+        setAudioLoading(false);
+      }
       if (state.seeking) return;
       const cur = currentTrack();
       const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
