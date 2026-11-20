@@ -4537,17 +4537,9 @@ a {
     color: var(--accent);
     background: transparent;
   }
-  .mobile-nav-btn.active::before {
-    content: "";
-    display: block;
-    position: absolute;
-    top: 0;
-    left: 50%;
-    transform: translateX(-50%);
-    width: 24px;
-    height: 2.5px;
-    border-radius: 0 0 2px 2px;
-    background: var(--accent);
+  .mobile-nav .mobile-nav-btn.active::before {
+    content: none;
+    display: none;
   }
 
   /* Native touch ergonomics & flat tactile press feedback */
