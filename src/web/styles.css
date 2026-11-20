@@ -6875,10 +6875,13 @@ body:not(.audio-playing) .fs-player .fs-cover {
 
 /* ---------------- Buffering: spinner until the tapped track actually starts ---------------- */
 body.audio-loading .qp-tile.playing .qp-wave span,
-body.audio-loading .track-row.playing .tr-idx svg,
+body.audio-loading .track-row.playing .tr-idx > *,
 body.audio-loading #btn-play svg,
 body.audio-loading #fs-play svg {
   display: none;
+}
+body.audio-loading .track-row.playing .tr-idx {
+  font-size: 0;
 }
 body.audio-loading .qp-tile.playing .qp-wave::after,
 body.audio-loading .track-row.playing .tr-idx::after,
