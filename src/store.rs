@@ -3765,26 +3765,48 @@ impl Store {
             return Ok(Vec::new());
         }
         let followed = self.followed_artist_ids(user_id).unwrap_or_default();
+        let listened = self.user_recent_tracks(user_id, 500, 0).unwrap_or_default();
+        let metas = self.all_artist_metas_map()?;
+
+        // Artists played via YouTube Music (`ar:ytm:…`) or known only by name
+        // (`ar:<slug>`) have no Deezer ID of their own, and `artists_meta`
+        // stores Deezer IDs under the canonical `ar:dz:…` key. Map every raw ID
+        // onto its Deezer artist where we can, so those plays still count and
+        // duplicates (same artist from two sources) merge into one entry.
+        let listened_tracks: Vec<Track> = listened.iter().map(|(t, _)| t.clone()).collect();
+        let resolver = ArtistResolver::build(&listened_tracks, &metas);
+
         let mut score: HashMap<String, f64> = HashMap::new();
+        let mut names: HashMap<String, String> = HashMap::new();
         // Followed artists get a strong, stable boost so they lead the list.
         for id in &followed {
-            *score.entry(id.clone()).or_insert(0.0) += 1000.0;
+            let name = metas.get(id).map(|m| m.name.clone()).unwrap_or_default();
+            let rid = match metas.get(id) {
+                Some(m) => resolver.resolve_meta(id, m),
+                None => resolver.resolve(id, &name),
+            };
+            if !name.is_empty() {
+                names.entry(rid.clone()).or_insert(name);
+            }
+            *score.entry(rid).or_insert(0.0) += 1000.0;
         }
 
         // Artists from listening history, ranked by play count and recency.
-        let listened = self.user_recent_tracks(user_id, 500, 0).unwrap_or_default();
-        let mut names: HashMap<String, String> = HashMap::new();
-        for (t, st) in listened {
-            let aid = t.artist_id();
+        for (t, st) in &listened {
+            let rid = resolver.resolve_track(t);
             let name = primary_artist(&t.artist);
             let name = if name.is_empty() { t.artist.clone() } else { name };
-            names.entry(aid.clone()).or_insert(name);
+            if !name.trim().is_empty() {
+                names.entry(rid.clone()).or_insert(name);
+            }
             let plays = (st.play_count.max(0) as f64).ln_1p().min(8.0);
             let recency = ((st.last_played.max(0) as f64) / 86_400.0).ln_1p().min(6.0);
-            *score.entry(aid).or_insert(0.0) += plays + recency;
+            *score.entry(rid).or_insert(0.0) += plays + recency;
         }
 
-        let metas = self.all_artist_metas_map()?;
+        // Artists that still lack a Deezer ID are kept (with an empty
+        // `deezer_id`) so the caller can look them up on Deezer by name;
+        // dropping them used to leave the feed empty for YTM-heavy listeners.
         let mut ranked: Vec<(f64, ArtistSummary)> = score
             .into_iter()
             .filter_map(|(id, s)| {
@@ -3799,15 +3821,17 @@ impl Store {
                             .and_then(|d| (!d.is_empty() && d != "0").then(|| d.to_string()))
                     })
                     .unwrap_or_default();
-                if deezer_id.is_empty() {
-                    return None;
-                }
                 let name = meta
                     .map(|m| m.name.clone())
-                    .filter(|n| !n.is_empty())
+                    .filter(|n| !n.trim().is_empty())
                     .or_else(|| names.get(&id).cloned())
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| deezer_id.clone());
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_default();
+                // Without a Deezer ID or a name there is nothing to look up.
+                if deezer_id.is_empty() && name.is_empty() {
+                    return None;
+                }
+                let name = if name.is_empty() { deezer_id.clone() } else { name };
                 let cover_url = meta.map(|m| m.cover_url.clone()).unwrap_or_default();
                 Some((
                     s,

@@ -5,7 +5,7 @@ use crate::auth::{
 };
 use crate::models::{
     AlbumSummary, ArtistSummary, Mood, PlayQueueState, Playlist, PublicUser, Track, User,
-    UserProfile, UserTrackStats, ERR_RESTORE_REQUIRED,
+    UserProfile, UserTrackStats, ERR_RESTORE_REQUIRED, slug,
 };
 use crate::store::SessionMeta;
 use crate::subsonic::{client_ip, user_agent, AppState};
@@ -1760,9 +1760,18 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
         .iter()
         .map(|artist| {
             let dz = state.sources.deezer.clone();
-            let id = artist.deezer_id.clone();
+            let store = state.store.clone();
+            let mut id = artist.deezer_id.clone();
             let name = artist.name.clone();
-            tokio::spawn(async move { dz.fetch_artist_releases(&id, &name, 4).await })
+            tokio::spawn(async move {
+                if id.is_empty() {
+                    match resolve_deezer_artist_by_name(&dz, &store, &name).await {
+                        Some(found) => id = found,
+                        None => return Vec::new(),
+                    }
+                }
+                dz.fetch_artist_releases(&id, &name, 4).await
+            })
         })
         .collect();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1805,6 +1814,52 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
     albums.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
     albums.truncate(limit);
     albums
+}
+
+/// Finds an artist's Deezer ID from their name (for artists known only via
+/// YouTube Music or by name). Only an exact, case-insensitive name match is
+/// accepted so we never show releases from a different artist. Hits and misses
+/// are remembered so each name is searched at most once a day.
+async fn resolve_deezer_artist_by_name(
+    dz: &crate::sources::deezer::DeezerSource,
+    store: &crate::store::Store,
+    name: &str,
+) -> Option<String> {
+    let name = name.trim();
+    let key_name = slug(name);
+    if key_name.is_empty() {
+        return None;
+    }
+    let cache_key = format!("dzartist:byname:{key_name}");
+    let now = Utc::now().timestamp();
+    if let Some(raw) = store.kv_get(&cache_key) {
+        if let Some((ts, id)) = raw.split_once('|') {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+            // Cached miss: retry after a day.
+            if ts.parse::<i64>().map_or(false, |t| now - t < 86_400) {
+                return None;
+            }
+        }
+    }
+    let wanted = name.to_lowercase();
+    let found = dz
+        .search_artists(name, 5)
+        .await
+        .into_iter()
+        .find(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name);
+    match found {
+        Some(a) => {
+            let _ = store.upsert_artist_meta(&a);
+            store.kv_set(&cache_key, &format!("{now}|{}", a.deezer_id));
+            Some(a.deezer_id)
+        }
+        None => {
+            store.kv_set(&cache_key, &format!("{now}|"));
+            None
+        }
+    }
 }
 
 /// Builds the new-releases shelf and advances the per-account "seen" marker so
