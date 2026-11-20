@@ -4480,8 +4480,11 @@
   // Reusable UI Renderers
   // ---------------------------------------------------------------------------
   function renderQuickTile(t) {
-    return `<div class="qp-tile" data-tid="${esc(t.id)}" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
+    const cur = currentTrack();
+    const playing = cur && cur.id === t.id ? ' playing' : '';
+    return `<div class="qp-tile${playing}" data-tid="${esc(t.id)}" onclick="App.playSingle(${esc(JSON.stringify(t.id))})">
       <img src="${esc(t.coverUrl)}" loading="lazy" alt="" />
+      <div class="qp-wave" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
       <div class="qp-info">
         <div class="qp-title">${esc(t.title)}</div>
         <div class="qp-sub">${esc(t.artist)}</div>
@@ -4960,7 +4963,7 @@
     saveServerQueue();
 
     // Highlight playing track in current view if visible
-    document.querySelectorAll('.track-row').forEach((row) => {
+    document.querySelectorAll('.track-row, .qp-tile').forEach((row) => {
       row.classList.toggle('playing', row.dataset.tid === track.id);
     });
 
@@ -5069,6 +5072,7 @@
       ? '<path d="M6.5 4.5h4v15h-4zm7 0h4v15h-4z"/>'
       : '<path d="M8 4.5v15l12-7.5z"/>';
     $('play-icon-svg').innerHTML = svgHtml;
+    document.body.classList.toggle('audio-playing', !!playing);
     if ($('fs-play-icon-svg')) $('fs-play-icon-svg').innerHTML = svgHtml;
   }
 

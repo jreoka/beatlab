@@ -6254,3 +6254,54 @@ html[data-theme="light"] .auth-error {
   .qp-pager .qp-sub { font-size: 10px; color: rgba(255, 255, 255, 0.75); }
   .qp-pager .qp-play { display: none; }
 }
+
+/* ---------------- Quick Picks: now-playing tile (accent border + mini waveform) ---------------- */
+.qp-tile { position: relative; }
+.qp-wave { display: none; }
+.qp-tile.playing {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 14px -2px var(--accent);
+}
+.qp-tile.playing .qp-wave {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 56px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  background: rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+.qp-wave span {
+  width: 3px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--accent);
+  transform-origin: center;
+  animation: qpWave 0.9s ease-in-out infinite;
+}
+.qp-wave span:nth-child(2) { animation-delay: -0.3s; }
+.qp-wave span:nth-child(3) { animation-delay: -0.6s; }
+.qp-wave span:nth-child(4) { animation-delay: -0.15s; }
+body:not(.audio-playing) .qp-wave span { animation-play-state: paused; }
+@keyframes qpWave {
+  0%, 100% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .qp-wave span { animation: none; transform: scaleY(0.6); }
+}
+
+@media (max-width: 780px) {
+  /* Square slot: center the waveform over the whole cover. */
+  .qp-pager .qp-tile.playing .qp-wave {
+    width: 100%;
+    background: rgba(0, 0, 0, 0.35);
+    gap: 4px;
+  }
+  .qp-pager .qp-wave span { width: 4px; height: 26px; }
+  .qp-pager .qp-tile.playing .qp-info { z-index: 1; }
+}
