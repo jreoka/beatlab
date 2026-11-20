@@ -32,6 +32,8 @@
     repeatAll: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/>',
     repeatOne: '<polyline points="17 2 21 6 17 10"/><path d="M3 12v-2a4 4 0 0 1 4-4h14"/><polyline points="7 22 3 18 7 14"/><path d="M21 12v2a4 4 0 0 1-4 4H3"/><path d="M11 10.2 12.4 9.2V15"/>',
     trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>',
+    lock: '<svg class="vis-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="11" width="15" height="10" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/></svg>',
+    globe: '<svg class="vis-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg>',
     pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>',
   };
 
@@ -3078,8 +3080,8 @@
       <div class="social-edit-row">
         <label>Visibility</label>
         <div class="pl-visibility-row">
-          <button type="button" class="pl-visibility-opt ${isPublic ? '' : 'selected'}" data-vis="private" onclick="App.pickPlaylistVisibility('private')">🔒 Private</button>
-          <button type="button" class="pl-visibility-opt ${isPublic ? 'selected' : ''}" data-vis="public" onclick="App.pickPlaylistVisibility('public')">🌐 Public</button>
+          <button type="button" class="pl-visibility-opt ${isPublic ? '' : 'selected'}" data-vis="private" onclick="App.pickPlaylistVisibility('private')">${ICONS.lock}Private</button>
+          <button type="button" class="pl-visibility-opt ${isPublic ? 'selected' : ''}" data-vis="public" onclick="App.pickPlaylistVisibility('public')">${ICONS.globe}Public</button>
         </div>
         <span class="pl-visibility-hint">${isPublic
           ? 'Anyone on this instance can find and view this playlist.'
@@ -3117,10 +3119,8 @@
         <img class="hero-art" src="${esc(pl.coverUrl)}" alt="${esc(pl.name)}" />
         <div class="hero-info">
           <div class="hero-kicker">${pl.isAuto ? 'MADE FOR YOU' : 'PLAYLIST'}</div>
-          <h1 class="hero-title">${esc(pl.name)}</h1>
-          <div class="hero-sub">By <strong>${esc(pl.ownerName)}</strong>${pl.comment ? ` · ${esc(pl.comment)}` : ''} · ${tracks.length} songs · ${fmtTotalDur(pl.duration)}
-            <span class="pl-visibility-badge" title="${pl.public ? 'Anyone can view this playlist' : 'Only you can view this playlist'}">${pl.public ? '🌐 Public' : '🔒 Private'}</span>
-          </div>
+          <h1 class="hero-title">${esc(pl.name)}<span class="pl-visibility-badge" title="${pl.public ? 'Anyone can view this playlist' : 'Only you can view this playlist'}">${pl.public ? `${ICONS.globe}Public` : `${ICONS.lock}Private`}</span></h1>
+          <div class="hero-sub">By <strong>${esc(pl.ownerName)}</strong>${pl.comment ? ` · ${esc(pl.comment)}` : ''} · ${tracks.length} songs · ${fmtTotalDur(pl.duration)}</div>
           <div class="hero-actions">
             ${tracks.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>` : ''}
             ${tracks.length > 1 ? `<button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>` : ''}

@@ -5068,6 +5068,17 @@ html.is-standalone .topbar {
   border-color: var(--accent);
   background: rgba(30, 215, 96, 0.1);
 }
+.hero-title .pl-visibility-badge {
+  margin-left: 10px;
+  vertical-align: middle;
+  letter-spacing: normal;
+  line-height: 1.4;
+  white-space: nowrap;
+  position: relative;
+  top: -2px;
+}
+.pl-visibility-opt .vis-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.pl-visibility-badge .vis-icon { width: 11px; height: 11px; flex-shrink: 0; }
 .pl-visibility-hint { color: var(--text-dim); font-size: 11px; line-height: 1.4; }
 .pl-visibility-badge {
   display: inline-flex;
