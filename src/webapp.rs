@@ -1751,18 +1751,27 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
         return Vec::new();
     }
 
-    let fetches = artists.iter().map(|artist| {
-        let dz = state.sources.deezer.clone();
-        let id = artist.deezer_id.clone();
-        let name = artist.name.clone();
-        async move { dz.fetch_artist_releases(&id, &name, 4).await }
-    });
-    let batches = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        futures::future::join_all(fetches),
-    )
-    .await
-    .unwrap_or_default();
+    // Each artist is fetched in its own task. We keep whatever finishes before
+    // the deadline; stragglers keep running detached so their responses land in
+    // the Deezer JSON cache and the next Home visit gets them instantly. (A
+    // single all-or-nothing timeout used to discard every result — and cancel
+    // the requests before they could be cached — whenever any one was slow.)
+    let handles: Vec<_> = artists
+        .iter()
+        .map(|artist| {
+            let dz = state.sources.deezer.clone();
+            let id = artist.deezer_id.clone();
+            let name = artist.name.clone();
+            tokio::spawn(async move { dz.fetch_artist_releases(&id, &name, 4).await })
+        })
+        .collect();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut batches: Vec<Vec<AlbumSummary>> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        if let Ok(Ok(batch)) = tokio::time::timeout_at(deadline, handle).await {
+            batches.push(batch);
+        }
+    }
 
     let mut albums: Vec<AlbumSummary> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
