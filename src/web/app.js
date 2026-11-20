@@ -967,7 +967,7 @@
       const bars = 40;
       const bw = canvas.width / bars;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = '#1ed760';
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
       const playing = !!audio && !audio.paused && !audio.ended;
       if (playing && audio.readyState >= 2) {
         ensureVisualizerAnalyser();
@@ -1171,11 +1171,15 @@
     setMarqueeText($('fs-title'), 'Ready');
     $('fs-artist').textContent = 'Beatlab';
     $('fs-bg').style.backgroundImage = '';
+    if ($('fs-mini-cover')) $('fs-mini-cover').src = '/api/web/cover/default';
+    if ($('fs-mini-title')) $('fs-mini-title').textContent = 'Ready';
+    if ($('fs-mini-artist')) $('fs-mini-artist').textContent = 'Beatlab';
     if ($('fs-like')) $('fs-like').classList.remove('active');
     if ($('fs-quality')) $('fs-quality').classList.add('hidden');
     if ($('fs-elapsed')) $('fs-elapsed').textContent = '0:00';
     if ($('fs-duration')) $('fs-duration').textContent = '0:00';
     if ($('fs-seek')) $('fs-seek').value = '0';
+    paintSeekFill();
     updatePlayButton(false);
 
     $('main-view').innerHTML = '';
@@ -1894,6 +1898,7 @@
               $('pb-seek').value = String(pct);
               if ($('fs-seek')) $('fs-seek').value = String(pct);
               if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = `${pct.toFixed(2)}%`;
+              paintSeekFill();
             }
           }
           loadLyricsForTrack(cur.id);
@@ -4990,6 +4995,7 @@
     if (!track) return;
     $('pb-cover').src = track.coverUrl;
     $('fs-cover').src = track.coverUrl;
+    if ($('fs-mini-cover')) $('fs-mini-cover').src = track.coverUrl;
     $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
 
     if ('mediaSession' in navigator) {
@@ -5039,6 +5045,7 @@
     if (!skipHeavy) {
       $('pb-cover').src = track.coverUrl;
       $('fs-cover').src = track.coverUrl;
+      if ($('fs-mini-cover')) $('fs-mini-cover').src = track.coverUrl;
       $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
     }
     setMarqueeText($('pb-title'), track.title);
@@ -5054,6 +5061,8 @@
 
     setMarqueeText($('fs-title'), track.title);
     $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(track.artist)}</span>${track.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(track.album)}</span>` : ''}`;
+    if ($('fs-mini-title')) $('fs-mini-title').textContent = track.title;
+    if ($('fs-mini-artist')) $('fs-mini-artist').textContent = track.artist;
     if ($('fs-like')) $('fs-like').classList.toggle('active', !!track.isStarred);
     if ($('fs-quality')) {
       $('fs-quality').textContent = track.qualityBadge;
@@ -5063,9 +5072,17 @@
     if ($('fs-duration')) $('fs-duration').textContent = fmtTime(track.duration);
     if ($('fs-elapsed')) $('fs-elapsed').textContent = '0:00';
     if ($('fs-seek')) $('fs-seek').value = '0';
+    paintSeekFill();
 
     document.title = `${track.title} · ${track.artist} — Beatlab`;
     updatePlayButton(active);
+  }
+
+  function paintSeekFill() {
+    for (const id of ['pb-seek', 'fs-seek']) {
+      const el = $(id);
+      if (el) el.style.setProperty('--pct', `${parseFloat(el.value) || 0}%`);
+    }
   }
 
   function updatePlayButton(playing) {
@@ -5747,6 +5764,7 @@
         if ($('fs-duration')) $('fs-duration').textContent = durStr;
         if ($('fs-seek')) $('fs-seek').value = String(pct);
         if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = `${pct.toFixed(2)}%`;
+        paintSeekFill();
       }
       updateMediaPositionState(false);
       if (cur && total > 20 && pos / total >= 0.75 && state.lastScrobbleCompleteId !== cur.id) {
@@ -5765,6 +5783,7 @@
         const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
         if ($('pb-seek') && e.target !== $('pb-seek')) $('pb-seek').value = String(val);
         if ($('fs-seek') && e.target !== $('fs-seek')) $('fs-seek').value = String(val);
+        paintSeekFill();
         if (total > 0) {
           const preview = fmtTime((val / 100) * total);
           $('pb-elapsed').textContent = preview;
@@ -7913,6 +7932,9 @@
       $('rp-lyrics-body').classList.toggle('hidden', tab !== 'lyrics');
     },
     setFsMobileView,
+    toggleFsMobileView: (view) => {
+      setFsMobileView(state.fsMobileView === view ? 'player' : view);
+    },
     setFsTab: (tab, silent = false) => {
       if (!silent && state.fsTab !== tab) haptic('tap');
       state.fsTab = tab;
