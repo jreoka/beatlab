@@ -299,6 +299,7 @@ async fn main() -> models::AppResult<()> {
             get(webapp::social_avatar_image),
         )
         .route("/api/web/social/profile/{user}", get(webapp::social_profile))
+        .route("/api/web/social/stats/{user}", get(webapp::social_stats))
         .route(
             "/api/web/social/follow/{user}",
             post(webapp::social_follow).delete(webapp::social_unfollow),

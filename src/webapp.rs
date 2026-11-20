@@ -3534,7 +3534,71 @@ pub async fn stats(
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute stats");
     };
 
-    let wrap_track = |t: &Track| to_web_track_with_maps(t, &starred, &track_stats, &ratings, false);
+    json_res(stats_payload(computed, &starred, &track_stats, &ratings, true))
+}
+
+/// Full listening stats for another user's profile — the same payload as the
+/// personal stats page. Track objects are decorated with the *viewer's* likes
+/// and ratings, and the most personal bits (the per-track activity log and
+/// the hidden-track count) are withheld unless the viewer is the target.
+pub async fn social_stats(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Query(q): Query<StatsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let viewer = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(target_id) = resolve_user_ref(&state, &reference) else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let Some(target) = state.store.get_public_user(target_id, viewer.id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "User not found");
+    };
+    let is_self = target.id == viewer.id;
+    let target_user = User {
+        id: target.id,
+        username: target.username.clone(),
+        password: String::new(),
+        created: target.created,
+    };
+    let range = crate::stats::StatsRange::from_str(q.range.as_deref());
+    let tz = q.tz.unwrap_or(0);
+    state.taste.enrich_user_listened_tracks(target.id).await;
+    let store = state.store.clone();
+    let vid = viewer.id;
+
+    let Ok((computed, starred, track_stats, ratings)) =
+        tokio::task::spawn_blocking(move || {
+            let now_ts = Utc::now().timestamp();
+            let c = crate::stats::build_user_stats(&store, &target_user, range, tz, now_ts);
+            let st = store.starred_ids(vid).unwrap_or_default();
+            let ts = store.track_stats_map(vid).unwrap_or_default();
+            let rt = store.user_ratings(vid).unwrap_or_default();
+            (c, st, ts, rt)
+        })
+        .await
+    else {
+        return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute stats");
+    };
+
+    json_res(stats_payload(computed, &starred, &track_stats, &ratings, is_self))
+}
+
+fn stats_payload(
+    mut computed: crate::stats::ComputedStats,
+    starred: &HashSet<String>,
+    track_stats: &HashMap<String, UserTrackStats>,
+    ratings: &HashMap<String, i32>,
+    is_self: bool,
+) -> Value {
+    if !is_self {
+        computed.recent_events.clear();
+        computed.library.hidden_tracks = 0;
+    }
+    let wrap_track = |t: &Track| to_web_track_with_maps(t, starred, track_stats, ratings, false);
 
     let top_tracks: Vec<Value> = computed
         .top_tracks
@@ -3632,7 +3696,8 @@ pub async fn stats(
         })
         .collect();
 
-    json_res(json!({
+    json!({
+        "isSelf": is_self,
         "range": computed.range.key(),
         "rangeLabel": computed.range.label(),
         "tzOffsetMin": computed.tz_offset_min,
@@ -3661,7 +3726,7 @@ pub async fn stats(
         "mostSkipped": most_skipped,
         "highlights": highlights,
         "recentEvents": recent_events,
-    }))
+    })
 }
 
 pub async fn get_playlist(

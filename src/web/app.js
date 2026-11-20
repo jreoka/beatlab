@@ -149,6 +149,11 @@
     social: {
       profileData: null,
       profileTab: 'radio',
+      // Full stats payload shown in the profile Stats tab (keyed by user + range).
+      profileStatsData: null,
+      profileStatsKey: '',
+      profileStatsRange: 'all',
+      profileStatsReq: 0,
       editColor: '',
       // null = untouched, a data URL = pending new picture, 'REMOVE' = clear.
       editAvatarData: null,
@@ -3874,10 +3879,21 @@
     }
   }
 
-  function renderStatsView() {
-    const d = state.statsData;
+  // Renders the full stats screen. With no `target` it is the personal stats
+  // route in #main-view; with a `target` user it fills the Stats tab of that
+  // user's profile (same layout, controls wired to the profile's handlers).
+  function renderStatsView(opts = {}) {
+    const target = opts.target || null;
+    const d = target ? state.social.profileStatsData : state.statsData;
     if (!d) return;
+    const host = target ? $('profile-tab-body') : $('main-view');
+    if (!host) return;
     hideStatsTooltip();
+    const isSelf = !target || d.isSelf;
+    const ownerName = target ? target.displayName || target.username : state.user?.username || 'Your';
+    const rangeFn = target ? 'App.setProfileStatsRange' : 'App.setStatsRange';
+    const metricFn = target ? 'App.setProfileStatsMetric' : 'App.setStatsMetric';
+    const refreshFn = target ? 'App.refreshProfileStats' : 'App.refreshStats';
 
     const s = d.summary || {};
     const streaks = d.streaks || {};
@@ -3891,17 +3907,17 @@
       ['365d', '1 Year'],
       ['all', 'All Time'],
     ];
-    let html = `<div class="stats-page">`;
+    let html = `<div class="stats-page${target ? ' stats-embedded' : ''}">`;
 
     // Hero Banner with Listener Persona + Controls
     html += `
       <section class="stats-hero">
         <div class="stats-hero-left">
           <div class="stats-hero-identity">
-            <span class="avatar-dot large">${avatarInner(selfAvatarUser())}</span>
+            <span class="avatar-dot large"${target?.avatarColor ? ` style="background:${esc(target.avatarColor)}"` : ''}>${avatarInner(target || selfAvatarUser())}</span>
             <div>
               <div class="hero-kicker">LISTENING ANALYTICS · ${esc(d.rangeLabel || 'All Time')}</div>
-              <h1 class="stats-hero-title">${esc(state.user?.username || 'Your')}’s Listening Stats</h1>
+              <${target ? 'h2' : 'h1'} class="stats-hero-title">${esc(ownerName)}’s Listening Stats</${target ? 'h2' : 'h1'}>
               <div class="stats-hero-dates">
                 Member since ${esc(fmtDateLabel(d.memberSince))}
                 ${d.firstListenAt ? ` · First stream ${esc(fmtDateLabel(d.firstListenAt))}` : ''}
@@ -3921,16 +3937,16 @@
             ${ranges
               .map(
                 ([k, lbl]) =>
-                  `<button class="tab-chip ${d.range === k ? 'active' : ''}" onclick="App.setStatsRange('${k}')">${esc(lbl)}</button>`
+                  `<button class="tab-chip ${d.range === k ? 'active' : ''}" onclick="${rangeFn}('${k}')">${esc(lbl)}</button>`
               )
               .join('')}
           </div>
           <div class="stats-ctrl-row">
             <div class="stats-seg-toggle" role="group" aria-label="Chart Metric">
-              <button class="stats-seg-btn ${metric === 'streams' ? 'active' : ''}" onclick="App.setStatsMetric('streams')">Streams</button>
-              <button class="stats-seg-btn ${metric === 'mins' ? 'active' : ''}" onclick="App.setStatsMetric('mins')">Minutes</button>
+              <button class="stats-seg-btn ${metric === 'streams' ? 'active' : ''}" onclick="${metricFn}('streams')">Streams</button>
+              <button class="stats-seg-btn ${metric === 'mins' ? 'active' : ''}" onclick="${metricFn}('mins')">Minutes</button>
             </div>
-            <button class="btn-secondary" onclick="App.refreshStats()" title="Refresh stats">Refresh</button>
+            <button class="btn-secondary" onclick="${refreshFn}()" title="Refresh stats">Refresh</button>
           </div>
         </div>
       </section>
@@ -3990,11 +4006,15 @@
       html += `
         <section class="stats-card stats-empty-card">
           <h2>No Streams Recorded in ${esc(d.rangeLabel || 'This Period')}</h2>
-          <p>Play songs from Home, Explore, or Search (or scrobble via Subsonic/Navidrome clients) to unlock your timeline graphs, 24-hour listening clock, mood radar, and top charts.</p>
+          ${
+            isSelf
+              ? `<p>Play songs from Home, Explore, or Search (or scrobble via Subsonic/Navidrome clients) to unlock your timeline graphs, 24-hour listening clock, mood radar, and top charts.</p>`
+              : `<p>${esc(ownerName)} hasn’t played anything in this period yet.</p>`
+          }
           <div class="hero-actions" style="justify-content:center;margin-top:14px">
-            <button class="btn-primary" onclick="App.navigate('explore')">Explore Music</button>
-            <button class="btn-secondary" onclick="App.navigate('home')">Go Home</button>
-            ${d.range !== 'all' ? `<button class="btn-secondary" onclick="App.setStatsRange('all')">View All Time</button>` : ''}
+            ${target ? '' : `<button class="btn-primary" onclick="App.navigate('explore')">Explore Music</button>
+            <button class="btn-secondary" onclick="App.navigate('home')">Go Home</button>`}
+            ${d.range !== 'all' ? `<button class="btn-secondary" onclick="${rangeFn}('all')">View All Time</button>` : ''}
           </div>
         </section>
       `;
@@ -4002,7 +4022,7 @@
         html += renderStatsActivityCard(d.recentEvents);
       }
       html += `</div>`;
-      $('main-view').innerHTML = html;
+      host.innerHTML = html;
       return;
     }
 
@@ -4075,7 +4095,7 @@
           <div class="stats-card-head">
             <div>
               <h2>Mood &amp; Vibe DNA</h2>
-              <p class="stats-card-sub">Your emotional listening fingerprint across Beatlab’s 10 vibes</p>
+              <p class="stats-card-sub">${isSelf ? 'Your' : `${esc(ownerName)}’s`} emotional listening fingerprint across Beatlab’s 10 vibes</p>
             </div>
           </div>
           <div class="stats-mood-split">
@@ -4232,7 +4252,7 @@
                       <span class="stats-lb-rank ${idx < 3 ? 'top' : ''}">${idx + 1}</span>
                       <img class="stats-lb-img round" src="${esc(a.coverUrl)}" loading="lazy" alt="" />
                       <div class="stats-lb-info">
-                        <div class="stats-lb-title">${esc(a.name)} ${a.isFollowed ? '<span class="stats-mini-tag">Following</span>' : ''}</div>
+                        <div class="stats-lb-title">${esc(a.name)} ${isSelf && a.isFollowed ? '<span class="stats-mini-tag">Following</span>' : ''}</div>
                         <div class="stats-lb-sub">${a.uniqueTracks} track${a.uniqueTracks === 1 ? '' : 's'} · ${fmtStatsDuration(a.listenedSecs)}</div>
                         <div class="stats-lb-meter"><span style="width:${Math.max(4, (a.streams / maxArtistStreams) * 100).toFixed(1)}%"></span></div>
                       </div>
@@ -4263,7 +4283,7 @@
                       <span class="stats-lb-rank ${idx < 3 ? 'top' : ''}">${idx + 1}</span>
                       <img class="stats-lb-img" src="${esc(al.coverUrl)}" loading="lazy" alt="" />
                       <div class="stats-lb-info">
-                        <div class="stats-lb-title">${esc(al.name)} ${al.isSaved ? '<span class="stats-mini-tag">Saved</span>' : ''}</div>
+                        <div class="stats-lb-title">${esc(al.name)} ${isSelf && al.isSaved ? '<span class="stats-mini-tag">Saved</span>' : ''}</div>
                         <div class="stats-lb-sub">${esc(al.artist)}${al.year ? ` · ${al.year}` : ''} · ${fmtStatsDuration(al.listenedSecs)}</div>
                         <div class="stats-lb-meter"><span style="width:${Math.max(4, (al.streams / maxAlbumStreams) * 100).toFixed(1)}%;background:var(--accent-blue)"></span></div>
                       </div>
@@ -4288,7 +4308,7 @@
           <div class="stats-card-head">
             <div>
               <h2>Most Played Tracks</h2>
-              <p class="stats-card-sub">Your top ${topTracks.length} heavy rotation songs</p>
+              <p class="stats-card-sub">${isSelf ? 'Your' : `${esc(ownerName)}’s`} top ${topTracks.length} heavy rotation songs</p>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button class="btn-primary" onclick="App.playListByIds(${topIdsJson}, 0)">${ICONS.play} Play Top Tracks</button>
@@ -4340,13 +4360,15 @@
     const ratingsDist = lib.ratingsDist || [0, 0, 0, 0, 0];
     const maxRatingCnt = Math.max(1, ...ratingsDist);
 
+    // Other users' profiles don't expose the activity log, so milestones go full width.
+    const showActivity = isSelf;
     html += `
-      <section class="stats-grid-2">
+      <section class="${showActivity ? 'stats-grid-2' : 'stats-section-gap'}">
         <div class="stats-card">
           <div class="stats-card-head">
             <div>
               <h2>Milestones &amp; Quirks</h2>
-              <p class="stats-card-sub">Standout moments from your listening history</p>
+              <p class="stats-card-sub">Standout moments from ${isSelf ? 'your' : `${esc(ownerName)}’s`} listening history</p>
             </div>
           </div>
           <div class="stats-milestones-grid">
@@ -4435,12 +4457,12 @@
           }
         </div>
 
-        ${renderStatsActivityCard(d.recentEvents || [])}
+        ${showActivity ? renderStatsActivityCard(d.recentEvents || []) : ''}
       </section>
     `;
 
     html += `</div>`;
-    $('main-view').innerHTML = html;
+    host.innerHTML = html;
 
     // Auto-scroll 365-day heatmap to the latest week on narrow viewports
     const hmScroll = $('stats-hm-scroll');
@@ -7351,6 +7373,7 @@
     const body = $('profile-tab-body');
     if (body) {
       body.innerHTML = renderProfileTabBody(data);
+      afterProfileTabRender(data);
       body.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
     document.querySelectorAll('#profile-tabs .tab-chip').forEach((el) => {
@@ -7358,67 +7381,72 @@
     });
   }
 
-  function publicStatsHtml(stats) {
-    if (!stats || !stats.totalStreams) {
-      return emptyState('No listening stats yet', 'These numbers appear once this listener starts playing music on Beatlab.');
+  const PROFILE_STATS_LOADING = `
+      <div class="main-loading-state" role="status" aria-live="polite">
+        <div class="loading-spinner" aria-hidden="true"></div>
+        <p class="loading-label">Crunching listening stats...</p>
+      </div>`;
+
+  function profileStatsKey(user, range) {
+    return `${user.id}:${range}`;
+  }
+
+  // The Stats tab shows the same full stats screen as the personal stats page.
+  // Its HTML is a loading placeholder until the payload arrives (or is cached).
+  function afterProfileTabRender(data) {
+    if ((data.tab || state.social.profileTab) !== 'stats') return;
+    const s = state.social;
+    if (s.profileStatsData && s.profileStatsKey === profileStatsKey(data.user, s.profileStatsRange)) {
+      renderStatsView({ target: data.user });
+      return;
     }
-    const topTracks = stats.topTracks || [];
-    const cards = [
-      ['Streams', stats.totalStreams.toLocaleString(), `${(stats.completedStreams || 0).toLocaleString()} completed`],
-      ['Listening time', fmtStatsDuration(stats.totalListeningSecs || 0), 'all time'],
-      ['Songs', (stats.uniqueTracks || 0).toLocaleString(), `${stats.uniqueAlbums || 0} albums`],
-      ['Artists', (stats.uniqueArtists || 0).toLocaleString(), 'explored'],
-      ['Best streak', `${stats.longestStreak || 0}d`, 'in a row'],
-    ];
-    return `
-      <section class="public-stats">
-        <div class="stats-kpi-grid">
-          ${cards
-            .map(
-              ([label, val, sub], i) => `
-            <div class="stats-kpi-card ${i === 0 ? 'accent-green' : ''}">
-              <div class="stats-kpi-label">${esc(label)}</div>
-              <div class="stats-kpi-val">${esc(val)}</div>
-              <div class="stats-kpi-sub">${esc(sub)}</div>
-            </div>`
-            )
-            .join('')}
-        </div>
-        ${
-          stats.topArtist || stats.topGenre
-            ? `<div class="public-stats-highlights">
-                 ${stats.topArtist ? `<div class="public-stat-highlight"><span>Top artist</span><strong>${esc(stats.topArtist)}</strong></div>` : ''}
-                 ${stats.topGenre ? `<div class="public-stat-highlight"><span>Top genre</span><strong>${esc(stats.topGenre)}</strong></div>` : ''}
-               </div>`
-            : ''
+    loadProfileStats(s.profileStatsRange);
+  }
+
+  async function loadProfileStats(range = 'all', { keepContent = false } = {}) {
+    const s = state.social;
+    const data = s.profileData;
+    if (!data) return;
+    const user = data.user;
+    const cleanRange = ['7d', '30d', '90d', '365d', 'all'].includes(range) ? range : 'all';
+    s.profileStatsRange = cleanRange;
+    const req = ++s.profileStatsReq;
+    const body = $('profile-tab-body');
+    if (body && !keepContent) {
+      body.innerHTML = PROFILE_STATS_LOADING;
+    } else if (body) {
+      body.querySelector('.stats-page')?.classList.add('stats-refreshing');
+    }
+    try {
+      const tz = -new Date().getTimezoneOffset();
+      const d = await api(
+        `/api/web/social/stats/${encodeURIComponent(user.username)}?range=${encodeURIComponent(cleanRange)}&tz=${encodeURIComponent(tz)}`
+      );
+      const cur = s.profileData;
+      if (req !== s.profileStatsReq || !cur || cur.user.id !== user.id || cur.tab !== 'stats') return;
+      cacheTracks((d.topTracks || []).map((x) => x.track));
+      cacheTracks((d.mostSkipped || []).map((x) => x.track));
+      if (d.highlights) {
+        for (const k of ['longestTrack', 'shortestTrack', 'firstTrackEver', 'mostCompletedTrack']) {
+          if (d.highlights[k]?.track) cacheTracks([d.highlights[k].track]);
         }
-        ${
-          topTracks.length
-            ? `<section class="section">
-                 <div class="section-head"><h2>Top tracks</h2><span style="color:var(--text-dim);font-size:12px">Most played</span></div>
-                 <div class="public-top-tracks">
-                   ${topTracks
-                     .map(
-                       (t, i) => `
-                     <div class="public-top-track">
-                       <span class="public-track-rank">${i + 1}</span>
-                       <div class="public-track-meta"><strong>${esc(t.title)}</strong><span>${esc(t.artist)}</span></div>
-                       <span class="public-track-plays">${(t.streams || 0).toLocaleString()} plays</span>
-                     </div>`
-                     )
-                     .join('')}
-                 </div>
-               </section>`
-            : ''
-        }
-        <p class="public-stats-foot">Member since ${esc(fmtDateLabel(stats.memberSince))}</p>
-      </section>`;
+      }
+      s.profileStatsData = d;
+      s.profileStatsKey = profileStatsKey(user, cleanRange);
+      renderStatsView({ target: user });
+    } catch (e) {
+      if (req !== s.profileStatsReq) return;
+      const b = $('profile-tab-body');
+      if (b && s.profileData?.tab === 'stats') {
+        b.innerHTML = emptyState('Couldn’t load stats', e?.message || 'Please try again.');
+      }
+    }
   }
 
   function renderProfileTabBody(data) {
     const tab = data.tab || state.social.profileTab;
     if (tab === 'stats') {
-      return publicStatsHtml(data.stats);
+      return PROFILE_STATS_LOADING;
     }
     if (tab === 'radio') {
       return radioPanelHtml(data);
@@ -7459,7 +7487,11 @@
       const defaultTab = 'stats';
       if (state.social.profileData && state.social.profileData.user.id !== u.id) {
         state.social.profileTab = defaultTab;
+        state.social.profileStatsRange = 'all';
       }
+      // Re-opening a profile always fetches fresh stats.
+      state.social.profileStatsData = null;
+      state.social.profileStatsKey = '';
       const data = {
         user: u,
         profile: profileRes.profile || {},
@@ -7513,6 +7545,7 @@
 
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
+      afterProfileTabRender(data);
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
     }
@@ -8000,6 +8033,17 @@
       renderStatsView();
     },
     refreshStats: () => renderStats(state.statsRange || 'all'),
+    setProfileStatsRange: (range) => {
+      haptic('tap');
+      loadProfileStats(range, { keepContent: true });
+    },
+    setProfileStatsMetric: (metric) => {
+      haptic('tap');
+      state.statsMetric = metric === 'mins' ? 'mins' : 'streams';
+      const u = state.social.profileData?.user;
+      if (u) renderStatsView({ target: u });
+    },
+    refreshProfileStats: () => loadProfileStats(state.social.profileStatsRange, { keepContent: true }),
     setRightTab: (tab) => {
       haptic('tap');
       $('tab-queue').classList.toggle('active', tab === 'queue');
