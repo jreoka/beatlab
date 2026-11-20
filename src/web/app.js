@@ -2155,13 +2155,62 @@
     `;
   }
 
+  const QP_PER_PAGE = 9;
+  const QP_MAX_PAGES = 4;
+
+  function quickPicksSectionHtml(quickPicks) {
+    const pages = [];
+    for (let i = 0; i < quickPicks.length; i += QP_PER_PAGE) pages.push(quickPicks.slice(i, i + QP_PER_PAGE));
+    const multi = pages.length > 1;
+    const chevron = (d) => `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${d}"/></svg>`;
+    const nav = multi ? `<div class="qp-nav">
+        <button class="qp-arrow" id="qp-prev" title="Previous" aria-label="Previous quick picks" disabled>${chevron('M15 18l-6-6 6-6')}</button>
+        <button class="qp-arrow" id="qp-next" title="Next" aria-label="Next quick picks">${chevron('M9 18l6-6-6-6')}</button>
+      </div>` : '';
+    const dots = multi ? `<div class="qp-dots" id="qp-dots">${pages.map((_, i) => `<button class="qp-dot${i === 0 ? ' active' : ''}" data-page="${i}" aria-label="Page ${i + 1}"></button>`).join('')}</div>` : '';
+    return `<section class="section quick-picks-section">
+      <div class="section-head"><h2>Quick Picks</h2>${nav}</div>
+      <div class="qp-pager" id="qp-pager">${pages.map((p) => `<div class="qp-page"><div class="quick-picks-grid">${p.map(renderQuickTile).join('')}</div></div>`).join('')}</div>
+      ${dots}
+    </section>`;
+  }
+
+  function bindQuickPicksPager() {
+    const pager = $('qp-pager');
+    if (!pager || pager.children.length < 2) return;
+    const prev = $('qp-prev');
+    const next = $('qp-next');
+    const dots = document.querySelectorAll('#qp-dots .qp-dot');
+    const count = pager.children.length;
+    const current = () => Math.round(pager.scrollLeft / Math.max(1, pager.clientWidth));
+    const goTo = (i) => {
+      const idx = Math.max(0, Math.min(count - 1, i));
+      pager.scrollTo({ left: idx * pager.clientWidth, behavior: 'smooth' });
+    };
+    const sync = () => {
+      const i = current();
+      if (prev) prev.disabled = i <= 0;
+      if (next) next.disabled = i >= count - 1;
+      dots.forEach((d, j) => d.classList.toggle('active', j === i));
+    };
+    if (prev) prev.onclick = () => goTo(current() - 1);
+    if (next) next.onclick = () => goTo(current() + 1);
+    dots.forEach((d) => { d.onclick = () => goTo(Number(d.dataset.page)); });
+    let raf = 0;
+    pager.addEventListener('scroll', () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; sync(); });
+    }, { passive: true });
+    sync();
+  }
+
   function newReleasesSectionHtml(newReleases, unseen) {
     if (!newReleases.length) return '';
     return `<section class="section" id="new-releases-section">
       <div class="section-head">
         <h2>New Releases${unseen > 0 ? ` <span class="new-count-pill">${unseen} new</span>` : ''}</h2>
       </div>
-      <div class="card-grid">${newReleases.map(renderNewReleaseCard).join('')}</div>
+      <div class="card-grid">${newReleases.slice(0, 8).map(renderNewReleaseCard).join('')}</div>
     </section>`;
   }
 
@@ -2171,7 +2220,7 @@
     try {
       const d = await api('/api/web/home', { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
-      const quickPicks = cacheTracks(d.quickPicks || []).slice(0, 6);
+      const quickPicks = cacheTracks(d.quickPicks || []).slice(0, QP_PER_PAGE * QP_MAX_PAGES);
       const newReleases = d.newReleases || [];
       const trending = cacheTracks(d.trending || []);
       const recent = cacheTracks(d.recent || []);
@@ -2186,10 +2235,7 @@
       let html = `<h1 class="page-greeting">${greetingText()}, ${esc(state.user.username)}</h1>`;
 
       if (quickPicks.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>Quick Picks</h2></div>
-          <div class="quick-picks-grid">${quickPicks.map(renderQuickTile).join('')}</div>
-        </section>`;
+        html += quickPicksSectionHtml(quickPicks);
       }
 
       if (mixedForYou.length > 0) {
@@ -2261,6 +2307,7 @@
 
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
+      bindQuickPicksPager();
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
     }

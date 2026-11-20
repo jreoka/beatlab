@@ -2,7 +2,7 @@ use crate::models::{slug, AlbumSummary, ArtistSummary, Track};
 use crate::sources::MusicSource;
 use crate::taste::classify_moods_str;
 use async_trait::async_trait;
-use chrono::{Datelike, Utc};
+use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -515,7 +515,11 @@ impl DeezerSource {
             return Vec::new();
         };
 
-        let min_year = Utc::now().year() - 1;
+        // Only genuinely new drops: released within the last ~month (and not
+        // pre-announced future dates). ISO dates compare lexicographically.
+        let today = Utc::now().date_naive();
+        let cutoff = (today - chrono::Duration::days(31)).format("%Y-%m-%d").to_string();
+        let today_str = today.format("%Y-%m-%d").to_string();
         let mut entries: Vec<(String, DzAlbum)> = parsed
             .data
             .into_iter()
@@ -540,14 +544,24 @@ impl DeezerSource {
         let mut out: Vec<AlbumSummary> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for (_, mut album) in entries {
-            let year = parse_year(&album.release_date);
-            if year <= 0 || year < min_year {
+            let Some(date) = album.release_date.trim().get(..10).map(str::to_string) else {
+                continue;
+            };
+            if date < cutoff || date > today_str {
                 continue;
             }
+            let released_ts = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc().timestamp());
             if album.artist.is_none() {
                 album.artist = Some(fallback_artist.clone());
             }
-            if let Some(summary) = album.into_summary() {
+            if let Some(mut summary) = album.into_summary() {
+                if let Some(ts) = released_ts {
+                    // Carry the exact release date so the feed sorts newest first.
+                    summary.created = ts;
+                }
                 if seen.insert(summary.id.clone()) {
                     out.push(summary);
                 }

@@ -6162,3 +6162,55 @@ html[data-theme="light"] .auth-error {
   background: rgba(225, 29, 72, 0.08);
   border-color: rgba(225, 29, 72, 0.3);
 }
+
+/* ---------------- Quick Picks pager (9 per page, swipe / arrows) ---------------- */
+.quick-picks-section .section-head { align-items: center; }
+.qp-nav { display: flex; gap: 6px; }
+.qp-arrow {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: inherit;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+}
+.qp-arrow:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border-bright); }
+.qp-arrow:disabled { opacity: 0.35; cursor: default; }
+.qp-pager {
+  display: flex;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.qp-pager::-webkit-scrollbar { display: none; }
+.qp-page {
+  flex: 0 0 100%;
+  min-width: 0;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+.qp-pager .quick-picks-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.qp-dots { display: flex; justify-content: center; gap: 6px; margin-top: 10px; }
+.qp-dot {
+  width: 6px;
+  height: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: var(--border-bright);
+  cursor: pointer;
+  transition: width 0.18s, background 0.18s;
+}
+.qp-dot.active { width: 18px; background: currentColor; }
+
+@media (max-width: 780px) {
+  .qp-pager .quick-picks-grid { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .qp-arrow { width: 28px; height: 28px; }
+}

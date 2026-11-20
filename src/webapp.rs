@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{Datelike, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -1740,12 +1740,12 @@ pub async fn passkey_delete(
 
 /// Builds the personalised "New Releases" feed: recent albums from artists the
 /// user follows or listens to. Fresh releases are pulled from Deezer in
-/// parallel; a short timeout keeps the home tab responsive, and the newest
-/// matching albums already in the local library fill any gaps.
+/// parallel (only releases from the last ~month); a short timeout keeps the
+/// home tab responsive.
 async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<AlbumSummary> {
     let artists = state
         .store
-        .relevant_artists_for_releases(uid, 8)
+        .relevant_artists_for_releases(uid, 16)
         .unwrap_or_default();
     if artists.is_empty() {
         return Vec::new();
@@ -1792,26 +1792,7 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
         }
     }
 
-    // Local fallback: newest recent albums from the same artists in the library.
-    if albums.len() < limit {
-        let min_year = Utc::now().year() - 2;
-        let artist_ids: HashSet<&str> = artists.iter().map(|a| a.id.as_str()).collect();
-        let local = state.store.build_album_summaries(uid).unwrap_or_default();
-        for album in local.into_iter().filter(|a| {
-            artist_ids.contains(a.artist_id.as_str())
-                && a.year >= min_year
-                && a.year <= min_year + 3
-        }) {
-            if seen.insert(album.id.clone()) {
-                albums.push(album);
-            }
-            if albums.len() >= limit {
-                break;
-            }
-        }
-    }
-
-    albums.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
+    albums.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.name.cmp(&b.name)));
     albums.truncate(limit);
     albums
 }
@@ -1869,7 +1850,7 @@ async fn build_new_releases(
     uid: i64,
     saved: &HashSet<String>,
 ) -> (Vec<Value>, usize, i64) {
-    let new_releases = collect_new_releases(state, uid, 12).await;
+    let new_releases = collect_new_releases(state, uid, 8).await;
     for a in &new_releases {
         let _ = state.store.upsert_album_meta(a);
     }
@@ -1962,7 +1943,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
         .map(|p| playlist_summary_json(&p))
         .collect();
 
-    let quick_picks = state.taste.quick_picks(uid, 12);
+    let quick_picks = state.taste.quick_picks(uid, 36);
     let recent: Vec<Track> = filter_visible_tracks(
         &state,
         uid,
