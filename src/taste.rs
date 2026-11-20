@@ -3353,22 +3353,93 @@ impl TasteEngine {
     }
 
     /// Ensures a full album is loaded into SQLite (hydrating from Deezer if it only has stubs).
-    pub async fn get_or_hydrate_album(&self, album_id: &str) -> Option<(AlbumSummary, Vec<Track>)> {
-        self.get_or_hydrate_album_with_hints(album_id, None, None).await
+    /// Finds the Deezer album ID for an album known only by name/artist, first via
+    /// album search, then by locating one of its songs and taking that song's album.
+    async fn find_deezer_album(
+        &self,
+        hint_pairs: &[(String, String)],
+        titles: &[String],
+    ) -> Option<String> {
+        for (artist, album) in hint_pairs.iter().take(3) {
+            let pa = primary_artist(artist);
+            let alb_clean = album.trim();
+            let q = if pa.trim().is_empty() {
+                alb_clean.to_string()
+            } else {
+                format!("{} {}", pa, alb_clean)
+            };
+            let want_alb = album_match_key(alb_clean);
+            let want_inst = alb_clean.to_lowercase().contains("instrumental");
+            let found = self
+                .sources
+                .deezer
+                .search_albums(&q, 15)
+                .await
+                .into_iter()
+                .find(|a| {
+                    !a.deezer_id.is_empty()
+                        && a.name.to_lowercase().contains("instrumental") == want_inst
+                        && album_match_key(&a.name) == want_alb
+                        && album_artists_match(&pa, &a.artist)
+                });
+            if let Some(a) = found {
+                return Some(a.deezer_id);
+            }
+        }
+
+        let (artist, _) = hint_pairs.first()?;
+        let pa = primary_artist(artist);
+        let want_albs: HashSet<String> = hint_pairs.iter().map(|(_, alb)| album_match_key(alb)).collect();
+        let mut seen_titles = HashSet::new();
+        for title in titles {
+            let core = crate::models::core_song_title(title);
+            if core.trim().is_empty() || !seen_titles.insert(core.clone()) || seen_titles.len() > 3 {
+                continue;
+            }
+            let q = if pa.trim().is_empty() {
+                title.trim().to_string()
+            } else {
+                format!("{} {}", pa, title.trim())
+            };
+            let hit = self
+                .sources
+                .deezer
+                .search_tracks(&q, 10)
+                .await
+                .into_iter()
+                .find(|t| {
+                    album_artists_match(&pa, &t.artist)
+                        && want_albs.contains(&album_match_key(&t.album))
+                        && t.deezer_album_id().is_some()
+                });
+            if let Some(t) = hit {
+                return t.deezer_album_id();
+            }
+        }
+        None
     }
 
+    pub async fn get_or_hydrate_album(&self, album_id: &str) -> Option<(AlbumSummary, Vec<Track>)> {
+        self.get_or_hydrate_album_with_hints(album_id, None, None, None).await
+    }
+
+    /// Resolves an album to its full, authoritative tracklist. The local library
+    /// only holds songs that were played or cached, so whenever the album can be
+    /// matched on Deezer its complete tracklist is used, with local copies kept
+    /// for songs Deezer also lists (so better-quality versions still win).
     pub async fn get_or_hydrate_album_with_hints(
         &self,
         album_id: &str,
         name_hint: Option<&str>,
         artist_hint: Option<&str>,
+        track_hint: Option<&str>,
     ) -> Option<(AlbumSummary, Vec<Track>)> {
         let existing_tracks = self.store.album_tracks(album_id).unwrap_or_default();
         let existing_meta = self.store.get_album_meta(album_id).ok().flatten();
 
         let local_summary = self.store.album_summary_by_id(0, album_id).ok().flatten();
 
-        // Determine if we know a Deezer album ID to hydrate full tracklist from.
+        // Known Deezer album ID, if any local data already links one.
         let mut dz_album_id = existing_meta
             .as_ref()
             .map(|m| m.deezer_id.clone())
@@ -3379,69 +3450,45 @@ impl TasteEngine {
                     .map(|s| s.deezer_id.clone())
                     .filter(|id| !id.is_empty())
             })
-            .or_else(|| {
-                album_id
-                    .strip_prefix("dz:")
-                    .map(|s| s.to_string())
-            })
-            .or_else(|| {
-                existing_tracks.iter().find_map(|t| {
-                    serde_json::from_str::<serde_json::Value>(&t.meta)
-                        .ok()
-                        .and_then(|v| v.get("deezer_album_id").and_then(|x| x.as_u64()))
-                        .filter(|&n| n > 0)
-                        .map(|n| n.to_string())
-                })
-            });
+            .or_else(|| album_id.strip_prefix("dz:").map(|s| s.to_string()))
+            .or_else(|| existing_tracks.iter().find_map(|t| t.deezer_album_id()))
+            .filter(|id| !id.is_empty() && id != "0");
 
-        let hint_pair = existing_meta
-            .as_ref()
-            .map(|m| (m.artist.clone(), m.name.clone()))
-            .or_else(|| {
-                local_summary
-                    .as_ref()
-                    .map(|s| (s.artist.clone(), s.name.clone()))
-            })
-            .or_else(|| {
-                existing_tracks
-                    .first()
-                    .map(|t| (t.artist.clone(), t.album.clone()))
-            })
-            .or_else(|| {
-                let nh = name_hint.map(str::trim).filter(|s| !s.is_empty())?;
-                let ah = artist_hint.map(str::trim).unwrap_or("");
-                Some((ah.to_string(), nh.to_string()))
+        // (artist, album name) pairs to search with. The client's hint comes from
+        // the exact song the user clicked, so it is the most trustworthy.
+        let mut hint_pairs: Vec<(String, String)> = Vec::new();
+        if let Some(nh) = name_hint.map(str::trim).filter(|s| !s.is_empty()) {
+            let ah = artist_hint.map(str::trim).unwrap_or("");
+            hint_pairs.push((ah.to_string(), nh.to_string()));
+        }
+        if let Some(m) = existing_meta.as_ref() {
+            hint_pairs.push((m.artist.clone(), m.name.clone()));
+        }
+        if let Some(s) = local_summary.as_ref() {
+            hint_pairs.push((s.artist.clone(), s.name.clone()));
+        }
+        if let Some(t) = existing_tracks.first() {
+            hint_pairs.push((t.artist.clone(), t.album.clone()));
+        }
+        hint_pairs.retain(|(_, alb)| !alb.trim().is_empty());
+        {
+            let mut seen = HashSet::new();
+            hint_pairs.retain(|(art, alb)| {
+                seen.insert((slug(&primary_artist(art)), album_match_key(alb)))
             });
+        }
+        let hint_pair = hint_pairs.first().cloned();
 
-        if dz_album_id.is_none() && existing_tracks.len() <= 2 {
-            if let Some((ref artist_name, ref album_name)) = hint_pair {
-                let alb_clean = album_name.trim();
-                if !alb_clean.is_empty() {
-                    let pa = primary_artist(artist_name);
-                    let q = if pa.is_empty() {
-                        alb_clean.to_string()
-                    } else {
-                        format!("{} {}", pa, alb_clean)
-                    };
-                    let want_alb_slug = slug(alb_clean);
-                    let want_art_slug = slug(&pa);
-                    let want_inst = alb_clean.to_lowercase().contains("instrumental");
-                    let candidates = self.sources.deezer.search_albums(&q, 10).await;
-                    dz_album_id = candidates
-                        .into_iter()
-                        .filter(|a| !a.deezer_id.is_empty())
-                        .filter(|a| {
-                            let cand_inst = a.name.to_lowercase().contains("instrumental");
-                            want_inst == cand_inst
-                        })
-                        .find(|a| {
-                            slug(&a.name) == want_alb_slug
-                                && (want_art_slug.is_empty()
-                                    || slug(&primary_artist(&a.artist)) == want_art_slug)
-                        })
-                        .map(|a| a.deezer_id);
-                }
-            } else if let Some(rest) = album_id.strip_prefix("al:dz-") {
+        if dz_album_id.is_none() {
+            let mut titles: Vec<String> = Vec::new();
+            if let Some(th) = track_hint.map(str::trim).filter(|s| !s.is_empty()) {
+                titles.push(th.to_string());
+            }
+            titles.extend(existing_tracks.iter().take(3).map(|t| t.title.clone()));
+            dz_album_id = self.find_deezer_album(&hint_pairs, &titles).await;
+        }
+        if dz_album_id.is_none() {
+            if let Some(rest) = album_id.strip_prefix("al:dz-") {
                 if let Some((dz_aid, alb_slug)) = rest.split_once('-') {
                     if !dz_aid.is_empty() && !alb_slug.is_empty() {
                         if let Some((_, _, albs, _)) = self.sources.deezer.fetch_artist(dz_aid).await {
@@ -3455,86 +3502,97 @@ impl TasteEngine {
             }
         }
 
-        if existing_tracks.len() <= 2 {
-            if let Some(ref dz_id) = dz_album_id {
-                if let Some((meta, tracks)) = self.sources.deezer.fetch_album(dz_id).await {
-                    let _ = self.store.upsert_album_meta(&meta);
-                    let _ = self.store.upsert_tracks(&tracks);
-                    let stored = self.store.album_tracks(&meta.id).unwrap_or(tracks);
-                    let final_tracks = self.upgrade_album_from_soulseek(&meta, stored).await;
-                    return Some((meta, final_tracks));
-                }
+        if let Some(ref dz_id) = dz_album_id {
+            if let Some((meta, dz_tracks)) = self.sources.deezer.fetch_album(dz_id).await {
+                let _ = self.store.upsert_album_meta(&meta);
+                let _ = self.store.upsert_tracks(&dz_tracks);
+                let stored = self
+                    .store
+                    .album_tracks(&meta.id)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or(dz_tracks);
+                // Fold in local copies (e.g. the version being played) of songs on
+                // the official tracklist; don't append unrelated local strays.
+                let official_keys: HashSet<String> = stored.iter().map(|t| t.song_key()).collect();
+                let local_same: Vec<Track> = existing_tracks
+                    .into_iter()
+                    .filter(|t| official_keys.contains(&t.song_key()))
+                    .collect();
+                let merged = merge_tracks_dedup(stored, local_same);
+                let final_tracks = self.upgrade_album_from_soulseek(&meta, merged).await;
+                return Some((meta, final_tracks));
+            }
+        }
+
+        // Deezer couldn't place it: search every source for the album's songs and
+        // merge them with what's stored locally.
+        let mut tracks = existing_tracks;
+        if let Some((ref artist_name, ref album_name)) = hint_pair {
+            let alb_clean = album_name.trim();
+            let pa = primary_artist(artist_name);
+            let q = if pa.trim().is_empty() {
+                alb_clean.to_string()
+            } else {
+                format!("{} {}", pa, alb_clean)
+            };
+            let want_alb = album_match_key(alb_clean);
+            let found: Vec<Track> = self
+                .sources
+                .search_all(&q, 25)
+                .await
+                .into_iter()
+                .filter(|t| {
+                    album_artists_match(&pa, &t.artist)
+                        && (album_match_key(&t.album) == want_alb
+                            || (tracks.is_empty()
+                                && slug(&crate::models::core_song_title(&t.title)) == want_alb))
+                })
+                .collect();
+            if !found.is_empty() {
+                let _ = self.store.upsert_tracks(&found);
+                tracks = merge_tracks_dedup(tracks, found);
+                tracks.sort_by(|a, b| {
+                    a.disc_no
+                        .cmp(&b.disc_no)
+                        .then_with(|| a.track_no.cmp(&b.track_no))
+                });
             }
         }
 
         if let Some(summary) = local_summary.or_else(|| self.store.album_summary_by_id(0, album_id).ok().flatten()) {
-            let tracks = if existing_tracks.is_empty() {
+            let tracks = if tracks.is_empty() {
                 self.store.album_tracks(&summary.id).unwrap_or_default()
             } else {
-                existing_tracks
+                tracks
             };
             let upgraded = self.upgrade_album_from_soulseek(&summary, tracks).await;
             return Some((summary, upgraded));
         }
 
-        if let Some(dz_id) = dz_album_id {
-            if let Some((meta, tracks)) = self.sources.deezer.fetch_album(&dz_id).await {
-                let _ = self.store.upsert_album_meta(&meta);
-                let _ = self.store.upsert_tracks(&tracks);
-                let upgraded = self.upgrade_album_from_soulseek(&meta, tracks).await;
-                return Some((meta, upgraded));
-            }
-        }
-
-        if let Some((artist_name, album_name)) = hint_pair {
+        if let Some((_, album_name)) = hint_pair {
             let alb_clean = album_name.trim();
-            if !alb_clean.is_empty() {
-                let pa = primary_artist(&artist_name);
-                let q = if pa.is_empty() {
-                    alb_clean.to_string()
-                } else {
-                    format!("{} {}", pa, alb_clean)
+            if !alb_clean.is_empty() && !tracks.is_empty() {
+                let first = &tracks[0];
+                let summary = AlbumSummary {
+                    id: first.album_id(),
+                    name: alb_clean.to_string(),
+                    artist: first.artist.clone(),
+                    artist_id: first.artist_id(),
+                    cover_id: first.id.clone(),
+                    cover_url: first.cover_url.clone(),
+                    genre: first.genre.clone(),
+                    year: first.year,
+                    label: String::new(),
+                    deezer_id: String::new(),
+                    song_count: tracks.len(),
+                    duration: tracks.iter().map(|t| t.duration.max(0)).sum(),
+                    play_count: 0,
+                    last_played: 0,
+                    created: first.created,
                 };
-                let mut tracks = existing_tracks;
-                if tracks.is_empty() {
-                    let found = self.sources.search_all(&q, 15).await;
-                    let want_alb_slug = slug(alb_clean);
-                    let want_art_slug = slug(&pa);
-                    for t in found {
-                        let t_alb_slug = slug(&t.album);
-                        let t_title_slug = slug(&crate::models::core_song_title(&t.title));
-                        let art_ok = want_art_slug.is_empty()
-                            || slug(&primary_artist(&t.artist)) == want_art_slug;
-                        if art_ok && (t_alb_slug == want_alb_slug || t_title_slug == want_alb_slug) {
-                            tracks.push(t);
-                        }
-                    }
-                    if !tracks.is_empty() {
-                        let _ = self.store.upsert_tracks(&tracks);
-                    }
-                }
-                if !tracks.is_empty() {
-                    let first = &tracks[0];
-                    let summary = AlbumSummary {
-                        id: first.album_id(),
-                        name: alb_clean.to_string(),
-                        artist: first.artist.clone(),
-                        artist_id: first.artist_id(),
-                        cover_id: first.id.clone(),
-                        cover_url: first.cover_url.clone(),
-                        genre: first.genre.clone(),
-                        year: first.year,
-                        label: String::new(),
-                        deezer_id: String::new(),
-                        song_count: tracks.len(),
-                        duration: tracks.iter().map(|t| t.duration.max(0)).sum(),
-                        play_count: 0,
-                        last_played: 0,
-                        created: first.created,
-                    };
-                    let _ = self.store.upsert_album_meta(&summary);
-                    return Some((summary, tracks));
-                }
+                let _ = self.store.upsert_album_meta(&summary);
+                return Some((summary, tracks));
             }
         }
         None
@@ -8899,6 +8957,31 @@ pub(crate) fn enrich_slsk_hit_with_base(
     if !base.meta.is_empty() {
         hit.meta = base.meta.clone();
     }
+}
+
+/// Normalizes an album title for cross-source comparison: drops release tags
+/// ("(Deluxe)", "[Remastered]") and store suffixes like " - Single" / " - EP".
+fn album_match_key(name: &str) -> String {
+    let mut s = crate::models::strip_release_tags(name).trim().to_string();
+    for suffix in [" - single", " - ep", " (single)", " (ep)"] {
+        if s.to_lowercase().ends_with(suffix) {
+            let keep = s.len() - suffix.len();
+            if s.is_char_boundary(keep) {
+                s.truncate(keep);
+            }
+        }
+    }
+    slug(s.trim())
+}
+
+/// Loose artist comparison across sources (handles "Artist - Topic", features, etc).
+fn album_artists_match(want_primary: &str, candidate: &str) -> bool {
+    if want_primary.trim().is_empty() {
+        return true;
+    }
+    let a = slug(want_primary);
+    let b = slug(&primary_artist(candidate));
+    a == b || (a.len() >= 3 && b.len() >= 3 && (a.contains(&b) || b.contains(&a)))
 }
 
 fn merge_tracks_dedup(primary: Vec<Track>, secondary: Vec<Track>) -> Vec<Track> {

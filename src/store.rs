@@ -1864,6 +1864,12 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every track in the library, newest first. Use for lookups that must not
+    /// miss older tracks (album/artist membership), unlike the capped `all_tracks`.
+    pub fn all_tracks_unbounded(&self) -> AppResult<Vec<Track>> {
+        self.all_tracks(i64::MAX as usize, 0)
+    }
+
     /// Returns user-affinity tracks (starred, manual playlists, played, rated, expanded radio links,
     /// same-artist/local/same-genre catalog matches) unioned with recent catalog tracks so personalized
     /// mixes never lose taste candidates past recent-insert offset limits.
@@ -2695,7 +2701,9 @@ impl Store {
             .flatten()
             .map(|m| m.deezer_id)
             .filter(|s| !s.is_empty());
-        let all = self.all_tracks(8000, 0)?;
+        // Must scan the whole library: a capped "newest N" window silently drops
+        // older tracks, leaving albums with only a stray recent song or two.
+        let all = self.all_tracks_unbounded()?;
         let artist_metas = self.all_artist_metas_map()?;
         let resolver = ArtistResolver::build(&all, &artist_metas);
 

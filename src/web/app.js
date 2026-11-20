@@ -2876,15 +2876,18 @@
     try {
       let hintName = '';
       let hintArtist = '';
+      let hintTrack = '';
       const cur = currentTrack();
       if (cur && cur.albumId === id) {
         hintName = cur.album || '';
         hintArtist = cur.artist || '';
+        hintTrack = cur.title || '';
       } else {
         for (const t of state.trackMap.values()) {
           if (t.albumId === id) {
             hintName = t.album || '';
             hintArtist = t.artist || '';
+            hintTrack = t.title || '';
             break;
           }
         }
@@ -2892,6 +2895,7 @@
       const qs = new URLSearchParams();
       if (hintName) qs.set('name', hintName);
       if (hintArtist) qs.set('artist', hintArtist);
+      if (hintTrack) qs.set('track', hintTrack);
       const qStr = qs.toString() ? `?${qs.toString()}` : '';
       const d = await api(`/api/web/album/${encodeURIComponent(id)}${qStr}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;

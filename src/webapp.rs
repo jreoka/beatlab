@@ -3333,6 +3333,8 @@ async fn build_instant_mix_response(
 pub struct EntityHintQuery {
     pub name: Option<String>,
     pub artist: Option<String>,
+    /// Title of the song the album was opened from, to locate the album online.
+    pub track: Option<String>,
 }
 
 pub async fn album_detail(
@@ -3347,7 +3349,12 @@ pub async fn album_detail(
     };
     let Some((album, tracks)) = state
         .taste
-        .get_or_hydrate_album_with_hints(&id, q.name.as_deref(), q.artist.as_deref())
+        .get_or_hydrate_album_with_hints(
+            &id,
+            q.name.as_deref(),
+            q.artist.as_deref(),
+            q.track.as_deref(),
+        )
         .await
     else {
         return err_res(StatusCode::NOT_FOUND, "Album not found");
