@@ -770,7 +770,7 @@
     const searchInput = $('global-search');
     if (searchInput) {
       searchInput.placeholder = isMobile
-        ? 'Search songs, artists, albums...'
+        ? 'Search music'
         : 'Search songs, artists, albums... (Press /)';
     }
     const rp = $('right-panel');
@@ -2083,6 +2083,7 @@
     state.ownSearchNavQuery = null;
 
     const hash = location.hash.replace(/^#/, '') || 'home';
+    document.body.dataset.route = hash.split(/[/?]/)[0];
     document.querySelectorAll('.nav-item').forEach((el) => {
       const r = el.dataset.route;
       const match =
@@ -2210,7 +2211,7 @@
       <div class="section-head">
         <h2>New Releases${unseen > 0 ? ` <span class="new-count-pill">${unseen} new</span>` : ''}</h2>
       </div>
-      <div class="card-grid">${newReleases.slice(0, 8).map(renderNewReleaseCard).join('')}</div>
+      <div class="card-grid rail">${newReleases.slice(0, 8).map(renderNewReleaseCard).join('')}</div>
     </section>`;
   }
 
@@ -2243,7 +2244,7 @@
           <div class="section-head">
             <h2>Mixed for you</h2>
           </div>
-          <div class="mixed-for-you-grid">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
+          <div class="mixed-for-you-grid rail">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;
       }
 
@@ -2252,14 +2253,14 @@
       if (mixes.length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Made For You</h2></div>
-          <div class="card-grid">${mixes.map(renderPlaylistCard).join('')}</div>
+          <div class="card-grid rail">${mixes.map(renderPlaylistCard).join('')}</div>
         </section>`;
       }
 
       if (recent.length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Recently Played</h2></div>
-          <div class="card-grid">${recent.slice(0, 8).map(renderTrackCard).join('')}</div>
+          <div class="card-grid rail">${recent.slice(0, 8).map(renderTrackCard).join('')}</div>
         </section>`;
       }
 
@@ -2273,7 +2274,7 @@
       if (recommendedArtists.length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Artists You Might Like</h2></div>
-          <div class="card-grid">${recommendedArtists.map(renderArtistCard).join('')}</div>
+          <div class="card-grid rail">${recommendedArtists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
 
@@ -2294,14 +2295,14 @@
       if (albums.length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Popular Albums</h2></div>
-          <div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>
+          <div class="card-grid rail">${albums.map(renderAlbumCard).join('')}</div>
         </section>`;
       }
 
       if (artists.length > 0) {
         html += `<section class="section">
           <div class="section-head"><h2>Top Artists</h2></div>
-          <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
+          <div class="card-grid rail">${artists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
 

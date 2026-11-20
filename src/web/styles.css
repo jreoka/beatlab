@@ -6305,3 +6305,242 @@ body:not(.audio-playing) .qp-wave span { animation-play-state: paused; }
   .qp-pager .qp-wave span { width: 4px; height: 26px; }
   .qp-pager .qp-tile.playing .qp-info { z-index: 1; }
 }
+
+/* ============================================================================
+   Layout polish (2026-11): flatter cards, cleaner heroes, mobile shell overhaul.
+   Kept last so it wins over the layered rules above.
+   ============================================================================ */
+
+/* ---- Cards: no boxed tiles, the artwork carries the card ---- */
+.media-card {
+  background: transparent;
+  border-color: transparent;
+  padding: 8px;
+}
+.media-card:hover {
+  background: var(--surface);
+  border-color: var(--border);
+}
+.card-art-wrap {
+  border: 0;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+}
+.card-title { margin-top: 2px; }
+.card-sub { margin-top: 2px; }
+
+/* ---- Detail heroes (album / playlist / artist): soft wash instead of a box ---- */
+.hero-header:not([style]) {
+  background: linear-gradient(180deg, var(--surface-2) 0%, transparent 100%);
+  border-color: transparent;
+}
+.hero-art,
+.hero-collage {
+  border: 0;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+
+@media (max-width: 780px) {
+  /* ---- Header: one compact row  [back] [logo] [ search ........ ] [avatar] ---- */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: auto;
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+  .topbar-nav-group { gap: 6px; flex-shrink: 0; }
+  body[data-route="home"] .nav-back-btn { display: none; }
+  .mobile-brand-name { display: none; }
+  .search-box {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+  }
+  .search-box input {
+    height: 38px;
+    padding: 0 34px 0 36px;
+    border-radius: 999px;
+    background: var(--surface);
+  }
+  .topbar-right { flex-shrink: 0; gap: 6px; }
+  .user-pill {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    max-width: none;
+  }
+  .user-pill #user-name,
+  .user-pill .user-pill-gear { display: none; }
+  .user-pill .avatar-dot {
+    width: 34px;
+    height: 34px;
+    font-size: 14px;
+  }
+
+  /* ---- Page rhythm ---- */
+  .main-view { padding: 16px 16px 28px; }
+  .page-greeting {
+    font-size: 24px;
+    letter-spacing: -0.02em;
+    margin-bottom: 16px;
+  }
+  .section { margin-bottom: 28px; }
+  .section-head { margin-bottom: 12px; }
+  .section-head h2 {
+    font-size: 19px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+
+  /* ---- Home rails: one swipeable row per section instead of tall 2-col walls ---- */
+  .card-grid.rail,
+  .mixed-for-you-grid.rail {
+    display: grid;
+    grid-auto-flow: column;
+    grid-template-columns: none;
+    grid-auto-columns: 40%;
+    gap: 12px;
+    margin: 0 -16px;
+    padding: 0 16px 2px;
+    scroll-padding: 0 16px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .mixed-for-you-grid.rail { grid-auto-columns: 44%; }
+  .card-grid.rail::-webkit-scrollbar,
+  .mixed-for-you-grid.rail::-webkit-scrollbar { display: none; }
+  .card-grid.rail > *,
+  .mixed-for-you-grid.rail > * {
+    scroll-snap-align: start;
+    min-width: 0;
+  }
+  .card-grid.rail .media-card {
+    padding: 0;
+    background: transparent;
+    border: 0;
+  }
+  .card-grid.rail .card-play-fab,
+  .card-grid.rail .card-pin-btn,
+  .card-grid.rail .card-del-btn { display: none; }
+  .card-grid.rail .card-art-wrap { margin-bottom: 8px; }
+  .card-grid.rail .card-art-wrap.round { width: 86%; margin-left: auto; margin-right: auto; }
+  .card-title { font-size: 13.5px; }
+  .card-sub { font-size: 12px; }
+
+  /* Library / other grids: borderless cards, quieter play buttons */
+  .card-grid:not(.rail) .media-card { padding: 0; }
+  .card-grid:not(.rail) { gap: 16px 12px; }
+  .card-play-fab {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+  }
+
+  /* ---- Track rows: a bit more breathing room ---- */
+  .track-row { min-height: 58px; }
+  .tr-thumb { border-radius: 4px; }
+
+  /* ---- Detail heroes ---- */
+  .hero-header {
+    margin: -16px -16px 18px;
+    padding: 24px 16px 18px;
+    border: 0;
+    border-radius: 0;
+    gap: 16px;
+  }
+  .hero-art,
+  .hero-collage {
+    width: 180px;
+    height: 180px;
+  }
+  .hero-kicker { font-size: 10.5px; margin-bottom: 4px; }
+  .hero-sub { font-size: 13px; margin-bottom: 14px; }
+  .hero-actions { gap: 8px; }
+  .hero-actions .btn-primary,
+  .hero-actions .btn-secondary {
+    border-radius: 999px;
+    padding: 8px 16px;
+  }
+
+  /* ---- Mini player: floating card above the nav ---- */
+  .player-bar {
+    left: 8px;
+    right: 8px;
+    bottom: calc(var(--mobile-nav-h) + env(safe-area-inset-bottom) + 6px);
+    height: 56px;
+    padding: 0 8px 0 6px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    overflow: hidden;
+  }
+  .pb-mini-progress {
+    top: auto;
+    bottom: 0;
+    left: 8px;
+    right: 8px;
+    background: transparent;
+  }
+  .pb-cover {
+    width: 42px;
+    height: 42px;
+    border-radius: 6px;
+  }
+  .play-main-btn {
+    width: 38px;
+    height: 38px;
+  }
+
+  /* ---- Bottom nav: quiet, accent only on the active tab ---- */
+  .mobile-nav {
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    -webkit-backdrop-filter: blur(16px);
+    backdrop-filter: blur(16px);
+    border-top: 1px solid var(--border);
+  }
+  .mobile-nav-btn,
+  .mobile-nav-btn.active {
+    background: transparent;
+    font-size: 10.5px;
+    font-weight: 600;
+    gap: 4px;
+  }
+  .mobile-nav-btn svg { width: 22px; height: 22px; }
+  .mobile-nav-btn.active { color: var(--text); }
+  .mobile-nav-btn.active svg { color: var(--accent); }
+}
+@media (max-width: 780px) {
+  .user-pill .avatar-dot { border-radius: 50%; }
+}
+
+/* Desktop home rails: one tidy row per section (no orphaned wrap rows);
+   extra items scroll sideways. Mobile sizing is set in the block above. */
+@media (min-width: 781px) {
+  .card-grid.rail,
+  .mixed-for-you-grid.rail {
+    display: grid;
+    grid-auto-flow: column;
+    grid-template-columns: none;
+    grid-auto-columns: minmax(160px, calc((100% - 4 * 14px) / 5));
+    gap: 14px;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    padding-bottom: 6px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-bright) transparent;
+  }
+  .card-grid.rail > *,
+  .mixed-for-you-grid.rail > * { scroll-snap-align: start; min-width: 0; }
+}
