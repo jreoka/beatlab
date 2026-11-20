@@ -4992,6 +4992,67 @@
     }, 220);
   }
 
+  function setMediaMetadata(track, artwork) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      artwork,
+    });
+  }
+
+  // Lock-screen / notification players (Android especially) can't render SVG
+  // placeholders and pick artwork by declared size/type. Load the cover once,
+  // then publish either its real type + size or a rasterized PNG copy.
+  let mediaArtworkToken = 0;
+  async function refineMediaArtwork(track, coverSrc) {
+    const token = ++mediaArtworkToken;
+    const stillCurrent = () => token === mediaArtworkToken && currentTrack()?.id === track.id;
+    try {
+      const res = await fetch(coverSrc, { credentials: 'same-origin' });
+      if (!res.ok) return;
+      const type = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      let img;
+      try {
+        img = await new Promise((resolve, reject) => {
+          const el = new Image();
+          el.onload = () => resolve(el);
+          el.onerror = reject;
+          el.src = objectUrl;
+        });
+      } catch {
+        URL.revokeObjectURL(objectUrl);
+        return;
+      }
+      const w = img.naturalWidth || 512;
+      const h = img.naturalHeight || 512;
+      const rasterOk = ['image/jpeg', 'image/png', 'image/webp'].includes(type);
+      let artwork;
+      if (rasterOk && Math.max(w, h) >= 256) {
+        artwork = [{ src: coverSrc, sizes: `${w}x${h}`, type }];
+      } else {
+        const size = 512;
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        // Cover-fit the image into a square.
+        const scale = Math.max(size / w, size / h);
+        const dw = w * scale;
+        const dh = h * scale;
+        ctx.drawImage(img, (size - dw) / 2, (size - dh) / 2, dw, dh);
+        artwork = [{ src: canvas.toDataURL('image/png'), sizes: `${size}x${size}`, type: 'image/png' }];
+      }
+      URL.revokeObjectURL(objectUrl);
+      if (!stillCurrent() || !('mediaSession' in navigator)) return;
+      setMediaMetadata(track, artwork);
+    } catch {
+      // keep the plain URL artwork already set
+    }
+  }
+
   function applyCommittedMediaUI(track) {
     if (!track) return;
     $('pb-cover').src = track.coverUrl;
@@ -5001,12 +5062,13 @@
 
     if ('mediaSession' in navigator) {
       try {
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: track.title,
-          artist: track.artist,
-          album: track.album,
-          artwork: [{ src: `${location.origin}${track.coverUrl}`, sizes: '512x512', type: 'image/jpeg' }],
-        });
+        const coverSrc = new URL(track.coverUrl, location.origin).href;
+        setMediaMetadata(track, [
+          { src: coverSrc, sizes: '96x96' },
+          { src: coverSrc, sizes: '256x256' },
+          { src: coverSrc, sizes: '512x512' },
+        ]);
+        refineMediaArtwork(track, coverSrc);
         navigator.mediaSession.setActionHandler('play', () => playCurrent());
         navigator.mediaSession.setActionHandler('pause', () => pauseCurrent());
         navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
