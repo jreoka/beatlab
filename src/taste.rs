@@ -2671,6 +2671,7 @@ impl TasteEngine {
         (tracks.len(), covers)
     }
 
+    #[cfg(test)]
     pub fn curated_mood_preview(&self, mood: Mood) -> (usize, Vec<String>) {
         let ids = self.load_curated_pool_ids(&mood_cache_key(mood), 24 * 3600);
         let tracks = if !ids.is_empty() {
