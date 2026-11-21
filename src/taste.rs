@@ -1942,12 +1942,12 @@ impl TasteEngine {
                 .unwrap_or(0)
         };
         // Don't hammer a rebuild that keeps failing (e.g. a thin catalog).
-        if now - kv_ts(format!("mix4u:attempt_at:{user_id}")) < MIX4U_RETRY_SECS {
+        if now - kv_ts(format!("mix4u:v4:attempt_at:{user_id}")) < MIX4U_RETRY_SECS {
             return false;
         }
 
         let tz = self.user_tz_offset_min(user_id);
-        let last_rebuilt = kv_ts(format!("mix4u:v3:rebuilt_at:{user_id}"));
+        let last_rebuilt = kv_ts(format!("mix4u:v4:rebuilt_at:{user_id}"));
         if mix4u_day(now, tz) > mix4u_day(last_rebuilt, tz) {
             return true;
         }
@@ -2056,7 +2056,7 @@ impl TasteEngine {
         self.store
             .kv_set(&format!("mix4u:mood:{user_id}"), slug);
         self.store.kv_set(
-            &format!("mix4u:v3:rebuilt_at:{user_id}"),
+            &format!("mix4u:v4:rebuilt_at:{user_id}"),
             &Utc::now().timestamp().to_string(),
         );
     }
@@ -2193,7 +2193,7 @@ impl TasteEngine {
             return;
         }
         self.store.kv_set(
-            &format!("mix4u:attempt_at:{user_id}"),
+            &format!("mix4u:v4:attempt_at:{user_id}"),
             &Utc::now().timestamp().to_string(),
         );
         let has_mixes = self.has_mixed_for_you(user_id);
@@ -2271,7 +2271,13 @@ impl TasteEngine {
 
             cards.push(MixedForYouCard {
                 id: p.id,
-                title: p.name,
+                // Named from the part, not the stored playlist name, so the rail
+                // never shows a stale name from before a rename.
+                title: if is_super {
+                    "Daily Supermix".to_string()
+                } else {
+                    format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
+                },
                 art_title: if is_super {
                     "Daily Supermix".to_string()
                 } else {
