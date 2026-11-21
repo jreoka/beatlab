@@ -842,16 +842,35 @@ impl DeezerSource {
         max_playlists: usize,
         per_playlist: usize,
     ) -> Vec<(String, Vec<Track>)> {
-        let playlists = self.search_playlists(query, 10).await;
+        let playlists = self.search_playlists(query, 15).await;
         let q_low = query.to_lowercase();
         let mut scored: Vec<(i32, DzPlaylist)> = playlists
             .into_iter()
             .filter_map(|p| {
+                if crate::sources::has_unrequested_scene_qualifier(&p.title, &q_low) {
+                    return None;
+                }
                 if !is_usable_mix_playlist(&p, &q_low) {
                     return None;
                 }
                 let rel = playlist_title_relevance_score(&p.title, &q_low)?;
-                Some((rel, p))
+                let is_editorial = p
+                    .user
+                    .as_ref()
+                    .map(|u| u.name.trim().to_ascii_lowercase().starts_with("deezer"))
+                    .unwrap_or(false);
+                let extra = crate::sources::extra_title_words(&p.title, &q_low);
+                if !is_editorial && extra > 3 {
+                    return None;
+                }
+                let mut score = rel - 6 * (extra as i32);
+                if is_editorial {
+                    score += 25;
+                }
+                if p.nb_tracks > 0 && p.nb_tracks < 12 {
+                    score -= 15;
+                }
+                Some((score, p))
             })
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -883,6 +902,12 @@ impl DeezerSource {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct DzPlaylistUser {
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct DzPlaylist {
     #[serde(default)]
     pub id: u64,
@@ -890,6 +915,8 @@ pub struct DzPlaylist {
     pub title: String,
     #[serde(default)]
     pub nb_tracks: usize,
+    #[serde(default)]
+    pub user: Option<DzPlaylistUser>,
 }
 
 fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
@@ -931,8 +958,28 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         "chakra",
         "yoga",
         "setlist",
+        "rockabilly",
+        "line dance",
+        "square dance",
+        "ballroom",
+        "polka",
+        "waltz",
+        "zumba",
+        "doo-wop",
+        "doowop",
+        "disney",
+        "nursery",
+        "toddler",
+        "wedding",
     ] {
         if title_low.contains(bad) && !query_low.contains(bad) {
+            return false;
+        }
+    }
+    for term in ["kids", "children", "baby", "twist", "swing", "christmas", "halloween"] {
+        if crate::taste::contains_term(&title_low, term)
+            && !crate::taste::contains_term(query_low, term)
+        {
             return false;
         }
     }
@@ -962,6 +1009,7 @@ pub(crate) fn score_mix_playlist(title: &str, nb_tracks: usize, query_low: &str)
         id: 0,
         title: title.to_string(),
         nb_tracks,
+        user: None,
     };
     if !is_usable_mix_playlist(&probe, query_low) {
         return None;
@@ -1008,6 +1056,11 @@ fn playlist_title_relevance_score(title: &str, query_low: &str) -> Option<i32> {
         if mentions_other_dec && !matches_query_dec {
             return None;
         }
+    } else if ["50s", "60s"]
+        .iter()
+        .any(|d| crate::taste::contains_term(&title_norm, d))
+    {
+        return None;
     }
 
     let generic = [
@@ -1459,6 +1512,7 @@ mod tests {
             id: 1,
             title: title.into(),
             nb_tracks,
+            user: None,
         };
         assert!(!is_usable_mix_playlist(&mk("Sad Covers", 60), "sad songs"));
         assert!(!is_usable_mix_playlist(&mk("Piano lullabies", 40), "ambient"));

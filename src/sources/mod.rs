@@ -546,22 +546,28 @@ pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
     ranked.into_iter().map(|(_, t)| t).collect()
 }
 
-/// YouTube Music's featured playlists are global, so a search for "80s hits" also returns
-/// "The Turkish Hits: 80s" or "Egyptian '80s". Reject playlists scoped to a regional or
-/// language scene the query did not ask for.
-fn has_unrequested_scene_qualifier(title: &str, query_low: &str) -> bool {
+/// YouTube Music and Deezer playlist searches are global, so a search for "80s hits" or
+/// "dance party" also returns "The Turkish Hits: 80s", "Egyptian '80s", or "Malayalam Dance Party".
+/// Reject playlists scoped to a regional or language scene the query did not ask for.
+pub(crate) fn has_unrequested_scene_qualifier(title: &str, query_low: &str) -> bool {
     const SCENES: &[&str] = &[
         "arabic", "khaleeji", "egyptian", "turkish", "persian", "kurdish", "bollywood",
-        "tollywood", "kollywood", "hindi", "punjabi", "tamil", "telugu", "bhojpuri", "haryanvi",
-        "desi", "indonesian", "malaysian", "thai", "vietnamese", "filipino", "opm", "mandopop",
-        "cantopop", "chinese", "korean", "japanese", "nigeria", "nigerian", "ghanaian",
-        "naija", "argentinian", "mexican", "brazilian", "colombian", "latin", "latino",
-        "spanish", "español", "éxitos", "french", "german", "italian", "polish", "russian",
-        "ukrainian", "greek", "dutch", "swedish", "canrock", "canadian", "australian",
-        "japan", "korea", "china", "taiwan", "india", "pakistan", "turkey", "egypt", "iran",
-        "indonesia", "malaysia", "thailand", "vietnam", "philippines", "africa", "african",
-        "ghana", "kenya", "brazil", "brasil", "mexico", "argentina", "colombia", "france",
-        "germany", "italy", "spain", "poland", "russia", "ukraine", "greece", "sweden",
+        "tollywood", "kollywood", "mollywood", "sandalwood", "hindi", "punjabi", "tamil",
+        "telugu", "malayalam", "marathi", "kannada", "bengali", "gujarati", "assamese",
+        "odia", "bhojpuri", "haryanvi", "desi", "bhangra", "garba", "dandiya", "kuthu",
+        "dappankuthu", "filmi", "qawwali", "carnatic", "hindustani", "malayali", "mallu",
+        "kerala", "maharashtra", "indonesian", "malaysian", "thai", "vietnamese", "filipino",
+        "opm", "mandopop", "cantopop", "chinese", "korean", "japanese", "nigeria", "nigerian",
+        "ghanaian", "naija", "argentinian", "mexican", "brazilian", "colombian", "latin",
+        "latino", "spanish", "español", "éxitos", "sertanejo", "forró", "forro", "pagode",
+        "brega", "corridos", "banda", "norteño", "norteno", "ranchera", "vallenato", "dembow",
+        "champeta", "french", "german", "schlager", "volksmusik", "italian", "flamenco",
+        "polish", "russian", "ukrainian", "greek", "dutch", "swedish", "chalga", "turbofolk",
+        "dabke", "shaabi", "mahraganat", "canrock", "canadian", "australian", "japan", "korea",
+        "china", "taiwan", "india", "pakistan", "turkey", "egypt", "iran", "indonesia",
+        "malaysia", "thailand", "vietnam", "philippines", "africa", "african", "ghana",
+        "kenya", "brazil", "brasil", "mexico", "argentina", "colombia", "france", "germany",
+        "italy", "spain", "poland", "russia", "ukraine", "greece", "sweden",
     ];
     let t = title.to_lowercase();
     SCENES.iter().any(|s| {
@@ -571,7 +577,7 @@ fn has_unrequested_scene_qualifier(title: &str, query_low: &str) -> bool {
 
 /// Number of meaningful title words that are not part of the query, used to prefer
 /// "The Hits: '80s" over "Relaxing 80s Rock" for the query "80s hits".
-fn extra_title_words(title: &str, query_low: &str) -> usize {
+pub(crate) fn extra_title_words(title: &str, query_low: &str) -> usize {
     const FILLER: &[&str] = &[
         "the", "of", "and", "a", "an", "in", "for", "to", "hits", "hit", "best", "top",
         "songs", "song", "music", "mix", "playlist", "essentials", "biggest", "greatest", "all",

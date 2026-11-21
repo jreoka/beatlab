@@ -642,11 +642,11 @@ fn rotate_out_recent_mix_tracks(
 }
 
 fn mood_cache_key(mood: Mood) -> String {
-    format!("curated:mood:v2:{}", mood.slug())
+    format!("curated:mood:v3:{}", mood.slug())
 }
 
 fn mood_user_cache_key(user_id: i64, mood: Mood) -> String {
-    format!("curated:mood_user:v3:{}:{}", user_id, mood.slug())
+    format!("curated:mood_user:v4:{}:{}", user_id, mood.slug())
 }
 
 fn explore_cache_key(key: &str) -> String {
@@ -4406,6 +4406,44 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         let mut curated_tracks: Vec<Track> = Vec::new();
         let mut seen_ids = HashSet::new();
         if !remote_batches.is_empty() {
+            // Deezer playlist tracks arrive without album genres; enrich them before
+            // mood-clash validation so off-mood tracks (e.g. Country/Soundtrack/50s Rock)
+            // cannot slip through an empty-genre check and get stamped with this mood.
+            let mut flat_for_enrich: Vec<Track> = remote_batches
+                .iter()
+                .flat_map(|(_, genre_label, batch)| {
+                    if genre_label.is_empty() {
+                        batch.clone()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            if !flat_for_enrich.is_empty() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(2500),
+                    self.sources.deezer.enrich_track_genres(&mut flat_for_enrich),
+                )
+                .await;
+                let enriched_by_id: HashMap<String, (String, i32)> = flat_for_enrich
+                    .into_iter()
+                    .filter(|t| !t.genre.trim().is_empty() || t.year > 0)
+                    .map(|t| (t.id, (t.genre, t.year)))
+                    .collect();
+                for (_, _, batch) in &mut remote_batches {
+                    for t in batch.iter_mut() {
+                        if let Some((g, y)) = enriched_by_id.get(&t.id) {
+                            if t.genre.trim().is_empty() && !g.trim().is_empty() {
+                                t.genre = g.clone();
+                            }
+                            if t.year <= 0 && *y > 0 {
+                                t.year = *y;
+                            }
+                        }
+                    }
+                }
+            }
+
             let remote_artists: Vec<String> = remote_batches
                 .iter()
                 .flat_map(|(_, _, batch)| batch.iter().map(|t| t.artist.clone()))
@@ -4432,6 +4470,11 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                     let meta_low = format!("{} {}", t.genre, ag).to_lowercase();
                     let strict_genre_match = has_mood_meta_match(&meta_low, mood);
                     if !strict_genre_match && is_mood_title_trap(&t, mood) {
+                        continue;
+                    }
+                    // Reject obscure / AI-slop Deezer uploads from user playlists when
+                    // they lack a direct genre match for this mood.
+                    if !strict_genre_match && is_low_rank_deezer_track(&t, 30_000) {
                         continue;
                     }
                     if pl_title.is_some() || strict_genre_match {
@@ -4498,17 +4541,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             .prof
             .genre_affinity
             .iter()
-            .filter(|(g, v)| {
-                **v > 0.5
-                    && is_track_compatible_with_mood(
-                        &Track {
-                            genre: (*g).clone(),
-                            ..Default::default()
-                        },
-                        "",
-                        mood,
-                    )
-            })
+            .filter(|(g, v)| **v > 0.5 && is_genre_fit_for_mood_query(g, mood))
             .map(|(g, v)| (g.clone(), *v))
             .collect();
         genres.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -4542,30 +4575,47 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         else {
             return Vec::new();
         };
+        let mut accepted_tracks: Vec<Track> = Vec::new();
+        for batch_list in batches {
+            for (pl_title, tracks) in batch_list {
+                if !is_curated_playlist_for_mood(&pl_title, mood)
+                    || Self::is_title_word_playlist(&tracks, mood)
+                {
+                    continue;
+                }
+                accepted_tracks.extend(tracks);
+            }
+        }
+        if accepted_tracks.is_empty() {
+            return Vec::new();
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.sources.deezer.enrich_track_genres(&mut accepted_tracks),
+        )
+        .await;
+
         let mut out = Vec::new();
         let mut seen_ids = HashSet::new();
         let mut to_upsert = Vec::new();
-        for batch_list in batches {
-            for (_, tracks) in batch_list {
-                if Self::is_title_word_playlist(&tracks, mood) {
-                    continue;
-                }
-                for mut t in tracks {
-                    if is_mood_clutter_track(&t)
-                        || !is_track_compatible_with_mood(&t, "", mood)
-                        || is_mood_title_trap(&t, mood)
-                    {
-                        continue;
-                    }
-                    t.moods = append_mood_slug(
-                        &classify_moods_str(&t.title, &t.album, &t.genre, ""),
-                        mood,
-                    );
-                    if seen_ids.insert(t.id.clone()) {
-                        to_upsert.push(t.clone());
-                        out.push(t);
-                    }
-                }
+        for mut t in accepted_tracks {
+            if is_mood_clutter_track(&t)
+                || !is_track_compatible_with_mood(&t, "", mood)
+                || is_mood_title_trap(&t, mood)
+            {
+                continue;
+            }
+            let strict_genre_match = has_mood_meta_match(&t.genre.to_lowercase(), mood);
+            if !strict_genre_match && is_low_rank_deezer_track(&t, 30_000) {
+                continue;
+            }
+            t.moods = append_mood_slug(
+                &classify_moods_str(&t.title, &t.album, &t.genre, ""),
+                mood,
+            );
+            if seen_ids.insert(t.id.clone()) {
+                to_upsert.push(t.clone());
+                out.push(t);
             }
         }
         if !to_upsert.is_empty() {
@@ -4718,7 +4768,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         let artists: Vec<String> = candidates.iter().map(|t| t.artist.clone()).collect();
         let artist_genres = self.store.known_artist_genres_for(&artists).unwrap_or_default();
 
-        let mut eligible: Vec<(Track, bool, bool, Vec<Mood>, f64)> = Vec::new();
+        let mut eligible: Vec<(Track, bool, bool, Vec<Mood>, f64, bool)> = Vec::new();
         for t in candidates {
             if is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
                 || is_mood_clutter_track(&t)
@@ -4747,16 +4797,27 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             if !meta_match && !is_familiar && is_mood_title_trap(&t, mood) {
                 continue;
             }
+            // Reject obscure / AI-slop Deezer uploads unless they have a direct genre match
+            // or already belong to the listener's own realm.
+            if !meta_match && !is_familiar && realm == 0.0 && is_low_rank_deezer_track(&t, 30_000) {
+                continue;
+            }
             // Every track needs real evidence for THIS mood. Taste alone never admits a track,
-            // otherwise each mood collapses into the same "favorites" playlist.
-            let stored_match = t.mood_list().contains(&mood) && (has_known_genre || is_curated);
+            // otherwise each mood collapses into the same "favorites" playlist. Do not let
+            // stale stored mood tags resurrect unrelated remote tracks whose genre doesn't match.
+            let stored_match = t.mood_list().contains(&mood)
+                && (meta_match
+                    || is_curated
+                    || (has_known_genre && (is_familiar || realm > 0.0 || t.source == "local")));
             if !is_curated && !meta_match && !clean_match && !stored_match {
                 continue;
             }
-            eligible.push((t, is_curated, meta_match, clean_moods, realm));
+            let strong_evidence = meta_match || clean_match || is_familiar || realm > 0.0;
+            eligible.push((t, is_curated, meta_match, clean_moods, realm, strong_evidence));
         }
 
-        let eligible_tracks: Vec<Track> = eligible.iter().map(|(t, _, _, _, _)| t.clone()).collect();
+        let eligible_tracks: Vec<Track> =
+            eligible.iter().map(|(t, _, _, _, _, _)| t.clone()).collect();
         let has_user_taste = !sctx.stats.is_empty() || profile_has_taste(&sctx.prof);
         let n_w = self.neural_blend_weight(0.65, &sctx);
         let n_scores = if has_user_taste && n_w > 0.0 {
@@ -4765,10 +4826,10 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             Vec::new()
         };
 
-        let mut scored: Vec<(f64, Track)> = eligible
+        let mut scored: Vec<(f64, bool, Track)> = eligible
             .into_iter()
             .enumerate()
-            .map(|(idx, (t, is_curated, meta_match, clean_moods, realm))| {
+            .map(|(idx, (t, is_curated, meta_match, clean_moods, realm, strong_evidence))| {
                 let taste_s = score_track_core(
                     &t,
                     &sctx.prof,
@@ -4806,12 +4867,26 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                     score += parse_rank_bonus(&t.meta) * 0.25;
                 }
 
-                (score, t)
+                let solid = strong_evidence
+                    || parse_deezer_rank(&t.meta).map_or(false, |r| r >= 80_000);
+                (score, solid, t)
             })
             .collect();
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let ordered: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        // Avoid tail divergence: once we already have a healthy set of strongly-evidenced
+        // or popular tracks, drop weak unverified filler instead of padding the bottom of
+        // the playlist with obscure/off-vibe tracks.
+        let solid_count = scored.iter().filter(|(_, solid, _)| *solid).count();
+        let ordered: Vec<Track> = if solid_count >= limit.min(18) {
+            scored
+                .into_iter()
+                .filter(|(_, solid, _)| *solid)
+                .map(|(_, _, t)| t)
+                .collect()
+        } else {
+            scored.into_iter().map(|(_, _, t)| t).collect()
+        };
         dedup_and_interleave(ordered, limit, 3)
     }
 }
@@ -7576,6 +7651,31 @@ fn is_junk_track_for_query(t: &Track, query_low: &str) -> bool {
         "unforgettable hits",
         "dj gotta",
         "kiggo",
+        "original music",
+        "rock 'n' roll music",
+        "rock n roll music",
+        "rock & roll music",
+        "dance music",
+        "party music",
+        "chill music",
+        "workout music",
+        "study music",
+        "sleep music",
+        "relaxing music",
+        "relaxation music",
+        "background music",
+        "club music",
+        "gym music",
+        "running music",
+        "lofi beats",
+        "lo-fi beats",
+        "chill beats",
+        "study beats",
+        "sleep sounds",
+        "nature sounds",
+        "country music",
+        "rock music",
+        "pop music",
     ] {
         if artist_low.contains(spam_artist) && !query_low.contains(spam_artist) {
             return true;
@@ -8224,6 +8324,11 @@ pub fn is_mood_clutter_track(t: &Track) -> bool {
     if t.duration > 0 && t.duration < 30 {
         return true;
     }
+    // Reject emoji-stuffed SEO/AI-slop titles (e.g. "Twist the Night - 50s Rock Twist 💃🌙")
+    // from remote catalogs while keeping CJK/non-Latin scripts intact.
+    if t.source != "local" && t.title.chars().any(|c| (c as u32) >= 0x1F300) {
+        return true;
+    }
     let title_album = format!("{} {}", t.title, t.album).to_lowercase();
     if is_cover_or_backing_title(&title_album) {
         return true;
@@ -8280,6 +8385,8 @@ pub fn is_track_compatible_with_mood(t: &Track, artist_genres: &str, mood: Mood)
             "phonk",
             "dubstep",
             "rave",
+            "eurodance",
+            "techno",
         ],
         Mood::Acoustic => &[
             "edm",
@@ -8289,6 +8396,12 @@ pub fn is_track_compatible_with_mood(t: &Track, artist_genres: &str, mood: Mood)
             "trap",
             "phonk",
             "trance",
+            "house",
+            "eurodance",
+            "club",
+            "electro",
+            "electronic",
+            "synthwave",
             "heavy metal",
             "death metal",
         ],
@@ -8301,8 +8414,30 @@ pub fn is_track_compatible_with_mood(t: &Track, artist_genres: &str, mood: Mood)
             "party",
             "phonk",
             "thrash",
+            "disco",
+            "dance",
+            "house",
+            "techno",
+            "reggaeton",
+            "salsa",
+            "cumbia",
+            "amapiano",
+            "happy",
+            "upbeat",
         ],
-        Mood::Energy => &["lullaby", "meditation", "new age", "ambient", "classical", "easy listening"],
+        Mood::Energy => &[
+            "lullaby",
+            "meditation",
+            "new age",
+            "ambient",
+            "classical",
+            "easy listening",
+            "slowcore",
+            "lounge",
+            "bossa nova",
+            "lo-fi",
+            "lofi",
+        ],
         Mood::Party => &[
             "classical",
             "lullaby",
@@ -8311,13 +8446,131 @@ pub fn is_track_compatible_with_mood(t: &Track, artist_genres: &str, mood: Mood)
             "slowcore",
             "acoustic",
             "bluegrass",
+            "country",
+            "folk",
+            "indie folk",
+            "americana",
+            "singer-songwriter",
+            "singer songwriter",
+            "rockabilly",
+            "rock & roll",
+            "rock 'n' roll",
+            "rock n roll",
+            "metal",
+            "heavy metal",
+            "death metal",
+            "black metal",
+            "thrash",
+            "grunge",
+            "emo",
+            "sad",
+            "melancholy",
+            "ballad",
+            "soundtrack",
+            "films/games",
+            "opera",
+            "blues",
+            "jazz",
+            "gospel",
+            "kids",
+            "children",
+            "nursery",
         ],
-        Mood::Upbeat => &["death metal", "black metal", "funeral", "slowcore", "dark ambient", "drone"],
-        Mood::LateNight => &["kids", "children", "nursery", "christian", "gospel", "bluegrass"],
+        Mood::Upbeat => &[
+            "death metal",
+            "black metal",
+            "doom metal",
+            "funeral",
+            "slowcore",
+            "dark ambient",
+            "drone",
+            "melancholy",
+            "sad",
+            "emo",
+        ],
+        Mood::LateNight => &[
+            "kids",
+            "children",
+            "nursery",
+            "christian",
+            "gospel",
+            "bluegrass",
+            "country",
+            "polka",
+            "eurodance",
+            "happy",
+        ],
         Mood::Groove => &["death metal", "black metal", "hardstyle", "bluegrass", "opera", "classical"],
-        Mood::RockIndie => &["classical", "kids", "meditation", "new age", "eurodance", "reggaeton"],
+        Mood::RockIndie => &[
+            "classical",
+            "kids",
+            "meditation",
+            "new age",
+            "eurodance",
+            "reggaeton",
+            "country",
+            "salsa",
+            "bachata",
+            "cumbia",
+            "merengue",
+            "opera",
+            "trance",
+            "hardstyle",
+        ],
     };
     !clashes.iter().any(|c| contains_term(&g_low, c))
+}
+
+/// Whether a listener's affinity genre is a sensible modifier to pair with `mood` when
+/// fetching personalized mood playlists (e.g. `"pop dance"` is great, while `"rock dance"`
+/// or `"country dance"` pulls in 1950s rockabilly / line-dance AI slop).
+fn is_genre_fit_for_mood_query(genre: &str, mood: Mood) -> bool {
+    let g_low = genre.trim().to_lowercase();
+    if g_low.is_empty() {
+        return false;
+    }
+    if !is_track_compatible_with_mood(
+        &Track {
+            genre: genre.to_string(),
+            ..Default::default()
+        },
+        "",
+        mood,
+    ) {
+        return false;
+    }
+    if has_mood_meta_match(&g_low, mood) {
+        return true;
+    }
+    // Avoid combining generic/non-mood umbrella genres with mood hints where playlist
+    // search diverges into novelty/retro playlists (e.g. "rock dance" -> 50s twist).
+    match mood {
+        Mood::Party => [
+            "pop",
+            "hip-hop",
+            "hip hop",
+            "rap",
+            "r&b",
+            "rnb",
+            "funk",
+            "latin",
+            "afrobeats",
+            "afropop",
+            "k-pop",
+            "kpop",
+            "j-pop",
+            "jpop",
+            "synthpop",
+            "electropop",
+            "indie pop",
+        ]
+        .iter()
+        .any(|k| contains_term(&g_low, k)),
+        Mood::Chill | Mood::LateNight | Mood::Melancholy | Mood::Acoustic => {
+            !matches!(g_low.as_str(), "soundtrack" | "films/games" | "rock" | "metal")
+        }
+        _ => !matches!(g_low.as_str(), "soundtrack" | "films/games"),
+    }
 }
 
 fn is_mood_title_trap(t: &Track, mood: Mood) -> bool {
@@ -9147,14 +9400,27 @@ fn parse_deezer_fans(bio: &str) -> Option<u64> {
     first.parse::<u64>().ok()
 }
 
-fn parse_rank_bonus(meta: &str) -> f64 {
+fn parse_deezer_rank(meta: &str) -> Option<u64> {
     if meta.is_empty() {
-        return 0.0;
+        return None;
     }
-    let rank = serde_json::from_str::<serde_json::Value>(meta)
+    serde_json::from_str::<serde_json::Value>(meta)
         .ok()
         .and_then(|v| v.get("rank").and_then(|r| r.as_u64()))
-        .unwrap_or(0);
+}
+
+fn is_low_rank_deezer_track(t: &Track, min_rank: u64) -> bool {
+    if t.source != "deezer" {
+        return false;
+    }
+    match parse_deezer_rank(&t.meta) {
+        Some(r) => r < min_rank,
+        None => false,
+    }
+}
+
+fn parse_rank_bonus(meta: &str) -> f64 {
+    let rank = parse_deezer_rank(meta).unwrap_or(0);
     if rank == 0 {
         0.0
     } else {
@@ -11273,6 +11539,153 @@ mod tests {
         assert!(!is_curated_playlist_for_mood("Sad Covers", Mood::Melancholy));
         assert!(!is_curated_playlist_for_mood("Party Workout Mix", Mood::Melancholy));
         assert!(is_curated_playlist_for_mood("Melancholy Indie Folk", Mood::Melancholy));
+    }
+
+    #[test]
+    fn party_mood_rejects_ai_slop_regional_playlists_and_tail_divergence() {
+        // Regional & retro playlists must not hijack generic "dance party" / "club hits" queries.
+        assert!(crate::sources::has_unrequested_scene_qualifier(
+            "Malayalam Dance Party",
+            "dance party"
+        ));
+        assert!(crate::sources::has_unrequested_scene_qualifier(
+            "Marathi Party Hits",
+            "club hits"
+        ));
+        assert!(crate::sources::deezer::score_mix_playlist(
+            "50s Rock & Roll Dance Party",
+            40,
+            "dance party"
+        )
+        .is_none());
+        assert!(crate::sources::deezer::score_mix_playlist(
+            "Dance Party Hits",
+            40,
+            "dance party"
+        )
+        .is_some());
+
+        // User-mood queries must not combine Rock or Country with "dance".
+        assert!(!is_genre_fit_for_mood_query("rock", Mood::Party));
+        assert!(!is_genre_fit_for_mood_query("country", Mood::Party));
+        assert!(!is_genre_fit_for_mood_query("films/games", Mood::Party));
+        assert!(is_genre_fit_for_mood_query("pop", Mood::Party));
+        assert!(is_genre_fit_for_mood_query("house", Mood::Party));
+
+        // AI-slop spam artists and emoji-stuffed titles are rejected as mood clutter.
+        let mk_slop = |id: &str, title: &str, artist: &str, genre: &str, rank: u64| Track {
+            id: id.into(),
+            source: "deezer".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: title.into(),
+            genre: genre.into(),
+            moods: "party".into(),
+            duration: 190,
+            bitrate: 256,
+            meta: format!(r#"{{"rank":{}}}"#, rank),
+            ..Default::default()
+        };
+        assert!(is_mood_clutter_track(&mk_slop(
+            "dz:slop1",
+            "Hot Rod Hustle",
+            "Rock n Roll Original Music",
+            "",
+            5000
+        )));
+        assert!(is_mood_clutter_track(&mk_slop(
+            "dz:slop2",
+            "Quit acting shy",
+            "Voltage vault rock 'n' roll music",
+            "",
+            4000
+        )));
+        assert!(is_mood_clutter_track(&mk_slop(
+            "dz:slop3",
+            "Twist the Night - Gaetano La Rocca - 50s Rock Twist 💃🌙",
+            "Gaetano La Rocca",
+            "",
+            3000
+        )));
+
+        // Country & Soundtrack tracks are incompatible with Party & Dance.
+        let country = mk_slop("dz:cntry", "Raised on dust", "Old Tennessee Country", "Country", 5000);
+        let ost = mk_slop("dz:ost", "Armadham", "Sushin Shyam", "Films/Games", 500_000);
+        assert!(!is_track_compatible_with_mood(&country, "", Mood::Party));
+        assert!(!is_track_compatible_with_mood(&ost, "", Mood::Party));
+
+        // Tail-divergence guard: when enough real Party tracks exist, weak/obscure
+        // curated filler is dropped instead of padding the bottom of the playlist.
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("partyuser", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mut cands = Vec::new();
+        let mut curated = HashSet::new();
+        for i in 0..20 {
+            let t = Track {
+                id: format!("dz:club{i}"),
+                source: "deezer".into(),
+                title: format!("Club Anthem {i}"),
+                artist: format!("DJ Real {i}"),
+                album: "Club Album".into(),
+                genre: "Dance, House".into(),
+                moods: "party".into(),
+                duration: 210,
+                bitrate: 256,
+                meta: r#"{"rank":650000}"#.into(),
+                ..Default::default()
+            };
+            curated.insert(t.id.clone());
+            cands.push(t);
+        }
+        let obscure_filler = Track {
+            id: "dz:obscure".into(),
+            source: "deezer".into(),
+            title: "Random Filler".into(),
+            artist: "Unknown Indie Guy".into(),
+            album: "Filler".into(),
+            genre: String::new(),
+            moods: "party".into(),
+            duration: 180,
+            bitrate: 256,
+            meta: r#"{"rank":12000}"#.into(),
+            ..Default::default()
+        };
+        let stale_wrong_genre = Track {
+            id: "dz:stale_rock".into(),
+            source: "deezer".into(),
+            title: "Old Rock Song".into(),
+            artist: "Classic Rocker".into(),
+            album: "Rock Album".into(),
+            genre: "Rock".into(),
+            moods: "party".into(),
+            duration: 200,
+            bitrate: 256,
+            meta: r#"{"rank":400000}"#.into(),
+            ..Default::default()
+        };
+        curated.insert(obscure_filler.id.clone());
+        cands.push(obscure_filler);
+        cands.push(stale_wrong_genre);
+        cands.push(country);
+        cands.push(ost);
+        store.upsert_tracks(&cands).unwrap();
+
+        let ranked = taste.rank_mood_mix(u.id, Mood::Party, cands, &curated, 35);
+        let ids: Vec<&str> = ranked.iter().map(|t| t.id.as_str()).collect();
+        assert!(!ids.contains(&"dz:obscure"), "obscure filler leaked into tail: {:?}", ids);
+        assert!(!ids.contains(&"dz:stale_rock"), "stale off-genre track leaked: {:?}", ids);
+        assert!(!ids.contains(&"dz:cntry"), "country track leaked: {:?}", ids);
+        assert!(!ids.contains(&"dz:ost"), "soundtrack leaked: {:?}", ids);
+        assert_eq!(ids.len(), 20, "expected only the 20 verified dance tracks: {:?}", ids);
     }
 
     #[test]
