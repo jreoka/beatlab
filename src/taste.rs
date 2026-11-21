@@ -601,6 +601,46 @@ pub fn find_explore_mix_spec(key: &str) -> Option<&'static ExploreMixSpec> {
     EXPLORE_MIX_SPECS.iter().find(|s| s.key == key)
 }
 
+/// Local hour at which a listener's "Mixed for you" rail turns over each day.
+const MIX4U_REFRESH_HOUR: i64 = 4;
+/// How often a taste change may trigger a (fairly costly) featured-mood re-check.
+const MIX4U_MOOD_RECHECK_SECS: i64 = 6 * 3600;
+/// Minimum gap between rebuild attempts, so a failing rebuild is not retried every tick.
+const MIX4U_RETRY_SECS: i64 = 30 * 60;
+/// The listener's very best picks stay in the mixes day after day; the rest rotate.
+const MIX4U_KEEP_TOP: usize = 12;
+
+/// The "mix day" a timestamp falls in for a listener at `tz_offset_min`
+/// (minutes east of UTC). Days start at `MIX4U_REFRESH_HOUR` local time.
+fn mix4u_day(ts: i64, tz_offset_min: i32) -> i64 {
+    (ts + i64::from(tz_offset_min) * 60 - MIX4U_REFRESH_HOUR * 3600).div_euclid(86_400)
+}
+
+/// Keep the top `keep_top` tracks where they are, then put tracks that were
+/// not in the previous mixes ahead of ones that were (each group keeps its
+/// ranked order). With a pool larger than the mixes, yesterday's repeats are
+/// the first to fall off the end.
+fn rotate_out_recent_mix_tracks(
+    pool: Vec<Track>,
+    previous_ids: &HashSet<String>,
+    keep_top: usize,
+) -> Vec<Track> {
+    if previous_ids.is_empty() || pool.len() <= keep_top {
+        return pool;
+    }
+    let mut out = Vec::with_capacity(pool.len());
+    let mut repeats = Vec::new();
+    for (i, t) in pool.into_iter().enumerate() {
+        if i < keep_top || !previous_ids.contains(&t.id) {
+            out.push(t);
+        } else {
+            repeats.push(t);
+        }
+    }
+    out.extend(repeats);
+    out
+}
+
 fn mood_cache_key(mood: Mood) -> String {
     format!("curated:mood:v2:{}", mood.slug())
 }
@@ -1853,27 +1893,80 @@ impl TasteEngine {
         best.map(|(_, mood)| mood).unwrap_or(Mood::Energy)
     }
 
-    fn mixed_for_you_needs_refresh(&self, user_id: i64, max_age_secs: i64) -> bool {
+    /// Remember the listener's UTC offset (minutes east of UTC, as reported by
+    /// their browser) so the daily mix refresh lands overnight in *their* day.
+    pub fn set_user_tz_offset(&self, user_id: i64, tz_offset_min: i32) {
+        if user_id <= 0 {
+            return;
+        }
+        let clean = tz_offset_min.clamp(-720, 840).to_string();
+        let key = format!("user:tz_offset_min:{user_id}");
+        if self.store.kv_get(&key).as_deref() != Some(clean.as_str()) {
+            self.store.kv_set(&key, &clean);
+        }
+    }
+
+    fn user_tz_offset_min(&self, user_id: i64) -> i32 {
+        self.store
+            .kv_get(&format!("user:tz_offset_min:{user_id}"))
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|v| v.clamp(-720, 840))
+            .unwrap_or(0)
+    }
+
+    fn has_mixed_for_you(&self, user_id: i64) -> bool {
+        self.store
+            .list_playlists(user_id, false)
+            .map(|pls| pls.iter().any(|p| p.kind.starts_with("mixed_for_you:")))
+            .unwrap_or(false)
+    }
+
+    /// Mixed for you is a daily product: the mixes stay put all day so a listener
+    /// can come back to a song they heard this morning, and turn over once a day
+    /// at `MIX4U_REFRESH_HOUR` local time. The only mid-day rebuild is when the
+    /// listener's featured mood changes, so the rail's titles never go stale.
+    fn mixed_for_you_needs_refresh(&self, user_id: i64) -> bool {
         if user_id <= 0 {
             return false;
         }
+        // Brand-new listeners get their mixes as soon as the catalog allows.
+        if !self.has_mixed_for_you(user_id) {
+            return true;
+        }
+
+        let now = Utc::now().timestamp();
+        let kv_ts = |key: String| {
+            self.store
+                .kv_get(&key)
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        // Don't hammer a rebuild that keeps failing (e.g. a thin catalog).
+        if now - kv_ts(format!("mix4u:attempt_at:{user_id}")) < MIX4U_RETRY_SECS {
+            return false;
+        }
+
+        let tz = self.user_tz_offset_min(user_id);
+        let last_rebuilt = kv_ts(format!("mix4u:v3:rebuilt_at:{user_id}"));
+        if mix4u_day(now, tz) > mix4u_day(last_rebuilt, tz) {
+            return true;
+        }
+
+        // Taste changed: occasionally check whether the featured mood moved.
+        // Recomputing the mood is not free, so it is rate limited.
         let dirty = self
             .store
             .kv_get(&format!("taste:dirty:{user_id}"))
             .map(|v| v == "1")
             .unwrap_or(false);
-        let last_rebuilt = self
-            .store
-            .kv_get(&format!("mix4u:v3:rebuilt_at:{user_id}"))
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
-        let has_mixes = self
-            .store
-            .list_playlists(user_id, false)
-            .map(|pls| pls.iter().any(|p| p.kind.starts_with("mixed_for_you:")))
-            .unwrap_or(false);
-
-        !has_mixes || dirty || (Utc::now().timestamp() - last_rebuilt) >= max_age_secs
+        let checked_key = format!("mix4u:mood_checked_at:{user_id}");
+        if dirty && now - kv_ts(checked_key.clone()) >= MIX4U_MOOD_RECHECK_SECS {
+            self.store.kv_set(&checked_key, &now.to_string());
+            let featured = self.featured_mixed_for_you_mood(user_id);
+            let current = self.store.kv_get(&format!("mix4u:mood:{user_id}"));
+            return current.as_deref() != Some(featured.slug());
+        }
+        false
     }
 
     /// Rebuild the four personalized mixes in the background. Called by the
@@ -1888,6 +1981,7 @@ impl TasteEngine {
         // If the user's dominant mood changed, drop the old theme's cards so a
         // single rail never shows two different moods at once.
         let previous = self.store.kv_get(&format!("mix4u:mood:{user_id}"));
+        let same_mood = previous.as_deref() == Some(slug);
         if let Some(old) = previous {
             if old != slug {
                 for part in Self::MIXED_FOR_YOU_PARTS {
@@ -1898,14 +1992,27 @@ impl TasteEngine {
             }
         }
 
-        let mut pool = self.mood_mix_tracks(user_id, mood, 90).await;
+        // Yesterday's tracks, so today's mixes can lead with something new.
+        let mut previous_ids: HashSet<String> = HashSet::new();
+        if same_mood {
+            for part in Self::MIXED_FOR_YOU_PARTS {
+                let pid = Self::mixed_for_you_playlist_id(user_id, slug, part);
+                for t in self.store.playlist_tracks(&pid).unwrap_or_default() {
+                    previous_ids.insert(t.id);
+                }
+            }
+        }
+
+        // Ask for more than the mixes hold, so there is room to rotate tracks in.
+        let mut pool = self.mood_mix_tracks(user_id, mood, 130).await;
         if pool.len() < 24 {
-            pool = self.mood_mix_tracks(user_id, mood, 120).await;
+            pool = self.mood_mix_tracks(user_id, mood, 170).await;
         }
         if pool.len() < 12 {
             return;
         }
         let pool = self.personalize_mixed_for_you_pool(user_id, mood, pool);
+        let pool = rotate_out_recent_mix_tracks(pool, &previous_ids, MIX4U_KEEP_TOP);
         let pool = dedup_and_interleave(pool, 96, 2);
         if pool.len() < 12 {
             return;
@@ -1923,11 +2030,8 @@ impl TasteEngine {
             let _ = self.store.upsert_auto_playlist(
                 &Self::mixed_for_you_playlist_id(user_id, slug, part),
                 user_id,
-                &format!("{} Mix {}", mood.mix_name(), idx + 1),
-                &format!(
-                    "A {} mix picked for you and refreshed in the background",
-                    mood.label()
-                ),
+                &format!("Daily Mix {}", idx + 1),
+                &format!("A {} mix picked for you", mood.label()),
                 &Self::mixed_for_you_kind(slug, part),
                 &ids,
             );
@@ -1940,9 +2044,9 @@ impl TasteEngine {
         let _ = self.store.upsert_auto_playlist(
             &Self::mixed_for_you_playlist_id(user_id, slug, "supermix"),
             user_id,
-            &format!("{} Supermix", mood.mix_name()),
+            "Daily Supermix",
             &format!(
-                "The best of your {} mixes, kept fresh by the background curator",
+                "The best of your {} mixes",
                 mood.label()
             ),
             &Self::mixed_for_you_kind(slug, "supermix"),
@@ -2070,15 +2174,40 @@ impl TasteEngine {
         out
     }
 
-    pub async fn refresh_mixed_for_you_if_stale_async(&self, user_id: i64, max_age_secs: i64) {
-        if !self.mixed_for_you_needs_refresh(user_id, max_age_secs) {
+    /// Rebuild the mixes if their day is over (or the featured mood moved).
+    /// A listener with no mixes yet waits for the first build; everyone else
+    /// keeps seeing today's mixes while tomorrow's are built in the background.
+    pub async fn refresh_mixed_for_you_if_stale_async(&self, user_id: i64) {
+        self.refresh_mixed_for_you_impl(user_id, false).await;
+    }
+
+    /// Same as `refresh_mixed_for_you_if_stale_async`, but always waits for the
+    /// rebuild. The background curator uses this so a whole user base rolling
+    /// over to a new day is rebuilt one listener at a time, not all at once.
+    async fn refresh_mixed_for_you_blocking(&self, user_id: i64) {
+        self.refresh_mixed_for_you_impl(user_id, true).await;
+    }
+
+    async fn refresh_mixed_for_you_impl(&self, user_id: i64, wait: bool) {
+        if !self.mixed_for_you_needs_refresh(user_id) {
             return;
         }
+        self.store.kv_set(
+            &format!("mix4u:attempt_at:{user_id}"),
+            &Utc::now().timestamp().to_string(),
+        );
+        let has_mixes = self.has_mixed_for_you(user_id);
+        // First builds sit on a request path (sign-up, home), so keep them short.
+        let budget = std::time::Duration::from_secs(if has_mixes { 15 } else { 8 });
         let engine = self.clone();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), async move {
-            engine.rebuild_mixed_for_you(user_id).await;
-        })
-        .await;
+        let build = async move {
+            let _ = tokio::time::timeout(budget, engine.rebuild_mixed_for_you(user_id)).await;
+        };
+        if has_mixes && !wait {
+            tokio::spawn(build);
+        } else {
+            build.await;
+        }
     }
 
     /// Ready-to-render cards for the home rail, including collage covers and a
@@ -2144,9 +2273,9 @@ impl TasteEngine {
                 id: p.id,
                 title: p.name,
                 art_title: if is_super {
-                    format!("{} Supermix", mood.mix_name())
+                    "Daily Supermix".to_string()
                 } else {
-                    format!("{} Mix", mood.mix_name())
+                    "Daily Mix".to_string()
                 },
                 number: if is_super {
                     String::new()
@@ -2208,7 +2337,7 @@ impl TasteEngine {
         // Rebuild from the clean, chart-only slate produced above.
         self.rebuild_auto_playlists(user_id);
         // Bounded so a cold catalog never slows down account creation.
-        self.refresh_mixed_for_you_if_stale_async(user_id, 900).await;
+        self.refresh_mixed_for_you_if_stale_async(user_id).await;
     }
 
     /// Cold-start / periodic background warming using pure HTTP Deezer global + multi-genre charts,
@@ -2458,7 +2587,7 @@ impl TasteEngine {
                     .await;
                 // Refresh personalized mixes first: rebuilding the generic auto
                 // mixes clears the shared "taste dirty" flag.
-                self.refresh_mixed_for_you_if_stale_async(uid, 900).await;
+                self.refresh_mixed_for_you_blocking(uid).await;
                 self.refresh_auto_playlists_if_stale_async(uid, 900).await;
             }
         }
@@ -9156,6 +9285,44 @@ mod tests {
     }
 
     #[test]
+    fn mix4u_day_turns_over_at_local_refresh_hour() {
+        // 2026-01-10 03:59:59 UTC and 04:00:00 UTC, listener in UTC.
+        let before = 1_768_017_599;
+        let at = before + 1;
+        assert_eq!(mix4u_day(at, 0), mix4u_day(before, 0) + 1);
+        // Same instant, listener at UTC-5: still the previous local evening.
+        assert_eq!(mix4u_day(at, -300), mix4u_day(before, -300));
+        // ...and their day turns over five hours later, at 04:00 local.
+        assert_eq!(mix4u_day(at + 5 * 3600, -300), mix4u_day(before, -300) + 1);
+        // Never-rebuilt (timestamp 0) is always an earlier day.
+        assert!(mix4u_day(at, 840) > mix4u_day(0, 840));
+    }
+
+    #[test]
+    fn rotate_out_recent_mix_tracks_keeps_favourites_and_demotes_repeats() {
+        let mk = |id: &str| Track {
+            id: id.into(),
+            title: id.into(),
+            artist: id.into(),
+            ..Default::default()
+        };
+        let pool: Vec<Track> = ["t1", "t2", "t3", "t4", "t5", "t6"].iter().map(|s| mk(s)).collect();
+        let previous: HashSet<String> = ["t1", "t3", "t4"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = rotate_out_recent_mix_tracks(pool.clone(), &previous, 2)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        // t1 is a top favourite and stays put; t3/t4 drop behind the new t5/t6.
+        assert_eq!(ids, vec!["t1", "t2", "t5", "t6", "t3", "t4"]);
+
+        let unchanged: Vec<String> = rotate_out_recent_mix_tracks(pool, &HashSet::new(), 2)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(unchanged, vec!["t1", "t2", "t3", "t4", "t5", "t6"]);
+    }
+
+    #[test]
     fn dedup_and_interleave_spaces_repeated_artists_apart() {
         let mk = |id: &str, artist: &str| Track {
             id: id.into(),
@@ -11299,9 +11466,10 @@ mod tests {
 
         let cards = taste.mixed_for_you_cards(u.id);
         assert_eq!(cards.len(), 4, "cards: {:?}", cards.iter().map(|c| &c.title).collect::<Vec<_>>());
-        assert_eq!(cards[0].title, "Energy Mix 1");
+        assert_eq!(cards[0].title, "Daily Mix 1");
+        assert_eq!(cards[0].art_title, "Daily Mix");
         assert_eq!(cards[0].number, "01");
-        assert_eq!(cards[3].title, "Energy Supermix");
+        assert_eq!(cards[3].title, "Daily Supermix");
         assert!(cards[3].is_super);
         assert!(cards[3].number.is_empty());
         assert_eq!(cards[0].covers.len(), 4);
@@ -11378,7 +11546,8 @@ mod tests {
 
         let cards = taste.mixed_for_you_cards(u.id);
         assert_eq!(cards.len(), 4);
-        assert_eq!(cards[0].title, "Feel Good Mix 1");
+        assert_eq!(cards[0].title, "Daily Mix 1");
+        assert_eq!(store.kv_get(&format!("mix4u:mood:{}", u.id)).as_deref(), Some(Mood::Upbeat.slug()));
         let mut all_ids: Vec<String> = Vec::new();
         for c in &cards {
             all_ids.extend(store.playlist_tracks(&c.id).unwrap().into_iter().map(|t| t.id));
@@ -11444,7 +11613,8 @@ mod tests {
 
         let cards = taste.mixed_for_you_cards(u.id);
         assert_eq!(cards.len(), 4);
-        assert_eq!(cards[0].title, "Feel Good Mix 1");
+        assert_eq!(cards[0].title, "Daily Mix 1");
+        assert_eq!(store.kv_get(&format!("mix4u:mood:{}", u.id)).as_deref(), Some(Mood::Upbeat.slug()));
         for c in &cards {
             let tracks = store.playlist_tracks(&c.id).unwrap();
             assert!(!tracks.is_empty());

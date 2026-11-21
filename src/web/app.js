@@ -2333,7 +2333,7 @@
     const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading...');
     try {
-      const d = await api('/api/web/home', { signal });
+      const d = await api(`/api/web/home?tz=${encodeURIComponent(-new Date().getTimezoneOffset())}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       const quickPicks = cacheTracks(d.quickPicks || []).slice(0, QP_PER_PAGE * QP_MAX_PAGES);
       const newReleases = d.newReleases || [];
@@ -2356,8 +2356,7 @@
       if (mixedForYou.length > 0) {
         html += `<section class="section">
           <div class="section-head">
-            <h2>Mixed for you</h2>
-          </div>
+            <h2>Mixed for you</h2>          </div>
           <div class="mixed-for-you-grid rail">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;
       }

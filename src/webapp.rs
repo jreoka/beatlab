@@ -762,6 +762,11 @@ pub struct SearchQuery {
 }
 
 #[derive(Deserialize)]
+pub struct HomeQuery {
+    pub tz: Option<i32>,
+}
+
+#[derive(Deserialize)]
 pub struct StatsQuery {
     pub range: Option<String>,
     pub tz: Option<i32>,
@@ -1901,12 +1906,19 @@ async fn build_new_releases(
     (items, unseen.len(), Utc::now().timestamp())
 }
 
-pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn home(
+    State(state): State<AppState>,
+    Query(q): Query<HomeQuery>,
+    headers: HeaderMap,
+) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
     let uid = user.id;
+    if let Some(tz) = q.tz {
+        state.taste.set_user_tz_offset(uid, tz);
+    }
     let is_fresh = !state.store.has_listening_history(uid).unwrap_or(false);
 
     // Fetch external charts first so fresh accounts immediately have popular
@@ -1932,7 +1944,7 @@ pub async fn home(State(state): State<AppState>, headers: HeaderMap) -> Response
     // Ensure auto-mixes exist and refresh cleanly whenever user feedback/playlists changed them.
     if state.store.count_tracks().unwrap_or(0) > 0 {
         // Mixed-for-you first: rebuilding generic auto mixes clears the dirty flag.
-        state.taste.refresh_mixed_for_you_if_stale_async(uid, 900).await;
+        state.taste.refresh_mixed_for_you_if_stale_async(uid).await;
         state.taste.refresh_auto_playlists_if_stale_async(uid, 900).await;
     }
     let playlists = state.store.list_playlists(uid, false).unwrap_or_default();
@@ -3746,7 +3758,7 @@ pub async fn get_playlist(
     }
     let pl = if pl.is_auto && pl.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
         if pl.kind.starts_with("mixed_for_you:") {
-            state.taste.refresh_mixed_for_you_if_stale_async(user.id, 900).await;
+            state.taste.refresh_mixed_for_you_if_stale_async(user.id).await;
         }
         state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
         state.store.get_playlist(&id).ok().flatten().unwrap_or(pl)
