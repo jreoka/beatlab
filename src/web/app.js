@@ -56,6 +56,69 @@
     } catch {}
   }
 
+  const RECENT_SEARCH_LIMIT = 6;
+
+  function recentSearchesStorageKey() {
+    return `beatlab_recent_searches_${state.user?.id || 'anon'}`;
+  }
+
+  function getRecentSearches() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(recentSearchesStorageKey()) || '[]');
+      return Array.isArray(raw) ? raw.filter((q) => typeof q === 'string' && q).slice(0, RECENT_SEARCH_LIMIT) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveRecentSearches(list) {
+    try {
+      localStorage.setItem(recentSearchesStorageKey(), JSON.stringify(list.slice(0, RECENT_SEARCH_LIMIT)));
+    } catch {}
+  }
+
+  function addRecentSearch(query) {
+    const q = String(query || '').trim();
+    if (!q) return;
+    const lower = q.toLowerCase();
+    saveRecentSearches([q, ...getRecentSearches().filter((s) => s.toLowerCase() !== lower)]);
+  }
+
+  function removeRecentSearch(query) {
+    saveRecentSearches(getRecentSearches().filter((s) => s !== query));
+  }
+
+  function hideRecentSearches() {
+    const box = document.getElementById('recent-searches');
+    if (box) box.classList.add('hidden');
+  }
+
+  function showRecentSearches() {
+    const box = document.getElementById('recent-searches');
+    const input = document.getElementById('global-search');
+    if (!box || !input) return;
+    const list = getRecentSearches();
+    if (!list.length || (input.value || '').trim()) {
+      box.classList.add('hidden');
+      return;
+    }
+    box.innerHTML =
+      `<div class="recent-searches-head">Recent searches</div>` +
+      list
+        .map(
+          (q, i) => `
+        <div class="recent-search-item" role="option" data-idx="${i}">
+          <svg class="recent-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          <span class="recent-search-text">${esc(q)}</span>
+          <button class="recent-search-remove" type="button" title="Remove" data-remove="${i}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>`
+        )
+        .join('');
+    box.classList.remove('hidden');
+  }
+
   function isPlaylistPinned(pid) {
     return getPinnedPlaylistIds().includes(pid);
   }
@@ -1819,16 +1882,54 @@
 
     globalSearch.addEventListener('input', (e) => {
       handleSearchBoxEdit(e.target.value);
+      if ((e.target.value || '').trim()) hideRecentSearches();
+      else showRecentSearches();
+    });
+
+    globalSearch.addEventListener('focus', () => showRecentSearches());
+
+    globalSearch.addEventListener('blur', () => {
+      hideRecentSearches();
+      // Live search fires while typing; only remember the query the user
+      // settled on (they left the box while its results were showing).
+      const q = (globalSearch.value || '').trim();
+      if (q && isSearchHash(location.hash.replace(/^#/, ''))) addRecentSearch(q);
     });
 
     globalSearch.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        hideRecentSearches();
+        return;
+      }
       if (e.key === 'Enter') {
         if (e.isComposing || e.keyCode === 229 || state.searchComposing) return;
         e.preventDefault();
         clearTimeout(state.searchTimer);
         state.searchTimer = null;
+        addRecentSearch(e.target.value);
+        hideRecentSearches();
         triggerSearchFromInput(e.target.value);
       }
+    });
+
+    const recentBox = $('recent-searches');
+    // Keep focus in the input so blur doesn't close the dropdown mid-click.
+    recentBox.addEventListener('mousedown', (e) => e.preventDefault());
+    recentBox.addEventListener('click', (e) => {
+      const list = getRecentSearches();
+      const removeBtn = e.target.closest('[data-remove]');
+      if (removeBtn) {
+        e.stopPropagation();
+        removeRecentSearch(list[Number(removeBtn.dataset.remove)]);
+        showRecentSearches();
+        return;
+      }
+      const item = e.target.closest('.recent-search-item');
+      if (!item) return;
+      const q = list[Number(item.dataset.idx)];
+      if (!q) return;
+      hideRecentSearches();
+      runRefinedSearch(q);
     });
 
     wireAudioEvents();
@@ -5394,6 +5495,7 @@
     state.searchTimer = null;
     state.searchComposing = false;
     state.ownSearchNavQuery = q;
+    addRecentSearch(q);
     $('global-search').value = q;
     $('clear-search-btn').classList.remove('hidden');
     navigate(`search?q=${encodeURIComponent(q)}`);
