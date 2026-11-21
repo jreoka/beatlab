@@ -653,6 +653,10 @@ fn explore_cache_key(key: &str) -> String {
     format!("curated:explore:{}", key)
 }
 
+fn explore_user_cache_key(user_id: i64, key: &str) -> String {
+    format!("curated:explore_user:v1:{}:{}", user_id, key)
+}
+
 fn query_cache_key(norm_query: &str) -> String {
     format!("curated:query:{}", slug(norm_query))
 }
@@ -2242,7 +2246,10 @@ impl TasteEngine {
             let part = parts.next().unwrap_or("");
             let is_super = part == "supermix";
             let (c1, c2) = mood.gradient();
-            let tracks = self.store.playlist_tracks(&p.id).unwrap_or_default();
+            let tracks = self.filter_hidden_tracks_for_user(
+                user_id,
+                self.store.playlist_tracks(&p.id).unwrap_or_default(),
+            );
 
             let mut covers: Vec<String> = Vec::new();
             for t in &tracks {
@@ -2674,13 +2681,40 @@ impl TasteEngine {
         Self::preview_from_tracks(&tracks)
     }
 
+    fn filter_hidden_tracks_for_user(&self, user_id: i64, tracks: Vec<Track>) -> Vec<Track> {
+        if user_id <= 0 || tracks.is_empty() {
+            return tracks;
+        }
+        let (hidden_ids, hidden_keys) = self.store.hidden_track_sets(user_id).unwrap_or_default();
+        if hidden_ids.is_empty() && hidden_keys.is_empty() {
+            return tracks;
+        }
+        tracks
+            .into_iter()
+            .filter(|t| {
+                !hidden_ids.contains(&t.id)
+                    && (hidden_keys.is_empty() || !hidden_keys.contains(&t.song_key()))
+            })
+            .collect()
+    }
+
     pub fn curated_mood_preview_for_user(&self, user_id: i64, mood: Mood) -> (usize, Vec<String>) {
         if user_id > 0 {
-            let user_ids = self.load_curated_pool_ids(&mood_user_cache_key(user_id, mood), 12 * 3600);
-            if !user_ids.is_empty() {
-                let tracks = self.store.get_tracks_by_ids(&user_ids).unwrap_or_default();
-                if !tracks.is_empty() {
-                    return Self::preview_from_tracks(&tracks);
+            let global_updated = self
+                .load_curated_pool_entry(&mood_cache_key(mood))
+                .map(|e| e.updated_at)
+                .unwrap_or(0);
+            if let Some(entry) = self.load_curated_pool_entry(&mood_user_cache_key(user_id, mood)) {
+                let fresh = (Utc::now().timestamp() - entry.updated_at) <= 12 * 3600;
+                if fresh && entry.updated_at >= global_updated && !entry.track_ids.is_empty() {
+                    let tracks = self
+                        .store
+                        .get_tracks_by_ids(&entry.track_ids)
+                        .unwrap_or_default();
+                    let tracks = self.filter_hidden_tracks_for_user(user_id, tracks);
+                    if !tracks.is_empty() {
+                        return Self::preview_from_tracks(&tracks);
+                    }
                 }
             }
         }
@@ -2694,24 +2728,18 @@ impl TasteEngine {
         } else {
             Vec::new()
         };
-        let base = if is_fresh_user {
-            Self::preview_from_tracks(&cached_curated_tracks)
-        } else {
-            self.curated_mood_preview(mood)
-        };
-        if base.0 >= 12 || user_id <= 0 {
-            return base;
-        }
-
         let local_mood = if is_fresh_user {
             Vec::new()
         } else {
-            self.store.tracks_by_mood(mood, 60, 0).unwrap_or_default()
+            self.store.tracks_by_mood(mood, 140, 0).unwrap_or_default()
         };
-        let user_pool = self
-            .store
-            .candidate_tracks_for_user(user_id, 400)
-            .unwrap_or_default();
+        let user_pool = if user_id > 0 {
+            self.store
+                .candidate_tracks_for_user(user_id, 900)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut candidates = Vec::new();
         let mut seen_ids = HashSet::new();
         for t in cached_curated_tracks
@@ -2723,9 +2751,12 @@ impl TasteEngine {
                 candidates.push(t);
             }
         }
+        if candidates.is_empty() {
+            return (0, Vec::new());
+        }
         let curated_ids: HashSet<String> = cached_curated_ids.into_iter().collect();
         let mut ranked = self.rank_mood_mix(user_id, mood, candidates, &curated_ids, 35);
-        if ranked.len() < 12 {
+        if ranked.len() < 12 && user_id > 0 && !is_fresh_user {
             let sctx = self.build_scoring_context(user_id);
             let mut have_keys: HashSet<String> = ranked.iter().map(Track::song_key).collect();
             let mut have_ids: HashSet<String> = ranked.iter().map(|t| t.id.clone()).collect();
@@ -2742,6 +2773,8 @@ impl TasteEngine {
                     || have_keys.contains(&t.song_key())
                     || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
                     || is_mood_clutter_track(&t)
+                    || ((t.source == "archive" || t.source == "soulseek")
+                        && !is_familiar_track(&t, &sctx.prof, &sctx.stats))
                 {
                     continue;
                 }
@@ -2764,20 +2797,46 @@ impl TasteEngine {
                 }
             }
         }
-        if ranked.len() > base.0 {
-            Self::preview_from_tracks(&ranked)
-        } else {
-            base
-        }
+        Self::preview_from_tracks(&ranked)
     }
 
-    pub fn curated_explore_preview(&self, spec: &ExploreMixSpec) -> (usize, Vec<String>) {
+    pub fn curated_explore_preview_for_user(
+        &self,
+        user_id: i64,
+        spec: &ExploreMixSpec,
+    ) -> (usize, Vec<String>) {
+        if user_id > 0 {
+            let global_updated = self
+                .load_curated_pool_entry(&explore_cache_key(spec.key))
+                .map(|e| e.updated_at)
+                .unwrap_or(0);
+            if let Some(entry) =
+                self.load_curated_pool_entry(&explore_user_cache_key(user_id, spec.key))
+            {
+                let fresh = (Utc::now().timestamp() - entry.updated_at) <= 12 * 3600;
+                if fresh && entry.updated_at >= global_updated && !entry.track_ids.is_empty() {
+                    let tracks = self
+                        .store
+                        .get_tracks_by_ids(&entry.track_ids)
+                        .unwrap_or_default();
+                    let tracks = self.filter_hidden_tracks_for_user(user_id, tracks);
+                    if !tracks.is_empty() {
+                        return Self::preview_from_tracks(&tracks);
+                    }
+                }
+            }
+        }
         let ids = self.load_curated_pool_ids(&explore_cache_key(spec.key), 24 * 3600);
-        if ids.is_empty() {
+        let curated_tracks = if !ids.is_empty() {
+            self.store.get_tracks_by_ids(&ids).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if curated_tracks.is_empty() && user_id <= 0 {
             return (0, Vec::new());
         }
-        let tracks = self.store.get_tracks_by_ids(&ids).unwrap_or_default();
-        Self::preview_from_tracks(&tracks)
+        let ranked = self.rank_explore_mix_tracks(user_id, spec, curated_tracks, 35);
+        Self::preview_from_tracks(&ranked)
     }
 
     pub fn curator_status_snapshot(&self) -> serde_json::Value {
@@ -2939,7 +2998,21 @@ impl TasteEngine {
         if curated_tracks.len() < 8 {
             curated_tracks = self.curate_explore_mix(spec).await;
         }
+        let ranked = self.rank_explore_mix_tracks(user_id, spec, curated_tracks, limit);
+        if user_id > 0 && !ranked.is_empty() {
+            let ids: Vec<String> = ranked.iter().map(|t| t.id.clone()).collect();
+            self.save_curated_pool(&explore_user_cache_key(user_id, spec.key), &ids);
+        }
+        ranked
+    }
 
+    fn rank_explore_mix_tracks(
+        &self,
+        user_id: i64,
+        spec: &ExploreMixSpec,
+        curated_tracks: Vec<Track>,
+        limit: usize,
+    ) -> Vec<Track> {
         let intent = parse_search_intent(spec.query);
         let sctx = self.build_scoring_context(user_id);
         let category_mood = intent.moods.first().copied();
@@ -12325,6 +12398,90 @@ mod tests {
         let (after_cnt, after_covers) = taste.curated_mood_preview_for_user(u.id, Mood::LateNight);
         assert_eq!(after_cnt, mix.len());
         assert_eq!(after_covers.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn curated_mood_and_explore_previews_match_opened_mix_count_before_opening() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("countcheck", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(
+                store.clone(),
+                vec![],
+            )),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        // Build 48 curated tracks for Chill (exceeding the 35-track mix limit) plus 2 hidden tracks.
+        let mut mood_tracks = Vec::new();
+        let mut mood_ids = Vec::new();
+        for i in 0..48 {
+            let id = format!("dz:chill_pool_{i}");
+            mood_ids.push(id.clone());
+            mood_tracks.push(Track {
+                id: id.clone(),
+                source: "deezer".into(),
+                title: format!("Soft Breeze {i}"),
+                artist: format!("LoFi Artist {i}"),
+                album: "Chill Sessions".into(),
+                genre: "Lo-Fi".into(),
+                moods: "chill".into(),
+                cover_url: format!("https://example.com/chill{i}.jpg"),
+                duration: 195,
+                bitrate: 320,
+                stream_url: id,
+                meta: r#"{"rank":500000}"#.into(),
+                ..Default::default()
+            });
+        }
+        store.upsert_tracks(&mood_tracks).unwrap();
+        taste.save_curated_pool(&mood_cache_key(Mood::Chill), &mood_ids);
+        // Hide one track from the curated pool.
+        taste.mark_not_interested(u.id, &mood_ids[0]);
+
+        let (mood_before_cnt, _) = taste.curated_mood_preview_for_user(u.id, Mood::Chill);
+        let mood_opened = taste.mood_mix_tracks(u.id, Mood::Chill, 35).await;
+        let (mood_after_cnt, _) = taste.curated_mood_preview_for_user(u.id, Mood::Chill);
+        assert_eq!(mood_opened.len(), 35);
+        assert_eq!(mood_before_cnt, mood_opened.len());
+        assert_eq!(mood_after_cnt, mood_opened.len());
+
+        // Build 45 curated tracks for the 80s Hits explore mix (also exceeding the 35-track limit).
+        let spec = find_explore_mix_spec("80s_hits").unwrap();
+        let mut era_tracks = Vec::new();
+        let mut era_ids = Vec::new();
+        for i in 0..45 {
+            let id = format!("dz:80s_pool_{i}");
+            era_ids.push(id.clone());
+            era_tracks.push(Track {
+                id: id.clone(),
+                source: "deezer".into(),
+                title: format!("Neon Anthem {i}"),
+                artist: format!("80s Band {i}"),
+                album: "1985 Classics".into(),
+                genre: "Synthpop".into(),
+                year: 1985,
+                cover_url: format!("https://example.com/80s{i}.jpg"),
+                duration: 220,
+                bitrate: 320,
+                stream_url: id,
+                meta: r#"{"rank":500000}"#.into(),
+                ..Default::default()
+            });
+        }
+        store.upsert_tracks(&era_tracks).unwrap();
+        taste.save_curated_pool(&explore_cache_key(spec.key), &era_ids);
+
+        let (era_before_cnt, _) = taste.curated_explore_preview_for_user(u.id, spec);
+        let era_opened = taste.get_curated_explore_mix_tracks(u.id, spec, 35).await;
+        let (era_after_cnt, _) = taste.curated_explore_preview_for_user(u.id, spec);
+        assert_eq!(era_opened.len(), 35);
+        assert_eq!(era_before_cnt, era_opened.len());
+        assert_eq!(era_after_cnt, era_opened.len());
     }
 
     #[tokio::test]

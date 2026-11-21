@@ -1952,7 +1952,7 @@ pub async fn home(
     let auto_mixes: Vec<Value> = playlists
         .into_iter()
         .filter(|p| p.is_auto && !p.kind.starts_with("mixed_for_you:"))
-        .map(|p| playlist_summary_json(&p))
+        .map(|p| playlist_summary_for_user_json(&state, uid, &p))
         .collect();
 
     let quick_picks = state.taste.quick_picks(uid, 36);
@@ -2091,7 +2091,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         if spec.kind != "decade" {
             continue;
         }
-        let (track_count, covers) = state.taste.curated_explore_preview(spec);
+        let (track_count, covers) = state.taste.curated_explore_preview_for_user(uid, spec);
         decades.push(json!({
             "key": spec.key,
             "kind": spec.kind,
@@ -3507,7 +3507,10 @@ pub async fn library(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .collect();
 
     json_res(json!({
-        "playlists": playlists.iter().map(playlist_summary_json).collect::<Vec<_>>(),
+        "playlists": playlists
+            .iter()
+            .map(|p| playlist_summary_for_user_json(&state, uid, p))
+            .collect::<Vec<_>>(),
         "likedTracks": to_web_tracks(&state, uid, &starred_tracks),
         "savedAlbums": saved_albums,
         "followedArtists": followed_artists,
@@ -3771,8 +3774,12 @@ pub async fn get_playlist(
     } else {
         raw_tracks
     };
+    let mut pl_summary = pl.clone();
+    if pl.is_auto {
+        pl_summary.track_count = tracks.len();
+    }
     json_res(json!({
-        "playlist": playlist_summary_json(&pl),
+        "playlist": playlist_summary_json(&pl_summary),
         "isOwner": pl.user_id == user.id,
         "tracks": to_web_tracks(&state, user.id, &tracks),
     }))
@@ -4874,6 +4881,27 @@ fn artist_json(a: &ArtistSummary, is_followed: bool) -> Value {
         "songCount": a.song_count,
         "isFollowed": is_followed,
     })
+}
+
+fn playlist_summary_for_user_json(state: &AppState, user_id: i64, p: &Playlist) -> Value {
+    if !p.is_auto || user_id <= 0 {
+        return playlist_summary_json(p);
+    }
+    let (hidden_ids, hidden_keys) = state.store.hidden_track_sets(user_id).unwrap_or_default();
+    if hidden_ids.is_empty() && hidden_keys.is_empty() {
+        return playlist_summary_json(p);
+    }
+    let raw = state.store.playlist_tracks(&p.id).unwrap_or_default();
+    let visible_count = raw
+        .into_iter()
+        .filter(|t| {
+            !hidden_ids.contains(&t.id)
+                && (hidden_keys.is_empty() || !hidden_keys.contains(&t.song_key()))
+        })
+        .count();
+    let mut adjusted = p.clone();
+    adjusted.track_count = visible_count;
+    playlist_summary_json(&adjusted)
 }
 
 fn playlist_summary_json(p: &Playlist) -> Value {
