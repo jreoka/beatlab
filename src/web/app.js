@@ -1891,6 +1891,7 @@
         const savedSec = q.positionMs > 1000 ? q.positionMs / 1000 : 0;
         state.pendingSeekSec = savedSec;
         updateNowPlayingUI(cur, false);
+        syncPlayingTrackRows(cur ? cur.id : '');
         renderQueuePanel();
         if (cur) {
           audio.src = buildStreamUrl(cur);
@@ -3186,11 +3187,14 @@
       const listJson = esc(JSON.stringify(recs.map((t) => t.id)));
       targetBox.innerHTML = `<div class="track-table">${recs
         .map((t, idx) => {
+          const cur = currentTrack();
+          const isCur = cur && cur.id === t.id;
           const metaSub = t.genre ? `${t.artist} · ${t.genre}` : t.artist;
           return `
-            <div class="track-row" data-tid="${esc(t.id)}">
+            <div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
               <div class="tr-idx" onclick="App.playListByIds(${listJson}, ${idx})">
                 <span class="tr-num">${idx + 1}</span>
+                <span class="tr-playing-icon">${ICONS.nowPlaying}</span>
                 <span class="tr-play-icon">${ICONS.play}</span>
               </div>
               <div class="tr-main" onclick="App.playListByIds(${listJson}, ${idx})">
@@ -4324,7 +4328,8 @@
                 return `
                   <div class="track-row stats-top-track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
                     <div class="tr-idx" onclick="App.playListByIds(${topIdsJson}, ${idx})">
-                      <span class="tr-num ${idx < 3 ? 'stats-medal' : ''}">${isCur ? ICONS.nowPlaying : idx + 1}</span>
+                      <span class="tr-num ${idx < 3 ? 'stats-medal' : ''}">${idx + 1}</span>
+                      <span class="tr-playing-icon">${ICONS.nowPlaying}</span>
                       <span class="tr-play-icon">${ICONS.play}</span>
                     </div>
                     <div class="tr-main" onclick="App.playListByIds(${topIdsJson}, ${idx})">
@@ -4635,7 +4640,10 @@
           ? ` data-pl-id="${esc(editablePlaylistId)}" data-pl-pos="${i}"`
           : '';
         return `<div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}"${plDataAttrs}>
-          <div class="tr-idx" onclick="${playClick}">${isCur ? ICONS.nowPlaying : useTrackNo && t.trackNo > 0 ? t.trackNo : i + 1}</div>
+          <div class="tr-idx" onclick="${playClick}">
+            <span class="tr-num">${useTrackNo && t.trackNo > 0 ? t.trackNo : i + 1}</span>
+            <span class="tr-playing-icon">${ICONS.nowPlaying}</span>
+          </div>
           <div class="tr-main" onclick="${playClick}">
             <img class="tr-thumb" src="${esc(t.coverUrl)}" loading="lazy" alt="" />
             <div class="tr-text">
@@ -4967,6 +4975,12 @@
     return Math.max(0, Math.min(startIndex, ordered.length - 1));
   }
 
+  function syncPlayingTrackRows(trackId) {
+    document.querySelectorAll('.track-row, .qp-tile').forEach((row) => {
+      row.classList.toggle('playing', !!trackId && row.dataset.tid === trackId);
+    });
+  }
+
   async function playQueueAt(index) {
     if (index < 0 || index >= state.queue.length) return;
     const prevTrackObj = currentTrack();
@@ -4992,9 +5006,7 @@
     saveServerQueue();
 
     // Highlight playing track in current view if visible
-    document.querySelectorAll('.track-row, .qp-tile').forEach((row) => {
-      row.classList.toggle('playing', row.dataset.tid === track.id);
-    });
+    syncPlayingTrackRows(track.id);
 
     if (!isBurst) {
       commitTrackLoad(loadToken, track);
@@ -6471,6 +6483,7 @@
           state.queueIndex = -1;
           audio.pause();
           audio.removeAttribute('src');
+          syncPlayingTrackRows('');
           renderQueuePanel();
           saveServerQueue();
         }

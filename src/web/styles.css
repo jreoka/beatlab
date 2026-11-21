@@ -1815,12 +1815,20 @@ a {
   display: block;
   color: var(--accent);
 }
+.tr-playing-icon,
 .tr-play-icon {
   display: none;
   align-items: center;
   justify-content: center;
 }
-.track-row:hover .tr-num {
+.track-row.playing .tr-num {
+  display: none;
+}
+.track-row.playing .tr-playing-icon {
+  display: inline-flex;
+}
+.track-row:has(.tr-play-icon):hover .tr-num,
+.track-row:has(.tr-play-icon):hover .tr-playing-icon {
   display: none;
 }
 .track-row:hover .tr-play-icon {
