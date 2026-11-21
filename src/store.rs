@@ -2076,7 +2076,7 @@ impl Store {
                     clauses.push("source = 'local'".to_string());
                     let lim_param_idx = artist_pats.len() + 1;
                     let aff_sql = format!(
-                        "SELECT {} FROM tracks WHERE ({}) ORDER BY created DESC LIMIT ?{}",
+                        "SELECT {} FROM tracks WHERE ({}) AND source NOT IN ('archive', 'soulseek') ORDER BY created DESC LIMIT ?{}",
                         TRACK_COLS,
                         clauses.join(" OR "),
                         lim_param_idx
@@ -2107,7 +2107,7 @@ impl Store {
                         .map(|idx| format!("lower(genre) LIKE ?{} ESCAPE '\\'", idx + 1))
                         .collect();
                     let gsql = format!(
-                        "SELECT {} FROM tracks WHERE ({}) ORDER BY created DESC LIMIT ?{}",
+                        "SELECT {} FROM tracks WHERE ({}) AND source NOT IN ('archive', 'soulseek') ORDER BY created DESC LIMIT ?{}",
                         TRACK_COLS,
                         gclauses.join(" OR "),
                         genre_pats.len() + 1
@@ -2165,7 +2165,7 @@ impl Store {
             if chart_total < 20 && chart_added == 0 && out.len() < limit {
                 let rem2 = limit - out.len();
                 let cat_sql = format!(
-                    "SELECT {} FROM tracks ORDER BY created DESC LIMIT ?1",
+                    "SELECT {} FROM tracks WHERE source NOT IN ('archive', 'soulseek') ORDER BY created DESC LIMIT ?1",
                     TRACK_COLS
                 );
                 let mut cstmt = conn.prepare(&cat_sql)?;
@@ -3051,6 +3051,7 @@ impl Store {
         let sql = format!(
             "SELECT {} FROM tracks
              WHERE (',' || lower(moods) || ',') LIKE ?1
+               AND source NOT IN ('archive', 'soulseek')
              ORDER BY
                (CASE WHEN trim(genre) != '' THEN 2 ELSE 0 END)
                + (CASE WHEN source = 'local' THEN 2 WHEN source = 'deezer' THEN 1 ELSE 0 END) DESC,

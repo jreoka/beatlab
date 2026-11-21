@@ -646,7 +646,7 @@ fn mood_cache_key(mood: Mood) -> String {
 }
 
 fn mood_user_cache_key(user_id: i64, mood: Mood) -> String {
-    format!("curated:mood_user:v4:{}:{}", user_id, mood.slug())
+    format!("curated:mood_user:v5:{}:{}", user_id, mood.slug())
 }
 
 fn explore_cache_key(key: &str) -> String {
@@ -2113,6 +2113,8 @@ impl TasteEngine {
                 || is_mood_title_trap(&t, mood)
                 || track_matches_topic(&t, "christmas")
                 || track_matches_topic(&t, "halloween")
+                || ((t.source == "archive" || t.source == "soulseek")
+                    && !is_familiar_track(&t, &sctx.prof, &sctx.stats))
             {
                 continue;
             }
@@ -4722,6 +4724,8 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                         || have_keys.contains(&t.song_key())
                         || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
                         || is_mood_clutter_track(&t)
+                        || ((t.source == "archive" || t.source == "soulseek")
+                            && !is_familiar_track(&t, &sctx.prof, &sctx.stats))
                     {
                         continue;
                     }
@@ -4768,7 +4772,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         let artists: Vec<String> = candidates.iter().map(|t| t.artist.clone()).collect();
         let artist_genres = self.store.known_artist_genres_for(&artists).unwrap_or_default();
 
-        let mut eligible: Vec<(Track, bool, bool, Vec<Mood>, f64, bool)> = Vec::new();
+        let mut eligible: Vec<(Track, bool, bool, Vec<Mood>, f64, bool, bool)> = Vec::new();
         for t in candidates {
             if is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
                 || is_mood_clutter_track(&t)
@@ -4793,6 +4797,16 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             let clean_match = clean_moods.contains(&mood) && (has_known_genre || t.source == "local");
             let realm = user_realm_score(&t, &sctx.prof, &sctx.stats);
             let is_familiar = is_familiar_track(&t, &sctx.prof, &sctx.stats);
+            let is_personal = is_personal_mix_track(&t, &sctx.prof, &sctx.stats);
+
+            // Never leak unplayed Archive.org / Soulseek search-cache leftovers (e.g.
+            // homonym albums or P2P fan mashups) into Moods & Vibes mixes.
+            if (t.source == "archive" || t.source == "soulseek") && !is_familiar {
+                continue;
+            }
+            if !is_familiar && t.source != "local" && is_live_concert_title(&t.title) {
+                continue;
+            }
 
             if !meta_match && !is_familiar && is_mood_title_trap(&t, mood) {
                 continue;
@@ -4813,12 +4827,41 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                 continue;
             }
             let strong_evidence = meta_match || clean_match || is_familiar || realm > 0.0;
-            eligible.push((t, is_curated, meta_match, clean_moods, realm, strong_evidence));
+            eligible.push((
+                t,
+                is_curated,
+                meta_match,
+                clean_moods,
+                realm,
+                strong_evidence,
+                is_personal,
+            ));
         }
 
         let eligible_tracks: Vec<Track> =
-            eligible.iter().map(|(t, _, _, _, _, _)| t.clone()).collect();
+            eligible.iter().map(|(t, _, _, _, _, _, _)| t.clone()).collect();
         let has_user_taste = !sctx.stats.is_empty() || profile_has_taste(&sctx.prof);
+        let user_has_metal_taste = [
+            "metal",
+            "heavy metal",
+            "thrash",
+            "death metal",
+            "black metal",
+            "nu metal",
+            "alt metal",
+            "metalcore",
+        ]
+        .iter()
+        .any(|g| {
+            sctx.prof.genre_affinity.get(*g).copied().unwrap_or(0.0) > 0.2
+                || sctx
+                    .prof
+                    .playlist_genre_affinity
+                    .get(*g)
+                    .copied()
+                    .unwrap_or(0.0)
+                    > 0.2
+        });
         let n_w = self.neural_blend_weight(0.65, &sctx);
         let n_scores = if has_user_taste && n_w > 0.0 {
             self.neural_scores(user_id, &[], None, &[mood], &[], &eligible_tracks)
@@ -4826,66 +4869,92 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
             Vec::new()
         };
 
-        let mut scored: Vec<(f64, bool, Track)> = eligible
+        let mut scored: Vec<(f64, bool, bool, Track)> = eligible
             .into_iter()
             .enumerate()
-            .map(|(idx, (t, is_curated, meta_match, clean_moods, realm, strong_evidence))| {
-                let taste_s = score_track_core(
-                    &t,
-                    &sctx.prof,
-                    &sctx.stats,
-                    ScoreMode::Supermix,
-                );
+            .map(
+                |(idx, (t, is_curated, meta_match, clean_moods, realm, strong_evidence, is_personal))| {
+                    let taste_s = score_track_core(
+                        &t,
+                        &sctx.prof,
+                        &sctx.stats,
+                        ScoreMode::Supermix,
+                    );
 
-                // Category evidence leads; the listener's realm only personalizes within it.
-                let mut evidence = if meta_match { 3.0 } else { 0.0 };
-                if is_curated {
-                    evidence += 1.5;
-                }
-                if clean_moods.contains(&mood) {
-                    evidence += 1.2;
-                }
-                if t.mood_list().contains(&mood) && (!t.genre.trim().is_empty() || is_curated) {
-                    evidence += 1.0;
-                }
-                // Prefer tracks whose strongest mood is this one, so overlapping genres
-                // (e.g. rock in both Energy and Rock/Indie) don't make every mood identical.
-                if clean_moods.first() == Some(&mood) {
-                    evidence += 1.0;
-                } else if clean_moods.len() >= 3 && !is_curated {
-                    evidence -= 0.6;
-                }
-
-                let mut score = taste_s * 0.6 + n_scores.get(idx).copied().unwrap_or(0.0) * n_w * 0.6;
-                score += evidence + realm * 1.2;
-                if has_user_taste {
-                    if t.source == "local" && realm == 0.0 {
-                        score += 0.6;
+                    // Category evidence leads; the listener's realm only personalizes within it.
+                    let mut evidence = if meta_match { 3.0 } else { 0.0 };
+                    if is_curated {
+                        evidence += 1.5;
                     }
-                    score += (t.quality_score() as f64 / 120.0) + parse_rank_bonus(&t.meta) * 0.12;
-                } else {
-                    score += parse_rank_bonus(&t.meta) * 0.25;
-                }
+                    if clean_moods.contains(&mood) {
+                        evidence += 1.2;
+                    }
+                    if t.mood_list().contains(&mood) && (!t.genre.trim().is_empty() || is_curated) {
+                        evidence += 1.0;
+                    }
+                    // Prefer tracks whose strongest mood is this one, so overlapping genres
+                    // (e.g. rock in both Energy and Rock/Indie) don't make every mood identical.
+                    if clean_moods.first() == Some(&mood) {
+                        evidence += 1.0;
+                    } else if clean_moods.len() >= 3 && !is_curated {
+                        evidence -= 0.6;
+                    }
 
-                let solid = strong_evidence
-                    || parse_deezer_rank(&t.meta).map_or(false, |r| r >= 80_000);
-                (score, solid, t)
-            })
+                    let mut score = taste_s * 0.6
+                        + n_scores.get(idx).copied().unwrap_or(0.0) * n_w * 0.6;
+                    score += evidence + realm * 1.2;
+                    if is_personal {
+                        score += 2.2;
+                    }
+                    // Avoid leaking unrequested Western heavy metal (e.g. Metallica) into
+                    // a J-Rock / indie listener's mood mix solely via an incidental "rock" tag.
+                    if has_user_taste && !is_personal && !user_has_metal_taste {
+                        let gl = t.genre.to_lowercase();
+                        if ["metal", "heavy metal", "thrash", "death metal", "black metal"]
+                            .iter()
+                            .any(|m| contains_term(&gl, m))
+                        {
+                            score -= 4.5;
+                        }
+                    }
+                    if has_user_taste {
+                        if t.source == "local" && realm == 0.0 {
+                            score += 0.6;
+                        }
+                        score +=
+                            (t.quality_score() as f64 / 120.0) + parse_rank_bonus(&t.meta) * 0.12;
+                    } else {
+                        score += parse_rank_bonus(&t.meta) * 0.25;
+                    }
+
+                    let solid = strong_evidence
+                        || parse_deezer_rank(&t.meta).map_or(false, |r| r >= 80_000);
+                    (score, solid, is_personal, t)
+                },
+            )
             .collect();
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        // Avoid tail divergence: once we already have a healthy set of strongly-evidenced
-        // or popular tracks, drop weak unverified filler instead of padding the bottom of
-        // the playlist with obscure/off-vibe tracks.
-        let solid_count = scored.iter().filter(|(_, solid, _)| *solid).count();
-        let ordered: Vec<Track> = if solid_count >= limit.min(18) {
+        // Avoid tail divergence: when the listener already has a rich personal pool for
+        // this mood, keep the mix in their musical world instead of padding the bottom
+        // with unrelated global chart tracks; otherwise drop weak unverified filler once
+        // we have enough solid tracks.
+        let personal_count = scored.iter().filter(|(_, _, p, _)| *p).count();
+        let solid_count = scored.iter().filter(|(_, solid, _, _)| *solid).count();
+        let ordered: Vec<Track> = if personal_count >= limit.min(20) {
             scored
                 .into_iter()
-                .filter(|(_, solid, _)| *solid)
-                .map(|(_, _, t)| t)
+                .filter(|(_, _, p, _)| *p)
+                .map(|(_, _, _, t)| t)
+                .collect()
+        } else if solid_count >= limit.min(18) {
+            scored
+                .into_iter()
+                .filter(|(_, solid, _, _)| *solid)
+                .map(|(_, _, _, t)| t)
                 .collect()
         } else {
-            scored.into_iter().map(|(_, _, t)| t).collect()
+            scored.into_iter().map(|(_, _, _, t)| t).collect()
         };
         dedup_and_interleave(ordered, limit, 3)
     }
@@ -8333,6 +8402,15 @@ pub fn is_mood_clutter_track(t: &Track) -> bool {
     if is_cover_or_backing_title(&title_album) {
         return true;
     }
+    // Reject unofficial mashups / fan bootlegs (e.g. "Gimpson/MC Sobieski/Kessoku Band · kessoku band X gimpson").
+    if title_album.contains("mashup")
+        || title_album.contains("bootleg")
+        || title_album.contains("ai cover")
+        || title_album.contains("fan cover")
+        || (t.artist.contains('/') && t.album.to_lowercase().contains(" x "))
+    {
+        return true;
+    }
     for noise in [
         "white noise",
         "brown noise",
@@ -8350,6 +8428,25 @@ pub fn is_mood_clutter_track(t: &Track) -> bool {
         }
     }
     false
+}
+
+fn is_live_concert_title(title: &str) -> bool {
+    let low = title.to_lowercase();
+    [
+        "(live with ",
+        "(live at ",
+        "(live from ",
+        "(live in ",
+        "[live with ",
+        "[live at ",
+        "[live from ",
+        "[live in ",
+        " - live at ",
+        " - live in ",
+        " - live from ",
+    ]
+    .iter()
+    .any(|p| low.contains(p))
 }
 
 pub fn has_mood_meta_match(meta_low: &str, mood: Mood) -> bool {
@@ -11686,6 +11783,145 @@ mod tests {
         assert!(!ids.contains(&"dz:cntry"), "country track leaked: {:?}", ids);
         assert!(!ids.contains(&"dz:ost"), "soundtrack leaked: {:?}", ids);
         assert_eq!(ids.len(), 20, "expected only the 20 verified dance tracks: {:?}", ids);
+    }
+
+    #[test]
+    fn mood_mix_excludes_unplayed_archive_leftovers_mashups_and_western_metal_for_jrock_listener() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jrock_fan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        // Listener has a rich J-Rock world (Kessoku Band, Eve, etc.) tagged "Rock, J-Rock".
+        let mut cands = Vec::new();
+        for i in 0..22 {
+            let t = Track {
+                id: format!("dz:jrock{i}"),
+                source: "deezer".into(),
+                title: format!("JRock Song {i}"),
+                artist: if i < 6 {
+                    "Kessoku Band".into()
+                } else {
+                    format!("JRock Act {i}")
+                },
+                album: "Kessoku Album".into(),
+                genre: "Rock, J-Rock".into(),
+                moods: "energy,rock_indie".into(),
+                duration: 220,
+                bitrate: 256,
+                meta: r#"{"rank":500000}"#.into(),
+                ..Default::default()
+            };
+            cands.push(t);
+        }
+
+        // Unplayed Archive.org / Soulseek leftovers from past searches ("shinkai", "kessoku band").
+        let mr_children_shinkai = Track {
+            id: "arc:shinkai1".into(),
+            source: "archive".into(),
+            title: "tegami".into(),
+            artist: "Mr.Children".into(),
+            album: "shinkai".into(),
+            genre: "Rock, J-Rock".into(),
+            moods: "energy,rock_indie".into(),
+            duration: 169,
+            bitrate: 320,
+            format: "mp3".into(),
+            ..Default::default()
+        };
+        let kessoku_mashup = Track {
+            id: "slsk:mashup1".into(),
+            source: "soulseek".into(),
+            title: "Sekretna Chłosta".into(),
+            artist: "Gimpson/MC Sobieski/Kessoku Band".into(),
+            album: "kessoku band X gimpson".into(),
+            genre: "Rock".into(),
+            moods: "energy,rock_indie".into(),
+            duration: 233,
+            bitrate: 320,
+            format: "mp3".into(),
+            ..Default::default()
+        };
+        // Even if a mashup came from Deezer, is_mood_clutter_track must reject it.
+        let mut dz_mashup = kessoku_mashup.clone();
+        dz_mashup.id = "dz:mashup1".into();
+        dz_mashup.source = "deezer".into();
+        assert!(is_mood_clutter_track(&dz_mashup));
+
+        // Global Western Metal chart tracks.
+        let metallica_one = Track {
+            id: "dz:met1".into(),
+            source: "deezer".into(),
+            title: "One".into(),
+            artist: "Metallica".into(),
+            album: "...And Justice For All".into(),
+            genre: "Metal, Rock".into(),
+            moods: "energy,rock_indie".into(),
+            duration: 448,
+            bitrate: 256,
+            meta: r#"{"rank":920000}"#.into(),
+            ..Default::default()
+        };
+        let metallica_live = Track {
+            id: "dz:met2".into(),
+            source: "deezer".into(),
+            title: "Enter Sandman (Live with the SFSO)".into(),
+            artist: "Metallica".into(),
+            album: "Enter Sandman (Live with the SFSO)".into(),
+            genre: "Metal, Rock".into(),
+            moods: "energy,rock_indie".into(),
+            duration: 331,
+            bitrate: 256,
+            meta: r#"{"rank":880000}"#.into(),
+            ..Default::default()
+        };
+
+        let mut all = cands.clone();
+        all.extend([
+            mr_children_shinkai.clone(),
+            kessoku_mashup.clone(),
+            metallica_one.clone(),
+            metallica_live.clone(),
+        ]);
+        store.upsert_tracks(&all).unwrap();
+        for t in &cands {
+            let _ = store.record_event(u.id, &t.id, "play", 1.0);
+        }
+
+        // candidate_tracks_for_user & tracks_by_mood must not pull unplayed archive/soulseek leftovers.
+        let user_pool_ids: HashSet<String> = store
+            .candidate_tracks_for_user(u.id, 100)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(!user_pool_ids.contains("arc:shinkai1"));
+        assert!(!user_pool_ids.contains("slsk:mashup1"));
+
+        let mood_db_ids: HashSet<String> = store
+            .tracks_by_mood(Mood::Energy, 100, 0)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(!mood_db_ids.contains("arc:shinkai1"));
+        assert!(!mood_db_ids.contains("slsk:mashup1"));
+
+        // rank_mood_mix excludes unplayed archive/soulseek, mashups, live concert tracks, and Metallica.
+        let curated = HashSet::from([metallica_one.id.clone(), metallica_live.id.clone()]);
+        let ranked = taste.rank_mood_mix(u.id, Mood::Energy, all, &curated, 35);
+        let ids: Vec<&str> = ranked.iter().map(|t| t.id.as_str()).collect();
+        assert!(!ids.contains(&"arc:shinkai1"), "unplayed archive leftover leaked: {:?}", ids);
+        assert!(!ids.contains(&"slsk:mashup1"), "mashup leaked: {:?}", ids);
+        assert!(!ids.contains(&"dz:met1"), "Western metal leaked into J-Rock mix: {:?}", ids);
+        assert!(!ids.contains(&"dz:met2"), "live concert metal leaked: {:?}", ids);
+        assert!(ids.iter().all(|id| id.starts_with("dz:jrock")), "ids={:?}", ids);
     }
 
     #[test]
