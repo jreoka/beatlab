@@ -642,11 +642,11 @@ fn rotate_out_recent_mix_tracks(
 }
 
 fn mood_cache_key(mood: Mood) -> String {
-    format!("curated:mood:v3:{}", mood.slug())
+    format!("curated:mood:v4:{}", mood.slug())
 }
 
 fn mood_user_cache_key(user_id: i64, mood: Mood) -> String {
-    format!("curated:mood_user:v5:{}:{}", user_id, mood.slug())
+    format!("curated:mood_user:v6:{}:{}", user_id, mood.slug())
 }
 
 fn explore_cache_key(key: &str) -> String {
@@ -4474,6 +4474,14 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                     if !strict_genre_match && is_mood_title_trap(&t, mood) {
                         continue;
                     }
+                    // Global Moods & Vibes pools are built from English queries and shared
+                    // across all listeners; keep non-Latin-script tracks (e.g. Arabic, Indic,
+                    // Cyrillic, CJK) out of the global pool so they don't leak into unrelated
+                    // listeners' mixes (scene-specific listeners get theirs via personal history
+                    // and `curate_user_mood_tracks`).
+                    if has_any_non_latin_script(&t) {
+                        continue;
+                    }
                     // Reject obscure / AI-slop Deezer uploads from user playlists when
                     // they lack a direct genre match for this mood.
                     if !strict_genre_match && is_low_rank_deezer_track(&t, 30_000) {
@@ -4771,6 +4779,7 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
         let sctx = self.build_scoring_context(user_id);
         let artists: Vec<String> = candidates.iter().map(|t| t.artist.clone()).collect();
         let artist_genres = self.store.known_artist_genres_for(&artists).unwrap_or_default();
+        let allowed_scripts = allowed_non_latin_scripts_for_user(&sctx.prof, &sctx.stats, &candidates);
 
         let mut eligible: Vec<(Track, bool, bool, Vec<Mood>, f64, bool, bool)> = Vec::new();
         for t in candidates {
@@ -4805,6 +4814,12 @@ fn is_title_word_playlist(tracks: &[Track], mood: Mood) -> bool {
                 continue;
             }
             if !is_familiar && t.source != "local" && is_live_concert_title(&t.title) {
+                continue;
+            }
+            // Reject non-personal tracks in unrequested non-Latin scripts (e.g. Arabic
+            // songs leaking from global YouTube Music "Sad Songs" playlists for a listener
+            // who only listens to English and Japanese music).
+            if !is_personal && !track_scripts_allowed(&t, &allowed_scripts) {
                 continue;
             }
 
@@ -8430,6 +8445,143 @@ pub fn is_mood_clutter_track(t: &Track) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ScriptFamily {
+    Arabic,
+    Indic,
+    Cyrillic,
+    Thai,
+    Hebrew,
+    Greek,
+    Japanese,
+    Korean,
+    Cjk,
+}
+
+fn non_latin_scripts_in_str(s: &str) -> HashSet<ScriptFamily> {
+    let mut out = HashSet::new();
+    for ch in s.chars() {
+        let cp = ch as u32;
+        let fam = match cp {
+            0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF => Some(ScriptFamily::Arabic),
+            0x0900..=0x0D7F => Some(ScriptFamily::Indic),
+            0x0400..=0x04FF | 0x0500..=0x052F => Some(ScriptFamily::Cyrillic),
+            0x0E00..=0x0E7F => Some(ScriptFamily::Thai),
+            0x0590..=0x05FF => Some(ScriptFamily::Hebrew),
+            0x0370..=0x03FF => Some(ScriptFamily::Greek),
+            0x3040..=0x309F | 0x30A0..=0x30FF => Some(ScriptFamily::Japanese),
+            0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => Some(ScriptFamily::Korean),
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF => Some(ScriptFamily::Cjk),
+            _ => None,
+        };
+        if let Some(f) = fam {
+            out.insert(f);
+        }
+    }
+    out
+}
+
+fn has_any_non_latin_script(t: &Track) -> bool {
+    !non_latin_scripts_in_str(&t.title).is_empty()
+        || !non_latin_scripts_in_str(&t.artist).is_empty()
+}
+
+fn allowed_non_latin_scripts_for_user(
+    prof: &TasteProfile,
+    stats: &HashMap<String, UserTrackStats>,
+    candidates: &[Track],
+) -> HashSet<ScriptFamily> {
+    let mut allowed = HashSet::new();
+    for t in candidates {
+        if is_personal_mix_track(t, prof, stats) {
+            for f in non_latin_scripts_in_str(&t.title) {
+                allowed.insert(f);
+            }
+            for f in non_latin_scripts_in_str(&t.artist) {
+                allowed.insert(f);
+            }
+        }
+    }
+    if allowed.contains(&ScriptFamily::Japanese) {
+        allowed.insert(ScriptFamily::Cjk);
+    }
+    for (g, &aff) in prof
+        .genre_affinity
+        .iter()
+        .chain(prof.playlist_genre_affinity.iter())
+    {
+        if aff <= 0.2 {
+            continue;
+        }
+        let gl = g.to_lowercase();
+        if ["j-pop", "jpop", "j-rock", "jrock", "anime", "japanese", "city pop"]
+            .iter()
+            .any(|k| contains_term(&gl, k))
+        {
+            allowed.insert(ScriptFamily::Japanese);
+            allowed.insert(ScriptFamily::Cjk);
+        }
+        if ["k-pop", "kpop", "k-rock", "krock", "korean"]
+            .iter()
+            .any(|k| contains_term(&gl, k))
+        {
+            allowed.insert(ScriptFamily::Korean);
+        }
+        if ["c-pop", "cpop", "mandopop", "cantopop", "chinese"]
+            .iter()
+            .any(|k| contains_term(&gl, k))
+        {
+            allowed.insert(ScriptFamily::Cjk);
+        }
+        if ["arabic", "khaleeji", "egyptian", "dabke", "mahraganat"]
+            .iter()
+            .any(|k| contains_term(&gl, k))
+        {
+            allowed.insert(ScriptFamily::Arabic);
+        }
+        if [
+            "indian",
+            "bollywood",
+            "hindi",
+            "punjabi",
+            "tamil",
+            "telugu",
+            "malayalam",
+            "marathi",
+            "kannada",
+            "bengali",
+            "desi",
+        ]
+        .iter()
+        .any(|k| contains_term(&gl, k))
+        {
+            allowed.insert(ScriptFamily::Indic);
+        }
+        if ["russian", "ukrainian"].iter().any(|k| contains_term(&gl, k)) {
+            allowed.insert(ScriptFamily::Cyrillic);
+        }
+        if contains_term(&gl, "thai") {
+            allowed.insert(ScriptFamily::Thai);
+        }
+        if contains_term(&gl, "greek") {
+            allowed.insert(ScriptFamily::Greek);
+        }
+        if contains_term(&gl, "hebrew") {
+            allowed.insert(ScriptFamily::Hebrew);
+        }
+    }
+    allowed
+}
+
+fn track_scripts_allowed(t: &Track, allowed: &HashSet<ScriptFamily>) -> bool {
+    let mut scripts = non_latin_scripts_in_str(&t.title);
+    scripts.extend(non_latin_scripts_in_str(&t.artist));
+    if scripts.is_empty() {
+        return true;
+    }
+    scripts.iter().all(|f| allowed.contains(f))
+}
+
 fn is_live_concert_title(title: &str) -> bool {
     let low = title.to_lowercase();
     [
@@ -11922,6 +12074,100 @@ mod tests {
         assert!(!ids.contains(&"dz:met1"), "Western metal leaked into J-Rock mix: {:?}", ids);
         assert!(!ids.contains(&"dz:met2"), "live concert metal leaked: {:?}", ids);
         assert!(ids.iter().all(|id| id.starts_with("dz:jrock")), "ids={:?}", ids);
+    }
+
+    #[test]
+    fn mood_mix_excludes_unrequested_arabic_ytm_tracks_while_keeping_listener_japanese_scripts() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("jp_mel_fan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let jp_seed = Track {
+            id: "ytm:jp1".into(),
+            source: "ytm".into(),
+            title: "まちがいさがし - Machigaisagashi".into(),
+            artist: "Masaki Suda".into(),
+            album: "LOVE".into(),
+            genre: "J-Pop".into(),
+            moods: "melancholy".into(),
+            duration: 224,
+            ..Default::default()
+        };
+        let jp_curated = Track {
+            id: "ytm:jp2".into(),
+            source: "ytm".into(),
+            title: "青い栞 - Aoi Shiori".into(),
+            artist: "Galileo Galilei".into(),
+            album: "Aoi Shiori".into(),
+            genre: String::new(),
+            moods: "melancholy".into(),
+            duration: 340,
+            ..Default::default()
+        };
+        let en_curated = Track {
+            id: "ytm:en1".into(),
+            source: "ytm".into(),
+            title: "Another Love (Official Video)".into(),
+            artist: "Tom Odell".into(),
+            album: "Another Love".into(),
+            genre: String::new(),
+            moods: "melancholy".into(),
+            duration: 248,
+            ..Default::default()
+        };
+        let arabic_1 = Track {
+            id: "ytm:ar1".into(),
+            source: "ytm".into(),
+            title: "لا يا قلب".into(),
+            artist: "Raad And Methaq".into(),
+            album: "لا يا قلب".into(),
+            genre: String::new(),
+            moods: "melancholy".into(),
+            duration: 286,
+            ..Default::default()
+        };
+        let arabic_2 = Track {
+            id: "ytm:ar2".into(),
+            source: "ytm".into(),
+            title: "شوارع فارغة".into(),
+            artist: "Ghaith Sabah".into(),
+            album: "شوارع فارغة".into(),
+            genre: String::new(),
+            moods: "melancholy".into(),
+            duration: 137,
+            ..Default::default()
+        };
+
+        let all = vec![
+            jp_seed.clone(),
+            jp_curated.clone(),
+            en_curated.clone(),
+            arabic_1.clone(),
+            arabic_2.clone(),
+        ];
+        store.upsert_tracks(&all).unwrap();
+        let _ = store.record_event(u.id, &jp_seed.id, "play", 1.0);
+
+        let curated = HashSet::from([
+            jp_curated.id.clone(),
+            en_curated.id.clone(),
+            arabic_1.id.clone(),
+            arabic_2.id.clone(),
+        ]);
+        let ranked = taste.rank_mood_mix(u.id, Mood::Melancholy, all, &curated, 35);
+        let ids: Vec<&str> = ranked.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"ytm:jp1"), "ids={:?}", ids);
+        assert!(ids.contains(&"ytm:jp2"), "Japanese track should be kept: {:?}", ids);
+        assert!(ids.contains(&"ytm:en1"), "English track should be kept: {:?}", ids);
+        assert!(!ids.contains(&"ytm:ar1"), "Arabic track leaked: {:?}", ids);
+        assert!(!ids.contains(&"ytm:ar2"), "Arabic track leaked: {:?}", ids);
     }
 
     #[test]
