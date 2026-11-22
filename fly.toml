@@ -15,7 +15,7 @@ primary_region = "ord"
   BEATLAB_S3_REGION = "auto"
   # BEATLAB_S3_ACCESS_KEY_ID = "..."
   # BEATLAB_S3_SECRET_ACCESS_KEY = "..."
-  BEATLAB_S3_MAX_GB = "400"
+  BEATLAB_S3_MAX_GB = "100"
   RUST_LOG = "info"
 
 [http_service]
