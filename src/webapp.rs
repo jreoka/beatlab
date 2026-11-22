@@ -22,9 +22,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use uuid::Uuid;
+use base64::Engine as _;
 use webauthn_rs::prelude::{
-    Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
-    RegisterPublicKeyCredential,
+    DiscoverableAuthentication, DiscoverableKey, Passkey, PasskeyAuthentication,
+    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
 };
 
 const INDEX_HTML: &str = include_str!("web/index.html");
@@ -1101,20 +1102,44 @@ pub async fn mfa_verify(
     json_res(json!({ "token": token, "created": false, "user": user_json(&state, &user) }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct PasskeyLoginReq {
-    pub username: String,
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
-/// Begins a passkey assertion for a named account.
+/// Begins a passkey assertion — either discoverable (usernameless) when no
+/// username is supplied, or scoped to a named account when one is provided.
 pub async fn passkey_login_options(
     State(state): State<AppState>,
-    Json(req): Json<PasskeyLoginReq>,
+    body: Option<Json<PasskeyLoginReq>>,
 ) -> Response {
     let Some(wa) = crate::auth::webauthn() else {
         return err_res(StatusCode::BAD_REQUEST, "Passkeys are unavailable on this server");
     };
-    let Some(user) = state.store.get_user_by_name(&req.username).ok().flatten() else {
+    let username = body
+        .and_then(|Json(req)| req.username)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let Some(username) = username else {
+        let (challenge_response, auth_state) = match wa.start_discoverable_authentication() {
+            Ok(v) => v,
+            Err(e) => return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+        let Ok(serialised) = serde_json::to_string(&auth_state) else {
+            return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Could not store challenge");
+        };
+        return match state
+            .store
+            .create_anonymous_auth_challenge("passkey_discoverable_login", &serialised)
+        {
+            Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": challenge_response.public_key })),
+            Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+    };
+
+    let Some(user) = state.store.get_user_by_name(&username).ok().flatten() else {
         return err_res(StatusCode::UNAUTHORIZED, "No passkeys found for that account");
     };
     if state
@@ -1167,37 +1192,89 @@ pub async fn passkey_login_verify(
     let Some(wa) = crate::auth::webauthn() else {
         return err_res(StatusCode::BAD_REQUEST, "Passkeys are unavailable on this server");
     };
-    let Some((user_id, state_json)) = state
+    let Ok(credential) = serde_json::from_value::<PublicKeyCredential>(req.credential) else {
+        return err_res(StatusCode::BAD_REQUEST, "Malformed passkey response");
+    };
+
+    let (user_id, credential_id, passkey_json, result) = if let Some((user_id, state_json)) = state
         .store
         .take_auth_challenge(&req.challenge, "passkey_login")
         .ok()
         .flatten()
-    else {
-        return err_res(StatusCode::UNAUTHORIZED, "Passkey challenge expired. Try again.");
-    };
-    let (auth_state, credential) = match (
-        serde_json::from_str::<PasskeyAuthentication>(&state_json),
-        serde_json::from_value::<PublicKeyCredential>(req.credential),
-    ) {
-        (Ok(a), Ok(c)) => (a, c),
-        _ => return err_res(StatusCode::BAD_REQUEST, "Malformed passkey response"),
-    };
-    let result = match wa.finish_passkey_authentication(&credential, &auth_state) {
-        Ok(r) => r,
-        Err(e) => return err_res(StatusCode::UNAUTHORIZED, &e.to_string()),
-    };
-    let credential_id = assertion_credential_id(&result);
-    let Some((owner_id, passkey_json)) = state
+    {
+        let Ok(auth_state) = serde_json::from_str::<PasskeyAuthentication>(&state_json) else {
+            return err_res(StatusCode::BAD_REQUEST, "Malformed passkey response");
+        };
+        let result = match wa.finish_passkey_authentication(&credential, &auth_state) {
+            Ok(r) => r,
+            Err(e) => return err_res(StatusCode::UNAUTHORIZED, &e.to_string()),
+        };
+        let credential_id = assertion_credential_id(&result);
+        let Some((owner_id, passkey_json)) = state
+            .store
+            .get_passkey_by_id(&credential_id)
+            .ok()
+            .flatten()
+        else {
+            return err_res(StatusCode::UNAUTHORIZED, "Unknown passkey");
+        };
+        if owner_id != user_id {
+            return err_res(StatusCode::UNAUTHORIZED, "Passkey does not belong to this account");
+        }
+        (user_id, credential_id, passkey_json, result)
+    } else if let Some(state_json) = state
         .store
-        .get_passkey_by_id(&credential_id)
+        .take_anonymous_auth_challenge(&req.challenge, "passkey_discoverable_login")
         .ok()
         .flatten()
-    else {
-        return err_res(StatusCode::UNAUTHORIZED, "Unknown passkey");
+    {
+        let Ok(auth_state) = serde_json::from_str::<DiscoverableAuthentication>(&state_json) else {
+            return err_res(StatusCode::BAD_REQUEST, "Malformed passkey response");
+        };
+        let (user_uuid, cred_id_bytes) = match wa.identify_discoverable_authentication(&credential) {
+            Ok(v) => v,
+            Err(_) => return err_res(StatusCode::UNAUTHORIZED, "Passkey did not include an account identifier"),
+        };
+        let credential_id =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id_bytes);
+        let Some((owner_id, passkey_json)) = state
+            .store
+            .get_passkey_by_id(&credential_id)
+            .ok()
+            .flatten()
+        else {
+            return err_res(StatusCode::UNAUTHORIZED, "Unknown passkey");
+        };
+        if Uuid::from_u128(owner_id as u128) != user_uuid {
+            return err_res(StatusCode::UNAUTHORIZED, "Passkey does not belong to this account");
+        }
+        if state
+            .store
+            .user_deleted_at(owner_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            > 0
+        {
+            return err_res(StatusCode::UNAUTHORIZED, "This account is pending deletion");
+        }
+        let Ok(passkey) = serde_json::from_str::<Passkey>(&passkey_json) else {
+            return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Stored passkey is unreadable");
+        };
+        let discoverable_key = DiscoverableKey::from(&passkey);
+        let result = match wa.finish_discoverable_authentication(
+            &credential,
+            auth_state,
+            &[discoverable_key],
+        ) {
+            Ok(r) => r,
+            Err(e) => return err_res(StatusCode::UNAUTHORIZED, &e.to_string()),
+        };
+        (owner_id, credential_id, passkey_json, result)
+    } else {
+        return err_res(StatusCode::UNAUTHORIZED, "Passkey challenge expired. Try again.");
     };
-    if owner_id != user_id {
-        return err_res(StatusCode::UNAUTHORIZED, "Passkey does not belong to this account");
-    }
+
     if result.needs_update() {
         if let Ok(mut passkey) = serde_json::from_str::<Passkey>(&passkey_json) {
             if passkey.update_credential(&result) == Some(true) {
@@ -1508,6 +1585,19 @@ pub async fn passkey_register_options(
             Ok(v) => v,
             Err(e) => return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
+    // Request a discoverable (resident) credential so the user can sign in
+    // with their passkey without typing a username first.
+    let mut public_key = match serde_json::to_value(&creation.public_key) {
+        Ok(v) => v,
+        Err(e) => return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if let Some(sel) = public_key
+        .get_mut("authenticatorSelection")
+        .and_then(|v| v.as_object_mut())
+    {
+        sel.insert("residentKey".to_string(), json!("required"));
+        sel.insert("requireResidentKey".to_string(), json!(true));
+    }
     let Ok(serialised) = serde_json::to_string(&registration) else {
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Could not store challenge");
     };
@@ -1515,7 +1605,7 @@ pub async fn passkey_register_options(
         .store
         .create_auth_challenge(user.id, "passkey_register", &serialised)
     {
-        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": creation.public_key })),
+        Ok(challenge) => json_res(json!({ "challenge": challenge, "publicKey": public_key })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

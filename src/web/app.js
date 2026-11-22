@@ -1328,7 +1328,7 @@
       options = options.publicKey;
     }
     const out = Object.assign({}, options);
-    out.challenge = base64urlToBytes(src.challenge);
+    out.challenge = base64urlToBytes(options.challenge);
     if (creating && out.user) {
       out.user = Object.assign({}, out.user, { id: base64urlToBytes(out.user.id) });
     }
@@ -8093,18 +8093,12 @@
         return;
       }
       const username = ($('auth-username') && $('auth-username').value || '').trim();
-      if (!username) {
-        const box = $('auth-error');
-        if (box) {
-          box.textContent = 'Enter your username first, then sign in with a passkey.';
-          box.classList.remove('hidden');
-        }
-        return;
-      }
+      const box = $('auth-mfa') && !$('auth-mfa').classList.contains('hidden') ? $('mfa-error') : $('auth-error');
+      if (box) box.classList.add('hidden');
       try {
         const opts = await api('/api/web/auth/passkey/options', {
           method: 'POST',
-          body: JSON.stringify({ username }),
+          body: JSON.stringify(username ? { username } : {}),
         });
         state.authChallenge = opts.challenge;
         const credential = await navigator.credentials.get({
@@ -8125,7 +8119,6 @@
         showToast(`Welcome back, ${res.user.username}`);
         await onSignedIn();
       } catch (err) {
-        const box = $('auth-mfa') && !$('auth-mfa').classList.contains('hidden') ? $('mfa-error') : $('auth-error');
         if (box) {
           box.textContent = err.message;
           box.classList.remove('hidden');

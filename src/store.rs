@@ -220,7 +220,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkeys(user_id);
             CREATE TABLE IF NOT EXISTS auth_challenges (
                 id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL DEFAULT 0,
+                user_id INTEGER,
                 kind TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 created INTEGER NOT NULL,
@@ -523,6 +523,38 @@ impl Store {
         ensure_column(&conn, "sessions", "mfa_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "deleted_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "restore_hash", "TEXT NOT NULL DEFAULT ''")?;
+        // Allow user_id to be NULL in auth_challenges for usernameless
+        // (discoverable) passkey sign-in ceremonies.
+        let auth_challenges_notnull: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(auth_challenges)")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?))
+            })?;
+            let found = rows
+                .filter_map(|r| r.ok())
+                .any(|(name, notnull)| name == "user_id" && notnull != 0);
+            found
+        };
+        if auth_challenges_notnull {
+            conn.execute_batch(
+                "
+                CREATE TABLE auth_challenges_new (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created INTEGER NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+                INSERT INTO auth_challenges_new(id, user_id, kind, payload, created)
+                    SELECT id, CASE WHEN user_id = 0 THEN NULL ELSE user_id END, kind, payload, created
+                    FROM auth_challenges;
+                DROP TABLE auth_challenges;
+                ALTER TABLE auth_challenges_new RENAME TO auth_challenges;
+                CREATE INDEX IF NOT EXISTS idx_auth_challenges_created ON auth_challenges(created);
+                ",
+            )?;
+        }
         // Cool cache: namespace entries by asset type and track real usage so
         // eviction only happens once the bucket is nearly full.
         ensure_column(
@@ -1135,17 +1167,35 @@ impl Store {
         Ok(id)
     }
 
+    /// Stores a short-lived challenge not yet bound to a user (e.g.
+    /// discoverable / usernameless passkey sign-in).
+    pub fn create_anonymous_auth_challenge(&self, kind: &str, payload: &str) -> AppResult<String> {
+        let id = crate::auth::random_token();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO auth_challenges(id, user_id, kind, payload, created) VALUES (?1, NULL, ?2, ?3, ?4)",
+            params![id, kind, payload, Utc::now().timestamp()],
+        )?;
+        Ok(id)
+    }
+
     /// Atomically reads and removes a challenge. Expired challenges are dropped.
     pub fn take_auth_challenge(&self, id: &str, kind: &str) -> AppResult<Option<(i64, String)>> {
         let conn = self.lock();
         let row: Option<(i64, String, i64)> = conn
             .query_row(
-                "SELECT user_id, payload, created FROM auth_challenges WHERE id = ?1 AND kind = ?2",
+                "SELECT user_id, payload, created FROM auth_challenges
+                 WHERE id = ?1 AND kind = ?2 AND user_id IS NOT NULL",
                 params![id, kind],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)?)),
             )
             .optional()?;
-        conn.execute("DELETE FROM auth_challenges WHERE id = ?1", params![id])?;
+        if row.is_some() {
+            conn.execute(
+                "DELETE FROM auth_challenges WHERE id = ?1 AND kind = ?2",
+                params![id, kind],
+            )?;
+        }
         let Some((user_id, payload, created)) = row else {
             return Ok(None);
         };
@@ -1158,6 +1208,37 @@ impl Store {
             return Ok(None);
         }
         Ok(Some((user_id, payload)))
+    }
+
+    /// Atomically reads and removes an anonymous (userless) challenge.
+    pub fn take_anonymous_auth_challenge(&self, id: &str, kind: &str) -> AppResult<Option<String>> {
+        let conn = self.lock();
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT payload, created FROM auth_challenges
+                 WHERE id = ?1 AND kind = ?2 AND user_id IS NULL",
+                params![id, kind],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if row.is_some() {
+            conn.execute(
+                "DELETE FROM auth_challenges WHERE id = ?1 AND kind = ?2",
+                params![id, kind],
+            )?;
+        }
+        let Some((payload, created)) = row else {
+            return Ok(None);
+        };
+        let ttl = if kind.starts_with("passkey") {
+            crate::auth::WEBAUTHN_CHALLENGE_TTL
+        } else {
+            crate::auth::LOGIN_CHALLENGE_TTL
+        };
+        if Utc::now().timestamp() - created > ttl {
+            return Ok(None);
+        }
+        Ok(Some(payload))
     }
 
     pub fn purge_expired_auth_challenges(&self) -> AppResult<()> {
@@ -7201,6 +7282,55 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, "audio");
         assert_eq!(candidates[0].1, "track:old");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anonymous_auth_challenges_work_and_legacy_table_migrates() {
+        let dir = std::env::temp_dir().join(format!("beatlab_auth_chal_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("beatlab.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    created INTEGER NOT NULL
+                 );
+                 CREATE TABLE auth_challenges (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created INTEGER NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db_path).unwrap();
+        let chal = store
+            .create_anonymous_auth_challenge("passkey_discoverable_login", "{\"state\":1}")
+            .unwrap();
+        // Taking with the wrong kind must not consume the challenge.
+        assert!(store.take_auth_challenge(&chal, "passkey_login").unwrap().is_none());
+        assert_eq!(
+            store
+                .take_anonymous_auth_challenge(&chal, "passkey_discoverable_login")
+                .unwrap()
+                .as_deref(),
+            Some("{\"state\":1}")
+        );
+        // Second take must return None.
+        assert!(store
+            .take_anonymous_auth_challenge(&chal, "passkey_discoverable_login")
+            .unwrap()
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
