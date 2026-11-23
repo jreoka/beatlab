@@ -1,5 +1,6 @@
 use crate::models::{err_msg, primary_artist, upgrade_cover_url, AppResult, LyricLine, LyricsData, Track};
 use crate::sources::local::extract_embedded_cover;
+use crate::sources::soulseek::{GrowingFile, SlskFile};
 use crate::sources::SourceRegistry;
 use crate::store::Store;
 use axum::body::Body;
@@ -72,6 +73,12 @@ pub enum PlayTarget {
         ext: String,
         webpage_url: String,
         cacheable: bool,
+    },
+    /// A Soulseek download still being written; served progressively.
+    Growing {
+        file: Arc<GrowingFile>,
+        content_type: String,
+        ext: String,
     },
 }
 
@@ -333,8 +340,40 @@ impl StreamEngine {
         // 3. Soulseek P2P source -> downloads into cache directory; falls back cleanly to
         // local/cached siblings or YouTube Music if peers are unreachable/queued/offline.
         if track.stream_url.starts_with("slsk://") {
-            if let Some(resolved) = self.sources.soulseek.resolve_track(track).await {
-                let local_path = PathBuf::from(resolved.strip_prefix("file:").unwrap_or(&resolved));
+            let slsk = self.sources.soulseek.resolve_track(track).await;
+            if let Some(SlskFile::Growing(file)) = slsk {
+                let ext = file
+                    .final_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or(&track.format)
+                    .to_string();
+                if file.claim_finalize() {
+                    // Index the file in the disk cache (and mirror it) once the
+                    // background transfer completes; playback has already begun.
+                    let this = self.clone();
+                    let tid = track.id.clone();
+                    let f = Arc::clone(&file);
+                    let ext2 = ext.clone();
+                    tokio::spawn(async move {
+                        if let Some(p) = f.wait_complete().await {
+                            let _ = this.store.upsert_cache_entry(
+                                &tid,
+                                &p.to_string_lossy(),
+                                f.size as i64,
+                            );
+                            let _ = this.store.prune_cache(this.max_cache_bytes);
+                            this.note_audio_access(&tid, &p, &ext2);
+                        }
+                    });
+                }
+                return Ok(PlayTarget::Growing {
+                    content_type: mime_for_audio_ext(&ext).to_string(),
+                    file,
+                    ext,
+                });
+            }
+            if let Some(SlskFile::Complete(local_path)) = slsk {
                 if local_path.exists() {
                     let bytes = std::fs::metadata(&local_path)
                         .map(|m| m.len() as i64)
@@ -555,7 +594,7 @@ impl StreamEngine {
     /// Pre-resolves stream metadata & kicks off background caching so next-track transitions feel instant.
     pub async fn warm_track(&self, track: &Track) -> AppResult<()> {
         match self.resolve_target(track).await? {
-            PlayTarget::LocalFile { .. } => Ok(()),
+            PlayTarget::LocalFile { .. } | PlayTarget::Growing { .. } => Ok(()),
             PlayTarget::RemoteHttp {
                 url,
                 headers,
@@ -700,6 +739,9 @@ impl StreamEngine {
             PlayTarget::LocalFile { path, content_type } => {
                 serve_local_file_range(&path, &content_type, range_hdr.as_deref()).await
             }
+            PlayTarget::Growing {
+                file, content_type, ..
+            } => serve_growing_file_range(file, &content_type, range_hdr.as_deref()),
             PlayTarget::RemoteHttp {
                 url,
                 headers,
@@ -907,12 +949,35 @@ impl StreamEngine {
             Ok(p) => p,
             Err(r) => return r,
         };
+        let mut stdin_feed: Option<Arc<GrowingFile>> = None;
         let (input_arg, custom_headers, ct) = match target {
             PlayTarget::LocalFile { path, .. } => (
                 path.to_string_lossy().to_string(),
                 vec![],
                 mime_for_audio_ext(fmt),
             ),
+            PlayTarget::Growing { file, ext, .. } => {
+                if file.is_done() {
+                    (
+                        file.final_path.to_string_lossy().to_string(),
+                        vec![],
+                        mime_for_audio_ext(fmt),
+                    )
+                } else if matches!(ext.as_str(), "m4a" | "mp4" | "alac" | "m4b") {
+                    // MP4 often stores its index at the end, so it cannot be
+                    // decoded from a pipe; wait for the full file.
+                    match file.wait_complete().await {
+                        Some(p) => (p.to_string_lossy().to_string(), vec![], mime_for_audio_ext(fmt)),
+                        None => {
+                            return (StatusCode::BAD_GATEWAY, "Soulseek transfer failed")
+                                .into_response()
+                        }
+                    }
+                } else {
+                    stdin_feed = Some(Arc::clone(file));
+                    ("pipe:0".to_string(), vec![], mime_for_audio_ext(fmt))
+                }
+            }
             PlayTarget::RemoteHttp {
                 url,
                 headers,
@@ -1019,6 +1084,9 @@ impl StreamEngine {
             }
         }
 
+        if let Some(feed) = stdin_feed {
+            return stream_child_stdout_fed(cmd, ct, "Failed to launch ffmpeg", Some(permit), feed);
+        }
         stream_child_stdout(cmd, ct, "Failed to launch ffmpeg", Some(permit))
     }
 
@@ -1564,6 +1632,13 @@ impl StreamEngine {
 
         let (input_arg, custom_headers) = match resolved {
             PlayTarget::LocalFile { path, .. } => (path.to_string_lossy().to_string(), vec![]),
+            PlayTarget::Growing { file, .. } => match file.wait_complete().await {
+                Some(p) => (p.to_string_lossy().to_string(), vec![]),
+                None => {
+                    let _ = tokio::fs::remove_file(&cover_tmp).await;
+                    return false;
+                }
+            },
             PlayTarget::RemoteHttp { url, headers, .. } => (url, headers),
         };
 
@@ -1966,6 +2041,157 @@ fn stream_child_stdout(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Like `stream_child_stdout`, but feeds the child's stdin from a download that
+/// is still growing, so ffmpeg can transcode while the transfer continues.
+fn stream_child_stdout_fed(
+    mut cmd: Command,
+    content_type: &str,
+    spawn_err: &'static str,
+    permit: Option<OwnedSemaphorePermit>,
+    feed: Arc<GrowingFile>,
+) -> Response {
+    cmd.kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return (StatusCode::BAD_GATEWAY, spawn_err).into_response();
+    };
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    tokio::spawn(async move {
+        let size = feed.size;
+        let mut body = std::pin::pin!(growing_range_stream(feed, 0, size.saturating_sub(1)));
+        while let Some(Ok(bytes)) = body.next().await {
+            // Write errors mean ffmpeg exited (client gone or seek); stop feeding.
+            if stdin.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+        let _ = stdin.shutdown().await;
+    });
+    let stream = ChildStdoutStream {
+        reader: ReaderStream::with_capacity(stdout, 65536),
+        _child: child,
+        _permit: permit,
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Yields bytes `start..=end` of a growing download, waiting for each part to
+/// land on disk. The total size is known up front from the Soulseek handshake.
+fn growing_range_stream(
+    file: Arc<GrowingFile>,
+    start: u64,
+    end: u64,
+) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static {
+    struct St {
+        file: Arc<GrowingFile>,
+        handle: Option<File>,
+        pos: u64,
+        end: u64,
+        buf: Vec<u8>,
+    }
+    let st = St {
+        file,
+        handle: None,
+        pos: start,
+        end,
+        buf: vec![0u8; 64 * 1024],
+    };
+    futures::stream::unfold(st, |mut st| async move {
+        if st.pos > st.end {
+            return None;
+        }
+        let result = read_growing_chunk(&st.file, &mut st.handle, st.pos, st.end, &mut st.buf).await;
+        match result {
+            Ok(b) => {
+                st.pos += b.len() as u64;
+                Some((Ok(b), st))
+            }
+            Err(e) => {
+                st.pos = st.end + 1;
+                Some((Err(e), st))
+            }
+        }
+    })
+}
+
+async fn read_growing_chunk(
+    file: &GrowingFile,
+    handle: &mut Option<File>,
+    pos: u64,
+    end: u64,
+    buf: &mut [u8],
+) -> std::io::Result<bytes::Bytes> {
+    let avail = file.wait_for(pos).await?;
+    if handle.is_none() {
+        // The part file is renamed once complete; fall back to the final path.
+        let mut f = match File::open(&file.part_path).await {
+            Ok(f) => f,
+            Err(_) => File::open(&file.final_path).await?,
+        };
+        f.seek(std::io::SeekFrom::Start(pos)).await?;
+        *handle = Some(f);
+    }
+    let want = (avail.min(end + 1) - pos).min(buf.len() as u64) as usize;
+    let f = handle.as_mut().expect("handle opened above");
+    let n = f.read(&mut buf[..want]).await?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "growing file shorter than advertised",
+        ));
+    }
+    Ok(bytes::Bytes::copy_from_slice(&buf[..n]))
+}
+
+fn serve_growing_file_range(
+    file: Arc<GrowingFile>,
+    content_type: &str,
+    range_hdr: Option<&str>,
+) -> Response {
+    let size = file.size;
+    if size == 0 {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if let Some(r_str) = range_hdr {
+        if let Some((start, end)) = parse_byte_range(r_str, size) {
+            return Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_LENGTH, (end - start + 1).to_string())
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, size),
+                )
+                .header(header::CACHE_CONTROL, "private, max-age=3600")
+                .body(Body::from_stream(growing_range_stream(file, start, end)))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        } else if r_str.trim().starts_with("bytes=") {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", size))
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::RANGE_NOT_SATISFIABLE.into_response());
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, size.to_string())
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .body(Body::from_stream(growing_range_stream(file, 0, size - 1)))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 fn play_target_ext(target: &PlayTarget, track: &Track) -> String {
     let raw = match target {
         PlayTarget::LocalFile { path, .. } => path
@@ -1973,7 +2199,7 @@ fn play_target_ext(target: &PlayTarget, track: &Track) -> String {
             .and_then(|e| e.to_str())
             .filter(|s| !s.is_empty())
             .unwrap_or(&track.format),
-        PlayTarget::RemoteHttp { ext, .. } => {
+        PlayTarget::RemoteHttp { ext, .. } | PlayTarget::Growing { ext, .. } => {
             if ext.is_empty() {
                 &track.format
             } else {
@@ -2451,6 +2677,81 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("bytes 2-5/10")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn growing_file_serves_range_while_download_is_in_progress() {
+        let dir = std::env::temp_dir().join(format!("beatlab_grow_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.part");
+        let fin = dir.join("x.flac");
+        let full: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&part, &full[..1000]).unwrap();
+
+        let g = Arc::new(GrowingFile::new(part.clone(), fin.clone(), full.len() as u64));
+        g.set_written(1000);
+
+        // Response is ready immediately, before the rest of the file exists.
+        let resp = serve_growing_file_range(Arc::clone(&g), "audio/flac", Some("bytes=500-"));
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()),
+            Some("bytes 500-199999/200000")
+        );
+
+        let writer_g = Arc::clone(&g);
+        let rest = full.clone();
+        tokio::spawn(async move {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&writer_g.part_path).unwrap();
+            for chunk in rest[1000..].chunks(30_000) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                f.write_all(chunk).unwrap();
+                f.flush().unwrap();
+                writer_g.set_written(writer_g.written() + chunk.len() as u64);
+            }
+            drop(f);
+            std::fs::rename(&writer_g.part_path, &writer_g.final_path).unwrap();
+            writer_g.finish(true);
+        });
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], &full[500..]);
+        assert_eq!(g.wait_complete().await, Some(fin.clone()));
+
+        // After completion (part renamed), new readers still work.
+        let resp2 = serve_growing_file_range(Arc::clone(&g), "audio/flac", Some("bytes=0-9"));
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body2[..], &full[..10]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn growing_file_stream_errors_when_transfer_fails() {
+        let dir = std::env::temp_dir().join(format!("beatlab_grow_fail_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("y.part");
+        std::fs::write(&part, [7u8; 100]).unwrap();
+        let g = Arc::new(GrowingFile::new(part, dir.join("y.flac"), 10_000));
+        g.set_written(100);
+
+        let resp = serve_growing_file_range(Arc::clone(&g), "audio/flac", None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let failer = Arc::clone(&g);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            failer.finish(false);
+        });
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("stream must end promptly on failure");
+        assert!(res.is_err(), "truncated transfer must surface as a body error");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

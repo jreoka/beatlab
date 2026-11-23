@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -90,6 +91,119 @@ impl PendingTransfer {
     }
 }
 
+const GROW_RUNNING: u8 = 0;
+const GROW_DONE: u8 = 1;
+const GROW_FAILED: u8 = 2;
+
+/// A Soulseek download that is still being written to disk. Playback reads it
+/// while it grows, so lossless/hi-res files start in about a second instead of
+/// waiting for the whole 30-150 MB transfer to finish.
+pub struct GrowingFile {
+    pub part_path: PathBuf,
+    pub final_path: PathBuf,
+    pub size: u64,
+    written: AtomicU64,
+    state: AtomicU8,
+    finalize_claimed: AtomicBool,
+    notify: Notify,
+}
+
+impl GrowingFile {
+    pub(crate) fn new(part_path: PathBuf, final_path: PathBuf, size: u64) -> Self {
+        Self {
+            part_path,
+            final_path,
+            size,
+            written: AtomicU64::new(0),
+            state: AtomicU8::new(GROW_RUNNING),
+            finalize_claimed: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_written(&self, n: u64) {
+        self.written.store(n, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn finish(&self, ok: bool) {
+        self.state
+            .store(if ok { GROW_DONE } else { GROW_FAILED }, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.state.load(Ordering::Acquire) == GROW_DONE
+    }
+
+    /// Returns true exactly once, so post-download bookkeeping (cache index,
+    /// cool-tier upload) runs once even when several requests share a download.
+    pub fn claim_finalize(&self) -> bool {
+        !self.finalize_claimed.swap(true, Ordering::AcqRel)
+    }
+
+    /// Waits until bytes past `pos` are on disk; returns how many bytes are available.
+    pub async fn wait_for(&self, pos: u64) -> std::io::Result<u64> {
+        loop {
+            let notified = self.notify.notified();
+            let w = self.written();
+            if w > pos {
+                return Ok(w);
+            }
+            match self.state.load(Ordering::Acquire) {
+                GROW_DONE => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "read past end of download",
+                    ))
+                }
+                GROW_FAILED => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "soulseek transfer failed",
+                    ))
+                }
+                _ => {}
+            }
+            if tokio::time::timeout(Duration::from_secs(30), notified)
+                .await
+                .is_err()
+                && self.written() <= pos
+                && self.state.load(Ordering::Acquire) == GROW_RUNNING
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "soulseek transfer stalled",
+                ));
+            }
+        }
+    }
+
+    /// Waits for the whole transfer; returns the final path on success.
+    pub async fn wait_complete(&self) -> Option<PathBuf> {
+        loop {
+            let notified = self.notify.notified();
+            match self.state.load(Ordering::Acquire) {
+                GROW_DONE => return Some(self.final_path.clone()),
+                GROW_FAILED => return None,
+                _ => {}
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Result of resolving a Soulseek track: either already fully on disk, or
+/// downloading with playback able to start immediately.
+pub enum SlskFile {
+    Complete(PathBuf),
+    Growing(Arc<GrowingFile>),
+}
+
 pub struct SoulseekSource {
     store: Store,
     download_dir: PathBuf,
@@ -103,6 +217,8 @@ pub struct SoulseekSource {
     pending_by_token: Mutex<HashMap<u32, Arc<PendingTransfer>>>,
     pending_pierce_peers: Mutex<HashMap<u32, (String, String)>>,
     in_flight_downloads: std::sync::Mutex<HashMap<String, Arc<Notify>>>,
+    /// Transfers past the handshake that are still streaming to disk, keyed by stream ref.
+    growing: std::sync::Mutex<HashMap<String, Arc<GrowingFile>>>,
     alt_streams: Mutex<HashMap<String, Vec<String>>>,
     next_token: Mutex<u32>,
     self_weak: OnceLock<Weak<Self>>,
@@ -138,6 +254,7 @@ impl SoulseekSource {
             pending_by_token: Mutex::new(HashMap::new()),
             pending_pierce_peers: Mutex::new(HashMap::new()),
             in_flight_downloads: std::sync::Mutex::new(HashMap::new()),
+            growing: std::sync::Mutex::new(HashMap::new()),
             alt_streams: Mutex::new(HashMap::new()),
             next_token: Mutex::new(1000),
             self_weak: OnceLock::new(),
@@ -779,9 +896,9 @@ impl SoulseekSource {
 
     /// Tries the primary `track.stream_url` first, then up to 2 cached alternate Soulseek peers
     /// for the same `song_key` if the primary peer is unavailable, firewalled, or queued.
-    pub async fn resolve_track(self: &Arc<Self>, track: &Track) -> Option<String> {
-        if let Some(path) = self.resolve_stream(&track.stream_url).await {
-            return Some(path);
+    pub async fn resolve_track(self: &Arc<Self>, track: &Track) -> Option<SlskFile> {
+        if let Some(f) = self.resolve_stream_singleflight(&track.stream_url).await {
+            return Some(f);
         }
         let key = track.song_key();
         let alts = {
@@ -794,8 +911,8 @@ impl SoulseekSource {
                 continue;
             }
             tried += 1;
-            if let Some(path) = self.resolve_stream(&alt_url).await {
-                return Some(path);
+            if let Some(f) = self.resolve_stream_singleflight(&alt_url).await {
+                return Some(f);
             }
             if tried >= 2 {
                 break;
@@ -804,7 +921,15 @@ impl SoulseekSource {
         None
     }
 
-    async fn resolve_stream_singleflight(self: &Arc<Self>, stream_ref: &str) -> Option<String> {
+    fn active_growing(&self, stream_ref: &str) -> Option<Arc<GrowingFile>> {
+        self.growing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(stream_ref)
+            .cloned()
+    }
+
+    async fn resolve_stream_singleflight(self: &Arc<Self>, stream_ref: &str) -> Option<SlskFile> {
         let rest = stream_ref.strip_prefix("slsk://")?;
         let (peer, remote_path) = rest.split_once('/')?;
 
@@ -812,13 +937,14 @@ impl SoulseekSource {
         let ext = sanitize_slsk_ext(remote_path);
         let base_hash = hash_str(stream_ref);
         let local_path = self.download_dir.join(format!("{}.{}", base_hash, ext));
-        if tokio::fs::metadata(&local_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0)
-            > 4096
-        {
-            return Some(format!("file:{}", local_path.display()));
+        let complete = |p: &Path| {
+            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) > 4096
+        };
+        if let Some(g) = self.active_growing(stream_ref) {
+            return Some(SlskFile::Growing(g));
+        }
+        if complete(&local_path) {
+            return Some(SlskFile::Complete(local_path));
         }
 
         struct InFlightDownloadGuard<'a> {
@@ -851,14 +977,14 @@ impl SoulseekSource {
         };
 
         if !is_leader {
+            // The leader only holds this slot through the handshake, so this
+            // wait is short; afterwards the transfer is either growing or done.
             notify.notified().await;
-            if tokio::fs::metadata(&local_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0)
-                > 4096
-            {
-                return Some(format!("file:{}", local_path.display()));
+            if let Some(g) = self.active_growing(stream_ref) {
+                return Some(SlskFile::Growing(g));
+            }
+            if complete(&local_path) {
+                return Some(SlskFile::Complete(local_path));
             }
             return None;
         }
@@ -868,17 +994,25 @@ impl SoulseekSource {
             key: stream_ref.to_string(),
             notify,
         };
-        self.download_from_peer(peer, remote_path, &local_path, &base_hash)
+        // Re-check: a transfer may have started between the first check and leadership.
+        if let Some(g) = self.active_growing(stream_ref) {
+            return Some(SlskFile::Growing(g));
+        }
+        if complete(&local_path) {
+            return Some(SlskFile::Complete(local_path));
+        }
+        self.download_from_peer(stream_ref, peer, remote_path, &local_path, &base_hash)
             .await
     }
 
     async fn download_from_peer(
         self: &Arc<Self>,
+        stream_ref: &str,
         peer: &str,
         remote_path: &str,
         local_path: &Path,
         base_hash: &str,
-    ) -> Option<String> {
+    ) -> Option<SlskFile> {
         // Wait briefly only if auto-connect is actively in progress; otherwise fail fast when offline.
         for _ in 0..8 {
             let (connected, connecting) = {
@@ -903,7 +1037,9 @@ impl SoulseekSource {
         self.pending_transfers.lock().await.push(Arc::clone(&pending));
 
         let res = self
-            .execute_peer_transfer(peer, remote_path, local_path, &part_path, token, &pending)
+            .execute_peer_transfer(
+                stream_ref, peer, remote_path, local_path, &part_path, token, &pending,
+            )
             .await;
 
         // Clean up transfer coordination state cleanly on any exit path.
@@ -919,15 +1055,17 @@ impl SoulseekSource {
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_peer_transfer(
         self: &Arc<Self>,
+        stream_ref: &str,
         peer: &str,
         remote_path: &str,
         local_path: &Path,
         part_path: &Path,
         token: u32,
         pending: &Arc<PendingTransfer>,
-    ) -> Option<String> {
+    ) -> Option<SlskFile> {
         let my_user = self
             .runtime
             .read()
@@ -1023,39 +1161,60 @@ impl SoulseekSource {
         fsock.write_all(&0u64.to_le_bytes()).await.ok()?;
 
         let mut file = tokio::fs::File::create(part_path).await.ok()?;
-        let mut chunk = [0u8; 32 * 1024];
-        let mut written = 0u64;
-        let xfer_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while written < size {
-            let now = tokio::time::Instant::now();
-            if now >= xfer_deadline {
-                break;
+        let mut chunk = vec![0u8; 64 * 1024];
+
+        // Read the first bytes inline: if the peer stalls here we can still
+        // fall back to an alternate peer / YouTube Music before answering the
+        // player. After that, playback starts while the rest streams in.
+        let first_need = (size as usize).min(chunk.len());
+        let n = match tokio::time::timeout(Duration::from_secs(8), fsock.read(&mut chunk[..first_need]))
+            .await
+        {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => {
+                drop(file);
+                let _ = tokio::fs::remove_file(part_path).await;
+                return None;
             }
-            let need = ((size - written) as usize).min(chunk.len());
-            let step_timeout = (xfer_deadline - now).min(Duration::from_secs(8));
-            let read_res = tokio::time::timeout(step_timeout, fsock.read(&mut chunk[..need])).await;
-            match read_res {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(n)) => {
-                    if file.write_all(&chunk[..n]).await.is_err() {
-                        written = 0;
-                        break;
-                    }
-                    written += n as u64;
-                }
-            }
-        }
-        let _ = file.flush().await;
-        drop(file);
-        if written != size {
+        };
+        if file.write_all(&chunk[..n]).await.is_err() || file.flush().await.is_err() {
+            drop(file);
             let _ = tokio::fs::remove_file(part_path).await;
             return None;
         }
-        if tokio::fs::rename(part_path, local_path).await.is_err() {
-            let _ = tokio::fs::remove_file(part_path).await;
-            return None;
-        }
-        Some(format!("file:{}", local_path.display()))
+
+        let growing = Arc::new(GrowingFile::new(
+            part_path.to_path_buf(),
+            local_path.to_path_buf(),
+            size,
+        ));
+        growing.set_written(n as u64);
+        self.growing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(stream_ref.to_string(), Arc::clone(&growing));
+
+        let this = Arc::clone(self);
+        let g = Arc::clone(&growing);
+        let key = stream_ref.to_string();
+        let peer_owned = peer.to_string();
+        tokio::spawn(async move {
+            let ok = continue_transfer(&mut fsock, &mut file, &mut chunk, &g).await;
+            drop(file);
+            let ok = ok
+                && tokio::fs::rename(&g.part_path, &g.final_path).await.is_ok();
+            if !ok {
+                let _ = tokio::fs::remove_file(&g.part_path).await;
+                debug!(peer = %peer_owned, written = g.written(), size = g.size, "soulseek transfer incomplete");
+            }
+            g.finish(ok);
+            let mut map = this.growing.lock().unwrap_or_else(|e| e.into_inner());
+            if map.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &g)) {
+                map.remove(&key);
+            }
+        });
+
+        Some(SlskFile::Growing(growing))
     }
 }
 
@@ -1196,8 +1355,44 @@ impl MusicSource for SoulseekSource {
 
     async fn resolve_stream(&self, stream_ref: &str) -> Option<String> {
         let arc = self.self_weak.get().and_then(|w| w.upgrade())?;
-        arc.resolve_stream_singleflight(stream_ref).await
+        let path = match arc.resolve_stream_singleflight(stream_ref).await? {
+            SlskFile::Complete(p) => p,
+            SlskFile::Growing(g) => g.wait_complete().await?,
+        };
+        Some(format!("file:{}", path.display()))
     }
+}
+
+/// Streams the rest of a Soulseek upload to disk, publishing progress after
+/// each flushed chunk so concurrent readers never read past durable bytes.
+async fn continue_transfer(
+    fsock: &mut TcpStream,
+    file: &mut tokio::fs::File,
+    chunk: &mut [u8],
+    g: &GrowingFile,
+) -> bool {
+    // Stall-based rather than a fixed total deadline: big hi-res files from
+    // slower peers legitimately take minutes, but a silent peer is dropped.
+    let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+    let mut written = g.written();
+    while written < g.size {
+        if tokio::time::Instant::now() >= hard_deadline {
+            return false;
+        }
+        let need = ((g.size - written) as usize).min(chunk.len());
+        let n = match tokio::time::timeout(Duration::from_secs(20), fsock.read(&mut chunk[..need])).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => return false,
+        };
+        // tokio's File buffers writes on a blocking thread; flush so the bytes
+        // are visible to readers before we advertise them.
+        if file.write_all(&chunk[..n]).await.is_err() || file.flush().await.is_err() {
+            return false;
+        }
+        written += n as u64;
+        g.set_written(written);
+    }
+    true
 }
 
 fn build_flac_search_query(query: &str) -> Option<String> {

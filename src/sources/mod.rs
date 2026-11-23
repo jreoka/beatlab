@@ -24,6 +24,9 @@ pub trait MusicSource: Send + Sync {
     fn available(&self) -> bool;
     fn status(&self) -> String;
     async fn search(&self, query: &str, limit: usize) -> Vec<Track>;
+    /// Resolves to a fully downloaded file. Playback paths use source-specific
+    /// progressive resolvers instead (e.g. `SoulseekSource::resolve_track`).
+    #[allow(dead_code)]
     async fn resolve_stream(&self, _stream_ref: &str) -> Option<String> {
         None
     }
