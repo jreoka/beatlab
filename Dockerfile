@@ -39,6 +39,7 @@ RUN mkdir -p /data
 ENV BEATLAB_ADDR=0.0.0.0:4533 \
     BEATLAB_DATA=/data \
     BEATLAB_CACHE_GB=5.0 \
+    XDG_CACHE_HOME=/data/.cache \
     RUST_LOG=info
 
 WORKDIR /data

@@ -17,6 +17,9 @@ primary_region = "ord"
   # BEATLAB_S3_SECRET_ACCESS_KEY = "..."
   BEATLAB_S3_MAX_GB = "100"
   RUST_LOG = "info"
+  # Keep yt-dlp's player/signature cache on the volume so restarts and
+  # deploys don't make the first plays re-fetch it.
+  XDG_CACHE_HOME = "/data/.cache"
 
 [http_service]
   internal_port = 4533

@@ -4570,13 +4570,21 @@ pub async fn save_queue(
 pub async fn warm_track(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = require_web_user(&state, &headers) {
         return r;
     }
+    // `?light=1` (hover intent) only pre-resolves the stream URL; the default
+    // (next in queue) also starts caching the audio.
+    let light = q.get("light").is_some_and(|v| v == "1");
     if let Some(t) = state.store.get_track(&id).ok().flatten() {
-        state.engine.spawn_warm_track(t);
+        if light {
+            state.engine.spawn_light_warm(t);
+        } else {
+            state.engine.spawn_warm_track(t);
+        }
     }
     json_res(json!({ "ok": true }))
 }
@@ -6778,7 +6786,13 @@ mod tests {
             let h = hdr.clone();
             let tid = format!("local:burst-track-{}", i % 12);
             handles.push(tokio::spawn(async move {
-                let r1 = warm_track(State(st.clone()), Path(tid.clone()), h.clone()).await;
+                let r1 = warm_track(
+                    State(st.clone()),
+                    Path(tid.clone()),
+                    Query(HashMap::new()),
+                    h.clone(),
+                )
+                .await;
                 let r2 = record_event(
                     State(st.clone()),
                     h.clone(),

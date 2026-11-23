@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
@@ -51,6 +52,9 @@ pub struct YtmSource {
     http: reqwest::Client,
     ytdlp_bin: String,
     ytdlp_sem: Arc<Semaphore>,
+    /// Index into the yt-dlp client attempts that last succeeded. When YouTube
+    /// breaks one player client, every play used to wait for it to fail first.
+    preferred_client: Arc<AtomicUsize>,
 }
 
 impl YtmSource {
@@ -67,6 +71,7 @@ impl YtmSource {
             http,
             ytdlp_bin,
             ytdlp_sem: Arc::new(Semaphore::new(4)),
+            preferred_client: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -325,9 +330,13 @@ impl YtmSource {
         ];
 
         let mut last_err = String::new();
-        for (extractor_args, fmt) in attempts {
+        for idx in client_attempt_order(self.preferred_client.load(Ordering::Relaxed), attempts.len()) {
+            let (extractor_args, fmt) = attempts[idx];
             match self.run_ytdlp_json(&watch_url, extractor_args, fmt).await {
-                Ok(res) => return Ok(res),
+                Ok(res) => {
+                    self.preferred_client.store(idx, Ordering::Relaxed);
+                    return Ok(res);
+                }
                 Err(e) => {
                     warn!(client = extractor_args, error = %e, "yt-dlp resolution attempt failed");
                     last_err = e.to_string();
@@ -985,9 +994,42 @@ fn score_ytm_candidate(
     score
 }
 
+/// Attempt order starting from the last client that worked, then the rest in
+/// their default priority.
+fn client_attempt_order(preferred: usize, n: usize) -> Vec<usize> {
+    let first = if preferred < n { preferred } else { 0 };
+    std::iter::once(first).chain((0..n).filter(move |&i| i != first)).collect()
+}
+
+/// Seconds-since-epoch expiry embedded in a googlevideo stream URL (`expire=`).
+pub fn stream_url_expiry(url: &str) -> Option<i64> {
+    let q = url.split_once('?')?.1;
+    q.split('&')
+        .find_map(|kv| kv.strip_prefix("expire="))
+        .and_then(|v| v.parse::<i64>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_order_starts_with_last_working_client() {
+        assert_eq!(client_attempt_order(0, 3), vec![0, 1, 2]);
+        assert_eq!(client_attempt_order(1, 3), vec![1, 0, 2]);
+        assert_eq!(client_attempt_order(2, 3), vec![2, 0, 1]);
+        assert_eq!(client_attempt_order(9, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn stream_url_expiry_reads_expire_param() {
+        assert_eq!(
+            stream_url_expiry("https://rr1.googlevideo.com/videoplayback?id=x&expire=1795000000&ei=y"),
+            Some(1_795_000_000)
+        );
+        assert_eq!(stream_url_expiry("https://example.com/a.flac"), None);
+        assert_eq!(stream_url_expiry("https://x/v?expire=abc"), None);
+    }
 
     #[test]
     fn innertube_parser_extracts_song_fields() {

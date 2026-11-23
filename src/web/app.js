@@ -1961,6 +1961,7 @@
     wireAudioEvents();
     wireKeyboardShortcuts();
     wireTrackGestures();
+    wireIntentWarm();
     wireStatsTooltips();
     window.addEventListener('hashchange', () => renderCurrentHash());
 
@@ -6368,6 +6369,62 @@
       ${navAction}
     `;
     positionContextMenu(menu, backdrop, event);
+  }
+
+  // Pre-resolve a track's stream URL when the user shows intent to play it
+  // (mouse resting on a row, or a finger going down on mobile), so the click
+  // doesn't pay for the YouTube lookup. Server side this never downloads audio
+  // or contacts Soulseek peers, and it's rate-limited here and there.
+  function wireIntentWarm() {
+    const recent = new Map(); // tid -> last warm time (ms)
+    const TTL_MS = 10 * 60 * 1000;
+    const MIN_GAP_MS = 300;
+    let lastSent = 0;
+    let hoverTimer = null;
+    let hoverTid = null;
+
+    const warm = (tid) => {
+      if (!tid || !state.token) return;
+      if (currentTrack()?.id === tid) return;
+      const now = Date.now();
+      const prev = recent.get(tid);
+      if (prev && now - prev < TTL_MS) return;
+      if (now - lastSent < MIN_GAP_MS) return;
+      lastSent = now;
+      recent.set(tid, now);
+      if (recent.size > 500) {
+        for (const [k, t] of recent) {
+          if (now - t > TTL_MS) recent.delete(k);
+        }
+      }
+      api(`/api/web/warm/${encodeURIComponent(tid)}?light=1`, { method: 'POST' }).catch(() => {});
+    };
+
+    const tidFrom = (target) => {
+      const el = target && target.closest ? target.closest('[data-tid]') : null;
+      return el ? el.dataset.tid : null;
+    };
+
+    document.addEventListener('pointerover', (e) => {
+      if (e.pointerType !== 'mouse') return;
+      const tid = tidFrom(e.target);
+      if (tid === hoverTid) return;
+      hoverTid = tid;
+      if (hoverTimer) {
+        clearTimeout(hoverTimer);
+        hoverTimer = null;
+      }
+      if (!tid) return;
+      hoverTimer = setTimeout(() => {
+        hoverTimer = null;
+        if (hoverTid === tid) warm(tid);
+      }, 250);
+    }, { passive: true });
+
+    document.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse') return;
+      warm(tidFrom(e.target));
+    }, { passive: true });
   }
 
   function wireTrackGestures() {

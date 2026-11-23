@@ -104,6 +104,7 @@ pub struct StreamEngine {
     in_flight_warms: Arc<StdMutex<HashSet<String>>>,
     in_flight_embeds: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     warm_sem: Arc<Semaphore>,
+    light_warm_sem: Arc<Semaphore>,
     cache_sem: Arc<Semaphore>,
     stream_proc_sem: Arc<Semaphore>,
     embed_sem: Arc<Semaphore>,
@@ -186,6 +187,7 @@ impl StreamEngine {
             in_flight_warms: Arc::new(StdMutex::new(HashSet::new())),
             in_flight_embeds: Arc::new(StdMutex::new(HashMap::new())),
             warm_sem: Arc::new(Semaphore::new(2)),
+            light_warm_sem: Arc::new(Semaphore::new(1)),
             cache_sem: Arc::new(Semaphore::new(3)),
             stream_proc_sem: Arc::new(Semaphore::new(8)),
             embed_sem: Arc::new(Semaphore::new(2)),
@@ -548,6 +550,22 @@ impl StreamEngine {
     }
 
     async fn perform_ytm_resolve(&self, track: &Track) -> AppResult<CachedResolved> {
+        let direct = track.stream_url.starts_with("ytm:");
+        let vid_key = format!("ytmvid:{}", track.id);
+        // The artist/title -> video match is stable, so remember it across
+        // restarts instead of re-searching YouTube Music on every first play.
+        if !direct {
+            if let Some(vid) = self.store.kv_get(&vid_key).filter(|v| !v.trim().is_empty()) {
+                match self.sources.ytm.resolve_stream(&vid).await {
+                    Ok(resolved) => return Ok(self.cache_resolved(track, resolved).await),
+                    Err(e) => {
+                        // Video removed or region-blocked: forget it and search again.
+                        debug!(track_id = %track.id, error = %e, "stored YTM video failed; re-searching");
+                        self.store.kv_delete(&vid_key);
+                    }
+                }
+            }
+        }
         let video_id = if let Some(vid) = track.stream_url.strip_prefix("ytm:") {
             vid.trim().to_string()
         } else if let Some(spec) = track.stream_url.strip_prefix("resolve:ytm:") {
@@ -577,18 +595,66 @@ impl StreamEngine {
         };
 
         let resolved = self.sources.ytm.resolve_stream(&video_id).await?;
+        if !direct {
+            self.store.kv_set(&vid_key, &video_id);
+        }
+        Ok(self.cache_resolved(track, resolved).await)
+    }
+
+    async fn cache_resolved(
+        &self,
+        track: &Track,
+        resolved: crate::sources::ytm::ResolvedStream,
+    ) -> CachedResolved {
         let item = CachedResolved {
+            expires_at: resolved_expiry(&resolved.url, Utc::now().timestamp()),
             url: resolved.url,
             headers: resolved.headers,
             ext: resolved.ext,
             webpage_url: resolved.source_webpage_url,
-            expires_at: Utc::now().timestamp() + 3600,
         };
-        {
-            let mut guard = self.resolved_cache.write().await;
-            guard.insert(track.id.clone(), item.clone());
+        let mut guard = self.resolved_cache.write().await;
+        guard.insert(track.id.clone(), item.clone());
+        item
+    }
+
+    /// Cheap pre-resolve for tracks the user is likely about to click (hover):
+    /// only fetches the YouTube stream URL, never downloads audio and never
+    /// contacts Soulseek peers. Bounded to one at a time so it can't crowd out
+    /// real plays.
+    pub fn spawn_light_warm(&self, track: Track) {
+        if !(track.stream_url.starts_with("resolve:") || track.stream_url.starts_with("ytm:")) {
+            return;
         }
-        Ok(item)
+        if let Ok(Some(entry)) = self.store.get_cache_entry(&track.id) {
+            if Path::new(&entry.path).exists() {
+                return;
+            }
+        }
+        let Ok(permit) = self.light_warm_sem.clone().try_acquire_owned() else {
+            return;
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            {
+                let guard = this.resolved_cache.read().await;
+                if guard
+                    .get(&track.id)
+                    .is_some_and(|c| c.expires_at > Utc::now().timestamp() + 600)
+                {
+                    return;
+                }
+            }
+            if this.find_local_or_cached_sibling(&track).is_some() {
+                return;
+            }
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                this.resolve_ytm_singleflight(&track, false),
+            )
+            .await;
+        });
     }
 
     /// Pre-resolves stream metadata & kicks off background caching so next-track transitions feel instant.
@@ -1987,6 +2053,16 @@ pub fn parse_byte_range(header_val: &str, total: u64) -> Option<(u64, u64)> {
     (start <= end).then_some((start, end))
 }
 
+/// When to stop reusing a resolved stream URL: YouTube's own `expire=` minus a
+/// safety margin (capped at 6h), or 1h when the URL doesn't say.
+fn resolved_expiry(url: &str, now: i64) -> i64 {
+    match crate::sources::ytm::stream_url_expiry(url) {
+        Some(exp) if exp - 600 > now + 60 => (exp - 600).min(now + 6 * 3600),
+        Some(_) => now + 60,
+        None => now + 3600,
+    }
+}
+
 fn sanitize_time_offset(t: f64) -> f64 {
     if t.is_finite() && t > 0.5 {
         t.min(86_400.0)
@@ -2616,6 +2692,22 @@ mod tests {
             HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"),
         );
         assert!(!is_safari_ua(&edge_hdrs));
+    }
+
+    #[test]
+    fn resolved_expiry_follows_url_expire_with_margin_and_cap() {
+        let now = 1_000_000;
+        // 6h link -> reuse until 10 minutes before expiry.
+        let u = format!("https://g/videoplayback?expire={}", now + 6 * 3600);
+        assert_eq!(resolved_expiry(&u, now), now + 6 * 3600 - 600);
+        // Very long link -> capped at 6h.
+        let u = format!("https://g/videoplayback?expire={}", now + 48 * 3600);
+        assert_eq!(resolved_expiry(&u, now), now + 6 * 3600);
+        // Nearly expired -> barely cached.
+        let u = format!("https://g/videoplayback?expire={}", now + 300);
+        assert_eq!(resolved_expiry(&u, now), now + 60);
+        // No expiry info -> old 1h default.
+        assert_eq!(resolved_expiry("https://g/a.m4a", now), now + 3600);
     }
 
     #[test]
