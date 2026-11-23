@@ -582,9 +582,11 @@ fn render_stats_heatmap(heatmap: &HeatmapStats) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let mut last_month: i32 = -1;
+    let mut last_label_col: Option<usize> = None;
     let month_labels: String = weeks
         .iter()
-        .map(|col| {
+        .enumerate()
+        .map(|(col_idx, col)| {
             let first = col
                 .iter()
                 .find(|(d, in_r, _, _)| *in_r && d.day() <= 7)
@@ -592,9 +594,12 @@ fn render_stats_heatmap(heatmap: &HeatmapStats) -> String {
             let mut label = "";
             if let Some((d, _, _, _)) = first {
                 let m = d.month0() as i32;
-                if m != last_month && (d.day() <= 7 || last_month == -1) {
+                let has_room = last_label_col.map_or(true, |prev| col_idx >= prev + 2);
+                let show_first = last_month == -1 && d.day() <= 21;
+                if m != last_month && has_room && (d.day() <= 7 || show_first) {
                     label = MONTHS[m as usize];
                     last_month = m;
+                    last_label_col = Some(col_idx);
                 }
             }
             format!(r#"<div class="stats-hm-month">{label}</div>"#)
@@ -647,7 +652,7 @@ fn render_stats_heatmap(heatmap: &HeatmapStats) -> String {
 
     let week_count = weeks.len().max(1);
     format!(
-        r#"<div class="stats-hm-scroll"><div class="stats-hm-inner"><div class="stats-hm-months-row"><div class="stats-hm-wd-spacer"></div><div class="stats-hm-months" style="grid-template-columns:repeat({week_count},minmax(10px,1fr))">{month_labels}</div></div><div class="stats-hm-body"><div class="stats-hm-weekdays"><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span><span></span></div><div class="stats-hm-grid" style="grid-template-columns:repeat({week_count},minmax(10px,1fr))">{cols_html}</div></div></div></div><div class="stats-hm-legend"><span>Less</span><span class="stats-hm-cell lv-0"></span><span class="stats-hm-cell lv-1"></span><span class="stats-hm-cell lv-2"></span><span class="stats-hm-cell lv-3"></span><span class="stats-hm-cell lv-4"></span><span>More</span></div>"#
+        r#"<div class="stats-hm-scroll"><div class="stats-hm-inner" style="--hm-weeks:{week_count}"><div class="stats-hm-months-row"><div class="stats-hm-wd-spacer"></div><div class="stats-hm-months" style="grid-template-columns:repeat({week_count},12px)">{month_labels}</div></div><div class="stats-hm-body"><div class="stats-hm-weekdays"><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span><span></span></div><div class="stats-hm-grid" style="grid-template-columns:repeat({week_count},12px)">{cols_html}</div></div></div></div><div class="stats-hm-legend"><span>Less</span><span class="stats-hm-cell lv-0"></span><span class="stats-hm-cell lv-1"></span><span class="stats-hm-cell lv-2"></span><span class="stats-hm-cell lv-3"></span><span class="stats-hm-cell lv-4"></span><span>More</span></div>"#
     )
 }
 
@@ -784,17 +789,31 @@ fn tiles(items: &[(String, String)]) -> String {
     )
 }
 
+fn cover_url(id: &str) -> String {
+    format!("/api/web/cover/{}?v=2", urlencoding::encode(id))
+}
+
 fn track_list(tracks: &[crate::stats::PublicTopTrack]) -> String {
     format!(
         r#"<ol class="list">{}</ol>"#,
         tracks
             .iter()
-            .map(|t| format!(
-                r#"<li><div class="li-main"><div class="li-title">{}</div><div class="li-sub">{}</div></div><div class="li-meta">{}</div></li>"#,
-                html_escape(&t.title),
-                html_escape(&t.artist),
-                plural(t.streams, "play", "plays")
-            ))
+            .map(|t| {
+                let art = if t.id.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        r#"<img class="stats-track-art" src="{}" loading="lazy" alt="" />"#,
+                        html_escape(&cover_url(&t.id))
+                    )
+                };
+                format!(
+                    r#"<li>{art}<div class="li-main"><div class="li-title">{}</div><div class="li-sub">{}</div></div><div class="li-meta">{}</div></li>"#,
+                    html_escape(&t.title),
+                    html_escape(&t.artist),
+                    plural(t.streams, "play", "plays")
+                )
+            })
             .collect::<String>()
     )
 }
@@ -1291,9 +1310,10 @@ fn stats_body(u: &PublicUser, d: &ComputedStats, metric: &str) -> String {
                 .map(|(idx, a)| {
                     let w_pct = (a.streams as f64 / max_a * 100.0).max(4.0);
                     format!(
-                        r#"<div class="stats-lb-row"><span class="stats-lb-rank{}">{}</span><div class="stats-lb-info"><div class="stats-lb-title">{}</div><div class="stats-lb-sub">{} · {}</div><div class="stats-lb-meter"><span style="width:{w_pct:.1}%"></span></div></div><div class="stats-lb-count"><strong>{}</strong><span>{}</span></div></div>"#,
+                        r#"<div class="stats-lb-row"><span class="stats-lb-rank{}">{}</span><img class="stats-lb-img round" src="{}" loading="lazy" alt="" /><div class="stats-lb-info"><div class="stats-lb-title">{}</div><div class="stats-lb-sub">{} · {}</div><div class="stats-lb-meter"><span style="width:{w_pct:.1}%"></span></div></div><div class="stats-lb-count"><strong>{}</strong><span>{}</span></div></div>"#,
                         if idx < 3 { " top" } else { "" },
                         idx + 1,
+                        html_escape(&cover_url(&a.id)),
                         html_escape(&a.name),
                         plural(a.unique_tracks, "track", "tracks"),
                         html_escape(&fmt_stats_duration(a.listened_secs)),
@@ -1318,9 +1338,10 @@ fn stats_body(u: &PublicUser, d: &ComputedStats, metric: &str) -> String {
                     let w_pct = (al.streams as f64 / max_al * 100.0).max(4.0);
                     let year_part = if al.year > 0 { format!(" · {}", al.year) } else { String::new() };
                     format!(
-                        r#"<div class="stats-lb-row"><span class="stats-lb-rank{}">{}</span><div class="stats-lb-info"><div class="stats-lb-title">{}</div><div class="stats-lb-sub">{}{} · {}</div><div class="stats-lb-meter"><span style="width:{w_pct:.1}%;background:#38bdf8"></span></div></div><div class="stats-lb-count"><strong>{}</strong><span>{}</span></div></div>"#,
+                        r#"<div class="stats-lb-row"><span class="stats-lb-rank{}">{}</span><img class="stats-lb-img" src="{}" loading="lazy" alt="" /><div class="stats-lb-info"><div class="stats-lb-title">{}</div><div class="stats-lb-sub">{}{} · {}</div><div class="stats-lb-meter"><span style="width:{w_pct:.1}%;background:#38bdf8"></span></div></div><div class="stats-lb-count"><strong>{}</strong><span>{}</span></div></div>"#,
                         if idx < 3 { " top" } else { "" },
                         idx + 1,
+                        html_escape(&cover_url(&al.id)),
                         html_escape(&al.name),
                         html_escape(&al.artist),
                         year_part,
@@ -1363,9 +1384,10 @@ fn stats_body(u: &PublicUser, d: &ComputedStats, metric: &str) -> String {
                     format!("{} · {}", html_escape(&t.artist), html_escape(&t.album))
                 };
                 format!(
-                    r#"<div class="stats-track-row"><span class="stats-lb-rank{}">{}</span><div class="li-main"><div class="li-title">{}</div><div class="li-sub">{sub}</div></div><span class="stats-play-pill">{} · {}</span><span class="stats-track-dur">{}</span></div>"#,
+                    r#"<div class="stats-track-row"><span class="stats-lb-rank{}">{}</span><img class="stats-track-art" src="{}" loading="lazy" alt="" /><div class="li-main"><div class="li-title">{}</div><div class="li-sub">{sub}</div></div><span class="stats-play-pill">{} · {}</span><span class="stats-track-dur">{}</span></div>"#,
                     if idx < 3 { " top" } else { "" },
                     idx + 1,
+                    html_escape(&cover_url(&t.id)),
                     html_escape(&t.title),
                     plural(item.streams, "play", "plays"),
                     html_escape(&fmt_stats_duration(item.listened_secs)),
@@ -1677,16 +1699,16 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
     .stats-clock-hit {{ cursor:pointer; }}
     .stats-clock-hit:hover {{ fill:rgba(255,255,255,.06); }}
     .stats-hm-scroll {{ overflow-x:auto; padding-bottom:6px; }}
-    .stats-hm-inner {{ min-width:680px; display:flex; flex-direction:column; gap:4px; }}
-    .stats-hm-months-row, .stats-hm-body {{ display:flex; align-items:stretch; gap:6px; }}
+    .stats-hm-inner {{ width:max-content; display:flex; flex-direction:column; gap:4px; }}
+    .stats-hm-months-row, .stats-hm-body {{ display:flex; align-items:flex-start; gap:6px; }}
     .stats-hm-months-row {{ align-items:center; }}
     .stats-hm-wd-spacer {{ width:28px; flex-shrink:0; }}
-    .stats-hm-months {{ flex:1; display:grid; gap:3px; }}
-    .stats-hm-month {{ font-size:10px; color:#6b7485; font-weight:600; white-space:nowrap; }}
-    .stats-hm-weekdays {{ width:28px; flex-shrink:0; display:grid; grid-template-rows:repeat(7,1fr); gap:3px; font-size:9.5px; color:#6b7485; align-items:center; }}
-    .stats-hm-grid {{ flex:1; display:grid; gap:3px; }}
-    .stats-hm-col {{ display:grid; grid-template-rows:repeat(7,1fr); gap:3px; }}
-    .stats-hm-cell {{ aspect-ratio:1/1; width:100%; min-width:9px; min-height:9px; border-radius:2px; background:#181c26; border:1px solid rgba(255,255,255,.03); }}
+    .stats-hm-months {{ display:grid; gap:3px; }}
+    .stats-hm-month {{ font-size:10px; color:#6b7485; font-weight:600; white-space:nowrap; overflow:visible; min-width:0; line-height:1.2; }}
+    .stats-hm-weekdays {{ width:28px; flex-shrink:0; display:grid; grid-template-rows:repeat(7,12px); gap:3px; font-size:9.5px; color:#6b7485; align-items:center; line-height:1; }}
+    .stats-hm-grid {{ display:grid; gap:3px; }}
+    .stats-hm-col {{ display:grid; grid-template-rows:repeat(7,12px); gap:3px; }}
+    .stats-hm-cell {{ width:12px; height:12px; border-radius:2px; background:#181c26; border:1px solid rgba(255,255,255,.03); }}
     .stats-hm-cell.empty {{ background:transparent; border-color:transparent; }}
     .stats-hm-cell.lv-0 {{ background:#181c26; }}
     .stats-hm-cell.lv-1 {{ background:#0e4429; }}
@@ -1725,6 +1747,8 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
     .stats-lb-row:hover {{ background:#181c26; }}
     .stats-lb-rank {{ width:22px; text-align:center; font-size:13px; font-weight:700; color:#6b7485; font-variant-numeric:tabular-nums; flex-shrink:0; }}
     .stats-lb-rank.top {{ color:#1ed760; }}
+    .stats-lb-img {{ width:44px; height:44px; border-radius:6px; object-fit:cover; flex-shrink:0; background:#181c26; border:1px solid #232834; }}
+    .stats-lb-img.round {{ border-radius:50%; }}
     .stats-lb-info {{ flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }}
     .stats-lb-title {{ font-size:13.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
     .stats-lb-sub {{ font-size:11.5px; color:#98a2b3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
@@ -1736,6 +1760,7 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
     .stats-track-list {{ display:flex; flex-direction:column; }}
     .stats-track-row {{ display:flex; align-items:center; gap:12px; padding:9px 8px; border-top:1px solid #1b1f29; }}
     .stats-track-row:first-child {{ border-top:0; }}
+    .stats-track-art {{ width:40px; height:40px; border-radius:6px; object-fit:cover; flex-shrink:0; background:#181c26; border:1px solid #232834; }}
     .stats-play-pill {{ font-size:11px; font-weight:600; padding:3px 8px; border-radius:999px; background:#181c26; border:1px solid #232834; color:#98a2b3; white-space:nowrap; font-variant-numeric:tabular-nums; flex-shrink:0; }}
     .stats-track-dur {{ font-size:12px; color:#6b7485; font-variant-numeric:tabular-nums; min-width:36px; text-align:right; flex-shrink:0; }}
     .stats-milestones-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; }}
@@ -1898,9 +1923,11 @@ pub fn render_profile_not_found_html() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Track;
     use crate::stats::{
         BestDayStat, DecadeStat, GenreStat, HeatmapDay, HighlightsData, LibraryStats, PersonaStats,
-        StatsRange, StreakStats, SummaryStats, TimelinePoint, TopArtistStat, WeekdayStat,
+        PublicTopTrack, StatsRange, StreakStats, SummaryStats, TimelinePoint, TopAlbumStat,
+        TopArtistStat, TopTrackStat, WeekdayStat,
     };
 
     fn user() -> PublicUser {
@@ -2086,7 +2113,21 @@ mod tests {
             }],
             oldest_track: None,
             newest_track: None,
-            top_tracks: vec![],
+            top_tracks: vec![TopTrackStat {
+                track: Track {
+                    id: "trk:42".into(),
+                    title: "Say It.".into(),
+                    artist: "Yorushika".into(),
+                    album: "Natsukusa".into(),
+                    duration: 242,
+                    ..Track::default()
+                },
+                streams: 9,
+                completed: 8,
+                skips: 1,
+                listened_secs: 2100,
+                last_played: 1_750_000_000,
+            }],
             top_artists: vec![TopArtistStat {
                 id: "ar:1".into(),
                 name: "Yorushika <3".into(),
@@ -2096,7 +2137,17 @@ mod tests {
                 pct: 23.8,
                 is_followed: false,
             }],
-            top_albums: vec![],
+            top_albums: vec![TopAlbumStat {
+                id: "al:7".into(),
+                name: "Natsukusa".into(),
+                artist: "Yorushika".into(),
+                artist_id: "ar:1".into(),
+                year: 2017,
+                streams: 9,
+                listened_secs: 2100,
+                unique_tracks: 4,
+                is_saved: false,
+            }],
             most_skipped: vec![],
             highlights: HighlightsData {
                 longest_track: None,
@@ -2153,6 +2204,42 @@ mod tests {
         assert!(html.contains("stats-radar-svg"));
         assert!(html.contains("stats-vbar-chart"));
         assert!(html.contains("Night Owl Explorer"));
+        // Cover art is rendered for tracks, artists, and albums.
+        assert!(html.contains(r#"src="/api/web/cover/trk%3A42?v=2""#));
+        assert!(html.contains(r#"src="/api/web/cover/ar%3A1?v=2""#));
+        assert!(html.contains(r#"src="/api/web/cover/al%3A7?v=2""#));
+    }
+
+    #[test]
+    fn overview_top_tracks_render_cover_art() {
+        let stats = PublicStats {
+            top_tracks: vec![PublicTopTrack {
+                id: "trk:99".into(),
+                title: "Hitchcock".into(),
+                artist: "Yorushika".into(),
+                streams: 14,
+            }],
+            ..PublicStats::default()
+        };
+        let html = render_profile_page(
+            "https://beat.example",
+            &user(),
+            &ProfileBody::Overview { stats: &stats, playlists: &[] },
+        );
+        assert!(html.contains(r#"class="stats-track-art" src="/api/web/cover/trk%3A99?v=2""#));
+    }
+
+    #[test]
+    fn heatmap_skips_colliding_first_month_label() {
+        let hm = HeatmapStats {
+            start_date: "2025-11-24".into(),
+            end_date: "2026-11-23".into(),
+            max_streams: 10,
+            days: vec![],
+        };
+        let html = render_stats_heatmap(&hm);
+        assert!(!html.contains(r#"<div class="stats-hm-month">Nov</div><div class="stats-hm-month">Dec</div>"#));
+        assert!(html.contains("grid-template-columns:repeat(53,12px)"));
     }
 
     #[test]

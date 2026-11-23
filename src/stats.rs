@@ -381,6 +381,7 @@ pub struct PublicStats {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicTopTrack {
+    pub id: String,
     pub title: String,
     pub artist: String,
     pub streams: usize,
@@ -407,6 +408,7 @@ pub fn build_public_stats(store: &Store, user: &User, now_ts: i64) -> PublicStat
             .into_iter()
             .take(5)
             .map(|t| PublicTopTrack {
+                id: t.track.id,
                 title: t.track.title,
                 artist: t.track.artist,
                 streams: t.streams,

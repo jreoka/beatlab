@@ -3423,7 +3423,7 @@ a {
   padding-bottom: 6px;
 }
 .stats-hm-inner {
-  min-width: 680px;
+  width: max-content;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -3438,9 +3438,8 @@ a {
   flex-shrink: 0;
 }
 .stats-hm-months {
-  flex: 1;
   display: grid;
-  grid-template-columns: repeat(53, minmax(10px, 1fr));
+  grid-template-columns: repeat(var(--hm-weeks, 53), 12px);
   gap: 3px;
 }
 .stats-hm-month {
@@ -3448,38 +3447,39 @@ a {
   color: var(--text-dim);
   font-weight: 600;
   white-space: nowrap;
+  overflow: visible;
+  min-width: 0;
+  line-height: 1.2;
 }
 .stats-hm-body {
   display: flex;
-  align-items: stretch;
+  align-items: flex-start;
   gap: 6px;
 }
 .stats-hm-weekdays {
   width: 28px;
   flex-shrink: 0;
   display: grid;
-  grid-template-rows: repeat(7, 1fr);
+  grid-template-rows: repeat(7, 12px);
   gap: 3px;
   font-size: 9.5px;
   color: var(--text-dim);
   align-items: center;
+  line-height: 1;
 }
 .stats-hm-grid {
-  flex: 1;
   display: grid;
-  grid-template-columns: repeat(53, minmax(10px, 1fr));
+  grid-template-columns: repeat(var(--hm-weeks, 53), 12px);
   gap: 3px;
 }
 .stats-hm-col {
   display: grid;
-  grid-template-rows: repeat(7, 1fr);
+  grid-template-rows: repeat(7, 12px);
   gap: 3px;
 }
 .stats-hm-cell {
-  aspect-ratio: 1 / 1;
-  width: 100%;
-  min-width: 9px;
-  min-height: 9px;
+  width: 12px;
+  height: 12px;
   border-radius: 2px;
   background: var(--surface-2);
   border: 1px solid rgba(255, 255, 255, 0.03);

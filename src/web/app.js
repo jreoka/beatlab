@@ -3861,15 +3861,20 @@
 
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     let lastMonth = -1;
+    let lastLabelCol = -3;
     const monthLabels = weeks
-      .map((col) => {
+      .map((col, colIdx) => {
         const firstDay = col.find((c) => c.inRange && c.date.getUTCDate() <= 7) || col.find((c) => c.inRange);
         let label = '';
         if (firstDay) {
           const m = firstDay.date.getUTCMonth();
-          if (m !== lastMonth && (firstDay.date.getUTCDate() <= 7 || lastMonth === -1)) {
+          const dayOfMonth = firstDay.date.getUTCDate();
+          const hasRoom = colIdx >= lastLabelCol + 2;
+          const showFirst = lastMonth === -1 && dayOfMonth <= 21;
+          if (m !== lastMonth && hasRoom && (dayOfMonth <= 7 || showFirst)) {
             label = months[m];
             lastMonth = m;
+            lastLabelCol = colIdx;
           }
         }
         return `<div class="stats-hm-month">${label}</div>`;
@@ -3901,7 +3906,7 @@
 
     return `
       <div class="stats-hm-scroll" id="stats-hm-scroll">
-        <div class="stats-hm-inner">
+        <div class="stats-hm-inner" style="--hm-weeks:${weeks.length}">
           <div class="stats-hm-months-row">
             <div class="stats-hm-wd-spacer"></div>
             <div class="stats-hm-months">${monthLabels}</div>
