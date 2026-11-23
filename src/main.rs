@@ -417,6 +417,9 @@ async fn main() -> models::AppResult<()> {
     // Mount /health outside enforce_allowed_url so container/platform health checks
     // (which hit 127.0.0.1 or private IPs without the public Host) still succeed.
     let app = app.route("/health", get(|| async { "ok" }));
+    // Outermost: record the real TCP peer so rate limiting can't be dodged with spoofed
+    // forwarding headers (see subsonic::client_ip).
+    let app = app.layer(middleware::from_fn(stamp_peer_ip));
 
     let addr: SocketAddr = addr_str.parse()?;
     if let Some(ref raw_url) = allowed_url_raw {
@@ -425,8 +428,22 @@ async fn main() -> models::AppResult<()> {
         info!(address = %addr, data_dir = %data_dir.display(), "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+/// Replaces any client-supplied `x-beatlab-peer-ip` with the actual socket peer address.
+async fn stamp_peer_ip(mut req: Request, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string());
+    let headers = req.headers_mut();
+    headers.remove(subsonic::PEER_IP_HEADER);
+    if let Some(ip) = peer.and_then(|p| header::HeaderValue::from_str(&p).ok()) {
+        headers.insert(subsonic::PEER_IP_HEADER, ip);
+    }
+    next.run(req).await
 }
 
 /// Allowed origin parsed from the `URL` environment variable.

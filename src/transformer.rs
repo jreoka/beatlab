@@ -856,6 +856,15 @@ type SeqItem = (Vec<(usize, f32)>, Option<[f32; 4]>, usize);
 
 /// Minimum number of held-out listens before the evaluation is trusted to gate the blend weight.
 const MIN_EVAL_ITEMS: usize = 6;
+/// ...spread over at least this many users, so one listener can't make or break the trust score.
+const MIN_EVAL_USERS: usize = 3;
+/// Most recent first-time discoveries held out per user (more items = less noisy evaluation).
+const MAX_HOLDOUTS_PER_USER: usize = 3;
+/// Personal-history size (listens + stars) at or below which the crowd correction is applied in full.
+const CROWD_FULL_BELOW: f32 = 5.0;
+/// Personal-history size at which the crowd correction bottoms out at `CROWD_MIN_ALPHA`.
+const CROWD_TAPER_AT: f32 = 30.0;
+const CROWD_MIN_ALPHA: f32 = 0.35;
 /// Sampled negatives per training example (in-batch negatives are added on top).
 const N_SAMPLED_NEGATIVES: usize = 8;
 /// Random catalog distractors each held-out target is ranked against.
@@ -873,17 +882,22 @@ const LISTEN_MERGE_WINDOW_SECS: i64 = 3 * 3600;
 
 /// Held-out ranking quality of the model versus two simple baselines.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EvalReport {
     /// Number of held-out listens evaluated.
     pub n: usize,
+    /// Number of distinct users those listens came from.
+    pub users: usize,
     pub model_mrr: f32,
     pub model_recall10: f32,
     /// Baseline: rank by global popularity (Deezer rank / quality).
     pub popularity_mrr: f32,
+    /// Baseline: rank by how many *other* users on this server liked the track (training data only).
+    pub server_pop_mrr: f32,
     /// Baseline: rank by artist/genre overlap with the user's context (content heuristic).
     pub content_mrr: f32,
     pub content_recall10: f32,
-    /// `model_mrr / max(popularity_mrr, content_mrr)`.
+    /// `model_mrr / max(popularity_mrr, server_pop_mrr, content_mrr)`.
     pub lift: f32,
     /// Smoothed 0.1..1.0 trust score derived from `lift`; scales the blend weight.
     pub quality: f32,
@@ -892,11 +906,11 @@ pub struct EvalReport {
 
 impl EvalReport {
     fn trusted(&self) -> bool {
-        self.n >= MIN_EVAL_ITEMS
+        self.n >= MIN_EVAL_ITEMS && self.users >= MIN_EVAL_USERS
     }
 
     fn compute_lift(&mut self) {
-        let base = self.popularity_mrr.max(self.content_mrr).max(1e-6);
+        let base = self.popularity_mrr.max(self.server_pop_mrr).max(self.content_mrr).max(1e-6);
         self.lift = self.model_mrr / base;
     }
 
@@ -944,6 +958,19 @@ pub struct TransformerNet {
     step_budget: u64,
     #[serde(default)]
     rejected_runs: u64,
+    /// Mean context vector over all trained users: the "what everyone here likes" direction.
+    /// Subtracted at scoring time (fully for thin histories) so new users aren't recommended
+    /// the server's crowd favourites just because other people play them. Empty until computed.
+    #[serde(default, with = "f32_b64")]
+    crowd_ctx: Vec<f32>,
+}
+
+/// How much of the crowd direction to remove from a context built from `personal_tokens`
+/// listens/stars: 1.0 for new users, tapering to `CROWD_MIN_ALPHA` for established ones.
+fn crowd_alpha(personal_tokens: usize) -> f32 {
+    let n = personal_tokens as f32;
+    let t = ((n - CROWD_FULL_BELOW) / (CROWD_TAPER_AT - CROWD_FULL_BELOW)).clamp(0.0, 1.0);
+    1.0 - (1.0 - CROWD_MIN_ALPHA) * t
 }
 
 impl TransformerNet {
@@ -986,12 +1013,52 @@ impl TransformerNet {
             steps_on_fingerprint: 0,
             step_budget: 0,
             rejected_runs: 0,
+            crowd_ctx: Vec::new(),
         }
+    }
+
+    /// Removes the crowd-taste component from a user's context vector (see `crowd_ctx`).
+    /// Scores are then `dot(result, track_unit)`.
+    fn personalize(&self, ctx_unit: &[f32; D_MODEL], personal_tokens: usize) -> [f32; D_MODEL] {
+        let mut out = *ctx_unit;
+        if self.crowd_ctx.len() == D_MODEL {
+            let a = crowd_alpha(personal_tokens);
+            for d in 0..D_MODEL {
+                out[d] -= a * self.crowd_ctx[d];
+            }
+        }
+        out
+    }
+
+    /// Recomputes `crowd_ctx` as the mean context over every user with a usable profile.
+    fn refresh_crowd(&mut self, table: &CorpusTable, users: &HashMap<i64, UserPrep>) {
+        let mut sum = [0.0f32; D_MODEL];
+        let mut n = 0usize;
+        let mut uids: Vec<i64> = users.keys().copied().filter(|&u| u > 0).collect();
+        uids.sort();
+        for uid in uids {
+            let p = &users[&uid];
+            let seq = profile_sequence(p, table, p.listens.len(), None, MAX_SEQ_LEN - 1);
+            if seq.len() < 2 {
+                continue;
+            }
+            let ctx = self.forward_context(uid, &seq).ctx_unit;
+            for d in 0..D_MODEL {
+                sum[d] += ctx[d];
+            }
+            n += 1;
+        }
+        self.crowd_ctx = if n == 0 {
+            Vec::new()
+        } else {
+            sum.iter().map(|s| s / n as f32).collect()
+        };
     }
 
     fn shapes_ok(&self) -> bool {
         let dd = D_MODEL * D_MODEL;
-        self.feature_weights.len() == N_FEAT_ROWS * D_MODEL
+        (self.crowd_ctx.is_empty() || self.crowd_ctx.len() == D_MODEL)
+            && self.feature_weights.len() == N_FEAT_ROWS * D_MODEL
             && self.feature_m.len() == N_FEAT_ROWS * D_MODEL
             && self.feature_v.len() == N_FEAT_ROWS * D_MODEL
             && self.feature_steps.len() == N_FEAT_ROWS
@@ -1936,6 +2003,8 @@ struct EvalItem {
 struct TrainingData {
     examples: Vec<TrainingExample>,
     holdouts: Vec<EvalItem>,
+    /// Per song: how many users liked it in the *training* data (held-out listens excluded).
+    server_pop: HashMap<u64, u32>,
 }
 
 struct NegSampler<'a> {
@@ -2060,13 +2129,16 @@ fn build_training_data(
     let mut examples = Vec::new();
     let mut holdouts = Vec::new();
     if table.len() < 4 {
-        return TrainingData { examples, holdouts };
+        return TrainingData { examples, holdouts, server_pop: HashMap::new() };
     }
     let mut rng = StdRng::seed_from_u64(seed);
     let sampler = NegSampler::new(table, users);
     let mut uids: Vec<i64> = users.keys().copied().collect();
     uids.sort();
-    let mut holdout_songs: HashMap<i64, u64> = HashMap::new();
+    // Songs held out per user: never used as a training positive for that user in any task
+    // (including later replays of the same song).
+    let mut holdout_songs: HashMap<i64, HashSet<u64>> = HashMap::new();
+    let no_holdouts: HashSet<u64> = HashSet::new();
 
     // Task 1: next positive listen given the listens before it (mirrors For You / Discover).
     for &uid in &uids {
@@ -2074,19 +2146,22 @@ fn build_training_data(
         let all_targets: Vec<usize> = (1..p.listens.len()).filter(|&i| is_positive_outcome(p.listens[i].1.outcome)).collect();
         let targets = &all_targets[all_targets.len().saturating_sub(80)..];
 
-        // Hold out the most recent listen of a track the user discovered by listening (not
+        // Hold out the most recent listens of tracks the user discovered by listening (not
         // starred / rated / playlisted, not heard earlier) to measure real generalization.
-        let holdout_at = if targets.len() >= 4 {
-            targets.iter().rev().copied().find(|&i| {
-                let s = table.song[p.listens[i].0];
-                i >= 3 && !p.explicit_songs.contains(&s) && !p.listens[..i].iter().any(|(j, _)| table.song[*j] == s)
-            })
-        } else {
-            None
-        };
-        if let Some(h) = holdout_at {
+        let max_holdouts = if targets.len() >= 4 { (targets.len() / 4).clamp(1, MAX_HOLDOUTS_PER_USER) } else { 0 };
+        let mut held: Vec<usize> = Vec::new();
+        for &i in targets.iter().rev() {
+            if held.len() >= max_holdouts {
+                break;
+            }
+            let s = table.song[p.listens[i].0];
+            if i >= 3 && !p.explicit_songs.contains(&s) && !p.listens[..i].iter().any(|(j, _)| table.song[*j] == s) {
+                held.push(i);
+            }
+        }
+        let held_songs: HashSet<u64> = held.iter().map(|&h| table.song[p.listens[h].0]).collect();
+        for &h in held.iter().rev() {
             let tgt = p.listens[h].0;
-            holdout_songs.insert(uid, table.song[tgt]);
             holdouts.push(EvalItem {
                 user_id: uid,
                 context: profile_sequence(p, table, h, Some(table.song[tgt]), MAX_SEQ_LEN - 1),
@@ -2095,11 +2170,11 @@ fn build_training_data(
         }
 
         for &i in targets {
-            if Some(i) == holdout_at {
-                continue;
-            }
             let (pos, ref l) = p.listens[i];
             let pos_song = table.song[pos];
+            if held_songs.contains(&pos_song) {
+                continue;
+            }
             let mut w = listen_target_weight(l.outcome).unwrap_or(1.0);
             if p.listens[..i].iter().any(|(j, _)| table.song[*j] == pos_song) {
                 // Repeat listens are real but trivially predictable; don't let them dominate.
@@ -2128,6 +2203,9 @@ fn build_training_data(
                 examples.push(TrainingExample { user_id: uid, context: ctx, positive: pos, negatives: negs, weight: w });
             }
         }
+        if !held_songs.is_empty() {
+            holdout_songs.insert(uid, held_songs);
+        }
     }
 
     // Task 2: manual playlist completion (mirrors Playlist DNA: history + seed tracks + name).
@@ -2141,9 +2219,13 @@ fn build_training_data(
         let mut holds: Vec<usize> = (0..pl.len()).collect();
         holds.shuffle(&mut rng);
         holds.truncate(12);
+        let held = holdout_songs.get(uid).unwrap_or(&no_holdouts);
         for h in holds {
             let pos = pl[h];
             let pos_song = table.song[pos];
+            if held.contains(&pos_song) {
+                continue;
+            }
             let mut w = 1.1f32;
             let mut ctx = Vec::new();
             if let Some(p) = users.get(uid) {
@@ -2177,7 +2259,14 @@ fn build_training_data(
     for &uid in &uids {
         let p = &users[&uid];
         let mut s = HashSet::new();
-        let positives: Vec<usize> = p.stars.iter().chain(&p.high_rated).copied().filter(|&i| s.insert(table.song[i])).collect();
+        let held = holdout_songs.get(&uid).unwrap_or(&no_holdouts);
+        let positives: Vec<usize> = p
+            .stars
+            .iter()
+            .chain(&p.high_rated)
+            .copied()
+            .filter(|&i| !held.contains(&table.song[i]) && s.insert(table.song[i]))
+            .collect();
         if positives.len() < 2 {
             continue;
         }
@@ -2206,8 +2295,8 @@ fn build_training_data(
     // logged-out use through the shared user-0 embedding).
     for &uid in &uids {
         let p = &users[&uid];
-        let hold = holdout_songs.get(&uid).copied();
-        let mut cands: Vec<usize> = p.pos_list.iter().copied().filter(|&i| Some(table.song[i]) != hold).collect();
+        let held = holdout_songs.get(&uid).unwrap_or(&no_holdouts);
+        let mut cands: Vec<usize> = p.pos_list.iter().copied().filter(|&i| !held.contains(&table.song[i])).collect();
         cands.shuffle(&mut rng);
         cands.truncate(6);
         for pos in cands {
@@ -2268,7 +2357,17 @@ fn build_training_data(
         ex.weight *= (12.0 / cnt).sqrt().clamp(0.35, 1.5);
     }
 
-    TrainingData { examples, holdouts }
+    let mut server_pop: HashMap<u64, u32> = HashMap::new();
+    for &uid in &uids {
+        let held = holdout_songs.get(&uid).unwrap_or(&no_holdouts);
+        for &s in &users[&uid].pos_songs {
+            if !held.contains(&s) {
+                *server_pop.entry(s).or_insert(0) += 1;
+            }
+        }
+    }
+
+    TrainingData { examples, holdouts, server_pop }
 }
 
 fn rank_of_first(scores: &[f32]) -> f32 {
@@ -2286,7 +2385,14 @@ fn rank_of_first(scores: &[f32]) -> f32 {
 
 /// Ranks each held-out listen against random unseen catalog tracks and compares the model
 /// with a popularity baseline and an artist/genre-overlap content baseline.
-fn evaluate(net: &TransformerNet, table: &CorpusTable, users: &HashMap<i64, UserPrep>, items: &[EvalItem], seed: u64) -> EvalReport {
+fn evaluate(
+    net: &TransformerNet,
+    table: &CorpusTable,
+    users: &HashMap<i64, UserPrep>,
+    items: &[EvalItem],
+    server_pop: &HashMap<u64, u32>,
+    seed: u64,
+) -> EvalReport {
     let mut rep = EvalReport {
         evaluated_at: Utc::now().timestamp(),
         ..Default::default()
@@ -2296,7 +2402,9 @@ fn evaluate(net: &TransformerNet, table: &CorpusTable, users: &HashMap<i64, User
     }
     let mut unit_cache: HashMap<usize, [f32; D_MODEL]> = HashMap::new();
     let (mut m_rr, mut m_hit, mut p_rr, mut c_rr, mut c_hit) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut s_rr = 0f64;
     let mut n = 0usize;
+    let mut eval_users: HashSet<i64> = HashSet::new();
     for (k, item) in items.iter().enumerate() {
         let mut rng = StdRng::seed_from_u64(seed ^ (k as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
         let seen = users.get(&item.user_id).map(|p| &p.seen_songs);
@@ -2318,7 +2426,8 @@ fn evaluate(net: &TransformerNet, table: &CorpusTable, users: &HashMap<i64, User
             continue;
         }
 
-        let ctx = net.forward_context(item.user_id, &item.context).ctx_unit;
+        // Score exactly as served: crowd taste removed according to the context's history size.
+        let ctx = net.personalize(&net.forward_context(item.user_id, &item.context).ctx_unit, item.context.len());
         let mut profile_rows: HashMap<usize, f32> = HashMap::new();
         for (feats, _, act) in &item.context {
             if *act == ACTION_SKIP || *act == ACTION_DISLIKE {
@@ -2336,6 +2445,7 @@ fn evaluate(net: &TransformerNet, table: &CorpusTable, users: &HashMap<i64, User
         let mut model_s = Vec::with_capacity(pool.len());
         let mut pop_s = Vec::with_capacity(pool.len());
         let mut content_s = Vec::with_capacity(pool.len());
+        let mut server_s = Vec::with_capacity(pool.len());
         for &i in &pool {
             let u = *unit_cache
                 .entry(i)
@@ -2354,23 +2464,32 @@ fn evaluate(net: &TransformerNet, table: &CorpusTable, users: &HashMap<i64, User
                 }
             }
             content_s.push(c + 0.01 * pop);
+            // Training-data likes only: the target is held out for this user so their own like
+            // isn't counted, and the pool's negatives exclude everything this user has heard.
+            let cnt = server_pop.get(&table.song[i]).copied().unwrap_or(0) as f32;
+            server_s.push(cnt + 0.01 * pop);
         }
         let mr = rank_of_first(&model_s);
         let pr = rank_of_first(&pop_s);
         let cr = rank_of_first(&content_s);
+        let sr = rank_of_first(&server_s);
         m_rr += 1.0 / mr as f64;
         p_rr += 1.0 / pr as f64;
         c_rr += 1.0 / cr as f64;
+        s_rr += 1.0 / sr as f64;
         m_hit += (mr <= 10.0) as u8 as f64;
         c_hit += (cr <= 10.0) as u8 as f64;
         n += 1;
+        eval_users.insert(item.user_id);
     }
     if n > 0 {
         let nf = n as f64;
         rep.n = n;
+        rep.users = eval_users.len();
         rep.model_mrr = (m_rr / nf) as f32;
         rep.model_recall10 = (m_hit / nf) as f32;
         rep.popularity_mrr = (p_rr / nf) as f32;
+        rep.server_pop_mrr = (s_rr / nf) as f32;
         rep.content_mrr = (c_rr / nf) as f32;
         rep.content_recall10 = (c_hit / nf) as f32;
         rep.compute_lift();
@@ -2459,12 +2578,15 @@ impl TransformerEngine {
             "stepsOnCurrentData": net.steps_on_fingerprint,
             "stepBudget": net.step_budget,
             "rejectedRuns": net.rejected_runs,
+            "crowdCorrection": net.crowd_ctx.len() == D_MODEL,
             "eval": {
                 "heldOutListens": ev.n,
+                "heldOutUsers": ev.users,
                 "trusted": ev.trusted(),
                 "modelMrr": r3(ev.model_mrr),
                 "modelRecall10": r3(ev.model_recall10),
                 "popularityMrr": r3(ev.popularity_mrr),
+                "serverPopularityMrr": r3(ev.server_pop_mrr),
                 "contentMrr": r3(ev.content_mrr),
                 "contentRecall10": r3(ev.content_recall10),
                 "lift": r3(ev.lift),
@@ -2660,6 +2782,7 @@ impl TransformerEngine {
             };
             seq_items = assemble_profile_sequence(history, stars, hist_cap);
         }
+        let personal_tokens = seq_items.len();
 
         for t in context_tracks.iter().take(MAX_SEED_TOKENS) {
             let (f, s) = TransformerNet::extract_track_features(t);
@@ -2673,7 +2796,7 @@ impl TransformerEngine {
             }
         }
 
-        let out = net.forward_context(user_id.max(0), &seq_items).ctx_unit;
+        let out = net.personalize(&net.forward_context(user_id.max(0), &seq_items).ctx_unit, personal_tokens);
         if !has_extra_ctx && user_id > 0 {
             if let Ok(mut cache) = self.user_vec_cache.write() {
                 cache.insert(user_id, (now, net.step_count, out));
@@ -2742,7 +2865,11 @@ impl TransformerEngine {
         // Fixed eval seed per data state so before/after numbers are comparable.
         let eval_seed = fnv1a_hash(fingerprint.as_bytes()) ^ 0x4556414c;
         let can_compare = net.step_count > 0 && data.holdouts.len() >= MIN_EVAL_ITEMS;
-        let before = can_compare.then(|| evaluate(&net, &table, &users, &data.holdouts, eval_seed));
+        if can_compare {
+            // Score the old weights against today's crowd so before/after compare like for like.
+            net.refresh_crowd(&table, &users);
+        }
+        let before = can_compare.then(|| evaluate(&net, &table, &users, &data.holdouts, &data.server_pop, eval_seed));
         let prev_net = can_compare.then(|| net.clone());
 
         let mut rng = StdRng::seed_from_u64(data_seed ^ 0x5348554646);
@@ -2761,8 +2888,9 @@ impl TransformerEngine {
             }
         }
         net.steps_on_fingerprint += steps_run as u64;
+        net.refresh_crowd(&table, &users);
 
-        let after = evaluate(&net, &table, &users, &data.holdouts, eval_seed);
+        let after = evaluate(&net, &table, &users, &data.holdouts, &data.server_pop, eval_seed);
         let rejected = match (&before, &prev_net) {
             (Some(b), Some(_)) => after.trusted() && after.model_mrr + 0.015 < b.model_mrr,
             _ => false,
@@ -2849,7 +2977,9 @@ fn distill_corpus_users(
         if seq.len() < 2 {
             continue;
         }
-        let ctx = net.forward_context(uid, &seq).ctx_unit;
+        // Same crowd correction as live scoring, so thin-history users don't get the server's
+        // favourites written into their taste links.
+        let ctx = net.personalize(&net.forward_context(uid, &seq).ctx_unit, seq.len());
         let disliked: HashSet<u64> = p.disliked.iter().map(|&i| table.song[i]).collect();
 
         let mut scored: Vec<(f64, usize)> = Vec::new();
@@ -3169,8 +3299,77 @@ mod tests {
                 }
             }
         }
-        assert_eq!(data.holdouts.len(), 1);
-        assert!(table.ids[data.holdouts[0].target].starts_with("rock"));
+        // 9 positive targets -> 2 held-out discoveries, never used as positives in any task.
+        assert_eq!(data.holdouts.len(), 2);
+        let held: HashSet<u64> = data.holdouts.iter().map(|h| table.song[h.target]).collect();
+        for h in &data.holdouts {
+            assert!(table.ids[h.target].starts_with("rock"));
+        }
+        for ex in data.examples.iter().filter(|e| e.user_id == u.id) {
+            assert!(!held.contains(&table.song[ex.positive]), "held-out song {} trained as a positive", table.ids[ex.positive]);
+        }
+        assert!(data.server_pop.keys().all(|s| !held.contains(s)), "held-out songs must not feed the server-popularity baseline");
+    }
+
+    #[test]
+    fn new_users_are_not_pushed_toward_the_crowds_favourites() {
+        let store = Store::open_memory().unwrap();
+        store.upsert_tracks(&genre_tracks()).unwrap();
+        // Four regulars all love rock0..rock2 (the server's crowd favourites), plus some variety.
+        let others = ["pop", "metal", "pop", "metal"];
+        for (k, other) in others.iter().enumerate() {
+            let u = store.create_user(&format!("regular{}", k), "pw123").unwrap();
+            for i in 0..3 {
+                listen(&store, u.id, &format!("rock{}", i), true);
+            }
+            for i in 0..5 {
+                listen(&store, u.id, &format!("{}{}", other, (i + k * 3) % 12), true);
+                listen(&store, u.id, &format!("rock{}", 3 + (i + k) % 9), true);
+            }
+        }
+        // A new user who has only played two jazz tracks.
+        let newbie = store.create_user("newbie", "pw123").unwrap();
+        listen(&store, newbie.id, "jazz0", true);
+        listen(&store, newbie.id, "jazz1", true);
+
+        let engine = TransformerEngine::load_or_new(&store);
+        for _ in 0..40 {
+            if engine.train_background_epoch(&store, 50, 16, false).skipped {
+                break;
+            }
+        }
+        assert!(engine.net.read().unwrap().crowd_ctx.len() == D_MODEL);
+
+        let all = genre_tracks();
+        let pick = |id: &str| all.iter().find(|t| t.id == id).unwrap().clone();
+        let cands = vec![pick("rock0"), pick("jazz5")];
+        let corrected = engine.score_candidates(&store, newbie.id, &[], None, &[], &[], &cands);
+
+        let saved = std::mem::take(&mut engine.net.write().unwrap().crowd_ctx);
+        engine.invalidate_user_cache(newbie.id);
+        let raw = engine.score_candidates(&store, newbie.id, &[], None, &[], &[], &cands);
+        engine.net.write().unwrap().crowd_ctx = saved;
+
+        assert!(
+            corrected[1] > corrected[0],
+            "new jazz listener should rank unheard jazz above the crowd's rock favourite: {:?}",
+            corrected
+        );
+        assert!(
+            corrected[0] - corrected[1] < raw[0] - raw[1],
+            "crowd correction must lower the crowd favourite relative to the personal match: raw={:?} corrected={:?}",
+            raw,
+            corrected
+        );
+    }
+
+    #[test]
+    fn crowd_correction_tapers_with_history() {
+        assert_eq!(crowd_alpha(0), 1.0);
+        assert_eq!(crowd_alpha(5), 1.0);
+        assert!(crowd_alpha(15) < 1.0 && crowd_alpha(15) > CROWD_MIN_ALPHA);
+        assert!((crowd_alpha(30) - CROWD_MIN_ALPHA).abs() < 1e-6);
+        assert!((crowd_alpha(500) - CROWD_MIN_ALPHA).abs() < 1e-6);
     }
 
     #[test]
