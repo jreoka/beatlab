@@ -5239,6 +5239,8 @@ pub struct ProfileUpdateReq {
     pub avatar_color: Option<String>,
     #[serde(default)]
     pub location: Option<String>,
+    #[serde(default, rename = "publicPage")]
+    pub public_page: Option<bool>,
 }
 
 fn public_user_json(u: &PublicUser) -> Value {
@@ -5272,6 +5274,7 @@ fn profile_json(p: &UserProfile) -> Value {
         "avatarColor": p.avatar_color,
         "location": p.location,
         "updated": p.updated,
+        "publicPage": p.public_page,
     })
 }
 
@@ -5359,6 +5362,11 @@ pub async fn social_update_profile(
     let bio = req.bio.unwrap_or(current.bio);
     let avatar_color = req.avatar_color.unwrap_or(current.avatar_color);
     let location = req.location.unwrap_or(current.location);
+    if let Some(enabled) = req.public_page {
+        if let Err(e) = state.store.set_public_page(user.id, enabled) {
+            return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+    }
     match state
         .store
         .update_profile(user.id, &display_name, &bio, &avatar_color, &location)
@@ -5535,6 +5543,183 @@ pub async fn social_profile(
         "radioSaved": radio_saved,
         "playlists": playlists,
     }))
+}
+
+/// Rendered public profile pages are cached briefly so anonymous traffic can't
+/// force the stats computation on every hit. The public-page opt-out is
+/// checked *before* the cache, so switching it off takes effect immediately;
+/// other profile edits show up within the TTL.
+const PUBLIC_PROFILE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const PUBLIC_PROFILE_CACHE_MAX: usize = 512;
+
+fn public_profile_cache() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, String)>> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, String)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+#[derive(Deserialize)]
+pub struct PublicProfileQuery {
+    pub range: Option<String>,
+}
+
+/// `/u/{username}` — public profile overview.
+pub async fn public_profile_page(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Query(q): Query<PublicProfileQuery>,
+    headers: HeaderMap,
+) -> Response {
+    render_public_profile(&state, &headers, &reference, None, q.range.as_deref()).await
+}
+
+/// `/u/{username}/{tab}` — stats, playlists, followers or following.
+pub async fn public_profile_tab_page(
+    State(state): State<AppState>,
+    Path((reference, tab)): Path<(String, String)>,
+    Query(q): Query<PublicProfileQuery>,
+    headers: HeaderMap,
+) -> Response {
+    render_public_profile(&state, &headers, &reference, Some(&tab), q.range.as_deref()).await
+}
+
+/// Public, sign-in-free profile pages. They show the same privacy-safe data
+/// the in-app profile exposes to any signed-in user, plus Open Graph meta so
+/// links unfurl in chat apps.
+async fn render_public_profile(
+    state: &AppState,
+    headers: &HeaderMap,
+    reference: &str,
+    tab_slug: Option<&str>,
+    range: Option<&str>,
+) -> Response {
+    use crate::profile_page::{ProfileBody, ProfileTab};
+    let html_response = |status: StatusCode, html: String| {
+        (
+            status,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            html,
+        )
+            .into_response()
+    };
+    let not_found =
+        || html_response(StatusCode::NOT_FOUND, crate::profile_page::render_profile_not_found_html());
+
+    let Some(tab) = ProfileTab::from_slug(tab_slug) else {
+        return not_found();
+    };
+    // Usernames only — numeric ids are not accepted on public URLs.
+    let name = reference.trim().trim_start_matches('@');
+    let Some(account) = state.store.get_user_by_name(name).ok().flatten() else {
+        return not_found();
+    };
+    // Viewer id 0 = anonymous; accounts pending deletion are excluded.
+    let Some(target) = state.store.get_public_user(account.id, 0).ok().flatten() else {
+        return not_found();
+    };
+    // Users who switched their public page off look exactly like a missing
+    // account, so the link doesn't confirm the username exists.
+    if !state.store.get_profile(target.id).map(|p| p.public_page).unwrap_or(false) {
+        return not_found();
+    }
+
+    let stats_range = crate::stats::StatsRange::from_str(range);
+    let origin = request_origin(headers);
+    let cache_key = format!("{}|{}|{}|{}", origin, target.id, tab.slug(), stats_range.key());
+    if let Ok(cache) = public_profile_cache().lock() {
+        if let Some((at, html)) = cache.get(&cache_key) {
+            if at.elapsed() < PUBLIC_PROFILE_CACHE_TTL {
+                return html_response(StatusCode::OK, html.clone());
+            }
+        }
+    }
+
+    let target_user = User {
+        id: target.id,
+        username: target.username.clone(),
+        password: String::new(),
+        created: target.created,
+    };
+    let public_playlists = |limit: usize| -> Vec<Playlist> {
+        state
+            .store
+            .list_playlists(target.id, true)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.user_id == target.id && p.public && !p.is_auto)
+            .take(limit)
+            .collect()
+    };
+    // Only list people who have a public page themselves; the rest are counted.
+    let visible_people = |users: Vec<PublicUser>| -> (Vec<PublicUser>, usize) {
+        let total = users.len();
+        let shown: Vec<PublicUser> = users
+            .into_iter()
+            .filter(|u| state.store.get_profile(u.id).map(|p| p.public_page).unwrap_or(false))
+            .take(200)
+            .collect();
+        let hidden = total.saturating_sub(shown.len());
+        (shown, hidden)
+    };
+    let now = Utc::now().timestamp();
+    let store = state.store.clone();
+
+    let html = match tab {
+        ProfileTab::Overview => {
+            let stats = tokio::task::spawn_blocking(move || {
+                crate::stats::build_public_stats(&store, &target_user, now)
+            })
+            .await
+            .unwrap_or_default();
+            let playlists = public_playlists(12);
+            crate::profile_page::render_profile_page(
+                &origin,
+                &target,
+                &ProfileBody::Overview { stats: &stats, playlists: &playlists },
+            )
+        }
+        ProfileTab::Stats => {
+            let Ok(stats) = tokio::task::spawn_blocking(move || {
+                crate::stats::build_public_range_stats(&store, &target_user, stats_range, now)
+            })
+            .await
+            else {
+                return html_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to compute stats".to_string(),
+                );
+            };
+            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Stats(&stats))
+        }
+        ProfileTab::Playlists => {
+            let playlists = public_playlists(100);
+            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Playlists(&playlists))
+        }
+        ProfileTab::Followers => {
+            let (users, hidden) =
+                visible_people(state.store.list_followers(target.id, 0).unwrap_or_default());
+            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Followers(&users, hidden))
+        }
+        ProfileTab::Following => {
+            let (users, hidden) =
+                visible_people(state.store.list_following(target.id, 0).unwrap_or_default());
+            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Following(&users, hidden))
+        }
+    };
+
+    if let Ok(mut cache) = public_profile_cache().lock() {
+        if cache.len() >= PUBLIC_PROFILE_CACHE_MAX {
+            cache.retain(|_, (at, _)| at.elapsed() < PUBLIC_PROFILE_CACHE_TTL);
+            if cache.len() >= PUBLIC_PROFILE_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(cache_key, (std::time::Instant::now(), html.clone()));
+    }
+    html_response(StatusCode::OK, html)
 }
 
 pub async fn social_follow(

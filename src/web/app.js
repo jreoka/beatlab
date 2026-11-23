@@ -2240,8 +2240,10 @@
     if (hash === 'home') return renderHome();
     if (hash === 'explore') return renderExplore();
     if (hash === 'community') return renderCommunity();
-    if (hash === 'profile') return renderProfileView('me');
-    if (hash.startsWith('user/')) return renderProfileView(safeDecodeUri(hash.slice(5)));
+    if (hash === 'profile' || hash.startsWith('profile/') || hash.startsWith('user/')) {
+      const { reference, tab } = parseProfileHash(hash);
+      return renderProfileView(reference, tab);
+    }
     if (hash.startsWith('explore-mix/')) return renderExploreMix(safeDecodeUri(hash.slice(12)));
     if (hash === 'mix' || hash.startsWith('mix?')) {
       const qIdx = hash.indexOf('?');
@@ -7556,17 +7558,84 @@
     navigate(`user/${encodeURIComponent(reference)}`);
   }
 
+  function shareProfile(username) {
+    if (!username) return;
+    haptic('success');
+    const data = state.social.profileData;
+    const u = data && data.user && data.user.username === username ? data.user : { username };
+    const isSelf = !!(data && data.isSelf && data.user && data.user.username === username);
+    // Share the section being viewed when it has a public counterpart
+    // (there's no public Radio page, so that falls back to the overview).
+    const publicTab = data && data.user && data.user.username === username && ['stats', 'playlists', 'followers', 'following'].includes(data.tab)
+      ? `/${data.tab}`
+      : '';
+    const url = `${location.origin}/u/${encodeURIComponent(username)}${publicTab}`;
+    state.currentShareUrl = url;
+    const nativeShareBtn =
+      typeof navigator.share === 'function'
+        ? `<button class="btn-secondary" onclick="App.nativeShareCurrent()">Share via Device</button>`
+        : '';
+    openModal(`
+      <div class="modal-head">
+        <h3>Share ${isSelf ? 'your profile' : 'profile'}</h3>
+        <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+      </div>
+      <div class="share-preview-card">
+        <div class="profile-avatar" style="width:64px;height:64px;font-size:26px;flex-shrink:0;background:${esc(u.avatarColor || '#1ed760')}">${avatarInner(u)}</div>
+        <div class="share-preview-meta">
+          <span class="share-kind-pill">PUBLIC PROFILE LINK</span>
+          <div class="share-preview-title">${esc(u.displayName || u.username)}</div>
+          <div class="share-preview-sub">@${esc(u.username)}</div>
+        </div>
+      </div>
+      <div class="share-url-row">
+        <input id="share-url-input" type="text" readonly value="${esc(url)}" onclick="this.select()" />
+        <button class="btn-primary" onclick="App.copyText(document.getElementById('share-url-input').value, 'Profile link copied!')">Copy Link</button>
+      </div>
+      <div class="share-modal-note">Anyone with this link can view the public profile — no sign-in needed. It has tabs for stats, public playlists, followers and following.</div>
+      <div class="share-modal-actions">
+        <a class="btn-secondary" href="${esc(url)}" target="_blank" rel="noopener">Open Public Page ↗</a>
+        ${nativeShareBtn}
+      </div>
+    `);
+  }
+
   function openMyProfile() {
     closeUserMenu();
     navigate('profile');
   }
 
-  function setProfileTab(tab) {
+  const PROFILE_TABS = ['stats', 'radio', 'playlists', 'followers', 'following'];
+
+  // `profile[/tab]` and `user/<ref>[/tab]` → { reference, tab }.
+  function parseProfileHash(hash) {
+    if (hash === 'profile' || hash.startsWith('profile/')) {
+      const tab = hash.slice('profile/'.length);
+      return { reference: 'me', tab: PROFILE_TABS.includes(tab) ? tab : '' };
+    }
+    const [refEnc = '', tab = ''] = hash.slice('user/'.length).split('/');
+    return { reference: safeDecodeUri(refEnc), tab: PROFILE_TABS.includes(tab) ? tab : '' };
+  }
+
+  // Keeps the address bar in sync with the open tab so it can be bookmarked,
+  // shared and walked with back/forward. pushState doesn't fire `hashchange`,
+  // so this never triggers a re-render by itself.
+  function syncProfileTabUrl(data, tab) {
+    const current = location.hash.replace(/^#/, '');
+    const base = current === 'profile' || current.startsWith('profile/')
+      ? 'profile'
+      : `user/${encodeURIComponent(data.user.username)}`;
+    const next = `${base}/${tab}`;
+    if (current !== next) history.pushState(null, '', `#${next}`);
+  }
+
+  function setProfileTab(tab, { updateUrl = true } = {}) {
     haptic('tap');
     state.social.profileTab = tab;
     const data = state.social.profileData;
     if (!data) return;
     data.tab = tab;
+    if (updateUrl) syncProfileTabUrl(data, tab);
     const body = $('profile-tab-body');
     if (body) {
       body.innerHTML = renderProfileTabBody(data);
@@ -7660,7 +7729,24 @@
       : emptyState(tab === 'following' ? 'Not following anyone' : 'No followers yet', tab === 'following' ? 'Find people with @mentions in the search bar.' : 'Share your profile to gain followers.');
   }
 
-  async function renderProfileView(reference) {
+  async function renderProfileView(reference, tab = '') {
+    // A bare profile URL means the default tab.
+    tab = tab || 'stats';
+    // Back/forward between tabs of the profile already on screen: just swap
+    // the tab body instead of refetching everything. Re-opening the tab that's
+    // already showing still does a full refresh.
+    const current = state.social.profileData;
+    if (
+      current &&
+      current.tab !== tab &&
+      $('profile-tab-body') &&
+      (reference === 'me'
+        ? current.isSelf
+        : String(reference).toLowerCase() === String(current.user.username).toLowerCase())
+    ) {
+      setProfileTab(tab, { updateUrl: false });
+      return;
+    }
     const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading profile...');
     const selfRef = reference === 'me';
@@ -7686,6 +7772,7 @@
         state.social.profileTab = defaultTab;
         state.social.profileStatsRange = 'all';
       }
+      state.social.profileTab = tab;
       // Re-opening a profile always fetches fresh stats.
       state.social.profileStatsData = null;
       state.social.profileStatsKey = '';
@@ -7732,6 +7819,7 @@
             ${isSelf
               ? `<button class="btn-secondary" onclick="App.openProfileEditor()">✎ Edit profile</button>`
               : `<button class="btn-follow ${u.isFollowing ? 'following' : ''}" data-follow-ref="${esc(u.username)}" onclick="App.toggleFollowUser(${esc(JSON.stringify(u.username))}, ${!u.isFollowing})">${u.isFollowing ? '✓ Following' : '+ Follow'}</button>`}
+            ${data.profile.publicPage !== false ? `<button class="btn-secondary" onclick="App.shareProfile(${esc(JSON.stringify(u.username))})">🔗 Share profile</button>` : ''}
           </div>
         </div>
       </div>
@@ -7936,6 +8024,12 @@
           ${SOCIAL_COLORS.map((c) => `<button type="button" class="social-color-swatch ${c === state.social.editColor ? 'selected' : ''}" style="background:${c}" onclick="App.pickProfileColor('${c}')" title="${c}"></button>`).join('')}
         </div>
       </div>
+      <div class="social-edit-row">
+        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+          <input type="checkbox" id="prof-public-page" style="width:auto;margin-top:3px" ${p.publicPage !== false ? 'checked' : ''} />
+          <span>Public profile link<br><small style="opacity:.7;font-weight:400">Let anyone with your link (${esc(location.origin)}/u/${esc(state.user.username)}) see your profile without signing in. Turning this off doesn't affect your profile inside Beatlab.</small></span>
+        </label>
+      </div>
       <button class="btn-primary" style="width:100%;margin-top:6px" onclick="App.submitProfileUpdate(event)">Save profile</button>
     `);
   }
@@ -7970,6 +8064,7 @@
           bio: $('prof-bio')?.value || '',
           location: $('prof-location')?.value || '',
           avatarColor: state.social.editColor || '',
+          publicPage: !!$('prof-public-page')?.checked,
         }),
       });
       if (typeof res.user?.avatarUrl === 'string') state.user.avatarUrl = res.user.avatarUrl;
@@ -8085,6 +8180,7 @@
     // Social
     openUserProfile,
     openMyProfile,
+    shareProfile,
     setProfileTab,
     toggleFollowUser,
     playUserRadio,

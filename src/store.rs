@@ -464,6 +464,7 @@ impl Store {
                 avatar BLOB,
                 avatar_mime TEXT NOT NULL DEFAULT '',
                 avatar_version INTEGER NOT NULL DEFAULT 0,
+                public_page INTEGER NOT NULL DEFAULT 1,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
@@ -515,6 +516,7 @@ impl Store {
         ensure_column(&conn, "user_profiles", "avatar", "BLOB")?;
         ensure_column(&conn, "user_profiles", "avatar_mime", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "user_profiles", "avatar_version", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "user_profiles", "public_page", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "sessions", "user_agent", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "sessions", "ip", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "sessions", "client", "TEXT NOT NULL DEFAULT ''")?;
@@ -1595,7 +1597,7 @@ impl Store {
         let conn = self.lock();
         let profile = conn
             .query_row(
-                "SELECT user_id, display_name, bio, avatar_color, location, updated
+                "SELECT user_id, display_name, bio, avatar_color, location, updated, public_page
                  FROM user_profiles WHERE user_id = ?1",
                 params![user_id],
                 |r| {
@@ -1606,6 +1608,7 @@ impl Store {
                         avatar_color: r.get(3)?,
                         location: r.get(4)?,
                         updated: r.get(5)?,
+                        public_page: r.get::<_, i64>(6)? != 0,
                     })
                 },
             )
@@ -1648,6 +1651,11 @@ impl Store {
                  updated = excluded.updated",
             params![user_id, display_name, bio, avatar_color, location, now],
         )?;
+        let public_page: i64 = conn.query_row(
+            "SELECT public_page FROM user_profiles WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )?;
         Ok(UserProfile {
             user_id,
             display_name,
@@ -1655,7 +1663,21 @@ impl Store {
             avatar_color,
             location,
             updated: now,
+            public_page: public_page != 0,
         })
+    }
+
+    /// Turns the user's sign-in-free `/u/{username}` page on or off. The row is
+    /// created with defaults if the user has never edited their profile.
+    pub fn set_public_page(&self, user_id: i64, enabled: bool) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO user_profiles(user_id, updated, public_page)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET public_page = excluded.public_page",
+            params![user_id, Utc::now().timestamp(), enabled as i64],
+        )?;
+        Ok(())
     }
 
     /// Stores (or replaces) the user's uploaded profile picture. The row is
@@ -6715,6 +6737,16 @@ mod tests {
             .unwrap();
         assert_eq!(profile.display_name, "Emily C");
         assert_eq!(store.get_profile(emily.id).unwrap().bio, "Synth-pop obsessive");
+        // Public page is on by default, can be switched off, and survives profile edits.
+        assert!(store.get_profile(emily.id).unwrap().public_page);
+        store.set_public_page(emily.id, false).unwrap();
+        assert!(!store.get_profile(emily.id).unwrap().public_page);
+        let edited = store
+            .update_profile(emily.id, "Emily C", "Synth-pop obsessive", "#8b5cf6", "Brooklyn")
+            .unwrap();
+        assert!(!edited.public_page);
+        store.set_public_page(emily.id, true).unwrap();
+        assert!(store.get_profile(emily.id).unwrap().public_page);
 
         // @mention-style search matches username, display name and bio
         let by_handle = store.search_public_users("@em", alex.id, 10).unwrap();

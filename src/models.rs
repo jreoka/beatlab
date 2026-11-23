@@ -45,6 +45,8 @@ pub struct UserProfile {
     pub avatar_color: String,
     pub location: String,
     pub updated: i64,
+    /// Whether the sign-in-free page at `/u/{username}` is enabled.
+    pub public_page: bool,
 }
 
 impl Default for UserProfile {
@@ -56,6 +58,7 @@ impl Default for UserProfile {
             avatar_color: String::new(),
             location: String::new(),
             updated: 0,
+            public_page: true,
         }
     }
 }

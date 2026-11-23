@@ -3,6 +3,7 @@ mod auth;
 mod engine;
 mod models;
 mod navidrome;
+mod profile_page;
 mod remote_cache;
 mod share_page;
 mod sources;
@@ -317,6 +318,9 @@ async fn main() -> models::AppResult<()> {
             post(webapp::social_save_user_radio).delete(webapp::social_unsave_user_radio),
         )
         .route("/api/web/social/feed", get(webapp::social_feed))
+        // Public, sign-in-free profile pages (shareable /u/{username} links)
+        .route("/u/{user}", get(webapp::public_profile_page))
+        .route("/u/{user}/{tab}", get(webapp::public_profile_tab_page))
         // Public Share Pages & Discord-Compatible Embed Endpoints
         .route("/s/{id}", get(webapp::public_share_page))
         .route("/s/{id}/embed", get(webapp::public_share_embed_page))

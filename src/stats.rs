@@ -415,6 +415,113 @@ pub fn build_public_stats(store: &Store, user: &User, now_ts: i64) -> PublicStat
     }
 }
 
+/// Name + count + share of total, used for the ranked lists on the public
+/// stats page (artists, genres, moods, decades).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicShare {
+    pub name: String,
+    pub streams: usize,
+    /// 0–100.
+    pub pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTopAlbum {
+    pub name: String,
+    pub artist: String,
+    pub streams: usize,
+}
+
+/// Fuller, range-aware listening stats for the sign-in-free `/u/{user}/stats`
+/// page. Like [`PublicStats`] this only carries aggregates and top-item names:
+/// no timestamps, time-of-day / weekday patterns, heatmaps, current streak,
+/// skips, hidden tracks or recent activity, so it can't reveal someone's
+/// daily routine.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicRangeStats {
+    pub range_key: &'static str,
+    pub range_label: &'static str,
+    pub total_streams: usize,
+    pub total_listening_secs: i64,
+    pub unique_tracks: usize,
+    pub unique_artists: usize,
+    pub unique_albums: usize,
+    pub active_days: usize,
+    pub new_artists_discovered: usize,
+    pub longest_streak: usize,
+    pub top_tracks: Vec<PublicTopTrack>,
+    pub top_artists: Vec<PublicShare>,
+    pub top_albums: Vec<PublicTopAlbum>,
+    pub genres: Vec<PublicShare>,
+    pub moods: Vec<PublicShare>,
+    pub decades: Vec<PublicShare>,
+}
+
+pub fn build_public_range_stats(
+    store: &Store,
+    user: &User,
+    range: StatsRange,
+    now_ts: i64,
+) -> PublicRangeStats {
+    let c = build_user_stats(store, user, range, 0, now_ts);
+    PublicRangeStats {
+        range_key: range.key(),
+        range_label: range.label(),
+        total_streams: c.summary.total_streams,
+        total_listening_secs: c.summary.total_listening_secs,
+        unique_tracks: c.summary.unique_tracks,
+        unique_artists: c.summary.unique_artists,
+        unique_albums: c.summary.unique_albums,
+        active_days: c.summary.active_days,
+        new_artists_discovered: c.summary.new_artists_discovered,
+        longest_streak: c.streaks.longest_days,
+        top_tracks: c
+            .top_tracks
+            .into_iter()
+            .take(10)
+            .map(|t| PublicTopTrack {
+                title: t.track.title,
+                artist: t.track.artist,
+                streams: t.streams,
+            })
+            .collect(),
+        top_artists: c
+            .top_artists
+            .into_iter()
+            .take(10)
+            .map(|a| PublicShare { name: a.name, streams: a.streams, pct: a.pct })
+            .collect(),
+        top_albums: c
+            .top_albums
+            .into_iter()
+            .take(10)
+            .map(|a| PublicTopAlbum { name: a.name, artist: a.artist, streams: a.streams })
+            .collect(),
+        genres: c
+            .genres
+            .into_iter()
+            .take(8)
+            .map(|g| PublicShare { name: g.name, streams: g.streams, pct: g.pct })
+            .collect(),
+        moods: c
+            .moods
+            .into_iter()
+            .filter(|m| m.streams > 0)
+            .take(6)
+            .map(|m| PublicShare { name: m.label, streams: m.streams, pct: m.pct })
+            .collect(),
+        decades: c
+            .decades
+            .into_iter()
+            .filter(|d| d.streams > 0)
+            .map(|d| PublicShare { name: d.label, streams: d.streams, pct: d.pct })
+            .collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compute_stats_from_data(
     user: &User,
