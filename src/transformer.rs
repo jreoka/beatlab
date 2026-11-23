@@ -21,28 +21,54 @@ pub const N_LAYERS: usize = 2;
 pub const MAX_SEQ_LEN: usize = 32;
 pub const N_ACTION_TYPES: usize = 8;
 
-const TRACK_ID_OFFSET: usize = 0;
-const N_TRACK_BUCKETS: usize = 2048;
-const SONG_KEY_OFFSET: usize = TRACK_ID_OFFSET + N_TRACK_BUCKETS;
-const N_SONG_KEY_BUCKETS: usize = 1024;
-const ARTIST_OFFSET: usize = SONG_KEY_OFFSET + N_SONG_KEY_BUCKETS;
-const N_ARTIST_BUCKETS: usize = 1024;
+// Shared hashed feature rows (content features that generalise across songs).
+const ARTIST_OFFSET: usize = 0;
+const N_ARTIST_BUCKETS: usize = 4096;
 const TEXT_OFFSET: usize = ARTIST_OFFSET + N_ARTIST_BUCKETS;
-const N_TEXT_BUCKETS: usize = 1024;
+const N_TEXT_BUCKETS: usize = 2048;
 const GENRE_OFFSET: usize = TEXT_OFFSET + N_TEXT_BUCKETS;
 const N_GENRE_BUCKETS: usize = 256;
 const MOOD_OFFSET: usize = GENRE_OFFSET + N_GENRE_BUCKETS;
 const N_MOOD_BUCKETS: usize = 16;
 const ERA_OFFSET: usize = MOOD_OFFSET + N_MOOD_BUCKETS;
 const N_ERA_BUCKETS: usize = 16;
-pub const N_FEAT_ROWS: usize = ERA_OFFSET + N_ERA_BUCKETS; // 5408
+pub const N_FEAT_ROWS: usize = ERA_OFFSET + N_ERA_BUCKETS; // 6432
+
+// Song identity is an exact per-song embedding (keyed by the song-key hash), not a hashed
+// bucket shared with unrelated songs. It rides in the same sparse feature list, tagged with
+// the top bit so it can't be confused with a shared row index.
+const _: () = assert!(usize::BITS == 64, "song identity features need 64-bit usize");
+const SONG_FEAT_FLAG: usize = 1 << 63;
+/// Weight of the song-identity embedding in a track's feature sum.
+const SONG_EMB_WEIGHT: f32 = 1.0;
+/// Upper bound on stored song embeddings; beyond it, songs absent from the current corpus are dropped.
+const MAX_SONG_EMBS: usize = 30_000;
+
+/// Canonical song-embedding key: the song-key hash without the flag bit. Every lookup,
+/// insert and membership test must go through this so keys always agree.
+#[inline]
+fn song_id(song_hash: u64) -> u64 {
+    song_hash & !(SONG_FEAT_FLAG as u64)
+}
+
+#[inline]
+fn song_feat(song_hash: u64) -> usize {
+    SONG_FEAT_FLAG | song_id(song_hash) as usize
+}
+
+/// The song key carried by a song-identity feature, or `None` for a shared row.
+#[inline]
+fn as_song_feat(row: usize) -> Option<u64> {
+    (row & SONG_FEAT_FLAG != 0).then_some((row & !SONG_FEAT_FLAG) as u64)
+}
 
 const ROPE_BASE: f32 = 10000.0;
 const XSA_EPS: f32 = 1e-6;
 const RMS_EPS: f32 = 1e-5;
-const CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v2";
-/// v1 checkpoints were trained on raw play/complete event pairs (label leakage) and are discarded.
-const LEGACY_CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v1";
+const CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v3";
+/// Discarded on startup: v1 learned a label-leakage shortcut; v2 used hashed track-ID buckets
+/// shared between unrelated songs (replaced by exact per-song embeddings in v3).
+const LEGACY_CHECKPOINT_KV_KEYS: [&str; 2] = ["transformer:checkpoint_v1", "transformer:checkpoint_v2"];
 
 pub const ACTION_STAR: usize = 0;
 pub const ACTION_PLAYLIST: usize = 1;
@@ -820,6 +846,15 @@ struct SparseAdamRow {
 }
 
 impl SparseAdamRow {
+    fn zeros() -> Self {
+        Self {
+            w: vec![0.0; D_MODEL],
+            m: vec![0.0; D_MODEL],
+            v: vec![0.0; D_MODEL],
+            step: 0,
+        }
+    }
+
     fn from_seed(seed: u64, scale: f32) -> Self {
         let mut w = vec![0.0f32; D_MODEL];
         for d in 0..D_MODEL {
@@ -936,6 +971,10 @@ pub struct TransformerNet {
     feature_v: Vec<f32>,
     feature_steps: Vec<u32>,
     user_embs: HashMap<i64, SparseAdamRow>,
+    /// Exact per-song identity embeddings (key = song-key hash), only for songs someone has
+    /// interacted with. Missing = zero vector, so unseen songs rely on content features.
+    #[serde(default)]
+    song_embs: HashMap<u64, SparseAdamRow>,
     action_emb: AdamArray,
     scalar_proj: AdamArray,
     blocks: Vec<TransformerBlock>,
@@ -996,6 +1035,7 @@ impl TransformerNet {
             feature_v: vec![0.0; N_FEAT_ROWS * D_MODEL],
             feature_steps: vec![0; N_FEAT_ROWS],
             user_embs: HashMap::new(),
+            song_embs: HashMap::new(),
             action_emb: AdamArray::new_init(N_ACTION_TYPES * D_MODEL, 0x1111_2222, emb_scale),
             scalar_proj: AdamArray::new_init(4 * D_MODEL, 0x3333_4444, 0.08),
             blocks,
@@ -1068,6 +1108,7 @@ impl TransformerNet {
             && self.ctx_proj_w.shape_ok(dd)
             && self.track_proj_w.shape_ok(dd)
             && self.user_embs.values().all(|r| r.w.len() == D_MODEL && r.m.len() == D_MODEL && r.v.len() == D_MODEL)
+            && self.song_embs.values().all(|r| r.w.len() == D_MODEL && r.m.len() == D_MODEL && r.v.len() == D_MODEL)
             && self.blocks.len() == N_LAYERS
             && self.blocks.iter().all(|b| {
                 b.rms1_g.shape_ok(D_MODEL)
@@ -1110,12 +1151,9 @@ impl TransformerNet {
     pub fn extract_track_features(t: &Track) -> (Vec<(usize, f32)>, [f32; 4]) {
         let mut feats = Vec::with_capacity(20);
 
-        let id_b = (fnv1a_hash(t.id.as_bytes()) as usize) % N_TRACK_BUCKETS;
-        feats.push((TRACK_ID_OFFSET + id_b, 0.55));
-
-        let sk = t.song_key();
-        let sk_b = (fnv1a_hash(sk.as_bytes()) as usize) % N_SONG_KEY_BUCKETS;
-        feats.push((SONG_KEY_OFFSET + sk_b, 0.60));
+        // Exact song identity (different releases of one song share it). Zero until the song
+        // has been interacted with and trained; content features below carry everything else.
+        feats.push((song_feat(fnv1a_hash(t.song_key().as_bytes())), SONG_EMB_WEIGHT));
 
         let pa = slug(&primary_artist(&t.artist));
         if !pa.is_empty() && pa != "unknown-artist" {
@@ -1267,6 +1305,14 @@ impl TransformerNet {
     fn sum_sparse_features(&self, feats: &[(usize, f32)], scalars: Option<[f32; 4]>) -> [f32; D_MODEL] {
         let mut out = [0.0f32; D_MODEL];
         for &(row, w) in feats {
+            if let Some(song) = as_song_feat(row) {
+                if let Some(e) = self.song_embs.get(&song) {
+                    for d in 0..D_MODEL {
+                        out[d] += e.w[d] * w;
+                    }
+                }
+                continue;
+            }
             let base = row * D_MODEL;
             let row_slice = &self.feature_weights[base..base + D_MODEL];
             for d in 0..D_MODEL {
@@ -1542,6 +1588,9 @@ impl TransformerNet {
             accumulate_sparse_feature_grad(&table.feats[ti], Some(table.scalars[ti]), &g_raw, &mut g_feats, &mut g_scalar);
         }
 
+        // Song identities that won't be stored must not eat into the clipping budget.
+        g_feats.retain(|row, _| as_song_feat(*row).map_or(true, |s| table.identity.contains(&s)));
+
         // Global gradient norm clipping (max_norm = 1.0)
         let mut sq_norm = 0.0f32;
         for bg in &block_grads {
@@ -1597,6 +1646,14 @@ impl TransformerNet {
         let b2 = 0.999f32;
         let eps = 1e-8f32;
         for (row, g_row) in g_feats {
+            if let Some(song) = as_song_feat(row) {
+                // Only songs someone interacted with get an identity; random catalog negatives
+                // don't, so the table stays small and unheard songs stay purely content-based.
+                if table.identity.contains(&song) {
+                    self.song_embs.entry(song).or_insert_with(SparseAdamRow::zeros).step_adamw(&g_row, lr, wd);
+                }
+                continue;
+            }
             self.feature_steps[row] = self.feature_steps[row].saturating_add(1);
             let s = self.feature_steps[row] as i32;
             let bc1 = 1.0 - b1.powi(s);
@@ -1822,6 +1879,9 @@ struct CorpusTable {
     artist: Vec<u64>,
     genres: Vec<Vec<u64>>,
     index: HashMap<String, usize>,
+    /// Songs someone has interacted with (events, stars, ratings, dislikes, playlists): the
+    /// only songs that get an exact identity embedding.
+    identity: HashSet<u64>,
 }
 
 impl CorpusTable {
@@ -1837,6 +1897,7 @@ impl CorpusTable {
             artist: Vec::with_capacity(n),
             genres: Vec::with_capacity(n),
             index: HashMap::with_capacity(n),
+            identity: HashSet::new(),
         };
         for id in ids {
             let t = &corpus.tracks[id];
@@ -1853,6 +1914,19 @@ impl CorpusTable {
                 fnv1a_hash(pa.as_bytes())
             });
             tbl.genres.push(genre_hashes(&t.genre));
+        }
+        let interacted = corpus
+            .user_events
+            .values()
+            .flat_map(|evs| evs.iter().map(|(id, _, _, _)| id))
+            .chain(corpus.user_stars.values().flatten())
+            .chain(corpus.user_ratings.values().flat_map(|rs| rs.iter().map(|(id, _)| id)))
+            .chain(corpus.user_disliked.values().flatten())
+            .chain(corpus.playlists.iter().flat_map(|(_, _, ids)| ids.iter()));
+        for id in interacted {
+            if let Some(i) = tbl.index.get(id) {
+                tbl.identity.insert(song_id(tbl.song[*i]));
+            }
         }
         tbl
     }
@@ -2539,8 +2613,10 @@ impl TransformerEngine {
             }),
             None => TransformerNet::new(),
         };
-        // v1 weights learned a label-leakage shortcut; free the space and retrain from scratch.
-        store.kv_delete(LEGACY_CHECKPOINT_KV_KEY);
+        // Older formats are incompatible; free the space and retrain from scratch.
+        for key in LEGACY_CHECKPOINT_KV_KEYS {
+            store.kv_delete(key);
+        }
         Self {
             net: RwLock::new(net),
             user_vec_cache: RwLock::new(HashMap::new()),
@@ -2888,6 +2964,9 @@ impl TransformerEngine {
             }
         }
         net.steps_on_fingerprint += steps_run as u64;
+        if net.song_embs.len() > MAX_SONG_EMBS {
+            net.song_embs.retain(|s, _| table.identity.contains(s));
+        }
         net.refresh_crowd(&table, &users);
 
         let after = evaluate(&net, &table, &users, &data.holdouts, &data.server_pop, eval_seed);
@@ -3118,6 +3197,8 @@ mod tests {
         let user_id = 42i64;
         let context: Vec<SeqItem> = vec![(f1.0, Some(f1.1), ACTION_STAR), (f2.0, Some(f2.1), ACTION_COMPLETE)];
         let cand_tracks = [pos, neg1, neg2];
+        let t1_song = song_id(fnv1a_hash(t1.song_key().as_bytes()));
+        net.song_embs.insert(t1_song, SparseAdamRow::from_seed(99, 0.1));
 
         let eval_loss = |n: &TransformerNet| -> f32 {
             let ctx = n.forward_context(user_id, &context);
@@ -3202,6 +3283,11 @@ mod tests {
         for d in [0usize, 11, 35] {
             let an = g_h[u_pos_idx * D_MODEL + d];
             check(&|n| &mut n.user_embs.get_mut(&42).unwrap().w[d], an, "UserEmb");
+        }
+        // t1 is context token 0; its exact song embedding enters the input sum with SONG_EMB_WEIGHT.
+        for d in [1usize, 20, 47] {
+            let an = g_h[d] * SONG_EMB_WEIGHT;
+            check(&|n| &mut n.song_embs.get_mut(&t1_song).unwrap().w[d], an, "SongEmb");
         }
     }
 
@@ -3361,6 +3447,56 @@ mod tests {
             raw,
             corrected
         );
+    }
+
+    #[test]
+    fn song_identity_is_exact_and_learns_song_level_co_listening() {
+        let store = Store::open_memory().unwrap();
+        let tracks = genre_tracks();
+        store.upsert_tracks(&tracks).unwrap();
+        // rock0/rock2 and rock4/rock8 share artist ("rock Artist 0"), genre, moods and title
+        // words; only song identity separates them. Group A plays rock0 then rock4, group B
+        // plays rock2 then rock8, so both followers are equally popular.
+        let filler = ["jazz", "pop", "metal"];
+        for (group, (first, follow)) in [("rock0", "rock4"), ("rock2", "rock8")].iter().enumerate() {
+            for k in 0..6 {
+                let u = store.create_user(&format!("g{}u{}", group, k), "pw123").unwrap();
+                for round in 0..3 {
+                    let f = filler[(k + round) % 3];
+                    listen(&store, u.id, &format!("{}{}", f, (k * 2 + round) % 12), true);
+                    listen(&store, u.id, first, true);
+                    listen(&store, u.id, follow, true);
+                }
+            }
+        }
+        let probe_a = store.create_user("probe_a", "pw123").unwrap();
+        let probe_b = store.create_user("probe_b", "pw123").unwrap();
+        for (u, first) in [(probe_a.id, "rock0"), (probe_b.id, "rock2")] {
+            listen(&store, u, "jazz11", true);
+            listen(&store, u, first, true);
+        }
+
+        let engine = TransformerEngine::load_or_new(&store);
+        for _ in 0..40 {
+            if engine.train_background_epoch(&store, 60, 16, false).skipped {
+                break;
+            }
+        }
+        {
+            let net = engine.net.read().unwrap();
+            let key = |id: &str| song_id(fnv1a_hash(tracks.iter().find(|t| t.id == id).unwrap().song_key().as_bytes()));
+            for id in ["rock0", "rock2", "rock4", "rock8"] {
+                assert!(net.song_embs.contains_key(&key(id)), "{} should have an identity embedding", id);
+            }
+            assert!(!net.song_embs.contains_key(&key("rock11")), "never-played songs get no identity row");
+        }
+
+        let pick = |id: &str| tracks.iter().find(|t| t.id == id).unwrap().clone();
+        let cands = vec![pick("rock4"), pick("rock8")];
+        let a = engine.score_candidates(&store, probe_a.id, &[], None, &[], &[], &cands);
+        let b = engine.score_candidates(&store, probe_b.id, &[], None, &[], &[], &cands);
+        assert!(a[0] > a[1], "after rock0, rock4 should beat rock8: {:?}", a);
+        assert!(b[1] > b[0], "after rock2, rock8 should beat rock4: {:?}", b);
     }
 
     #[test]
