@@ -7765,7 +7765,9 @@
       const u = profileRes.user;
       const pstats = profileRes.stats || {};
       const radio = results[3] || emptyRadio;
+      const nowPlaying = profileRes.nowPlaying && profileRes.nowPlaying.track ? profileRes.nowPlaying : null;
       cacheTracks(radio.tracks || []);
+      if (nowPlaying) cacheTracks([nowPlaying.track]);
       const isSelf = selfRef || !!u.isSelf;
       const defaultTab = 'stats';
       if (state.social.profileData && state.social.profileData.user.id !== u.id) {
@@ -7799,6 +7801,24 @@
       ];
       const name = u.displayName || u.username;
 
+      const nowPlayingHtml = nowPlaying
+        ? (() => {
+            const nt = nowPlaying.track;
+            const npSub = nt.album
+              ? `<span class="clickable" onclick="event.stopPropagation();App.navigate('artist/${encodeURIComponent(nt.artistId)}')">${esc(nt.artist)}</span> · <span class="clickable" onclick="event.stopPropagation();App.navigate('album/${encodeURIComponent(nt.albumId)}')">${esc(nt.album)}</span>`
+              : `<span class="clickable" onclick="event.stopPropagation();App.navigate('artist/${encodeURIComponent(nt.artistId)}')">${esc(nt.artist)}</span>`;
+            return `<div class="profile-now-playing" onclick="App.playSingle(${esc(JSON.stringify(nt.id))})" role="button" tabindex="0" aria-label="Play ${esc(nt.title)}">
+              <img class="profile-np-art" src="${esc(nt.coverUrl)}" loading="lazy" alt="" />
+              <div class="profile-np-info">
+                <div class="profile-np-kicker"><span class="profile-np-eq" aria-hidden="true"><span></span><span></span><span></span></span>Currently listening</div>
+                <div class="profile-np-title">${esc(nt.title)}</div>
+                <div class="profile-np-sub">${npSub}</div>
+              </div>
+              <button class="icon-btn profile-np-play" title="Play track" onclick="event.stopPropagation();App.playSingle(${esc(JSON.stringify(nt.id))})">${ICONS.play}</button>
+            </div>`;
+          })()
+        : '';
+
       let html = `<div class="hero-header" style="border-color:${esc(color)}55;background:${esc(color)}14">
         <div class="profile-avatar" style="background:${esc(color)}">${avatarInner(u)}</div>
         <div class="hero-info">
@@ -7823,6 +7843,7 @@
           </div>
         </div>
       </div>
+      ${nowPlayingHtml}
       <div class="tabs-bar" id="profile-tabs">
         ${tabs.map(([key, label]) => `<button class="tab-chip ${data.tab === key ? 'active' : ''}" data-ptab="${key}" onclick="App.setProfileTab('${key}')">${label}</button>`).join('')}
       </div>

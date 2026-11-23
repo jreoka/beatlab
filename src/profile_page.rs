@@ -11,7 +11,7 @@
 //! Every page carries Open Graph / Twitter meta so links unfurl nicely in
 //! Discord, iMessage, Slack, etc.
 
-use crate::models::{Playlist, PublicUser};
+use crate::models::{Playlist, PublicUser, Track};
 use crate::share_page::html_escape;
 use crate::stats::{ComputedStats, HeatmapStats, HourStat, MoodStat, PublicStats, TimelineStats};
 use chrono::{Datelike, Duration, NaiveDate};
@@ -1508,7 +1508,35 @@ fn people_body(users: &[PublicUser], hidden: usize, empty_msg: &str) -> String {
 // Page shell
 // ---------------------------------------------------------------------------
 
-pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> String {
+fn render_now_playing_card(track: Option<&Track>) -> String {
+    let Some(t) = track else {
+        return String::new();
+    };
+    let sub = if t.album.trim().is_empty() {
+        html_escape(&t.artist)
+    } else {
+        format!("{} · {}", html_escape(&t.artist), html_escape(&t.album))
+    };
+    format!(
+        r#"<div class="now-playing-card" aria-label="Currently listening">
+  <img class="np-art" src="{}" loading="lazy" alt="" />
+  <div class="np-info">
+    <div class="np-kicker"><span class="np-eq" aria-hidden="true"><span></span><span></span><span></span></span>Currently listening</div>
+    <div class="np-title">{}</div>
+    <div class="np-sub">{sub}</div>
+  </div>
+</div>"#,
+        html_escape(&cover_url(&t.id)),
+        html_escape(&t.title),
+    )
+}
+
+pub fn render_profile_page(
+    origin: &str,
+    u: &PublicUser,
+    body: &ProfileBody,
+    now_playing: Option<&Track>,
+) -> String {
     let tab = body.tab();
     let (og_title, og_desc) = build_meta(u, body);
     let page_url = match body {
@@ -1625,6 +1653,18 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
     .brand {{ display:inline-flex; align-items:center; gap:8px; color:#98a2b3; text-decoration:none; font-weight:700; font-size:14px; margin-bottom:20px; }}
     .brand img {{ width:22px; height:22px; }}
     .hero {{ border:1px solid {color}55; background:{color}14; border-radius:16px; padding:24px; display:flex; gap:20px; align-items:center; flex-wrap:wrap; }}
+    .now-playing-card {{ margin-top:14px; background:linear-gradient(135deg, rgba(30,215,96,.10), #12151c 58%); border:1px solid rgba(30,215,96,.28); border-radius:12px; padding:12px 14px; display:flex; align-items:center; gap:12px; }}
+    .np-art {{ width:48px; height:48px; border-radius:8px; object-fit:cover; flex-shrink:0; background:#181c26; border:1px solid #232834; }}
+    .np-info {{ flex:1; min-width:0; }}
+    .np-kicker {{ display:inline-flex; align-items:center; gap:6px; font-size:10.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:#1ed760; }}
+    .np-eq {{ display:inline-flex; align-items:flex-end; gap:2px; height:11px; }}
+    .np-eq span {{ width:2.5px; border-radius:2px; background:#1ed760; animation:npEq 1s ease-in-out infinite; }}
+    .np-eq span:nth-child(1) {{ height:5px; animation-delay:0s; }}
+    .np-eq span:nth-child(2) {{ height:10px; animation-delay:.2s; }}
+    .np-eq span:nth-child(3) {{ height:7px; animation-delay:.4s; }}
+    @keyframes npEq {{ 0%,100% {{ transform:scaleY(.35); }} 50% {{ transform:scaleY(1); }} }}
+    .np-title {{ font-size:14.5px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px; }}
+    .np-sub {{ font-size:12.5px; color:#98a2b3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
     .avatar {{ width:112px; height:112px; border-radius:50%; background:{color}; color:#06120b; display:grid; place-items:center; font-size:46px; font-weight:800; overflow:hidden; flex-shrink:0; }}
     .avatar img, .mini-av img {{ width:100%; height:100%; object-fit:cover; }}
     .info {{ flex:1; min-width:220px; }}
@@ -1821,6 +1861,7 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
         </div>
       </div>
     </div>
+    {now_playing_html}
     <nav class="tabs" aria-label="Profile sections">{tabs_html}</nav>
     {body_html}
     <div class="foot">Listen, follow @{username} and play their radio on <a href="/">Beatlab</a>.</div>
@@ -1888,6 +1929,7 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
         bio_html = bio_html,
         loc_html = loc_html,
         counters_html = counters_html,
+        now_playing_html = render_now_playing_card(now_playing),
         tabs_html = tabs_html,
         body_html = body_html,
     )
@@ -2166,6 +2208,7 @@ mod tests {
             "https://beat.example",
             &user(),
             &ProfileBody::Overview { stats: &stats, playlists: &[] },
+            None,
         );
         assert!(html.contains("Emily &lt;C&gt;"));
         assert!(!html.contains("Emily <C>"));
@@ -2178,6 +2221,30 @@ mod tests {
         for slug in ["stats", "playlists", "followers", "following"] {
             assert!(html.contains(&format!(r#"href="/u/emily/{slug}""#)), "{slug}");
         }
+        assert!(!html.contains(r#"class="now-playing-card""#));
+    }
+
+    #[test]
+    fn renders_now_playing_banner_when_active() {
+        let stats = PublicStats::default();
+        let np = Track {
+            id: "trk:live".into(),
+            title: "Night <Flight>".into(),
+            artist: "Yorushika".into(),
+            album: "Plagiarism".into(),
+            ..Track::default()
+        };
+        let html = render_profile_page(
+            "https://beat.example",
+            &user(),
+            &ProfileBody::Overview { stats: &stats, playlists: &[] },
+            Some(&np),
+        );
+        assert!(html.contains("now-playing-card"));
+        assert!(html.contains("Currently listening"));
+        assert!(html.contains("Night &lt;Flight&gt;"));
+        assert!(html.contains("Yorushika · Plagiarism"));
+        assert!(html.contains(r#"src="/api/web/cover/trk%3Alive?v=2""#));
     }
 
     #[test]
@@ -2187,6 +2254,7 @@ mod tests {
             "https://beat.example",
             &user(),
             &ProfileBody::Stats { stats: &s, metric: "streams" },
+            None,
         );
         assert!(html.contains(r#"content="https://beat.example/u/emily/stats?range=30d""#));
         assert!(html.contains(r#"class="chip active" href="/u/emily/stats?range=30d""#));
@@ -2225,6 +2293,7 @@ mod tests {
             "https://beat.example",
             &user(),
             &ProfileBody::Overview { stats: &stats, playlists: &[] },
+            None,
         );
         assert!(html.contains(r#"class="stats-track-art" src="/api/web/cover/trk%3A99?v=2""#));
     }
@@ -2252,6 +2321,7 @@ mod tests {
             "https://beat.example",
             &user(),
             &ProfileBody::Followers(std::slice::from_ref(&friend), 2),
+            None,
         );
         assert!(html.contains(r#"href="/u/zoe""#));
         assert!(html.contains("2 listeners without a public profile are not listed."));

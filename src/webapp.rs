@@ -5491,6 +5491,24 @@ pub async fn social_avatar_image(
     }
 }
 
+/// Returns the user's currently playing track if it was started recently
+/// enough to still be playing (track duration + 45s grace, clamped to 3m..1h,
+/// or 10m when duration is unknown).
+fn active_now_playing(state: &AppState, user_id: i64, now: i64) -> Option<(Track, i64)> {
+    let np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+    let (track, started_at, _) = np.get(&user_id)?;
+    let window = if track.duration > 0 {
+        (track.duration as i64).clamp(180, 3600) + 45
+    } else {
+        600
+    };
+    if now.saturating_sub(*started_at) <= window {
+        Some((track.clone(), *started_at))
+    } else {
+        None
+    }
+}
+
 pub async fn social_profile(
     State(state): State<AppState>,
     Path(reference): Path<String>,
@@ -5514,9 +5532,10 @@ pub async fn social_profile(
         password: String::new(),
         created: target.created,
     };
+    let now = Utc::now().timestamp();
     let store = state.store.clone();
     let stats = tokio::task::spawn_blocking(move || {
-        crate::stats::build_public_stats(&store, &target_user, Utc::now().timestamp())
+        crate::stats::build_public_stats(&store, &target_user, now)
     })
     .await
     .unwrap_or_default();
@@ -5536,12 +5555,21 @@ pub async fn social_profile(
         .take(12)
         .map(|p| playlist_summary_json(&p))
         .collect();
+    let now_playing = active_now_playing(&state, target_id, now).and_then(|(t, started_at)| {
+        to_web_tracks(&state, user.id, &[t]).into_iter().next().map(|wt| {
+            json!({
+                "track": wt,
+                "startedAt": started_at,
+            })
+        })
+    });
     json_res(json!({
         "user": public_user_json(&target),
         "profile": profile_json(&profile),
         "stats": serde_json::to_value(&stats).unwrap_or(Value::Null),
         "radioSaved": radio_saved,
         "playlists": playlists,
+        "nowPlaying": now_playing,
     }))
 }
 
@@ -5634,8 +5662,22 @@ async fn render_public_profile(
     } else {
         "streams"
     };
+    let now = Utc::now().timestamp();
+    let now_playing = active_now_playing(state, target.id, now);
+    let np_cache_tag = now_playing
+        .as_ref()
+        .map(|(t, _)| t.id.as_str())
+        .unwrap_or("");
     let origin = request_origin(headers);
-    let cache_key = format!("{}|{}|{}|{}|{}", origin, target.id, tab.slug(), stats_range.key(), stats_metric);
+    let cache_key = format!(
+        "{}|{}|{}|{}|{}|{}",
+        origin,
+        target.id,
+        tab.slug(),
+        stats_range.key(),
+        stats_metric,
+        np_cache_tag
+    );
     if let Ok(cache) = public_profile_cache().lock() {
         if let Some((at, html)) = cache.get(&cache_key) {
             if at.elapsed() < PUBLIC_PROFILE_CACHE_TTL {
@@ -5671,7 +5713,7 @@ async fn render_public_profile(
         let hidden = total.saturating_sub(shown.len());
         (shown, hidden)
     };
-    let now = Utc::now().timestamp();
+    let np_track = now_playing.as_ref().map(|(t, _)| t);
     let store = state.store.clone();
 
     let html = match tab {
@@ -5686,6 +5728,7 @@ async fn render_public_profile(
                 &origin,
                 &target,
                 &ProfileBody::Overview { stats: &stats, playlists: &playlists },
+                np_track,
             )
         }
         ProfileTab::Stats => {
@@ -5708,21 +5751,37 @@ async fn render_public_profile(
                 &origin,
                 &target,
                 &ProfileBody::Stats { stats: &stats, metric: stats_metric },
+                np_track,
             )
         }
         ProfileTab::Playlists => {
             let playlists = public_playlists(100);
-            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Playlists(&playlists))
+            crate::profile_page::render_profile_page(
+                &origin,
+                &target,
+                &ProfileBody::Playlists(&playlists),
+                np_track,
+            )
         }
         ProfileTab::Followers => {
             let (users, hidden) =
                 visible_people(state.store.list_followers(target.id, 0).unwrap_or_default());
-            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Followers(&users, hidden))
+            crate::profile_page::render_profile_page(
+                &origin,
+                &target,
+                &ProfileBody::Followers(&users, hidden),
+                np_track,
+            )
         }
         ProfileTab::Following => {
             let (users, hidden) =
                 visible_people(state.store.list_following(target.id, 0).unwrap_or_default());
-            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Following(&users, hidden))
+            crate::profile_page::render_profile_page(
+                &origin,
+                &target,
+                &ProfileBody::Following(&users, hidden),
+                np_track,
+            )
         }
     };
 
