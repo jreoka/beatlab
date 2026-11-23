@@ -4,6 +4,7 @@ use crate::taste::classify_moods_str;
 use crate::store::Store;
 use async_trait::async_trait;
 use flate2::read::ZlibDecoder;
+use futures::stream::{FuturesUnordered, StreamExt};
 use md5::{Digest, Md5};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -202,6 +203,87 @@ impl GrowingFile {
 pub enum SlskFile {
     Complete(PathBuf),
     Growing(Arc<GrowingFile>),
+}
+
+/// How many peers one play may contact for the same song.
+const MAX_RACING_PEERS: usize = 3;
+/// How long the current peer(s) get to deliver audio before the next is started.
+/// A healthy peer usually sends its first bytes in 0.5-2s.
+const PEER_STAGGER: Duration = Duration::from_millis(2000);
+
+/// Runs `attempt` over `candidates`, starting one at a time but launching the next
+/// whenever an attempt fails or `stagger` passes without a winner. Returns the first
+/// success; dropping the remaining futures cancels them.
+async fn race_staggered<'a, T, F, Fut>(candidates: &'a [String], stagger: Duration, attempt: F) -> Option<T>
+where
+    F: Fn(&'a str) -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let mut queue = candidates.iter();
+    let mut running = FuturesUnordered::new();
+    loop {
+        if running.is_empty() {
+            running.push(attempt(queue.next()?.as_str()));
+        }
+        let more = queue.len() > 0;
+        tokio::select! {
+            res = running.next() => {
+                if let Some(Some(v)) = res {
+                    return Some(v);
+                }
+                // Failed attempt: start the next candidate immediately.
+                if let Some(c) = queue.next() {
+                    running.push(attempt(c.as_str()));
+                }
+            }
+            _ = tokio::time::sleep(stagger), if more => {
+                if let Some(c) = queue.next() {
+                    running.push(attempt(c.as_str()));
+                }
+            }
+        }
+    }
+}
+
+struct PendingCleanup {
+    src: Arc<SoulseekSource>,
+    pending: Arc<PendingTransfer>,
+    token: u32,
+    done: bool,
+}
+
+impl PendingCleanup {
+    async fn cleanup(src: &SoulseekSource, pending: &Arc<PendingTransfer>, token: u32) {
+        src.pending_transfers
+            .lock()
+            .await
+            .retain(|p| !Arc::ptr_eq(p, pending));
+        if let Some((upload_tok, _)) = *pending.upload_info.lock().await {
+            src.pending_by_token.lock().await.remove(&upload_tok);
+        }
+        src.pending_pierce_peers.lock().await.remove(&token);
+    }
+
+    async fn run(&mut self) {
+        Self::cleanup(&self.src, &self.pending, self.token).await;
+        self.done = true;
+    }
+}
+
+impl Drop for PendingCleanup {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // Cancelled mid-handshake (lost a race). The maps use async locks, so
+        // finish cleanup on the runtime.
+        let src = Arc::clone(&self.src);
+        let pending = Arc::clone(&self.pending);
+        let token = self.token;
+        tokio::spawn(async move {
+            Self::cleanup(&src, &pending, token).await;
+        });
+    }
 }
 
 pub struct SoulseekSource {
@@ -894,31 +976,48 @@ impl SoulseekSource {
         }
     }
 
-    /// Tries the primary `track.stream_url` first, then up to 2 cached alternate Soulseek peers
-    /// for the same `song_key` if the primary peer is unavailable, firewalled, or queued.
+    /// Races the primary `track.stream_url` against up to 2 cached alternate peers for the
+    /// same `song_key`, staggered "happy eyeballs" style: the next peer starts when the
+    /// current ones fail or haven't delivered audio within `PEER_STAGGER`. The first peer
+    /// to send bytes wins and the rest are cancelled. A dead peer used to cost ~20s each
+    /// in sequence; now the worst case is roughly the fastest live peer.
     pub async fn resolve_track(self: &Arc<Self>, track: &Track) -> Option<SlskFile> {
-        if let Some(f) = self.resolve_stream_singleflight(&track.stream_url).await {
-            return Some(f);
-        }
-        let key = track.song_key();
         let alts = {
             let guard = self.alt_streams.lock().await;
-            guard.get(&key).cloned().unwrap_or_default()
+            guard.get(&track.song_key()).cloned().unwrap_or_default()
         };
-        let mut tried = 0usize;
-        for alt_url in alts {
-            if alt_url == track.stream_url {
-                continue;
-            }
-            tried += 1;
-            if let Some(f) = self.resolve_stream_singleflight(&alt_url).await {
-                return Some(f);
-            }
-            if tried >= 2 {
+        let mut candidates = vec![track.stream_url.clone()];
+        for alt in alts {
+            if candidates.len() >= MAX_RACING_PEERS {
                 break;
             }
+            if !candidates.contains(&alt) {
+                candidates.push(alt);
+            }
         }
-        None
+        // A candidate that's already on disk or mid-download needs no race.
+        for c in &candidates {
+            if let Some(f) = self.ready_file(c) {
+                return Some(f);
+            }
+        }
+        race_staggered(&candidates, PEER_STAGGER, |c| self.resolve_stream_singleflight(c)).await
+    }
+
+    /// Already-downloaded or downloading file for a stream ref, without contacting peers.
+    fn ready_file(&self, stream_ref: &str) -> Option<SlskFile> {
+        if let Some(g) = self.active_growing(stream_ref) {
+            return Some(SlskFile::Growing(g));
+        }
+        let rest = stream_ref.strip_prefix("slsk://")?;
+        let (_, remote_path) = rest.split_once('/')?;
+        let p = self.download_dir.join(format!(
+            "{}.{}",
+            hash_str(stream_ref),
+            sanitize_slsk_ext(remote_path)
+        ));
+        (std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 4096)
+            .then_some(SlskFile::Complete(p))
     }
 
     fn active_growing(&self, stream_ref: &str) -> Option<Arc<GrowingFile>> {
@@ -1036,22 +1135,20 @@ impl SoulseekSource {
         let pending = Arc::new(PendingTransfer::new(peer, remote_path, token));
         self.pending_transfers.lock().await.push(Arc::clone(&pending));
 
+        // Cleans up transfer coordination state on every exit path, including
+        // cancellation when this peer loses a race to a faster one.
+        let mut cleanup = PendingCleanup {
+            src: Arc::clone(self),
+            pending: Arc::clone(&pending),
+            token,
+            done: false,
+        };
         let res = self
             .execute_peer_transfer(
                 stream_ref, peer, remote_path, local_path, &part_path, token, &pending,
             )
             .await;
-
-        // Clean up transfer coordination state cleanly on any exit path.
-        {
-            let mut list = self.pending_transfers.lock().await;
-            list.retain(|p| !Arc::ptr_eq(p, &pending));
-        }
-        if let Some((upload_tok, _)) = *pending.upload_info.lock().await {
-            self.pending_by_token.lock().await.remove(&upload_tok);
-        }
-        self.pending_pierce_peers.lock().await.remove(&token);
-
+        cleanup.run().await;
         res
     }
 
@@ -1413,6 +1510,48 @@ fn build_flac_search_query(query: &str) -> Option<String> {
     }
 }
 
+/// Bytes/sec the file must arrive at to play without stalling, now that
+/// playback starts mid-download.
+fn required_bytes_per_sec(t: &Track) -> u32 {
+    if t.size > 0 && t.duration > 0 {
+        return (t.size / t.duration as i64).clamp(1, u32::MAX as i64) as u32;
+    }
+    if t.bitrate > 0 {
+        return (t.bitrate as u32).saturating_mul(1000) / 8;
+    }
+    if t.is_lossless() {
+        let sr = if t.sample_rate > 0 { t.sample_rate as u32 } else { 44_100 };
+        let bd = if t.bit_depth > 0 { t.bit_depth as u32 } else { 16 };
+        // Stereo PCM at ~60% after FLAC compression.
+        return sr * bd * 2 / 8 * 6 / 10;
+    }
+    40_000
+}
+
+/// 1 = peer can keep up with playback (reported speed >= 1.5x the file's
+/// bitrate) or reports no speed (many clients send 0, so unknown is not
+/// penalised); 0 = known too slow and would stutter mid-song.
+fn speed_class(h: &SlskSearchHit) -> u8 {
+    if h.avg_speed == 0 {
+        return 1;
+    }
+    let need = required_bytes_per_sec(&h.track) as u64;
+    (h.avg_speed as u64 * 2 >= need * 3) as u8
+}
+
+/// Lossless always wins over lossy; among lossless copies, a peer fast enough
+/// to stream beats a higher-resolution one that would stall mid-song.
+fn rank_key(h: &SlskSearchHit) -> std::cmp::Reverse<(u8, u8, u8, u8, i32, u32)> {
+    std::cmp::Reverse((
+        h.track.is_lossless() as u8,
+        speed_class(h),
+        h.track.quality_tier() as u8,
+        h.slot_free as u8,
+        h.track.quality_score(),
+        h.avg_speed,
+    ))
+}
+
 fn rank_and_dedup_hits(
     collected: Vec<SlskSearchHit>,
     limit: usize,
@@ -1426,13 +1565,7 @@ fn rank_and_dedup_hits(
     let mut alt_updates: Vec<(String, Vec<String>)> = Vec::new();
     for (key, mut hits) in by_key {
         hits.sort_by_key(|h| {
-            std::cmp::Reverse((
-                h.track.is_lossless() as u8,
-                h.track.quality_tier() as u8,
-                h.slot_free as u8,
-                h.track.quality_score(),
-                h.avg_speed,
-            ))
+            rank_key(h)
         });
         let mut seen_urls = HashSet::new();
         let urls: Vec<String> = hits
@@ -1450,13 +1583,7 @@ fn rank_and_dedup_hits(
     }
 
     out.sort_by_key(|h| {
-        std::cmp::Reverse((
-            h.track.is_lossless() as u8,
-            h.track.quality_tier() as u8,
-            h.slot_free as u8,
-            h.track.quality_score(),
-            h.avg_speed,
-        ))
+        rank_key(h)
     });
     let tracks = out.into_iter().take(limit).map(|h| h.track).collect();
     (tracks, alt_updates)
@@ -2306,6 +2433,116 @@ mod tests {
         assert_eq!(build_flac_search_query("Daft Punk flac"), None);
         assert_eq!(build_flac_search_query("Discovery lossless"), None);
         assert_eq!(build_flac_search_query("   "), None);
+    }
+
+    fn hit(url: &str, format: &str, bit_depth: i32, sample_rate: i32, size_mb: i64, avg_speed: u32) -> SlskSearchHit {
+        SlskSearchHit {
+            track: Track {
+                id: format!("slsk:{}", url),
+                source: "soulseek".into(),
+                title: "Song".into(),
+                artist: "Artist".into(),
+                format: format.into(),
+                bit_depth,
+                sample_rate,
+                duration: 240,
+                size: size_mb * 1024 * 1024,
+                stream_url: url.into(),
+                ..Default::default()
+            },
+            slot_free: true,
+            avg_speed,
+        }
+    }
+
+    #[test]
+    fn ranking_prefers_fast_cd_flac_over_hi_res_that_would_stall() {
+        // 24/96 at 120 MB over 4 min needs ~520 KB/s; this peer only does 150 KB/s.
+        let slow_hires = hit("slsk://slow/a.flac", "flac", 24, 96_000, 120, 150_000);
+        // 16/44.1 at 30 MB needs ~130 KB/s; peer does 2 MB/s.
+        let fast_cd = hit("slsk://fast/a.flac", "flac", 16, 44_100, 30, 2_000_000);
+        let (ranked, alts) = rank_and_dedup_hits(vec![slow_hires, fast_cd], 5);
+        assert_eq!(ranked[0].stream_url, "slsk://fast/a.flac");
+        assert_eq!(alts[0].1, vec!["slsk://fast/a.flac", "slsk://slow/a.flac"]);
+    }
+
+    #[test]
+    fn ranking_keeps_hi_res_when_peer_is_fast_or_speed_unknown() {
+        let fast_hires = hit("slsk://h/a.flac", "flac", 24, 96_000, 120, 3_000_000);
+        let fast_cd = hit("slsk://c/a.flac", "flac", 16, 44_100, 30, 3_000_000);
+        let (ranked, _) = rank_and_dedup_hits(vec![fast_cd.clone(), fast_hires], 5);
+        assert_eq!(ranked[0].stream_url, "slsk://h/a.flac");
+
+        let unknown_hires = hit("slsk://u/a.flac", "flac", 24, 96_000, 120, 0);
+        let (ranked, _) = rank_and_dedup_hits(vec![fast_cd, unknown_hires], 5);
+        assert_eq!(ranked[0].stream_url, "slsk://u/a.flac", "unknown speed is neutral, not penalised");
+    }
+
+    #[test]
+    fn ranking_never_trades_lossless_for_lossy_on_speed() {
+        let slow_flac = hit("slsk://s/a.flac", "flac", 16, 44_100, 30, 20_000);
+        let mut fast_mp3 = hit("slsk://m/a.mp3", "mp3", 0, 44_100, 9, 5_000_000);
+        fast_mp3.track.bitrate = 320;
+        let (ranked, _) = rank_and_dedup_hits(vec![fast_mp3, slow_flac], 5);
+        assert_eq!(ranked[0].stream_url, "slsk://s/a.flac");
+    }
+
+    fn cands(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn race_uses_only_primary_when_it_answers_quickly() {
+        let started = std::sync::Mutex::new(Vec::new());
+        let c = cands(&["a", "b", "c"]);
+        let res = race_staggered(&c, Duration::from_millis(200), |id| {
+            started.lock().unwrap().push(id.to_string());
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some(id.to_string())
+            }
+        })
+        .await;
+        assert_eq!(res.as_deref(), Some("a"));
+        assert_eq!(*started.lock().unwrap(), vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn race_starts_next_peer_when_primary_stalls() {
+        let c = cands(&["stuck", "ok"]);
+        let t0 = std::time::Instant::now();
+        let res = race_staggered(&c, Duration::from_millis(100), |id| async move {
+            if id == "stuck" {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                None
+            } else {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some(id.to_string())
+            }
+        })
+        .await;
+        assert_eq!(res.as_deref(), Some("ok"));
+        assert!(t0.elapsed() < Duration::from_secs(2), "stalled primary must not block the race");
+    }
+
+    #[tokio::test]
+    async fn race_moves_on_immediately_when_primary_fails() {
+        let c = cands(&["dead", "ok"]);
+        let t0 = std::time::Instant::now();
+        let res = race_staggered(&c, Duration::from_secs(10), |id| async move {
+            (id == "ok").then(|| id.to_string())
+        })
+        .await;
+        assert_eq!(res.as_deref(), Some("ok"));
+        assert!(t0.elapsed() < Duration::from_secs(1), "a failure must not wait for the stagger");
+    }
+
+    #[tokio::test]
+    async fn race_returns_none_when_every_peer_fails() {
+        let c = cands(&["a", "b", "c"]);
+        let res: Option<String> =
+            race_staggered(&c, Duration::from_millis(50), |_| async { None }).await;
+        assert!(res.is_none());
     }
 
     #[test]
