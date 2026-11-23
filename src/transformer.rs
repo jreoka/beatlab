@@ -65,10 +65,76 @@ fn as_song_feat(row: usize) -> Option<u64> {
 const ROPE_BASE: f32 = 10000.0;
 const XSA_EPS: f32 = 1e-6;
 const RMS_EPS: f32 = 1e-5;
-const CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v3";
+const CHECKPOINT_KV_KEY: &str = "transformer:checkpoint_v4";
 /// Discarded on startup: v1 learned a label-leakage shortcut; v2 used hashed track-ID buckets
-/// shared between unrelated songs (replaced by exact per-song embeddings in v3).
-const LEGACY_CHECKPOINT_KV_KEYS: [&str; 2] = ["transformer:checkpoint_v1", "transformer:checkpoint_v2"];
+/// shared between unrelated songs; v3 had no notion of listen timing.
+const LEGACY_CHECKPOINT_KV_KEYS: [&str; 3] =
+    ["transformer:checkpoint_v1", "transformer:checkpoint_v2", "transformer:checkpoint_v3"];
+
+/// Time-since-listen buckets for history tokens: <15m, <1h, <6h, <1d, <1w, <30d, older, plus
+/// `AGE_NONE` for tokens without a time (stars, seeds, queries). Lets the model tell the current
+/// session from long-term taste.
+const N_AGE_BUCKETS: usize = 8;
+const AGE_NONE: usize = N_AGE_BUCKETS - 1;
+
+fn age_bucket(secs: i64) -> usize {
+    match secs.max(0) {
+        s if s < 15 * 60 => 0,
+        s if s < 3600 => 1,
+        s if s < 6 * 3600 => 2,
+        s if s < 86_400 => 3,
+        s if s < 7 * 86_400 => 4,
+        s if s < 30 * 86_400 => 5,
+        _ => 6,
+    }
+}
+
+/// Spread (in standard deviations x this) of the model's scores handed to the blender.
+const NEURAL_SCORE_SCALE: f32 = 1.5;
+/// Floor on the per-list standard deviation of raw scores, so a list of near-identical
+/// candidates isn't stretched into large, meaningless differences.
+const NORM_MIN_STD: f32 = 0.05;
+/// Training worker threads per step (each runs part of the batch).
+const MAX_TRAIN_THREADS: usize = 8;
+/// Model weights tried when blending with the heuristic during evaluation.
+const BLEND_WEIGHT_GRID: [f32; 8] = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
+/// A blend weight counts as "as good as the best" within this much MRR.
+const BLEND_MRR_TOLERANCE: f32 = 0.005;
+/// Typical `taste.rs` blend weight (`base` ~0.75 x established-user factor ~1.2): how a
+/// measured best blend weight maps onto the model factor in `multiplier_for`.
+const BLEND_BASE_WEIGHT: f32 = 0.9;
+const BOOTSTRAP_RESAMPLES: usize = 1000;
+
+/// Centres raw context-track scores across one candidate list and scales them to a fixed
+/// spread (clipped to +-3 SD). The model's own temperature (`logit_scale`) then can't change
+/// how much it sways rankings; only the trust multiplier does.
+fn normalize_scores(raw: &[f32]) -> Vec<f32> {
+    let vals: Vec<f32> = raw.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect();
+    if vals.len() < 2 {
+        return vec![0.0; vals.len()];
+    }
+    let n = vals.len() as f32;
+    let mean = vals.iter().sum::<f32>() / n;
+    let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let sd = var.sqrt().max(NORM_MIN_STD);
+    vals.iter().map(|v| ((v - mean) / sd).clamp(-3.0, 3.0) * NEURAL_SCORE_SCALE).collect()
+}
+
+/// Mean of `diffs` with a percentile bootstrap interval `(lo, hi)` at the given tail quantiles.
+fn bootstrap_mean_ci(diffs: &[f32], seed: u64, lo_q: f32, hi_q: f32) -> (f32, f32, f32) {
+    if diffs.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let n = diffs.len();
+    let mean = diffs.iter().sum::<f32>() / n as f32;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut means: Vec<f32> = (0..BOOTSTRAP_RESAMPLES)
+        .map(|_| (0..n).map(|_| diffs[rng.gen_range(0..n)]).sum::<f32>() / n as f32)
+        .collect();
+    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |q: f32| means[((q * (BOOTSTRAP_RESAMPLES - 1) as f32).round() as usize).min(BOOTSTRAP_RESAMPLES - 1)];
+    (mean, at(lo_q), at(hi_q))
+}
 
 pub const ACTION_STAR: usize = 0;
 pub const ACTION_PLAYLIST: usize = 1;
@@ -391,7 +457,28 @@ struct BlockGrad {
     b2: Vec<f32>,
 }
 
+fn add_into(dst: &mut [f32], src: &[f32]) {
+    for (a, b) in dst.iter_mut().zip(src) {
+        *a += *b;
+    }
+}
+
 impl BlockGrad {
+    fn add(&mut self, o: &BlockGrad) {
+        add_into(&mut self.rms1_g, &o.rms1_g);
+        add_into(&mut self.wq, &o.wq);
+        add_into(&mut self.wk, &o.wk);
+        add_into(&mut self.wv, &o.wv);
+        add_into(&mut self.wo, &o.wo);
+        add_into(&mut self.rms2_g, &o.rms2_g);
+        add_into(&mut self.w1, &o.w1);
+        add_into(&mut self.b1, &o.b1);
+        add_into(&mut self.w_gate, &o.w_gate);
+        add_into(&mut self.b_gate, &o.b_gate);
+        add_into(&mut self.w2, &o.w2);
+        add_into(&mut self.b2, &o.b2);
+    }
+
     fn new() -> Self {
         Self {
             rms1_g: [0.0; D_MODEL],
@@ -886,8 +973,9 @@ impl SparseAdamRow {
     }
 }
 
-/// One context token: sparse feature rows, optional continuous scalars, and the action type.
-type SeqItem = (Vec<(usize, f32)>, Option<[f32; 4]>, usize);
+/// One context token: sparse feature rows, optional continuous scalars, the action type, and
+/// the time-since-listen bucket (`AGE_NONE` when untimed).
+type SeqItem = (Vec<(usize, f32)>, Option<[f32; 4]>, usize, usize);
 
 /// Minimum number of held-out listens before the evaluation is trusted to gate the blend weight.
 const MIN_EVAL_ITEMS: usize = 6;
@@ -932,11 +1020,24 @@ pub struct EvalReport {
     /// Baseline: rank by artist/genre overlap with the user's context (content heuristic).
     pub content_mrr: f32,
     pub content_recall10: f32,
-    /// `model_mrr / max(popularity_mrr, server_pop_mrr, content_mrr)`.
+    /// `model_mrr / max(popularity_mrr, server_pop_mrr, content_mrr)` (informational).
     pub lift: f32,
-    /// Smoothed 0.1..1.0 trust score derived from `lift`; scales the blend weight.
+    /// Heuristic stand-in for `score_track_core` on its own (see `HeuristicProxy`).
+    pub heuristic_mrr: f32,
+    /// Heuristic + model at `blend_weight`.
+    pub blend_mrr: f32,
+    /// The largest model weight that ranked held-out listens (nearly) as well as the best blend
+    /// (0 = adding the model never beat the heuristic alone).
+    pub blend_weight: f32,
+    /// Lower end of the 80% bootstrap interval of the per-listen gain at `blend_weight`;
+    /// above zero means the improvement is unlikely to be noise.
+    pub blend_gain_lo: f32,
+    /// Smoothed 0.1..1.0 trust score derived from the blend result; scales the blend weight.
     pub quality: f32,
     pub evaluated_at: i64,
+    /// Per-listen reciprocal rank of the model alone, for paired before/after comparison.
+    #[serde(skip)]
+    item_rr: Vec<f32>,
 }
 
 impl EvalReport {
@@ -949,10 +1050,25 @@ impl EvalReport {
         self.lift = self.model_mrr / base;
     }
 
-    /// Folds this run's lift into the smoothed quality score carried over from `prev`.
+    /// This run's trust score: how much weight the model earned *on top of the heuristic*.
+    /// The model factor in `multiplier_for` (0.25 + 1.10 q) is aimed at the measured best blend
+    /// weight; an improvement that isn't clearly above noise is capped at a modest 0.3.
+    fn blend_quality(&self) -> f32 {
+        if self.blend_weight <= 0.0 || self.blend_mrr <= self.heuristic_mrr {
+            return 0.1;
+        }
+        let q = ((self.blend_weight / BLEND_BASE_WEIGHT - 0.25) / 1.10).clamp(0.1, 1.0);
+        if self.blend_gain_lo > 0.0 {
+            q
+        } else {
+            q.min(0.3)
+        }
+    }
+
+    /// Folds this run's blend result into the smoothed quality score carried over from `prev`.
     fn with_quality_from(mut self, prev: &EvalReport) -> Self {
         if self.trusted() {
-            let q = ((self.lift - 0.85) / 0.65).clamp(0.1, 1.0);
+            let q = self.blend_quality();
             self.quality = if prev.trusted() { 0.5 * prev.quality + 0.5 * q } else { q };
         } else {
             self.quality = prev.quality;
@@ -976,6 +1092,7 @@ pub struct TransformerNet {
     #[serde(default)]
     song_embs: HashMap<u64, SparseAdamRow>,
     action_emb: AdamArray,
+    age_emb: AdamArray,
     scalar_proj: AdamArray,
     blocks: Vec<TransformerBlock>,
     final_rms_g: AdamArray,
@@ -1037,6 +1154,7 @@ impl TransformerNet {
             user_embs: HashMap::new(),
             song_embs: HashMap::new(),
             action_emb: AdamArray::new_init(N_ACTION_TYPES * D_MODEL, 0x1111_2222, emb_scale),
+            age_emb: AdamArray::new_init(N_AGE_BUCKETS * D_MODEL, 0x9999_aaaa, emb_scale),
             scalar_proj: AdamArray::new_init(4 * D_MODEL, 0x3333_4444, 0.08),
             blocks,
             final_rms_g: AdamArray::new_ones(D_MODEL),
@@ -1074,11 +1192,12 @@ impl TransformerNet {
     fn refresh_crowd(&mut self, table: &CorpusTable, users: &HashMap<i64, UserPrep>) {
         let mut sum = [0.0f32; D_MODEL];
         let mut n = 0usize;
+        let now = Utc::now().timestamp();
         let mut uids: Vec<i64> = users.keys().copied().filter(|&u| u > 0).collect();
         uids.sort();
         for uid in uids {
             let p = &users[&uid];
-            let seq = profile_sequence(p, table, p.listens.len(), None, MAX_SEQ_LEN - 1);
+            let seq = profile_sequence(p, table, p.listens.len(), None, MAX_SEQ_LEN - 1, now);
             if seq.len() < 2 {
                 continue;
             }
@@ -1103,6 +1222,7 @@ impl TransformerNet {
             && self.feature_v.len() == N_FEAT_ROWS * D_MODEL
             && self.feature_steps.len() == N_FEAT_ROWS
             && self.action_emb.shape_ok(N_ACTION_TYPES * D_MODEL)
+            && self.age_emb.shape_ok(N_AGE_BUCKETS * D_MODEL)
             && self.scalar_proj.shape_ok(4 * D_MODEL)
             && self.final_rms_g.shape_ok(D_MODEL)
             && self.ctx_proj_w.shape_ok(dd)
@@ -1358,18 +1478,22 @@ impl TransformerNet {
         let mut token_feats = Vec::with_capacity(seq_len);
         let mut token_scalars = Vec::with_capacity(seq_len);
         let mut token_actions = Vec::with_capacity(seq_len);
+        let mut token_ages = Vec::with_capacity(seq_len);
 
-        for (pos, (feats, scalars, action)) in items.iter().enumerate() {
+        for (pos, (feats, scalars, action, age)) in items.iter().enumerate() {
             let mut v = self.sum_sparse_features(feats, *scalars);
             let act_idx = (*action).min(N_ACTION_TYPES - 1);
+            let age_idx = (*age).min(N_AGE_BUCKETS - 1);
             let act_row = &self.action_emb.w[act_idx * D_MODEL..(act_idx + 1) * D_MODEL];
+            let age_row = &self.age_emb.w[age_idx * D_MODEL..(age_idx + 1) * D_MODEL];
             for d in 0..D_MODEL {
-                v[d] += act_row[d];
+                v[d] += act_row[d] + age_row[d];
             }
             x0[pos * D_MODEL..(pos + 1) * D_MODEL].copy_from_slice(&v);
             token_feats.push(feats.clone());
             token_scalars.push(*scalars);
             token_actions.push(Some(act_idx));
+            token_ages.push(age_idx);
         }
 
         // Last token is [USER_u] so RoPE relative offset from the user token to the
@@ -1380,6 +1504,7 @@ impl TransformerNet {
         token_feats.push(Vec::new());
         token_scalars.push(None);
         token_actions.push(None);
+        token_ages.push(AGE_NONE);
 
         let mut h = x0;
         let mut block_caches = Vec::with_capacity(self.blocks.len());
@@ -1404,6 +1529,7 @@ impl TransformerNet {
             token_feats,
             token_scalars,
             token_actions,
+            token_ages,
             block_caches,
             h_last: h_last.try_into().unwrap(),
             final_rms,
@@ -1413,57 +1539,22 @@ impl TransformerNet {
         }
     }
 
-    /// One AdamW step of sampled-softmax InfoNCE over a batch. Each example ranks its positive
-    /// against its own sampled negatives plus every other example's positive (in-batch negatives),
-    /// skipping in-batch items the user is already known to like.
-    fn train_step(
-        &mut self,
+    /// Forward + backward for `batch[range]`, accumulating into one gradient set. Runs on a
+    /// worker thread; reads the weights only.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_grads(
+        &self,
         batch: &[&TrainingExample],
+        range: std::ops::Range<usize>,
         table: &CorpusTable,
         users: &HashMap<i64, UserPrep>,
-        lr: f32,
-    ) -> f32 {
-        if batch.is_empty() {
-            return 0.0;
-        }
-        let wd = 1e-4f32;
-        let mut block_grads: Vec<BlockGrad> = (0..self.blocks.len()).map(|_| BlockGrad::new()).collect();
-        let mut g_final_rms_g = [0.0f32; D_MODEL];
-        let mut g_ctx_w = vec![0.0f32; D_MODEL * D_MODEL];
-        let mut g_trk_w = vec![0.0f32; D_MODEL * D_MODEL];
-        let mut g_action = vec![0.0f32; N_ACTION_TYPES * D_MODEL];
-        let mut g_scalar = vec![0.0f32; 4 * D_MODEL];
-        let mut g_logit_scale = 0.0f32;
-
-        let mut g_feats: HashMap<usize, [f32; D_MODEL]> = HashMap::new();
-        let mut g_users: HashMap<i64, [f32; D_MODEL]> = HashMap::new();
-
-        // Encode every distinct candidate in the batch exactly once.
-        let mut local: HashMap<usize, usize> = HashMap::new();
-        let mut cand_ids: Vec<usize> = Vec::new();
-        for ex in batch {
-            for &i in std::iter::once(&ex.positive).chain(ex.negatives.iter()) {
-                local.entry(i).or_insert_with(|| {
-                    cand_ids.push(i);
-                    cand_ids.len() - 1
-                });
-            }
-        }
-        let mut units = Vec::with_capacity(cand_ids.len());
-        let mut raws = Vec::with_capacity(cand_ids.len());
-        let mut norms = Vec::with_capacity(cand_ids.len());
-        for &i in &cand_ids {
-            let (u, r, n) = self.encode_feats_unit(&table.feats[i], table.scalars[i]);
-            units.push(u);
-            raws.push(r);
-            norms.push(n);
-        }
-        let mut g_units = vec![[0.0f32; D_MODEL]; cand_ids.len()];
-
-        let inv_batch = 1.0 / (batch.len() as f32);
-        let mut total_loss = 0.0f32;
-
-        for (bi, ex) in batch.iter().enumerate() {
+        local: &HashMap<usize, usize>,
+        units: &[[f32; D_MODEL]],
+        inv_batch: f32,
+    ) -> StepGrads {
+        let mut g = StepGrads::new(self.blocks.len(), units.len());
+        for bi in range {
+            let ex = batch[bi];
             let ctx_cache = self.forward_context(ex.user_id, &ex.context);
 
             let pos_song = table.song[ex.positive];
@@ -1510,17 +1601,17 @@ impl TransformerNet {
             }
             let ce_loss = -(probs[0].max(1e-12)).ln();
             let ex_w = ex.weight * inv_batch;
-            total_loss += ce_loss * ex_w;
+            g.loss += ce_loss * ex_w;
 
             let mut g_ctx_unit = [0.0f32; D_MODEL];
             for (k, &c) in cl.iter().enumerate() {
                 let target = if k == 0 { 1.0f32 } else { 0.0f32 };
                 let g_logit = (probs[k] - target) * ex_w;
-                g_logit_scale += g_logit * cosines[k];
+                g.logit_scale += g_logit * cosines[k];
                 let g_cos = g_logit * self.logit_scale;
                 for d in 0..D_MODEL {
                     g_ctx_unit[d] += g_cos * units[c][d];
-                    g_units[c][d] += g_cos * ctx_cache.ctx_unit[d];
+                    g.units[c][d] += g_cos * ctx_cache.ctx_unit[d];
                 }
             }
 
@@ -1534,7 +1625,7 @@ impl TransformerNet {
                 D_MODEL,
                 D_MODEL,
                 &mut g_h_norm,
-                &mut g_ctx_w,
+                &mut g.ctx_w,
             );
 
             let final_rms_g: [f32; D_MODEL] = self.final_rms_g.w[..D_MODEL].try_into().unwrap();
@@ -1546,62 +1637,135 @@ impl TransformerNet {
                 ctx_cache.final_rms,
                 &final_rms_g,
                 &mut g_h_seq[u_pos * D_MODEL..(u_pos + 1) * D_MODEL],
-                &mut g_final_rms_g,
+                &mut g.final_rms_g,
             );
 
             let mut g_h = g_h_seq;
             for l in (0..self.blocks.len()).rev() {
-                g_h = self.blocks[l].backward(&g_h, &ctx_cache.block_caches[l], ctx_cache.seq_len, &mut block_grads[l]);
+                g_h = self.blocks[l].backward(&g_h, &ctx_cache.block_caches[l], ctx_cache.seq_len, &mut g.blocks[l]);
             }
 
             for pos in 0..ctx_cache.seq_len {
                 let gp: [f32; D_MODEL] = g_h[pos * D_MODEL..(pos + 1) * D_MODEL].try_into().unwrap();
                 if let Some(act_idx) = ctx_cache.token_actions[pos] {
-                    let ga = &mut g_action[act_idx * D_MODEL..(act_idx + 1) * D_MODEL];
+                    let age_idx = ctx_cache.token_ages[pos];
                     for d in 0..D_MODEL {
-                        ga[d] += gp[d];
+                        g.action[act_idx * D_MODEL + d] += gp[d];
+                        g.age[age_idx * D_MODEL + d] += gp[d];
                     }
                     accumulate_sparse_feature_grad(
                         &ctx_cache.token_feats[pos],
                         ctx_cache.token_scalars[pos],
                         &gp,
-                        &mut g_feats,
-                        &mut g_scalar,
+                        &mut g.feats,
+                        &mut g.scalar,
                     );
                 } else {
-                    let entry = g_users.entry(ctx_cache.user_id).or_insert([0.0; D_MODEL]);
+                    let entry = g.users.entry(ctx_cache.user_id).or_insert([0.0; D_MODEL]);
                     for d in 0..D_MODEL {
                         entry[d] += gp[d];
                     }
                 }
             }
         }
+        g
+    }
+
+    /// One AdamW step of sampled-softmax InfoNCE over a batch. Each example ranks its positive
+    /// against its own sampled negatives plus every other example's positive (in-batch negatives),
+    /// skipping in-batch items the user is already known to like. Examples are split across
+    /// worker threads; their gradients are summed in a fixed order, so results are reproducible.
+    fn train_step(
+        &mut self,
+        batch: &[&TrainingExample],
+        table: &CorpusTable,
+        users: &HashMap<i64, UserPrep>,
+        lr: f32,
+    ) -> f32 {
+        if batch.is_empty() {
+            return 0.0;
+        }
+        let wd = 1e-4f32;
+
+        // Encode every distinct candidate in the batch exactly once.
+        let mut local: HashMap<usize, usize> = HashMap::new();
+        let mut cand_ids: Vec<usize> = Vec::new();
+        for ex in batch {
+            for &i in std::iter::once(&ex.positive).chain(ex.negatives.iter()) {
+                local.entry(i).or_insert_with(|| {
+                    cand_ids.push(i);
+                    cand_ids.len() - 1
+                });
+            }
+        }
+        let mut units = Vec::with_capacity(cand_ids.len());
+        let mut raws = Vec::with_capacity(cand_ids.len());
+        let mut norms = Vec::with_capacity(cand_ids.len());
+        for &i in &cand_ids {
+            let (u, r, n) = self.encode_feats_unit(&table.feats[i], table.scalars[i]);
+            units.push(u);
+            raws.push(r);
+            norms.push(n);
+        }
+
+        let inv_batch = 1.0 / (batch.len() as f32);
+        let n_threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(MAX_TRAIN_THREADS)
+            .min(batch.len())
+            .max(1);
+        let chunk = batch.len().div_ceil(n_threads);
+        let this: &Self = self;
+        let parts: Vec<StepGrads> = if n_threads == 1 {
+            vec![this.batch_grads(batch, 0..batch.len(), table, users, &local, &units, inv_batch)]
+        } else {
+            let (local, units) = (&local, &units);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|t| {
+                        let range = (t * chunk).min(batch.len())..((t + 1) * chunk).min(batch.len());
+                        scope.spawn(move || this.batch_grads(batch, range, table, users, local, units, inv_batch))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                    .collect()
+            })
+        };
+        let mut parts = parts.into_iter();
+        let mut g = parts.next().expect("at least one gradient part");
+        for part in parts {
+            g.merge(part);
+        }
+        let total_loss = g.loss;
 
         // Backprop the track tower once per distinct candidate.
+        let mut g_trk_w = vec![0.0f32; D_MODEL * D_MODEL];
         for (c, &ti) in cand_ids.iter().enumerate() {
-            if g_units[c].iter().all(|&g| g == 0.0) {
+            if g.units[c].iter().all(|&v| v == 0.0) {
                 continue;
             }
-            let g_proj = l2_normalize_backward(&g_units[c], &units[c], norms[c]);
+            let g_proj = l2_normalize_backward(&g.units[c], &units[c], norms[c]);
             let mut g_raw = [0.0f32; D_MODEL];
             matmul_backward(&g_proj, &raws[c], &self.track_proj_w.w, D_MODEL, D_MODEL, &mut g_raw, &mut g_trk_w);
-            accumulate_sparse_feature_grad(&table.feats[ti], Some(table.scalars[ti]), &g_raw, &mut g_feats, &mut g_scalar);
+            accumulate_sparse_feature_grad(&table.feats[ti], Some(table.scalars[ti]), &g_raw, &mut g.feats, &mut g.scalar);
         }
 
         // Song identities that won't be stored must not eat into the clipping budget.
-        g_feats.retain(|row, _| as_song_feat(*row).map_or(true, |s| table.identity.contains(&s)));
+        g.feats.retain(|row, _| as_song_feat(*row).map_or(true, |s| table.identity.contains(&s)));
 
         // Global gradient norm clipping (max_norm = 1.0)
         let mut sq_norm = 0.0f32;
-        for bg in &block_grads {
+        for bg in &g.blocks {
             sq_norm += bg.sq_norm();
         }
-        for &v in g_final_rms_g.iter().chain(&g_ctx_w).chain(&g_trk_w).chain(&g_action).chain(&g_scalar) {
+        for &v in g.final_rms_g.iter().chain(&g.ctx_w).chain(&g_trk_w).chain(&g.action).chain(&g.age).chain(&g.scalar) {
             sq_norm += v * v;
         }
-        sq_norm += g_logit_scale * g_logit_scale;
-        for g in g_feats.values().chain(g_users.values()) {
-            for &v in g {
+        sq_norm += g.logit_scale * g.logit_scale;
+        for gr in g.feats.values().chain(g.users.values()) {
+            for &v in gr {
                 sq_norm += v * v;
             }
         }
@@ -1609,21 +1773,23 @@ impl TransformerNet {
         let grad_norm = sq_norm.sqrt();
         if grad_norm > 1.0 {
             let clip = 1.0 / grad_norm;
-            for bg in &mut block_grads {
+            for bg in &mut g.blocks {
                 bg.scale(clip);
             }
-            for v in g_final_rms_g
+            for v in g
+                .final_rms_g
                 .iter_mut()
-                .chain(g_ctx_w.iter_mut())
+                .chain(g.ctx_w.iter_mut())
                 .chain(g_trk_w.iter_mut())
-                .chain(g_action.iter_mut())
-                .chain(g_scalar.iter_mut())
+                .chain(g.action.iter_mut())
+                .chain(g.age.iter_mut())
+                .chain(g.scalar.iter_mut())
             {
                 *v *= clip;
             }
-            g_logit_scale *= clip;
-            for g in g_feats.values_mut().chain(g_users.values_mut()) {
-                for v in g.iter_mut() {
+            g.logit_scale *= clip;
+            for gr in g.feats.values_mut().chain(g.users.values_mut()) {
+                for v in gr.iter_mut() {
                     *v *= clip;
                 }
             }
@@ -1633,19 +1799,22 @@ impl TransformerNet {
         let step_u32 = self.step_count.min(u32::MAX as u64) as u32;
 
         for (l, blk) in self.blocks.iter_mut().enumerate() {
-            blk.apply_adamw(&block_grads[l], lr, wd, step_u32);
+            blk.apply_adamw(&g.blocks[l], lr, wd, step_u32);
         }
-        self.final_rms_g.step_adamw(&g_final_rms_g, lr, 0.0, step_u32);
-        self.ctx_proj_w.step_adamw(&g_ctx_w, lr, wd, step_u32);
+        self.final_rms_g.step_adamw(&g.final_rms_g, lr, 0.0, step_u32);
+        self.ctx_proj_w.step_adamw(&g.ctx_w, lr, wd, step_u32);
         self.track_proj_w.step_adamw(&g_trk_w, lr, wd, step_u32);
-        self.action_emb.step_adamw(&g_action, lr, wd, step_u32);
-        self.scalar_proj.step_adamw(&g_scalar, lr, wd, step_u32);
+        self.action_emb.step_adamw(&g.action, lr, wd, step_u32);
+        self.age_emb.step_adamw(&g.age, lr, wd, step_u32);
+        self.scalar_proj.step_adamw(&g.scalar, lr, wd, step_u32);
 
         // Sparse AdamW for touched shared feature rows
         let b1 = 0.9f32;
         let b2 = 0.999f32;
         let eps = 1e-8f32;
-        for (row, g_row) in g_feats {
+        let mut feat_grads: Vec<(usize, [f32; D_MODEL])> = g.feats.into_iter().collect();
+        feat_grads.sort_by_key(|(row, _)| *row);
+        for (row, g_row) in feat_grads {
             if let Some(song) = as_song_feat(row) {
                 // Only songs someone interacted with get an identity; random catalog negatives
                 // don't, so the table stays small and unheard songs stay purely content-based.
@@ -1661,9 +1830,9 @@ impl TransformerNet {
             let base = row * D_MODEL;
             for d in 0..D_MODEL {
                 let idx = base + d;
-                let g = g_row[d];
-                self.feature_m[idx] = b1 * self.feature_m[idx] + (1.0 - b1) * g;
-                self.feature_v[idx] = b2 * self.feature_v[idx] + (1.0 - b2) * g * g;
+                let gv = g_row[d];
+                self.feature_m[idx] = b1 * self.feature_m[idx] + (1.0 - b1) * gv;
+                self.feature_v[idx] = b2 * self.feature_v[idx] + (1.0 - b2) * gv * gv;
                 let mh = self.feature_m[idx] / bc1;
                 let vh = self.feature_v[idx] / bc2;
                 self.feature_weights[idx] -= lr * (mh / (vh.sqrt() + eps) + wd * self.feature_weights[idx]);
@@ -1671,11 +1840,12 @@ impl TransformerNet {
         }
 
         // Sparse AdamW for touched per-user embeddings
-        for (uid, g_u) in g_users {
+        for (uid, g_u) in g.users {
             self.get_or_insert_user_row(uid).step_adamw(&g_u, lr, wd);
         }
 
         // Adam update for logit_scale
+        let g_logit_scale = g.logit_scale;
         self.logit_scale_m = b1 * self.logit_scale_m + (1.0 - b1) * g_logit_scale;
         self.logit_scale_v = b2 * self.logit_scale_v + (1.0 - b2) * g_logit_scale * g_logit_scale;
         let mh = self.logit_scale_m / (1.0 - b1.powi(step_u32 as i32));
@@ -1718,6 +1888,62 @@ impl TransformerNet {
     }
 }
 
+/// Gradients accumulated over part of a batch; one per training worker, summed afterwards.
+struct StepGrads {
+    blocks: Vec<BlockGrad>,
+    final_rms_g: [f32; D_MODEL],
+    ctx_w: Vec<f32>,
+    action: Vec<f32>,
+    age: Vec<f32>,
+    scalar: Vec<f32>,
+    logit_scale: f32,
+    feats: HashMap<usize, [f32; D_MODEL]>,
+    users: HashMap<i64, [f32; D_MODEL]>,
+    /// Per distinct batch candidate (indexed like `cand_ids`).
+    units: Vec<[f32; D_MODEL]>,
+    loss: f32,
+}
+
+impl StepGrads {
+    fn new(n_blocks: usize, n_cands: usize) -> Self {
+        Self {
+            blocks: (0..n_blocks).map(|_| BlockGrad::new()).collect(),
+            final_rms_g: [0.0; D_MODEL],
+            ctx_w: vec![0.0; D_MODEL * D_MODEL],
+            action: vec![0.0; N_ACTION_TYPES * D_MODEL],
+            age: vec![0.0; N_AGE_BUCKETS * D_MODEL],
+            scalar: vec![0.0; 4 * D_MODEL],
+            logit_scale: 0.0,
+            feats: HashMap::new(),
+            users: HashMap::new(),
+            units: vec![[0.0; D_MODEL]; n_cands],
+            loss: 0.0,
+        }
+    }
+
+    fn merge(&mut self, o: StepGrads) {
+        for (a, b) in self.blocks.iter_mut().zip(&o.blocks) {
+            a.add(b);
+        }
+        add_into(&mut self.final_rms_g, &o.final_rms_g);
+        add_into(&mut self.ctx_w, &o.ctx_w);
+        add_into(&mut self.action, &o.action);
+        add_into(&mut self.age, &o.age);
+        add_into(&mut self.scalar, &o.scalar);
+        self.logit_scale += o.logit_scale;
+        self.loss += o.loss;
+        for (a, b) in self.units.iter_mut().zip(&o.units) {
+            add_into(a, b);
+        }
+        for (k, v) in o.feats {
+            add_into(self.feats.entry(k).or_insert([0.0; D_MODEL]), &v);
+        }
+        for (k, v) in o.users {
+            add_into(self.users.entry(k).or_insert([0.0; D_MODEL]), &v);
+        }
+    }
+}
+
 fn accumulate_sparse_feature_grad(
     feats: &[(usize, f32)],
     scalars: Option<[f32; 4]>,
@@ -1750,6 +1976,7 @@ struct ContextForwardCache {
     token_feats: Vec<Vec<(usize, f32)>>,
     token_scalars: Vec<Option<[f32; 4]>>,
     token_actions: Vec<Option<usize>>,
+    token_ages: Vec<usize>,
     block_caches: Vec<BlockCache>,
     h_last: [f32; D_MODEL],
     final_rms: f32,
@@ -1939,8 +2166,13 @@ impl CorpusTable {
         self.index.get(id).copied()
     }
 
+    /// An untimed token (star, seed, dislike sample).
     fn item(&self, i: usize, action: usize) -> SeqItem {
-        (self.feats[i].clone(), Some(self.scalars[i]), action)
+        self.item_at(i, action, AGE_NONE)
+    }
+
+    fn item_at(&self, i: usize, action: usize, age: usize) -> SeqItem {
+        (self.feats[i].clone(), Some(self.scalars[i]), action, age)
     }
 }
 
@@ -2039,11 +2271,19 @@ fn prepare_users(corpus: &NeuralTrainingCorpus, table: &CorpusTable) -> HashMap<
 }
 
 /// Profile context from the user's first `upto` listens (stars prefixed when history is short).
-fn profile_sequence(p: &UserPrep, table: &CorpusTable, upto: usize, exclude_song: Option<u64>, cap: usize) -> Vec<SeqItem> {
+/// Each listen is tagged with how long before `ref_at` (the moment being predicted) it happened.
+fn profile_sequence(
+    p: &UserPrep,
+    table: &CorpusTable,
+    upto: usize,
+    exclude_song: Option<u64>,
+    cap: usize,
+    ref_at: i64,
+) -> Vec<SeqItem> {
     let upto = upto.min(p.listens.len());
     let start = upto.saturating_sub(cap);
     let window = &p.listens[start..upto];
-    let history: Vec<SeqItem> = window.iter().map(|(i, l)| table.item(*i, l.action)).collect();
+    let history: Vec<SeqItem> = window.iter().map(|(i, l)| table.item_at(*i, l.action, age_bucket(ref_at - l.at))).collect();
     let stars = if history.len() < PROFILE_SHORT_HISTORY {
         let hist_songs: HashSet<u64> = window.iter().map(|(i, _)| table.song[*i]).collect();
         p.stars
@@ -2206,6 +2446,7 @@ fn build_training_data(
         return TrainingData { examples, holdouts, server_pop: HashMap::new() };
     }
     let mut rng = StdRng::seed_from_u64(seed);
+    let now = Utc::now().timestamp();
     let sampler = NegSampler::new(table, users);
     let mut uids: Vec<i64> = users.keys().copied().collect();
     uids.sort();
@@ -2238,7 +2479,7 @@ fn build_training_data(
             let tgt = p.listens[h].0;
             holdouts.push(EvalItem {
                 user_id: uid,
-                context: profile_sequence(p, table, h, Some(table.song[tgt]), MAX_SEQ_LEN - 1),
+                context: profile_sequence(p, table, h, Some(table.song[tgt]), MAX_SEQ_LEN - 1, p.listens[h].1.at),
                 target: tgt,
             });
         }
@@ -2265,11 +2506,11 @@ fn build_training_data(
             };
             let ctx = match seed_k {
                 Some(k) => {
-                    let mut seq = profile_sequence(p, table, k, Some(pos_song), CONTEXT_HISTORY_CAP);
+                    let mut seq = profile_sequence(p, table, k, Some(pos_song), CONTEXT_HISTORY_CAP, l.at);
                     seq.push(table.item(p.listens[k].0, ACTION_SEED));
                     seq
                 }
-                None => profile_sequence(p, table, i, Some(pos_song), MAX_SEQ_LEN - 1),
+                None => profile_sequence(p, table, i, Some(pos_song), MAX_SEQ_LEN - 1, l.at),
             };
             let ctx = token_dropout(ctx, &mut rng);
             let negs = sampler.sample(uid, pos, &mut rng);
@@ -2308,7 +2549,7 @@ fn build_training_data(
                     if p.listens[start..].iter().any(|(j, _)| table.song[*j] == pos_song) {
                         w *= 0.5;
                     }
-                    ctx = profile_sequence(p, table, p.listens.len(), Some(pos_song), CONTEXT_HISTORY_CAP);
+                    ctx = profile_sequence(p, table, p.listens.len(), Some(pos_song), CONTEXT_HISTORY_CAP, now);
                 }
             }
             let mut others: Vec<usize> = (0..pl.len()).filter(|&k| k != h).collect();
@@ -2319,7 +2560,7 @@ fn build_training_data(
                 ctx.push(table.item(pl[k], ACTION_SEED));
             }
             if !q.is_empty() && rng.gen_bool(0.7) {
-                ctx.push((q.clone(), None, ACTION_QUERY));
+                ctx.push((q.clone(), None, ACTION_QUERY, AGE_NONE));
             }
             let negs = sampler.sample(*uid, pos, &mut rng);
             if !negs.is_empty() {
@@ -2410,9 +2651,9 @@ fn build_training_data(
                 if p.listens[start..].iter().any(|(j, _)| table.song[*j] == pos_song) {
                     w *= 0.5;
                 }
-                profile_sequence(p, table, p.listens.len(), Some(pos_song), CONTEXT_HISTORY_CAP)
+                profile_sequence(p, table, p.listens.len(), Some(pos_song), CONTEXT_HISTORY_CAP, now)
             };
-            ctx.push((qf, None, ACTION_QUERY));
+            ctx.push((qf, None, ACTION_QUERY, AGE_NONE));
             let ctx_user = if anonymous { 0 } else { uid };
             let negs = sampler.sample(uid, pos, &mut rng);
             if !negs.is_empty() {
@@ -2457,8 +2698,81 @@ fn rank_of_first(scores: &[f32]) -> f32 {
     r
 }
 
-/// Ranks each held-out listen against random unseen catalog tracks and compares the model
-/// with a popularity baseline and an artist/genre-overlap content baseline.
+/// Stand-in for `taste::score_track_core`, rebuilt from an evaluation context alone. The live
+/// scorer reads the user's *current* profile, which already contains the held-out listen, so
+/// it can't be used for evaluation without leaking the answer. Mirrors its main terms and
+/// magnitudes: saturating artist / genre / mood affinity (signed by skips and dislikes) plus a
+/// small popularity nudge, so blend weights measured against it carry over to `taste.rs`.
+struct HeuristicProxy {
+    artist: HashMap<usize, f32>,
+    genre: HashMap<usize, f32>,
+    mood: HashMap<usize, f32>,
+    genre_norm: f32,
+}
+
+fn action_affinity(action: usize) -> f32 {
+    match action {
+        ACTION_STAR => 2.0,
+        ACTION_PLAYLIST => 1.6,
+        ACTION_SEED => 1.2,
+        ACTION_COMPLETE | ACTION_QUERY => 1.0,
+        ACTION_PLAY => 0.3,
+        ACTION_SKIP => -0.8,
+        ACTION_DISLIKE => -1.6,
+        _ => 0.0,
+    }
+}
+
+impl HeuristicProxy {
+    fn from_context(ctx: &[SeqItem]) -> Self {
+        let mut hp = HeuristicProxy {
+            artist: HashMap::new(),
+            genre: HashMap::new(),
+            mood: HashMap::new(),
+            genre_norm: 2.5,
+        };
+        for (feats, _, act, _) in ctx {
+            let a = action_affinity(*act);
+            if a == 0.0 {
+                continue;
+            }
+            for &(row, w) in feats {
+                let map = if (ARTIST_OFFSET..TEXT_OFFSET).contains(&row) {
+                    &mut hp.artist
+                } else if (GENRE_OFFSET..MOOD_OFFSET).contains(&row) {
+                    &mut hp.genre
+                } else if (MOOD_OFFSET..ERA_OFFSET).contains(&row) {
+                    &mut hp.mood
+                } else {
+                    continue;
+                };
+                *map.entry(row).or_insert(0.0) += a * w;
+            }
+        }
+        let total_pos_genre: f32 = hp.genre.values().filter(|v| **v > 0.0).sum();
+        hp.genre_norm = (total_pos_genre * 0.35).clamp(2.5, 8.0);
+        hp
+    }
+
+    fn score(&self, feats: &[(usize, f32)], scalars: &[f32; 4]) -> f32 {
+        let (mut a, mut g, mut m) = (0.0f32, 0.0f32, 0.0f32);
+        for &(row, w) in feats {
+            if let Some(v) = self.artist.get(&row) {
+                a += v * w;
+            } else if let Some(v) = self.genre.get(&row) {
+                g += v * w;
+            } else if let Some(v) = self.mood.get(&row) {
+                m += v * w;
+            }
+        }
+        let artist_term = (a / 2.5).tanh() * if a >= 0.0 { 5.2 } else { 5.0 };
+        artist_term + (g / self.genre_norm).tanh() * 3.0 + (m / 2.5).tanh() * 1.2 + 0.5 * scalars[0]
+    }
+}
+
+/// Ranks each held-out listen against random unseen catalog tracks. Reports the model alone
+/// versus popularity / server-popularity / content baselines, and, what decides its weight,
+/// whether adding the model's served scores to a heuristic ranker improves the ranking.
 fn evaluate(
     net: &TransformerNet,
     table: &CorpusTable,
@@ -2475,9 +2789,10 @@ fn evaluate(
         return rep;
     }
     let mut unit_cache: HashMap<usize, [f32; D_MODEL]> = HashMap::new();
-    let (mut m_rr, mut m_hit, mut p_rr, mut c_rr, mut c_hit) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    let (mut m_hit, mut p_rr, mut c_rr, mut c_hit) = (0f64, 0f64, 0f64, 0f64);
     let mut s_rr = 0f64;
-    let mut n = 0usize;
+    let mut model_rr: Vec<f32> = Vec::new();
+    let mut blend_rr: Vec<Vec<f32>> = vec![Vec::new(); BLEND_WEIGHT_GRID.len()];
     let mut eval_users: HashSet<i64> = HashSet::new();
     for (k, item) in items.iter().enumerate() {
         let mut rng = StdRng::seed_from_u64(seed ^ (k as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
@@ -2502,8 +2817,9 @@ fn evaluate(
 
         // Score exactly as served: crowd taste removed according to the context's history size.
         let ctx = net.personalize(&net.forward_context(item.user_id, &item.context).ctx_unit, item.context.len());
+        let heuristic = HeuristicProxy::from_context(&item.context);
         let mut profile_rows: HashMap<usize, f32> = HashMap::new();
-        for (feats, _, act) in &item.context {
+        for (feats, _, act, _) in &item.context {
             if *act == ACTION_SKIP || *act == ACTION_DISLIKE {
                 continue;
             }
@@ -2517,6 +2833,7 @@ fn evaluate(
         }
 
         let mut model_s = Vec::with_capacity(pool.len());
+        let mut heur_s = Vec::with_capacity(pool.len());
         let mut pop_s = Vec::with_capacity(pool.len());
         let mut content_s = Vec::with_capacity(pool.len());
         let mut server_s = Vec::with_capacity(pool.len());
@@ -2524,11 +2841,8 @@ fn evaluate(
             let u = *unit_cache
                 .entry(i)
                 .or_insert_with(|| net.encode_feats_unit(&table.feats[i], table.scalars[i]).0);
-            let mut cos = 0.0f32;
-            for d in 0..D_MODEL {
-                cos += ctx[d] * u[d];
-            }
-            model_s.push(cos);
+            model_s.push((0..D_MODEL).map(|d| ctx[d] * u[d]).sum::<f32>());
+            heur_s.push(heuristic.score(&table.feats[i], &table.scalars[i]));
             let pop = table.scalars[i][0] + 0.05 * table.scalars[i][1];
             pop_s.push(pop);
             let mut c = 0.0f32;
@@ -2543,30 +2857,52 @@ fn evaluate(
             let cnt = server_pop.get(&table.song[i]).copied().unwrap_or(0) as f32;
             server_s.push(cnt + 0.01 * pop);
         }
+        let served = served_scores(net, &model_s);
+        for (gi, &w) in BLEND_WEIGHT_GRID.iter().enumerate() {
+            let blended: Vec<f32> = heur_s.iter().zip(&served).map(|(h, m)| h + w * m).collect();
+            blend_rr[gi].push(1.0 / rank_of_first(&blended));
+        }
         let mr = rank_of_first(&model_s);
-        let pr = rank_of_first(&pop_s);
         let cr = rank_of_first(&content_s);
-        let sr = rank_of_first(&server_s);
-        m_rr += 1.0 / mr as f64;
-        p_rr += 1.0 / pr as f64;
+        model_rr.push(1.0 / mr);
+        p_rr += 1.0 / rank_of_first(&pop_s) as f64;
         c_rr += 1.0 / cr as f64;
-        s_rr += 1.0 / sr as f64;
+        s_rr += 1.0 / rank_of_first(&server_s) as f64;
         m_hit += (mr <= 10.0) as u8 as f64;
         c_hit += (cr <= 10.0) as u8 as f64;
-        n += 1;
         eval_users.insert(item.user_id);
     }
+    let n = model_rr.len();
     if n > 0 {
         let nf = n as f64;
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
         rep.n = n;
         rep.users = eval_users.len();
-        rep.model_mrr = (m_rr / nf) as f32;
+        rep.model_mrr = mean(&model_rr);
         rep.model_recall10 = (m_hit / nf) as f32;
         rep.popularity_mrr = (p_rr / nf) as f32;
         rep.server_pop_mrr = (s_rr / nf) as f32;
         rep.content_mrr = (c_rr / nf) as f32;
         rep.content_recall10 = (c_hit / nf) as f32;
         rep.compute_lift();
+
+        // BLEND_WEIGHT_GRID[0] is 0.0: the heuristic alone.
+        rep.heuristic_mrr = mean(&blend_rr[0]);
+        // The largest weight that still ranks (nearly) as well as the best one: how far the
+        // model can be leaned on before it starts to hurt. Plateaus are common when the
+        // heuristic ties many candidates and any model weight breaks the ties equally well.
+        let means: Vec<f32> = blend_rr.iter().map(|v| mean(v)).collect();
+        let top = means.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let best = if top <= means[0] + 1e-6 {
+            0
+        } else {
+            (1..means.len()).rev().find(|&gi| means[gi] >= top - BLEND_MRR_TOLERANCE).unwrap_or(0)
+        };
+        rep.blend_weight = BLEND_WEIGHT_GRID[best];
+        rep.blend_mrr = mean(&blend_rr[best]);
+        let gains: Vec<f32> = blend_rr[best].iter().zip(&blend_rr[0]).map(|(b, h)| b - h).collect();
+        rep.blend_gain_lo = bootstrap_mean_ci(&gains, seed ^ 0x626c_656e_64, 0.10, 0.90).1;
+        rep.item_rr = model_rr;
     }
     rep
 }
@@ -2594,6 +2930,13 @@ pub struct TransformerEngine {
     user_vec_cache: RwLock<HashMap<i64, (i64, u64, [f32; D_MODEL])>>,
     unit_cache: RwLock<HashMap<u64, [f32; D_MODEL]>>,
     train_lock: std::sync::Mutex<()>,
+}
+
+/// Exactly what callers blend with their heuristic scores: list-normalised model scores, damped
+/// while the model has barely trained. Also used by evaluation so it measures what is served.
+fn served_scores(net: &TransformerNet, raw: &[f32]) -> Vec<f32> {
+    let confidence = (net.step_count as f32 / 40.0).clamp(0.05, 1.0);
+    normalize_scores(raw).into_iter().map(|v| v * confidence).collect()
 }
 
 fn track_cache_key(t: &Track, model_step: u64) -> u64 {
@@ -2665,6 +3008,10 @@ impl TransformerEngine {
                 "serverPopularityMrr": r3(ev.server_pop_mrr),
                 "contentMrr": r3(ev.content_mrr),
                 "contentRecall10": r3(ev.content_recall10),
+                "heuristicMrr": r3(ev.heuristic_mrr),
+                "blendMrr": r3(ev.blend_mrr),
+                "blendWeight": r3(ev.blend_weight),
+                "blendGainLower": r3(ev.blend_gain_lo),
                 "lift": r3(ev.lift),
                 "quality": r3(ev.quality),
                 "evaluatedAt": ev.evaluated_at,
@@ -2731,23 +3078,13 @@ impl TransformerEngine {
         if net.step_count == 0 {
             return vec![0.0; candidates.len()];
         }
-        let confidence = (net.step_count as f32 / 40.0).clamp(0.05, 1.0);
         let ctx_vec = self.compute_context_vector_locked(&net, store, user_id, context_tracks, query, moods, genres);
-        self.track_units(&net, candidates)
+        let raw: Vec<f32> = self
+            .track_units(&net, candidates)
             .iter()
-            .map(|u| {
-                let mut cos = 0.0f32;
-                for d in 0..D_MODEL {
-                    cos += ctx_vec[d] * u[d];
-                }
-                let s = cos * net.logit_scale * confidence;
-                if s.is_finite() {
-                    s
-                } else {
-                    0.0
-                }
-            })
-            .collect()
+            .map(|u| (0..D_MODEL).map(|d| ctx_vec[d] * u[d]).sum())
+            .collect();
+        served_scores(&net, &raw)
     }
 
     fn multiplier_for(net: &TransformerNet, history_count: usize) -> f64 {
@@ -2781,22 +3118,20 @@ impl TransformerEngine {
         if net.step_count == 0 {
             return vec![0.0; artists.len()];
         }
-        let confidence = (net.step_count as f32 / 40.0).clamp(0.05, 1.0);
         let ctx_vec = self.compute_context_vector_locked(&net, store, user_id, &[], None, &[], &[]);
-        let mut scores = Vec::with_capacity(artists.len());
-        for (name, genres) in artists {
-            let mut synth = Track::default();
-            synth.artist = name.clone();
-            synth.genre = genres.clone();
-            let (t_unit, _, _, _, _) = net.encode_track_unit(&synth);
-            let mut cos = 0.0f32;
-            for d in 0..D_MODEL {
-                cos += ctx_vec[d] * t_unit[d];
-            }
-            let s = cos * net.logit_scale * confidence;
-            scores.push(if s.is_finite() { s } else { 0.0 });
-        }
-        scores
+        let raw: Vec<f32> = artists
+            .iter()
+            .map(|(name, genres)| {
+                let synth = Track {
+                    artist: name.clone(),
+                    genre: genres.clone(),
+                    ..Track::default()
+                };
+                let (t_unit, _, _, _, _) = net.encode_track_unit(&synth);
+                (0..D_MODEL).map(|d| ctx_vec[d] * t_unit[d]).sum()
+            })
+            .collect();
+        served_scores(&net, &raw)
     }
 
     fn compute_context_vector_locked(
@@ -2837,7 +3172,7 @@ impl TransformerEngine {
                     by_id.get(l.track_id.as_str()).map(|t| {
                         hist_songs.insert(t.song_key());
                         let (f, s) = TransformerNet::extract_track_features(t);
-                        (f, Some(s), l.action)
+                        (f, Some(s), l.action, age_bucket(now - l.at))
                     })
                 })
                 .collect();
@@ -2850,7 +3185,7 @@ impl TransformerEngine {
                     .take(STAR_PREFIX_MAX)
                     .map(|(t, _)| {
                         let (f, s) = TransformerNet::extract_track_features(&t);
-                        (f, Some(s), ACTION_STAR)
+                        (f, Some(s), ACTION_STAR, AGE_NONE)
                     })
                     .collect()
             } else {
@@ -2862,13 +3197,13 @@ impl TransformerEngine {
 
         for t in context_tracks.iter().take(MAX_SEED_TOKENS) {
             let (f, s) = TransformerNet::extract_track_features(t);
-            seq_items.push((f, Some(s), ACTION_SEED));
+            seq_items.push((f, Some(s), ACTION_SEED, AGE_NONE));
         }
 
         if has_query {
             let qf = TransformerNet::extract_query_features(query.unwrap_or(""), moods, genres);
             if !qf.is_empty() {
-                seq_items.push((qf, None, ACTION_QUERY));
+                seq_items.push((qf, None, ACTION_QUERY, AGE_NONE));
             }
         }
 
@@ -2970,8 +3305,14 @@ impl TransformerEngine {
         net.refresh_crowd(&table, &users);
 
         let after = evaluate(&net, &table, &users, &data.holdouts, &data.server_pop, eval_seed);
+        // Paired comparison on the same held-out listens and candidate pools: discard the update
+        // only when it is clearly worse (even the optimistic end of a 90% bootstrap interval of
+        // the per-listen change is a loss), not whenever noise dips the average.
         let rejected = match (&before, &prev_net) {
-            (Some(b), Some(_)) => after.trusted() && after.model_mrr + 0.015 < b.model_mrr,
+            (Some(b), Some(_)) if after.trusted() && !after.item_rr.is_empty() && b.item_rr.len() == after.item_rr.len() => {
+                let diffs: Vec<f32> = after.item_rr.iter().zip(&b.item_rr).map(|(a, b)| a - b).collect();
+                bootstrap_mean_ci(&diffs, eval_seed ^ 0x6761_7465, 0.05, 0.95).2 < 0.0
+            }
             _ => false,
         };
         if rejected {
@@ -3049,10 +3390,11 @@ fn distill_corpus_users(
 
     let mut uids: Vec<i64> = users.keys().copied().collect();
     uids.sort();
+    let now = Utc::now().timestamp();
     let mut distilled = 0usize;
     for uid in uids {
         let p = &users[&uid];
-        let seq = profile_sequence(p, table, p.listens.len(), None, MAX_SEQ_LEN - 1);
+        let seq = profile_sequence(p, table, p.listens.len(), None, MAX_SEQ_LEN - 1, now);
         if seq.len() < 2 {
             continue;
         }
@@ -3195,7 +3537,7 @@ mod tests {
         let f1 = TransformerNet::extract_track_features(&t1);
         let f2 = TransformerNet::extract_track_features(&t2);
         let user_id = 42i64;
-        let context: Vec<SeqItem> = vec![(f1.0, Some(f1.1), ACTION_STAR), (f2.0, Some(f2.1), ACTION_COMPLETE)];
+        let context: Vec<SeqItem> = vec![(f1.0, Some(f1.1), ACTION_STAR, AGE_NONE), (f2.0, Some(f2.1), ACTION_COMPLETE, 2)];
         let cand_tracks = [pos, neg1, neg2];
         let t1_song = song_id(fnv1a_hash(t1.song_key().as_bytes()));
         net.song_embs.insert(t1_song, SparseAdamRow::from_seed(99, 0.1));
@@ -3375,7 +3717,7 @@ mod tests {
         for ex in &data.examples {
             let id = &table.ids[ex.positive];
             assert!(!id.starts_with("pop"), "skipped track {} used as a positive", id);
-            if let Some((last_feats, _, act)) = ex.context.last() {
+            if let Some((last_feats, _, act, _)) = ex.context.last() {
                 if *act != ACTION_QUERY {
                     assert!(
                         *last_feats != table.feats[ex.positive],
@@ -3426,9 +3768,11 @@ mod tests {
         }
         assert!(engine.net.read().unwrap().crowd_ctx.len() == D_MODEL);
 
-        let all = genre_tracks();
-        let pick = |id: &str| all.iter().find(|t| t.id == id).unwrap().clone();
-        let cands = vec![pick("rock0"), pick("jazz5")];
+        // Score the whole catalog: served scores are normalised per candidate list, so the list
+        // must be realistic for the gap between two tracks to mean anything.
+        let cands = genre_tracks();
+        let at = |id: &str| cands.iter().position(|t| t.id == id).unwrap();
+        let (fav, mine) = (at("rock0"), at("jazz5"));
         let corrected = engine.score_candidates(&store, newbie.id, &[], None, &[], &[], &cands);
 
         let saved = std::mem::take(&mut engine.net.write().unwrap().crowd_ctx);
@@ -3437,15 +3781,16 @@ mod tests {
         engine.net.write().unwrap().crowd_ctx = saved;
 
         assert!(
-            corrected[1] > corrected[0],
-            "new jazz listener should rank unheard jazz above the crowd's rock favourite: {:?}",
-            corrected
+            corrected[mine] > corrected[fav],
+            "new jazz listener should rank unheard jazz above the crowd's rock favourite: jazz5={} rock0={}",
+            corrected[mine],
+            corrected[fav]
         );
         assert!(
-            corrected[0] - corrected[1] < raw[0] - raw[1],
-            "crowd correction must lower the crowd favourite relative to the personal match: raw={:?} corrected={:?}",
-            raw,
-            corrected
+            corrected[fav] - corrected[mine] < raw[fav] - raw[mine],
+            "crowd correction must lower the crowd favourite relative to the personal match: raw gap={} corrected gap={}",
+            raw[fav] - raw[mine],
+            corrected[fav] - corrected[mine]
         );
     }
 
@@ -3497,6 +3842,105 @@ mod tests {
         let b = engine.score_candidates(&store, probe_b.id, &[], None, &[], &[], &cands);
         assert!(a[0] > a[1], "after rock0, rock4 should beat rock8: {:?}", a);
         assert!(b[1] > b[0], "after rock2, rock8 should beat rock4: {:?}", b);
+    }
+
+    #[test]
+    fn served_scores_ignore_model_temperature_and_are_bounded() {
+        let raw = [0.31f32, -0.12, 0.05, 0.44, f32::NAN, -0.3];
+        let a = normalize_scores(&raw);
+        // Multiplying by any temperature (logit_scale) changes nothing once normalised.
+        let scaled: Vec<f32> = raw.iter().map(|v| v * 17.0).collect();
+        let b = normalize_scores(&scaled);
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-4);
+        }
+        let mean: f32 = a.iter().sum::<f32>() / a.len() as f32;
+        let sd = (a.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / a.len() as f32).sqrt();
+        assert!(mean.abs() < 1e-4 && (sd - NEURAL_SCORE_SCALE).abs() < 1e-3, "mean={mean} sd={sd}");
+        assert!(a.iter().all(|v| v.is_finite() && v.abs() <= 3.0 * NEURAL_SCORE_SCALE + 1e-4));
+        // Near-identical candidates aren't stretched into big differences.
+        let flat = normalize_scores(&[0.500, 0.501, 0.499]);
+        assert!(flat.iter().all(|v| v.abs() < 0.05));
+        assert_eq!(normalize_scores(&[0.7]), vec![0.0]);
+    }
+
+    #[test]
+    fn bootstrap_interval_separates_real_changes_from_noise() {
+        let worse: Vec<f32> = (0..20).map(|i| -0.2 + 0.01 * (i % 3) as f32).collect();
+        let (m, lo, hi) = bootstrap_mean_ci(&worse, 1, 0.05, 0.95);
+        assert!(lo <= m && m <= hi && hi < 0.0, "clearly worse: {m} [{lo}, {hi}]");
+        let noisy: Vec<f32> = (0..10).map(|i| if i % 2 == 0 { 0.5 } else { -0.52 }).collect();
+        let (_, lo, hi) = bootstrap_mean_ci(&noisy, 1, 0.05, 0.95);
+        assert!(lo < 0.0 && hi > 0.0, "noise must straddle zero: [{lo}, {hi}]");
+    }
+
+    #[test]
+    fn age_buckets_cover_session_to_long_term() {
+        assert_eq!(age_bucket(-5), 0);
+        assert_eq!(age_bucket(60), 0);
+        assert_eq!(age_bucket(20 * 60), 1);
+        assert_eq!(age_bucket(2 * 3600), 2);
+        assert_eq!(age_bucket(12 * 3600), 3);
+        assert_eq!(age_bucket(3 * 86_400), 4);
+        assert_eq!(age_bucket(10 * 86_400), 5);
+        assert_eq!(age_bucket(400 * 86_400), 6);
+        assert!(AGE_NONE > 6 && AGE_NONE < N_AGE_BUCKETS);
+    }
+
+    #[test]
+    fn split_batch_gradients_match_serial() {
+        let store = Store::open_memory().unwrap();
+        store.upsert_tracks(&genre_tracks()).unwrap();
+        for (k, g) in ["rock", "jazz", "pop"].iter().enumerate() {
+            let u = store.create_user(&format!("sb{}", k), "pw123").unwrap();
+            for i in 0..8 {
+                listen(&store, u.id, &format!("{}{}", g, (i * 5 + k) % 12), i % 4 != 3);
+            }
+        }
+        let corpus = store.load_transformer_corpus(CORPUS_EVENTS_PER_USER, CORPUS_CATALOG_LIMIT).unwrap();
+        let table = CorpusTable::build(&corpus);
+        let users = prepare_users(&corpus, &table);
+        let data = build_training_data(&corpus, &table, &users, 3);
+        let batch: Vec<&TrainingExample> = data.examples.iter().take(9).collect();
+        assert!(batch.len() >= 6);
+
+        let net = TransformerNet::new();
+        let mut local: HashMap<usize, usize> = HashMap::new();
+        let mut cand_ids = Vec::new();
+        for ex in &batch {
+            for &i in std::iter::once(&ex.positive).chain(ex.negatives.iter()) {
+                local.entry(i).or_insert_with(|| {
+                    cand_ids.push(i);
+                    cand_ids.len() - 1
+                });
+            }
+        }
+        let units: Vec<[f32; D_MODEL]> = cand_ids.iter().map(|&i| net.encode_feats_unit(&table.feats[i], table.scalars[i]).0).collect();
+        let inv = 1.0 / batch.len() as f32;
+        let serial = net.batch_grads(&batch, 0..batch.len(), &table, &users, &local, &units, inv);
+        let mut split = net.batch_grads(&batch, 0..2, &table, &users, &local, &units, inv);
+        split.merge(net.batch_grads(&batch, 2..5, &table, &users, &local, &units, inv));
+        split.merge(net.batch_grads(&batch, 5..batch.len(), &table, &users, &local, &units, inv));
+
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() <= 1e-5 + 1e-4 * x.abs().max(y.abs()), "{what}: {x} vs {y}");
+            }
+        };
+        assert!((serial.loss - split.loss).abs() < 1e-5);
+        close(&serial.blocks[0].wq, &split.blocks[0].wq, "wq");
+        close(&serial.blocks[1].w2, &split.blocks[1].w2, "w2");
+        close(&serial.ctx_w, &split.ctx_w, "ctx_w");
+        close(&serial.age, &split.age, "age");
+        close(&serial.action, &split.action, "action");
+        assert_eq!(serial.feats.len(), split.feats.len());
+        for (k, v) in &serial.feats {
+            close(v, &split.feats[k], "feats");
+        }
+        for (a, b) in serial.units.iter().zip(&split.units) {
+            close(a, b, "units");
+        }
+        assert!(serial.age.iter().any(|v| *v != 0.0), "timed history tokens must train the age embedding");
     }
 
     #[test]
@@ -3633,6 +4077,8 @@ mod tests {
             "model should beat both baselines on genre-separable users: {:?}",
             ev
         );
+        assert!(ev.blend_mrr >= ev.heuristic_mrr && ev.heuristic_mrr > 0.0, "{:?}", ev);
+        assert!(ev.blend_weight > 0.0 && ev.blend_gain_lo > 0.0, "model should clearly improve the heuristic here: {:?}", ev);
         assert!(ev.quality > 0.5 && engine.adaptive_multiplier(30) > 1.0, "{:?}", ev);
 
         // New data re-opens training.
