@@ -1,6 +1,6 @@
 use crate::auth::{hash_recovery_code, RESTORE_WINDOW_SECS};
 use crate::models::{
-    constant_time_eq, err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
+    err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
     ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, PublicUser, RadioStation,
     ShareRecord, Track, User, UserEventRow, UserProfile, UserTrackStats,
 };
@@ -595,6 +595,7 @@ impl Store {
         )?;
         let _ = conn.execute("DELETE FROM kv WHERE key LIKE 'nn:user:%'", []);
 
+        migrate_plaintext_passwords(&mut conn)?;
         migrate_legacy_moods(&mut conn)?;
         migrate_artist_disambiguation(&mut conn)?;
         migrate_artist_disambiguation_v2(&mut conn)?;
@@ -608,6 +609,8 @@ impl Store {
 
     pub fn create_user(&self, username: &str, password: &str) -> AppResult<User> {
         let uname = validate_credentials(username, password).map_err(|e| err_msg(e))?;
+        // Hash before taking the DB lock: Argon2 is deliberately slow.
+        let hashed = crate::auth::hash_password(password)?;
         let conn = self.lock();
         let existing: Option<i64> = conn
             .query_row(
@@ -622,13 +625,13 @@ impl Store {
         let now = Utc::now().timestamp();
         conn.execute(
             "INSERT INTO users(username, password, created) VALUES (?1, ?2, ?3)",
-            params![uname, password, now],
+            params![uname, hashed, now],
         )?;
         let id = conn.last_insert_rowid();
         Ok(User {
             id,
             username: uname,
-            password: password.to_string(),
+            password: hashed,
             created: now,
         })
     }
@@ -637,16 +640,21 @@ impl Store {
     /// account. Unknown usernames must go through the sign-up flow instead.
     pub fn authenticate_user(&self, username: &str, password: &str) -> AppResult<User> {
         let uname = validate_credentials(username, password).map_err(err_msg)?;
-        let conn = self.lock();
-        let existing: Option<(User, i64)> = conn
-            .query_row(
+        let existing: Option<(User, i64)> = {
+            let conn = self.lock();
+            conn.query_row(
                 "SELECT id, username, password, created, deleted_at FROM users WHERE lower(username) = lower(?1)",
                 params![uname],
                 |r| Ok((row_to_user(r)?, r.get::<_, i64>(4)?)),
             )
-            .optional()?;
+            .optional()?
+        };
+        // Verify with the DB lock released so a slow hash never stalls others.
+        if existing.is_none() {
+            crate::auth::verify_password_dummy(password);
+        }
         match existing {
-            Some((user, deleted_at)) if constant_time_eq(&user.password, password) => {
+            Some((user, deleted_at)) if crate::auth::verify_password(&user.password, password) => {
                 if deleted_at > 0 {
                     Err(err_msg(crate::models::ERR_RESTORE_REQUIRED))
                 } else {
@@ -666,6 +674,7 @@ impl Store {
         password: &str,
     ) -> AppResult<(User, bool)> {
         let uname = validate_credentials(username, password).map_err(|e| err_msg(e))?;
+        let hashed = crate::auth::hash_password(password)?;
         let conn = self.lock();
         let existing: Option<(User, i64)> = conn
             .query_row(
@@ -675,7 +684,7 @@ impl Store {
             )
             .optional()?;
         if let Some((u, deleted_at)) = existing {
-            if !constant_time_eq(&u.password, password) {
+            if !crate::auth::verify_password(&u.password, password) {
                 return Err(err_msg("Invalid username or password"));
             }
             if deleted_at > 0 {
@@ -687,7 +696,7 @@ impl Store {
         let now = Utc::now().timestamp();
         match conn.execute(
             "INSERT INTO users(username, password, created) VALUES (?1, ?2, ?3)",
-            params![uname, password, now],
+            params![uname, hashed, now],
         ) {
             Ok(_) => {
                 let id = conn.last_insert_rowid();
@@ -695,7 +704,7 @@ impl Store {
                     User {
                         id,
                         username: uname,
-                        password: password.to_string(),
+                        password: hashed,
                         created: now,
                     },
                     true,
@@ -711,7 +720,7 @@ impl Store {
                     )
                     .optional()?
                     .ok_or_else(|| err_msg("Failed to create user"))?;
-                if constant_time_eq(&u.password, password) {
+                if crate::auth::verify_password(&u.password, password) {
                     Ok((u, false))
                 } else {
                     Err(err_msg("Invalid username or password"))
@@ -746,10 +755,11 @@ impl Store {
         if new_password.is_empty() || new_password.len() > 256 {
             return Err(err_msg("Password must be 1 to 256 characters"));
         }
+        let hashed = crate::auth::hash_password(new_password)?;
         let conn = self.lock();
         conn.execute(
             "UPDATE users SET password = ?1 WHERE id = ?2",
-            params![new_password, user_id],
+            params![hashed, user_id],
         )?;
         Ok(())
     }
@@ -810,6 +820,29 @@ impl Store {
         Ok(user)
     }
 
+    /// The `kind` of a live session token (`web`, `nd`, `subsonic`), if any.
+    pub fn session_kind(&self, token: &str) -> AppResult<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT kind FROM sessions WHERE token = ?1 AND revoked = 0",
+                params![token.trim()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Signs out every token session of a user except `keep_token`. Subsonic
+    /// client rows are left alone: they authenticate with the API key, not
+    /// the password, so a password change does not affect them.
+    pub fn delete_other_sessions(&self, user_id: i64, keep_token: &str) -> AppResult<usize> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "DELETE FROM sessions WHERE user_id = ?1 AND kind <> 'subsonic' AND token <> ?2",
+            params![user_id, keep_token.trim()],
+        )?)
+    }
+
     pub fn delete_session(&self, token: &str) -> AppResult<()> {
         let conn = self.lock();
         conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
@@ -845,18 +878,10 @@ impl Store {
             // write to once a minute (or when the connection details change)
             // to avoid a DB write per media chunk.
             if now - last_seen >= 60 || saved_ip != ip || saved_ua != user_agent {
-                if revoked == 0 {
-                    conn.execute(
-                        "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3
-                         WHERE token = ?4",
-                        params![now, ip, user_agent, token],
-                    )?;
-                } else {
-                    conn.execute(
-                        "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3 WHERE token = ?4",
-                        params![now, ip, user_agent, token],
-                    )?;
-                }
+                conn.execute(
+                    "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3 WHERE token = ?4",
+                    params![now, ip, user_agent, token],
+                )?;
             }
             return Ok((token, revoked != 0));
         }
@@ -1044,13 +1069,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_totp_step(&self, user_id: i64, step: i64) -> AppResult<()> {
+    /// Records the TOTP step that was just accepted. Returns false when an
+    /// equal or later step was already used, so two concurrent requests that
+    /// both verified the same code cannot both succeed (replay protection).
+    pub fn mark_totp_step(&self, user_id: i64, step: i64) -> AppResult<bool> {
         let conn = self.lock();
-        conn.execute(
-            "UPDATE totp_secrets SET last_step = ?1 WHERE user_id = ?2",
+        Ok(conn.execute(
+            "UPDATE totp_secrets SET last_step = ?1 WHERE user_id = ?2 AND last_step < ?1",
             params![step, user_id],
-        )?;
-        Ok(())
+        )? > 0)
     }
 
     pub fn passkey_count(&self, user_id: i64) -> AppResult<usize> {
@@ -1384,11 +1411,22 @@ impl Store {
     /// Hard-deletes accounts whose recovery window has expired. Cascading
     /// foreign keys remove their library, playlists, social graph and 2FA data.
     pub fn purge_expired_deleted_users(&self) -> AppResult<usize> {
-        let conn = self.lock();
-        Ok(conn.execute(
-            "DELETE FROM users WHERE deleted_at > 0 AND deleted_at < ?1",
-            params![Utc::now().timestamp() - RESTORE_WINDOW_SECS],
-        )?)
+        let expired: Vec<i64> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM users WHERE deleted_at > 0 AND deleted_at < ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![Utc::now().timestamp() - RESTORE_WINDOW_SECS], |r| {
+                    r.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for id in &expired {
+            self.hard_delete_user(*id)?;
+        }
+        Ok(expired.len())
     }
 
     // -- Security audit trail --------------------------------------------------
@@ -1485,8 +1523,48 @@ impl Store {
     /// Permanently removes an account. Only for admin use after the recovery
     /// window has been skipped explicitly.
     pub fn hard_delete_user(&self, user_id: i64) -> AppResult<()> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // These tables predate foreign keys (or are keyed loosely), so the
+        // users row cascade does not reach them; remove them explicitly so a
+        // purged account leaves no playlists, history or taste data behind.
+        // Other listeners' saved "<user>'s radio" playlists can never refresh
+        // again once the target is gone, so they go too.
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id IN
+                 (SELECT playlist_id FROM user_radios WHERE target_id = ?1)",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM playlists WHERE id IN
+                 (SELECT playlist_id FROM user_radios WHERE target_id = ?1)",
+            params![user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id IN
+                 (SELECT id FROM playlists WHERE user_id = ?1)",
+            params![user_id],
+        )?;
+        for table in [
+            "playlists",
+            "user_track_stats",
+            "events",
+            "stars",
+            "saved_albums",
+            "followed_artists",
+            "ratings",
+            "play_queues",
+            "radio_stations",
+            "user_taste_links",
+            "hidden_tracks",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE user_id = ?1"),
+                params![user_id],
+            )?;
+        }
+        tx.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1502,8 +1580,10 @@ impl Store {
                COALESCE(p.bio, '') AS bio,
                COALESCE(p.avatar_color, '') AS avatar_color,
                COALESCE(p.location, '') AS location,
-               (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.id) AS followers_count,
-               (SELECT COUNT(*) FROM follows f WHERE f.follower_id = u.id) AS following_count,
+               (SELECT COUNT(*) FROM follows f JOIN users fu ON fu.id = f.follower_id
+                 WHERE f.following_id = u.id AND fu.deleted_at = 0) AS followers_count,
+               (SELECT COUNT(*) FROM follows f JOIN users fu ON fu.id = f.following_id
+                 WHERE f.follower_id = u.id AND fu.deleted_at = 0) AS following_count,
                EXISTS(SELECT 1 FROM follows f WHERE f.follower_id = ?1 AND f.following_id = u.id) AS is_following,
                COALESCE(p.avatar_version, 0) AS avatar_version,
                COALESCE(p.avatar_mime, '') AS avatar_mime
@@ -1629,7 +1709,11 @@ impl Store {
 
     pub fn get_public_user(&self, target_id: i64, viewer_id: i64) -> AppResult<Option<PublicUser>> {
         let conn = self.lock();
-        let sql = format!("{} WHERE u.id = ?2", Self::PUBLIC_USER_SELECT);
+        // Accounts pending deletion disappear from everyone but themselves.
+        let sql = format!(
+            "{} WHERE u.id = ?2 AND (u.deleted_at = 0 OR u.id = ?1)",
+            Self::PUBLIC_USER_SELECT
+        );
         let user = conn
             .query_row(&sql, params![viewer_id, target_id], row_to_public_user)
             .optional()?;
@@ -1654,9 +1738,10 @@ impl Store {
         let conn = self.lock();
         let sql = format!(
             "{base}
-             WHERE instr(lower(u.username), ?2) > 0
+             WHERE u.deleted_at = 0
+               AND (instr(lower(u.username), ?2) > 0
                 OR instr(lower(COALESCE(p.display_name, '')), ?2) > 0
-                OR instr(lower(COALESCE(p.bio, '')), ?2) > 0
+                OR instr(lower(COALESCE(p.bio, '')), ?2) > 0)
              ORDER BY
                 CASE WHEN lower(u.username) = ?2 THEN 0
                      WHEN lower(COALESCE(p.display_name, '')) = ?2 THEN 1
@@ -1685,7 +1770,7 @@ impl Store {
         let conn = self.lock();
         let sql = format!(
             "{base}
-             WHERE u.id != ?1
+             WHERE u.id != ?1 AND u.deleted_at = 0
              ORDER BY followers_count DESC, u.username ASC
              LIMIT ?2",
             base = Self::PUBLIC_USER_SELECT,
@@ -1709,9 +1794,11 @@ impl Store {
         }
         let conn = self.lock();
         let exists: Option<i64> = conn
-            .query_row("SELECT id FROM users WHERE id = ?1", params![following_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM users WHERE id = ?1 AND deleted_at = 0",
+                params![following_id],
+                |r| r.get(0),
+            )
             .optional()?;
         if exists.is_none() {
             return Err(err_msg("User not found"));
@@ -1737,7 +1824,8 @@ impl Store {
         let conn = self.lock();
         let sql = format!(
             "{base}
-             WHERE u.id IN (SELECT follower_id FROM follows WHERE following_id = ?2)
+             WHERE u.deleted_at = 0
+               AND u.id IN (SELECT follower_id FROM follows WHERE following_id = ?2)
              ORDER BY (SELECT created FROM follows WHERE follower_id = u.id AND following_id = ?2) DESC,
                       u.username ASC",
             base = Self::PUBLIC_USER_SELECT,
@@ -1759,7 +1847,8 @@ impl Store {
         let conn = self.lock();
         let sql = format!(
             "{base}
-             WHERE u.id IN (SELECT following_id FROM follows WHERE follower_id = ?2)
+             WHERE u.deleted_at = 0
+               AND u.id IN (SELECT following_id FROM follows WHERE follower_id = ?2)
              ORDER BY (SELECT created FROM follows WHERE follower_id = ?2 AND following_id = u.id) DESC,
                       u.username ASC",
             base = Self::PUBLIC_USER_SELECT,
@@ -4603,7 +4692,7 @@ impl Store {
                     (SELECT pt.track_id FROM playlist_tracks pt WHERE pt.playlist_id = p.id ORDER BY pt.pos ASC LIMIT 1)
              FROM playlists p
              LEFT JOIN users u ON u.id = p.user_id
-             WHERE p.user_id = ?1 OR p.public = 1
+             WHERE p.user_id = ?1 OR (p.public = 1 AND COALESCE(u.deleted_at, 0) = 0)
              ORDER BY p.is_auto ASC, p.changed DESC"
         } else {
             "SELECT p.id, p.user_id, COALESCE(u.username, 'beatlab'), p.name, p.comment,
@@ -5908,6 +5997,35 @@ impl ArtistResolver {
     }
 }
 
+/// Older builds stored passwords in plaintext. Replace every such row with an
+/// Argon2id hash in one transaction; rows that are already hashed are skipped,
+/// so this is a no-op after the first run.
+fn migrate_plaintext_passwords(conn: &mut Connection) -> AppResult<()> {
+    let legacy: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, password FROM users WHERE password NOT LIKE '$argon2%' AND password <> ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    for (id, plain) in &legacy {
+        let hashed = crate::auth::hash_password(plain)?;
+        tx.execute(
+            "UPDATE users SET password = ?1 WHERE id = ?2",
+            params![hashed, id],
+        )?;
+    }
+    tx.commit()?;
+    tracing::info!(count = legacy.len(), "migrated plaintext passwords to Argon2id");
+    Ok(())
+}
+
 fn migrate_artist_disambiguation(conn: &mut Connection) -> AppResult<()> {
     let done: Option<String> = conn
         .query_row(
@@ -6109,6 +6227,111 @@ mod tests {
         let key2 = store.regenerate_api_key(alice.id).unwrap();
         assert_ne!(key1, key2);
         assert!(store.get_user_by_api_key(&key1).unwrap().is_none());
+    }
+
+    #[test]
+    fn plaintext_passwords_are_migrated_to_argon2_on_open() {
+        let dir = std::env::temp_dir().join(format!("beatlab_pw_mig_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("beatlab.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    created INTEGER NOT NULL
+                 );
+                 INSERT INTO users(username, password, created) VALUES ('legacy', 'old-plain', 1);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db_path).unwrap();
+        let stored = store.get_user_by_name("legacy").unwrap().unwrap().password;
+        assert!(crate::auth::is_password_hash(&stored));
+        assert!(store.authenticate_user("legacy", "old-plain").is_ok());
+        assert!(store.authenticate_user("legacy", "wrong").is_err());
+        drop(store);
+        // Re-opening leaves the hash untouched.
+        let store = Store::open(&db_path).unwrap();
+        assert_eq!(store.get_user_by_name("legacy").unwrap().unwrap().password, stored);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn totp_step_cannot_be_replayed() {
+        let store = Store::open_memory().unwrap();
+        let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
+        store.save_totp(alice.id, "JBSWY3DPEHPK3PXP", true).unwrap();
+        assert!(store.mark_totp_step(alice.id, 100).unwrap());
+        assert!(!store.mark_totp_step(alice.id, 100).unwrap());
+        assert!(!store.mark_totp_step(alice.id, 99).unwrap());
+        assert!(store.mark_totp_step(alice.id, 101).unwrap());
+    }
+
+    #[test]
+    fn hard_delete_removes_non_cascading_user_data() {
+        let store = Store::open_memory().unwrap();
+        let (gone, _) = store.authenticate_or_create_user("gone", "pw").unwrap();
+        let (kept, _) = store.authenticate_or_create_user("kept", "pw").unwrap();
+        let t = Track { id: "dz:42".into(), source: "deezer".into(), title: "T".into(), ..Default::default() };
+        store.upsert_tracks(&[t]).unwrap();
+        for uid in [gone.id, kept.id] {
+            store.create_playlist(uid, "Mine", "", true, &["dz:42".to_string()]).unwrap();
+            store.star_track(uid, "dz:42").unwrap();
+            store.set_rating(uid, "dz:42", 4).unwrap();
+        }
+        store.hard_delete_user(gone.id).unwrap();
+
+        assert!(store.list_playlists(kept.id, true).unwrap().iter().all(|p| p.user_id == kept.id));
+        assert!(store.starred_ids(gone.id).unwrap().is_empty());
+        assert!(store.user_ratings(gone.id).unwrap().is_empty());
+        assert_eq!(store.starred_ids(kept.id).unwrap().len(), 1);
+        let orphans: i64 = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id NOT IN (SELECT id FROM playlists)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn hard_delete_removes_saved_radios_of_that_user() {
+        let store = Store::open_memory().unwrap();
+        let (target, _) = store.authenticate_or_create_user("radio-target", "pw").unwrap();
+        let (fan, _) = store.authenticate_or_create_user("radio-fan", "pw").unwrap();
+        let pl = store.create_playlist(fan.id, "radio-target Radio", "", false, &[]).unwrap();
+        store.save_user_radio(fan.id, target.id, &pl.id).unwrap();
+        let mine = store.create_playlist(fan.id, "Keep me", "", false, &[]).unwrap();
+
+        store.hard_delete_user(target.id).unwrap();
+        assert!(store.get_playlist(&pl.id).unwrap().is_none());
+        assert!(store.get_playlist(&mine.id).unwrap().is_some());
+        assert!(store.all_user_radios().unwrap().is_empty());
+    }
+
+    #[test]
+    fn soft_deleted_users_are_hidden_from_social_surfaces() {
+        let store = Store::open_memory().unwrap();
+        let (viewer, _) = store.authenticate_or_create_user("viewer", "pw").unwrap();
+        let (ghost, _) = store.authenticate_or_create_user("ghostly", "pw").unwrap();
+        store.follow_user(viewer.id, ghost.id).unwrap();
+        store.create_playlist(ghost.id, "Public mix", "", true, &[]).unwrap();
+        store.soft_delete_user(ghost.id, "hash").unwrap();
+
+        assert!(store.search_public_users("ghostly", viewer.id, 10).unwrap().is_empty());
+        assert!(store.get_public_user(ghost.id, viewer.id).unwrap().is_none());
+        assert!(store.get_public_user(ghost.id, ghost.id).unwrap().is_some());
+        assert!(store.list_following(viewer.id, viewer.id).unwrap().is_empty());
+        assert!(store.follow_user(viewer.id, ghost.id).is_err());
+        assert!(store.list_playlists(viewer.id, true).unwrap().iter().all(|p| p.user_id != ghost.id));
+        let me = store.get_public_user(viewer.id, viewer.id).unwrap().unwrap();
+        assert_eq!(me.following_count, 0);
     }
 
     #[test]

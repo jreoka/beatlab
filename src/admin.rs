@@ -33,6 +33,34 @@ pub fn admin_names() -> &'static [String] {
     ADMINS.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// Error for open sign-up attempts that use a name listed in `ADMIN_USERNAME`.
+/// Without this, anyone could register an admin name that has no account yet
+/// and gain the admin panel. Admin accounts are created at startup from
+/// `ADMIN_PASSWORD` instead (see `bootstrap_admin_accounts`).
+pub const RESERVED_ADMIN_NAME: &str = "That username is reserved";
+
+/// Creates any `ADMIN_USERNAME` account that doesn't exist yet, using the
+/// `ADMIN_PASSWORD` environment variable. Without a password the name stays
+/// reserved (sign-up refuses it) and a warning explains how to create it.
+pub fn bootstrap_admin_accounts(store: &crate::store::Store, admin_password: Option<&str>) {
+    for name in admin_names() {
+        match store.get_user_by_name(name) {
+            Ok(Some(_)) => {}
+            Ok(None) => match admin_password.filter(|p| !p.is_empty()) {
+                Some(pw) => match store.create_user(name, pw) {
+                    Ok(_) => tracing::info!(admin = %name, "created admin account from ADMIN_PASSWORD"),
+                    Err(e) => tracing::warn!(admin = %name, error = %e, "could not create admin account"),
+                },
+                None => tracing::warn!(
+                    admin = %name,
+                    "admin account does not exist and its username is reserved; set ADMIN_PASSWORD to create it at startup"
+                ),
+            },
+            Err(e) => tracing::warn!(admin = %name, error = %e, "could not look up admin account"),
+        }
+    }
+}
+
 pub fn is_admin_username(username: &str) -> bool {
     let name = username.trim().to_ascii_lowercase();
     !name.is_empty() && admin_names().iter().any(|admin| admin.eq_ignore_ascii_case(&name))
@@ -83,6 +111,16 @@ fn signed_in_user(state: &AppState, headers: &HeaderMap) -> Option<User> {
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, Response> {
     let user = signed_in_user(state, headers)
         .ok_or_else(|| err_res(StatusCode::UNAUTHORIZED, "Sign in to continue"))?;
+    // Admin actions need an interactive web-player session. The API key (and
+    // Navidrome sessions minted from it) is handed to third-party music apps
+    // and must not unlock the admin panel.
+    let token = token_from_headers(headers).unwrap_or_default();
+    if state.store.session_kind(&token).ok().flatten().as_deref() != Some("web") {
+        return Err(err_res(
+            StatusCode::FORBIDDEN,
+            "Sign in to the Beatlab web player to use the admin panel",
+        ));
+    }
     if !is_admin_username(&user.username) {
         return Err(err_res(
             StatusCode::FORBIDDEN,
@@ -368,7 +406,12 @@ pub async fn reset_password(
         Some(pw) => (pw, false),
         None => (generate_temp_password(), true),
     };
-    if let Err(e) = state.store.change_password(id, &new_password) {
+    let store = state.store.clone();
+    let pw = new_password.clone();
+    let changed = tokio::task::spawn_blocking(move || store.change_password(id, &pw))
+        .await
+        .unwrap_or_else(|_| Err(crate::models::err_msg("Could not change password")));
+    if let Err(e) = changed {
         return err_res(StatusCode::BAD_REQUEST, &e.to_string());
     }
     let revoke = req.revoke_sessions.unwrap_or(true);

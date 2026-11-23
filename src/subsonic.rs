@@ -41,6 +41,19 @@ pub fn client_ip(headers: &HeaderMap) -> String {
     String::new()
 }
 
+/// Client IP used for rate limiting. Prefers the header set by the hosting
+/// proxy (Fly.io overwrites `Fly-Client-IP`), which a client cannot forge the
+/// way it can prepend entries to `X-Forwarded-For`.
+pub fn rate_limit_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("fly-client-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(64).collect())
+        .unwrap_or_else(|| client_ip(headers))
+}
+
 pub fn user_agent(headers: &HeaderMap) -> String {
     headers
         .get(header::USER_AGENT)
@@ -346,7 +359,20 @@ fn authenticate_subsonic(
     params: &HashMap<String, String>,
     headers: &HeaderMap,
 ) -> Result<User, (i32, &'static str)> {
-    let user = authenticate_subsonic_credentials(state, params)?;
+    let rate_keys = crate::auth::rate_keys("apikey", "", &rate_limit_ip(headers));
+    if crate::auth::throttled_for(&rate_keys).is_some() {
+        return Err((40, "Too many failed sign-in attempts from this address. Try again later."));
+    }
+    let user = match authenticate_subsonic_credentials(state, params) {
+        Ok(u) => u,
+        Err(e) => {
+            // Only bad credentials count; a missing-parameter probe (code 10) doesn't.
+            if e.0 == 40 {
+                crate::auth::record_failure(&rate_keys);
+            }
+            return Err(e);
+        }
+    };
 
     // Subsonic clients re-send credentials on every request rather than using
     // a server-issued token. Track them as sessions so they appear in the
@@ -507,7 +533,15 @@ pub async fn dispatch(
         "createUser" => {
             let u = params.get("username").map(|s| s.trim()).unwrap_or("");
             let p = params.get("password").map(|s| s.as_str()).unwrap_or("");
-            match state.store.create_user(u, p) {
+            if crate::admin::is_admin_username(u) {
+                return error_resp(&params, 50, crate::admin::RESERVED_ADMIN_NAME);
+            }
+            let store = state.store.clone();
+            let (u, p) = (u.to_string(), p.to_string());
+            let created = tokio::task::spawn_blocking(move || store.create_user(&u, &p))
+                .await
+                .unwrap_or_else(|_| Err(crate::models::err_msg("Could not create user")));
+            match created {
                 Ok(new_user) => {
                     state.taste.prime_new_user(new_user.id).await;
                     respond(&params, true, None)
@@ -515,22 +549,15 @@ pub async fn dispatch(
                 Err(e) => error_resp(&params, 0, &e.to_string()),
             }
         }
-        "changePassword" => {
-            let target = params
-                .get("username")
-                .map(|s| s.as_str())
-                .unwrap_or(&user.username);
-            if !target.eq_ignore_ascii_case(&user.username) {
-                return error_resp(&params, 50, "You can only change your own password");
-            }
-            let Some(new_pw) = params.get("password") else {
-                return error_resp(&params, 10, "Missing password");
-            };
-            match state.store.change_password(uid, new_pw) {
-                Ok(()) => respond(&params, true, None),
-                Err(e) => error_resp(&params, 0, &e.to_string()),
-            }
-        }
+        // Clients authenticate with the API key, a credential that lives in
+        // third-party apps. It must not be able to replace the account
+        // password (which would bypass the web player's current-password and
+        // two-factor checks), so password changes stay in the web player.
+        "changePassword" => error_resp(
+            &params,
+            50,
+            "Change your password in the Beatlab web player (Settings → Security)",
+        ),
 
         "getMusicFolders" => respond(
             &params,

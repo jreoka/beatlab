@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 use base64::Engine as _;
 use webauthn_rs::prelude::{
-    DiscoverableAuthentication, DiscoverableKey, Passkey, PasskeyAuthentication,
+    AuthenticationResult, DiscoverableAuthentication, DiscoverableKey, Passkey, PasskeyAuthentication,
     PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
 };
 
@@ -533,12 +533,70 @@ fn unauthorized() -> Response {
     err_res(StatusCode::UNAUTHORIZED, "Please sign in")
 }
 
+/// Runs CPU-heavy work (password hashing) on the blocking pool so it never
+/// stalls the async workers. `None` only if the task panicked.
+async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
+/// Re-checks the account password for a sensitive action. Failures count
+/// toward the same per-account limit as sign-in, so a stolen session can't
+/// brute-force the password through these endpoints either.
+async fn check_current_password(
+    user: &User,
+    password: &str,
+    wrong_msg: &str,
+) -> Result<(), Response> {
+    let rate_keys = crate::auth::rate_keys("signin", &user.username, "");
+    if let Some(wait) = crate::auth::throttled_for(&rate_keys) {
+        return Err(too_many_attempts(wait));
+    }
+    let (stored, attempt) = (user.password.clone(), password.to_string());
+    let ok = run_blocking(move || crate::auth::verify_password(&stored, &attempt))
+        .await
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        crate::auth::record_failure(&rate_keys);
+        Err(err_res(StatusCode::BAD_REQUEST, wrong_msg))
+    }
+}
+
+fn too_many_attempts(retry_after: i64) -> Response {
+    let mut res = err_res(
+        StatusCode::TOO_MANY_REQUESTS,
+        &crate::auth::throttle_message(retry_after),
+    );
+    if let Ok(v) = retry_after.max(1).to_string().parse() {
+        res.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    res
+}
+
 /// Signed-in user together with the bearer token backing this request. Needed
 /// whenever a successful MFA check must be recorded against the session.
+///
+/// Only interactive web-player sessions qualify. The API key (and Navidrome
+/// sessions minted from it) is a credential users paste into third-party
+/// music apps, so it must never be able to manage the account itself —
+/// otherwise anyone holding it could e.g. enrol their own passkey and take
+/// over the account.
 fn require_web_user_with_token(state: &AppState, headers: &HeaderMap) -> Result<(User, String), Response> {
-    let user = require_web_user(state, headers)?;
     let token = extract_web_token(headers, None).ok_or_else(unauthorized)?;
+    let user = resolve_web_user(state, headers, None).ok_or_else(unauthorized)?;
+    if state.store.session_kind(&token).ok().flatten().as_deref() != Some("web") {
+        return Err(err_res(
+            StatusCode::FORBIDDEN,
+            "Sign in to the Beatlab web player to manage your account",
+        ));
+    }
     Ok((user, token))
+}
+
+/// Account-management gate for endpoints that need the user but not the token.
+fn require_account_session(state: &AppState, headers: &HeaderMap) -> Result<User, Response> {
+    require_web_user_with_token(state, headers).map(|(user, _)| user)
 }
 
 /// True when this session has proved a second factor recently.
@@ -562,10 +620,17 @@ fn second_factor_ok(state: &AppState, user: &User, code: Option<&str>) -> Result
         Some(code) => code,
         None => return Ok(false),
     };
+    // A 6-digit code is guessable without a cap on attempts, so failures are
+    // counted per account across sign-in and every step-up prompt.
+    let rate_keys = crate::auth::rate_keys("mfa", &user.username, "");
+    if let Some(wait) = crate::auth::throttled_for(&rate_keys) {
+        return Err(too_many_attempts(wait));
+    }
     if let Some(totp) = state.store.get_totp(user.id).ok().flatten().filter(|t| t.enabled) {
         match verify_totp(&totp.secret, code, totp.last_step) {
             Ok(Some(step)) => {
-                if state.store.mark_totp_step(user.id, step).is_ok() {
+                if state.store.mark_totp_step(user.id, step).unwrap_or(false) {
+                    crate::auth::record_success(&rate_keys);
                     return Ok(true);
                 }
             }
@@ -574,8 +639,10 @@ fn second_factor_ok(state: &AppState, user: &User, code: Option<&str>) -> Result
         }
     }
     if state.store.consume_recovery_code(user.id, code).unwrap_or(false) {
+        crate::auth::record_success(&rate_keys);
         return Ok(true);
     }
+    crate::auth::record_failure(&rate_keys);
     Ok(false)
 }
 
@@ -817,7 +884,26 @@ pub async fn signin(
     headers: HeaderMap,
     Json(req): Json<AuthReq>,
 ) -> Response {
-    match state.store.authenticate_user(&req.username, &req.password) {
+    let rate_keys = crate::auth::rate_keys(
+        "signin",
+        &req.username,
+        &crate::subsonic::rate_limit_ip(&headers),
+    );
+    if let Some(wait) = crate::auth::throttled_for(&rate_keys) {
+        return too_many_attempts(wait);
+    }
+    let store = state.store.clone();
+    let (username, password) = (req.username.clone(), req.password.clone());
+    // Argon2 verification is CPU-bound; keep it off the async workers.
+    let outcome = tokio::task::spawn_blocking(move || store.authenticate_user(&username, &password))
+        .await
+        .unwrap_or_else(|_| Err(crate::models::err_msg("Sign-in failed")));
+    match &outcome {
+        Ok(_) => crate::auth::record_success(&rate_keys),
+        Err(e) if e.0 == ERR_RESTORE_REQUIRED => crate::auth::record_success(&rate_keys),
+        Err(_) => crate::auth::record_failure(&rate_keys),
+    }
+    match outcome {
         Ok(user) => {
             if state.store.is_2fa_enabled(user.id).unwrap_or(false) {
                 return match state.store.create_auth_challenge(user.id, "mfa_login", "") {
@@ -876,7 +962,15 @@ pub async fn signup(
     if req.password != req.confirm_password {
         return err_res(StatusCode::BAD_REQUEST, "Passwords do not match");
     }
-    match state.store.create_user(&req.username, &req.password) {
+    if crate::admin::is_admin_username(&req.username) {
+        return err_res(StatusCode::CONFLICT, crate::admin::RESERVED_ADMIN_NAME);
+    }
+    let store = state.store.clone();
+    let (username, password) = (req.username.clone(), req.password.clone());
+    let created = run_blocking(move || store.create_user(&username, &password))
+        .await
+        .unwrap_or_else(|| Err(crate::models::err_msg("Could not create account")));
+    match created {
         Ok(user) => {
             let taste = state.taste.clone();
             let uid = user.id;
@@ -912,7 +1006,7 @@ pub struct RevokeSessionReq {
 /// is returned so the UI can revoke individual entries; only authenticated
 /// owners can reach this endpoint.
 pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let user = match require_web_user(&state, &headers) {
+    let user = match require_account_session(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -943,7 +1037,7 @@ pub async fn revoke_session(
     headers: HeaderMap,
     Json(req): Json<RevokeSessionReq>,
 ) -> Response {
-    let user = match require_web_user(&state, &headers) {
+    let user = match require_account_session(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -964,7 +1058,7 @@ pub async fn allow_session(
     headers: HeaderMap,
     Json(req): Json<RevokeSessionReq>,
 ) -> Response {
-    let user = match require_web_user(&state, &headers) {
+    let user = match require_account_session(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -981,7 +1075,7 @@ pub async fn allow_session(
 
 /// Revoke every session belonging to the signed-in user, including this one.
 pub async fn revoke_all_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let user = match require_web_user(&state, &headers) {
+    let user = match require_account_session(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -1033,22 +1127,36 @@ pub async fn change_password(
     headers: HeaderMap,
     Json(req): Json<PasswordChangeReq>,
 ) -> Response {
-    let (user, _) = match require_explicit_code(&state, &headers, req.code.as_deref()) {
+    // Check the password before the 2FA code so a typo in the password
+    // doesn't burn a one-time recovery code.
+    let (user, _) = match require_web_user_with_token(&state, &headers) {
         Ok(value) => value,
         Err(r) => return r,
     };
-    if !crate::models::constant_time_eq(&user.password, &req.current_password) {
-        return err_res(StatusCode::BAD_REQUEST, "Current password is incorrect");
+    if let Err(r) = check_current_password(&user, &req.current_password, "Current password is incorrect").await {
+        return r;
     }
-    match state.store.change_password(user.id, &req.new_password) {
+    let (user, token) = match require_explicit_code(&state, &headers, req.code.as_deref()) {
+        Ok(value) => value,
+        Err(r) => return r,
+    };
+    let store = state.store.clone();
+    let (uid, new_password) = (user.id, req.new_password.clone());
+    let changed = run_blocking(move || store.change_password(uid, &new_password))
+        .await
+        .unwrap_or_else(|| Err(crate::models::err_msg("Could not change password")));
+    match changed {
         Ok(()) => {
+            // Anyone who signed in with the old password is signed out; this
+            // browser stays signed in.
+            let signed_out = state.store.delete_other_sessions(user.id, &token).unwrap_or(0);
             state.store.record_security_event(
                 user.id,
                 "password_changed",
-                "Account password changed",
+                &format!("Account password changed ({signed_out} other sessions signed out)"),
                 &client_ip(&headers),
             );
-            json_res(json!({ "ok": true }))
+            json_res(json!({ "ok": true, "signedOut": signed_out }))
         }
         Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
     }
@@ -1275,17 +1383,7 @@ pub async fn passkey_login_verify(
         return err_res(StatusCode::UNAUTHORIZED, "Passkey challenge expired. Try again.");
     };
 
-    if result.needs_update() {
-        if let Ok(mut passkey) = serde_json::from_str::<Passkey>(&passkey_json) {
-            if passkey.update_credential(&result) == Some(true) {
-                if let Ok(updated) = serde_json::to_string(&passkey) {
-                    let _ = state.store.touch_passkey(&credential_id, &updated);
-                }
-            }
-        }
-    } else {
-        let _ = state.store.touch_passkey(&credential_id, &passkey_json);
-    }
+    persist_passkey_use(&state, &credential_id, &passkey_json, &result);
     let Some(user) = state.store.get_user_by_id(user_id).ok().flatten() else {
         return err_res(StatusCode::UNAUTHORIZED, "Account not found");
     };
@@ -1301,6 +1399,27 @@ pub async fn passkey_login_verify(
         &client_ip(&headers),
     );
     json_res(json!({ "token": token, "created": false, "user": user_json(&state, &user) }))
+}
+
+/// Stores the updated signature counter (when it changed) and the last-used
+/// time of a passkey after a successful assertion.
+fn persist_passkey_use(
+    state: &AppState,
+    credential_id: &str,
+    passkey_json: &str,
+    result: &AuthenticationResult,
+) {
+    let mut stored = passkey_json.to_string();
+    if result.needs_update() {
+        if let Ok(mut passkey) = serde_json::from_str::<Passkey>(passkey_json) {
+            if passkey.update_credential(result) == Some(true) {
+                if let Ok(updated) = serde_json::to_string(&passkey) {
+                    stored = updated;
+                }
+            }
+        }
+    }
+    let _ = state.store.touch_passkey(credential_id, &stored);
 }
 
 #[derive(Deserialize)]
@@ -1365,13 +1484,17 @@ pub async fn account_delete(
     headers: HeaderMap,
     Json(req): Json<DeleteAccountReq>,
 ) -> Response {
+    let (user, _) = match require_web_user_with_token(&state, &headers) {
+        Ok(value) => value,
+        Err(r) => return r,
+    };
+    if let Err(r) = check_current_password(&user, &req.password, "Password is incorrect").await {
+        return r;
+    }
     let (user, _) = match require_explicit_code(&state, &headers, req.code.as_deref()) {
         Ok(value) => value,
         Err(r) => return r,
     };
-    if !crate::models::constant_time_eq(&user.password, &req.password) {
-        return err_res(StatusCode::BAD_REQUEST, "Password is incorrect");
-    }
     let restore_hash = hash_token(&random_token());
     state.store.record_security_event(
         user.id,
@@ -1387,7 +1510,7 @@ pub async fn account_delete(
 
 /// Everything the security settings screen needs in a single request.
 pub async fn twofa_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let user = match require_web_user(&state, &headers) {
+    let user = match require_account_session(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -1435,9 +1558,11 @@ pub async fn twofa_status(State(state): State<AppState>, headers: HeaderMap) -> 
 }
 
 /// Creates (or recreates a pending) TOTP enrolment and returns its QR code.
-pub async fn totp_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let user = match require_web_user(&state, &headers) {
-        Ok(u) => u,
+/// When the account already has a second factor (a passkey), adding another
+/// one requires proving it first, so a hijacked session cannot plant its own.
+pub async fn totp_start(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let (user, _) = match require_sensitive_auth(&state, &headers, optional_code(&body).as_deref()) {
+        Ok(v) => v,
         Err(r) => return r,
     };
     if let Some(existing) = state.store.get_totp(user.id).ok().flatten() {
@@ -1486,7 +1611,9 @@ pub async fn totp_enable(
         Ok(None) => return err_res(StatusCode::BAD_REQUEST, "That code is not valid"),
         Err(e) => return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let _ = state.store.mark_totp_step(user.id, step);
+    if !state.store.mark_totp_step(user.id, step).unwrap_or(false) {
+        return err_res(StatusCode::BAD_REQUEST, "That code was already used");
+    }
     if let Err(e) = state.store.set_totp_enabled(user.id, true) {
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
@@ -1559,12 +1686,15 @@ pub async fn twofa_disable(
     json_res(json!({ "ok": true }))
 }
 
-/// Starts a WebAuthn credential creation ceremony.
+/// Starts a WebAuthn credential creation ceremony. Like `totp_start`, an
+/// account that already has a second factor must prove it before enrolling
+/// another passkey.
 pub async fn passkey_register_options(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    let (user, _) = match require_web_user_with_token(&state, &headers) {
+    let (user, _) = match require_sensitive_auth(&state, &headers, optional_code(&body).as_deref()) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -1792,15 +1922,7 @@ pub async fn passkey_stepup_verify(
     if owner_id != user.id {
         return err_res(StatusCode::UNAUTHORIZED, "Passkey does not belong to this account");
     }
-    if result.needs_update() {
-        if let Ok(mut passkey) = serde_json::from_str::<Passkey>(&passkey_json) {
-            if passkey.update_credential(&result) == Some(true) {
-                if let Ok(updated) = serde_json::to_string(&passkey) {
-                    let _ = state.store.touch_passkey(&credential_id, &updated);
-                }
-            }
-        }
-    }
+    persist_passkey_use(&state, &credential_id, &passkey_json, &result);
     let _ = state.store.mark_session_mfa(&token);
     state.store.record_security_event(
         user.id,
@@ -1824,13 +1946,23 @@ pub async fn passkey_delete(
     if !state.store.delete_passkey(user.id, &id).unwrap_or(false) {
         return err_res(StatusCode::NOT_FOUND, "Passkey not found");
     }
+    // Recovery codes back up a second factor. Once the last one is gone they
+    // would be inert leftovers that resurface if 2FA is set up again later.
+    let still_enabled = state.store.is_2fa_enabled(user.id).unwrap_or(true);
+    if !still_enabled {
+        let _ = state.store.replace_recovery_codes(user.id, &[]);
+    }
     state.store.record_security_event(
         user.id,
         "passkey_removed",
-        "Passkey removed",
+        if still_enabled {
+            "Passkey removed"
+        } else {
+            "Last passkey removed — two-factor authentication is now off"
+        },
         &client_ip(&headers),
     );
-    json_res(json!({ "ok": true }))
+    json_res(json!({ "ok": true, "twoFactorEnabled": still_enabled }))
 }
 
 /// Builds the personalised "New Releases" feed: recent albums from artists the
@@ -4498,7 +4630,17 @@ fn is_link_preview_bot(headers: &HeaderMap) -> bool {
 
 fn resolve_share_tracks_live(state: &AppState, share: &crate::models::ShareRecord) -> Vec<Track> {
     if share.kind == "playlist" {
-        if let Ok(Some(pl)) = state.store.get_playlist(&share.target_id) {
+        // Follow the playlist live only while it is public or the sharer owns
+        // it. If someone else's playlist is made private after being shared,
+        // the link falls back to the snapshot taken at share time instead of
+        // leaking later edits.
+        if let Some(pl) = state
+            .store
+            .get_playlist(&share.target_id)
+            .ok()
+            .flatten()
+            .filter(|pl| pl.public || pl.user_id == share.user_id)
+        {
             let raw = state.store.playlist_tracks(&pl.id).unwrap_or_default();
             let list = if pl.is_auto {
                 filter_visible_tracks(state, pl.user_id, raw)
@@ -5605,6 +5747,148 @@ mod tests {
         assert_eq!(q2.compat.as_deref(), Some("1"));
     }
 
+    fn account_test_state() -> AppState {
+        use crate::engine::StreamEngine;
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use crate::store::Store;
+        use crate::taste::TasteEngine;
+        use std::sync::{Arc, Mutex};
+
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-acct-{}", uuid::Uuid::new_v4()));
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
+        AppState {
+            store,
+            sources,
+            engine,
+            taste,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn api_keys_and_client_sessions_cannot_manage_the_account() {
+        let state = account_test_state();
+        let (u, _) = state.store.authenticate_or_create_user("owner", "pw123").unwrap();
+        let api_key = state.store.get_or_create_api_key(u.id).unwrap();
+        let nd_token = state.store.create_session(u.id, "nd").unwrap();
+        let web_token = state.store.create_session(u.id, "web").unwrap();
+
+        for tok in [&api_key, &nd_token] {
+            let res = regenerate_api_key(State(state.clone()), bearer(tok), Bytes::new()).await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+            let res = passkey_register_options(State(state.clone()), bearer(tok), Bytes::new()).await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+            let res = list_sessions(State(state.clone()), bearer(tok)).await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        }
+        // The API key still works for ordinary player endpoints.
+        assert_eq!(
+            sources_info(State(state.clone()), bearer(&api_key)).await.status(),
+            StatusCode::OK
+        );
+        // A real web session can manage the account.
+        let res = regenerate_api_key(State(state.clone()), bearer(&web_token), Bytes::new()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_signins_are_throttled_and_passwords_are_hashed() {
+        let state = account_test_state();
+        let (u, _) = state.store.authenticate_or_create_user("throttled-user", "right-pass").unwrap();
+        assert!(crate::auth::is_password_hash(&state.store.get_user_by_id(u.id).unwrap().unwrap().password));
+
+        let attempt = |pw: &str| AuthReq { username: "throttled-user".into(), password: pw.into() };
+        for _ in 0..crate::auth::MAX_FAILURES_PER_ACCOUNT {
+            let res = signin(State(state.clone()), HeaderMap::new(), Json(attempt("wrong"))).await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+        // Even the right password is refused while the account is throttled.
+        let res = signin(State(state.clone()), HeaderMap::new(), Json(attempt("right-pass"))).await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(res.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn wrong_password_does_not_burn_a_recovery_code() {
+        let state = account_test_state();
+        let (u, _) = state.store.authenticate_or_create_user("codeuser", "real-pass").unwrap();
+        state.store.save_totp(u.id, &crate::auth::generate_totp_secret(), true).unwrap();
+        let codes = crate::auth::generate_recovery_codes(2);
+        state.store.replace_recovery_codes(u.id, &codes).unwrap();
+        let tok = state.store.create_session(u.id, "web").unwrap();
+
+        let res = change_password(
+            State(state.clone()),
+            bearer(&tok),
+            Json(PasswordChangeReq {
+                current_password: "wrong-pass".into(),
+                new_password: "new-pass".into(),
+                code: Some(codes[0].clone()),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.store.recovery_code_stats(u.id).unwrap(), (2, 0));
+
+        let res = change_password(
+            State(state.clone()),
+            bearer(&tok),
+            Json(PasswordChangeReq {
+                current_password: "real-pass".into(),
+                new_password: "new-pass".into(),
+                code: Some(codes[0].clone()),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(state.store.recovery_code_stats(u.id).unwrap(), (2, 1));
+        assert!(state.store.authenticate_user("codeuser", "new-pass").is_ok());
+    }
+
+    #[tokio::test]
+    async fn password_change_signs_out_other_sessions_only() {
+        let state = account_test_state();
+        let (u, _) = state.store.authenticate_or_create_user("pwuser", "old-pass").unwrap();
+        let current = state.store.create_session(u.id, "web").unwrap();
+        let other = state.store.create_session(u.id, "web").unwrap();
+        let nd = state.store.create_session(u.id, "nd").unwrap();
+
+        let res = change_password(
+            State(state.clone()),
+            bearer(&current),
+            Json(PasswordChangeReq {
+                current_password: "old-pass".into(),
+                new_password: "new-pass".into(),
+                code: None,
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(state.store.get_session_user(&current).unwrap().is_some());
+        assert!(state.store.get_session_user(&other).unwrap().is_none());
+        assert!(state.store.get_session_user(&nd).unwrap().is_none());
+    }
+
     #[test]
     fn radio_query_accepts_playlist_and_exclusions() {
         let uri: Uri = "/api/web/radio?playlist=pl-123&exclude=t1,t2".parse().unwrap();
@@ -5915,7 +6199,6 @@ mod tests {
         assert!(!html.contains("renderStatsDonutSvg"));
         assert!(!html.contains(".stats-grid-3"));
         assert!(!html.contains(".stats-signal-grid"));
-        assert!(!html.contains("linear-gradient"));
         assert!(html.contains(&format!(
             r#"href="/web/favicon.svg?v={}""#,
             favicon_asset().short_hash

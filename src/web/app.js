@@ -716,9 +716,35 @@
       data = { error: text };
     }
     if (!resp.ok) {
-      throw new Error(data.error || `Request failed (${resp.status})`);
+      const httpErr = new Error(data.error || `Request failed (${resp.status})`);
+      httpErr.status = resp.status;
+      throw httpErr;
     }
     return data;
+  }
+
+  // POSTs to an endpoint that may require a fresh second factor. When the
+  // server answers 403 asking for one, prompt for an authenticator/recovery
+  // code and retry once. Resolves to null if the user cancels the prompt.
+  async function apiWithStepUp(path, promptText) {
+    const first = securityCodeValue();
+    try {
+      return await api(path, {
+        method: 'POST',
+        body: JSON.stringify({ code: first || undefined }),
+      });
+    } catch (err) {
+      if (err.status !== 403 || !/two-factor|recovery code/i.test(err.message || '')) throw err;
+    }
+    const code = await promptModal({
+      title: 'Confirm your identity',
+      message: promptText,
+      label: '2FA or recovery code',
+      placeholder: '000000',
+      confirmLabel: 'Continue',
+    });
+    if (code === null) return null;
+    return api(path, { method: 'POST', body: JSON.stringify({ code }) });
   }
 
   function cacheTracks(list) {
@@ -8531,11 +8557,17 @@
     },
     startTotpSetup: async () => {
       try {
-        state.settingsData.totpSetup = await api('/api/web/2fa/totp/start', { method: 'POST' });
-        renderSettingsModalBody();
+        const setup = await apiWithStepUp(
+          '/api/web/2fa/totp/start',
+          'Your account already has a passkey. Enter an unused recovery code (or verify with your passkey first) to add an authenticator app.'
+        );
+        if (setup) state.settingsData.totpSetup = setup;
       } catch (err) {
         showToast(err.message);
       }
+      // A step-up prompt replaces the settings modal; reopen it if so.
+      if ($('settings-body')) renderSettingsModalBody();
+      else openSettingsModal('security');
     },
     cancelTotpSetup: () => {
       state.settingsData.totpSetup = null;
@@ -8607,7 +8639,14 @@
         return;
       }
       try {
-        const opts = await api('/api/web/2fa/passkey/options', { method: 'POST' });
+        const opts = await apiWithStepUp(
+          '/api/web/2fa/passkey/options',
+          'Two-factor authentication is on. Enter a code from your authenticator app or an unused recovery code to add another passkey.'
+        );
+        if (!opts) {
+          openSettingsModal('security');
+          return;
+        }
         const credential = await navigator.credentials.create({
           publicKey: webauthnOptions(opts.publicKey, true),
         });
@@ -9090,7 +9129,7 @@
     submitPasswordChange: async (e) => {
       e.preventDefault();
       try {
-        await api('/api/web/account/password', {
+        const res = await api('/api/web/account/password', {
           method: 'POST',
           body: JSON.stringify({
             currentPassword: $('pw-cur').value,
@@ -9099,7 +9138,12 @@
           }),
         });
         state.settingsData.showPasswordForm = false;
-        showToast('Password updated');
+        const others = res && res.signedOut > 0 ? res.signedOut : 0;
+        showToast(
+          others
+            ? `Password updated · signed out ${others} other ${others === 1 ? 'session' : 'sessions'}`
+            : 'Password updated'
+        );
         renderSettingsModalBody();
       } catch (err) {
         showToast(err.message);

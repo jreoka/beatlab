@@ -188,7 +188,12 @@ pub async fn login(
             "API key required. Find it in Beatlab → Settings → Apps & API.",
         );
     }
+    let rate_keys = crate::auth::rate_keys("apikey", "", &crate::subsonic::rate_limit_ip(&headers));
+    if let Some(wait) = crate::auth::throttled_for(&rate_keys) {
+        return json_err(StatusCode::TOO_MANY_REQUESTS, &crate::auth::throttle_message(wait));
+    }
     let Some(user) = state.store.get_user_by_api_key(key).ok().flatten() else {
+        crate::auth::record_failure(&rate_keys);
         return json_err(StatusCode::UNAUTHORIZED, "Invalid API key");
     };
     let supplied_name = req.username.trim();
@@ -1051,10 +1056,14 @@ pub async fn update_user(
     if id != user.id.to_string() {
         return json_err(StatusCode::FORBIDDEN, "Can only update your own account");
     }
-    if let Some(pw) = req.password {
-        if let Err(e) = state.store.change_password(user.id, &pw) {
-            return json_err(StatusCode::BAD_REQUEST, &e.to_string());
-        }
+    // Navidrome sessions are minted from the API key; like the Subsonic
+    // `changePassword` endpoint, they must not be able to replace the account
+    // password and so sidestep the web player's password + 2FA checks.
+    if req.password.as_deref().is_some_and(|pw| !pw.is_empty()) {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "Change your password in the Beatlab web player (Settings → Security)",
+        );
     }
     json_ok(
         json!({

@@ -52,6 +52,194 @@ pub fn hash_token(value: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Password hashing (Argon2id)
+// ---------------------------------------------------------------------------
+
+const ARGON2_PREFIX: &str = "$argon2";
+
+fn argon2_hasher() -> argon2::Argon2<'static> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    // OWASP's recommended Argon2id baseline (19 MiB, 2 passes). Tests use a
+    // tiny cost so the suite stays fast; the format is identical.
+    #[cfg(not(test))]
+    let params = Params::new(19 * 1024, 2, 1, None);
+    #[cfg(test)]
+    let params = Params::new(256, 1, 1, None);
+    Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        params.expect("valid Argon2 parameters"),
+    )
+}
+
+/// Argon2 runs allowed at once. Each one takes ~19 MiB and a full core, so a
+/// burst of sign-ins must queue rather than exhaust a small VM's memory.
+const MAX_CONCURRENT_HASHES: usize = 2;
+
+static HASH_SLOTS: OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> = OnceLock::new();
+
+/// Runs `f` while holding one of the limited hashing slots (blocking until a
+/// slot frees up). Only call from blocking contexts (`spawn_blocking`, startup).
+fn with_hash_slot<T>(f: impl FnOnce() -> T) -> T {
+    let (lock, cvar) = HASH_SLOTS.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()));
+    {
+        let mut busy = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while *busy >= MAX_CONCURRENT_HASHES {
+            busy = cvar.wait(busy).unwrap_or_else(|p| p.into_inner());
+        }
+        *busy += 1;
+    }
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some((lock, cvar)) = HASH_SLOTS.get() {
+                let mut busy = lock.lock().unwrap_or_else(|p| p.into_inner());
+                *busy = busy.saturating_sub(1);
+                cvar.notify_one();
+            }
+        }
+    }
+    let _release = Release;
+    f()
+}
+
+/// Hashes a password into a self-describing PHC string (`$argon2id$…`).
+pub fn hash_password(password: &str) -> AppResult<String> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    let salt = SaltString::generate(&mut OsRng);
+    with_hash_slot(|| {
+        argon2_hasher()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .map_err(|e| err_msg(format!("Could not hash password: {e}")))
+    })
+}
+
+/// Burns the same Argon2 work as a real check when the username doesn't
+/// exist, so response time doesn't reveal which accounts exist.
+pub fn verify_password_dummy(password: &str) {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    let hash = DUMMY.get_or_init(|| hash_password("beatlab-timing-equaliser").unwrap_or_default());
+    let _ = verify_password(hash, password);
+}
+
+pub fn is_password_hash(stored: &str) -> bool {
+    stored.starts_with(ARGON2_PREFIX)
+}
+
+/// Checks a password against a stored Argon2 hash. Rows that predate hashing
+/// (plaintext) are compared in constant time; startup migrates them anyway.
+pub fn verify_password(stored: &str, password: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    if !is_password_hash(stored) {
+        return !stored.is_empty() && constant_time_eq(stored, password);
+    }
+    match PasswordHash::new(stored) {
+        Ok(parsed) => with_hash_slot(|| {
+            argon2_hasher()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        }),
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Failed-attempt rate limiting
+// ---------------------------------------------------------------------------
+
+/// Window over which failed attempts are counted.
+pub const RATE_WINDOW_SECS: i64 = 15 * 60;
+/// Failed sign-ins allowed per account in a window before it is throttled.
+pub const MAX_FAILURES_PER_ACCOUNT: u32 = 10;
+/// Failed attempts allowed per client IP in a window (covers many accounts).
+pub const MAX_FAILURES_PER_IP: u32 = 50;
+/// Failed API-key attempts allowed per IP. API keys carry 122 random bits, so
+/// this only sheds load from abusive clients; it is high so a music app still
+/// retrying an old key doesn't keep its owner locked out after they fix it.
+pub const MAX_API_KEY_FAILURES_PER_IP: u32 = 300;
+
+static FAILURES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>> =
+    OnceLock::new();
+
+fn failures() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, (u32, i64)>> {
+    FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Rate-limit keys for one attempt: the account (when known) and the client IP
+/// (when known). Empty parts are skipped.
+pub fn rate_keys(scope: &str, account: &str, ip: &str) -> Vec<String> {
+    let mut keys = Vec::with_capacity(2);
+    let account = account.trim().to_lowercase();
+    if !account.is_empty() {
+        keys.push(format!("{scope}:acct:{account}"));
+    }
+    if !ip.trim().is_empty() {
+        keys.push(format!("{scope}:ip:{}", ip.trim()));
+    }
+    keys
+}
+
+fn limit_for(key: &str) -> u32 {
+    if key.starts_with("apikey:") {
+        MAX_API_KEY_FAILURES_PER_IP
+    } else if key.contains(":ip:") {
+        MAX_FAILURES_PER_IP
+    } else {
+        MAX_FAILURES_PER_ACCOUNT
+    }
+}
+
+/// Seconds until another attempt is allowed, or `None` when not throttled.
+pub fn throttled_for(keys: &[String]) -> Option<i64> {
+    let now = Utc::now().timestamp();
+    let map = failures();
+    keys.iter()
+        .filter_map(|k| {
+            let (count, start) = *map.get(k)?;
+            let remaining = start + RATE_WINDOW_SECS - now;
+            (remaining > 0 && count >= limit_for(k)).then_some(remaining)
+        })
+        .max()
+}
+
+pub fn record_failure(keys: &[String]) {
+    let now = Utc::now().timestamp();
+    let mut map = failures();
+    if map.len() > 50_000 {
+        map.retain(|_, (_, start)| now - *start < RATE_WINDOW_SECS);
+    }
+    for key in keys {
+        let entry = map.entry(key.clone()).or_insert((0, now));
+        if now - entry.1 >= RATE_WINDOW_SECS {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+}
+
+/// A successful sign-in clears the account's counter (not the IP's).
+pub fn record_success(keys: &[String]) {
+    let mut map = failures();
+    for key in keys.iter().filter(|k| !k.contains(":ip:")) {
+        map.remove(key);
+    }
+}
+
+/// Human-readable message for a throttled request.
+pub fn throttle_message(retry_after: i64) -> String {
+    let mins = (retry_after + 59) / 60;
+    format!(
+        "Too many failed attempts. Try again in {} minute{}.",
+        mins.max(1),
+        if mins == 1 { "" } else { "s" }
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Base32 (RFC 4648) — used by every TOTP authenticator app
 // ---------------------------------------------------------------------------
 
@@ -256,6 +444,58 @@ pub fn assertion_credential_id(result: &AuthenticationResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_hashes_verify_and_legacy_plaintext_still_works() {
+        let hash = hash_password("hunter2").unwrap();
+        assert!(hash.starts_with("$argon2id$"));
+        assert_ne!(hash, hash_password("hunter2").unwrap(), "salted");
+        assert!(verify_password(&hash, "hunter2"));
+        assert!(!verify_password(&hash, "hunter3"));
+        assert!(verify_password("legacy-plain", "legacy-plain"));
+        assert!(!verify_password("legacy-plain", "nope"));
+        assert!(!verify_password("", ""));
+    }
+
+    #[test]
+    fn concurrent_hashing_is_bounded_and_never_deadlocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    with_hash_slot(|| {
+                        let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+                        PEAK.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        RUNNING.fetch_sub(1, Ordering::SeqCst);
+                    });
+                    let h = hash_password(&format!("pw{i}")).unwrap();
+                    assert!(verify_password(&h, &format!("pw{i}")));
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(PEAK.load(Ordering::SeqCst) <= MAX_CONCURRENT_HASHES);
+        verify_password_dummy("anything");
+    }
+
+    #[test]
+    fn rate_limiter_throttles_after_limit_and_resets_on_success() {
+        let keys = rate_keys("test-scope", "Limited-User", "");
+        assert_eq!(keys, vec!["test-scope:acct:limited-user".to_string()]);
+        for _ in 0..MAX_FAILURES_PER_ACCOUNT - 1 {
+            record_failure(&keys);
+        }
+        assert!(throttled_for(&keys).is_none());
+        record_failure(&keys);
+        assert!(throttled_for(&keys).unwrap() > 0);
+        record_success(&keys);
+        assert!(throttled_for(&keys).is_none());
+    }
 
     #[test]
     fn base32_roundtrip() {

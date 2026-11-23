@@ -92,6 +92,7 @@ async fn main() -> models::AppResult<()> {
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Store::open(&data_dir.join("beatlab.db"))?;
+    admin::bootstrap_admin_accounts(&store, std::env::var("ADMIN_PASSWORD").ok().as_deref());
 
     // Passkeys are bound to the public origin. `BEATLAB_ORIGIN` wins over `URL`
     // so deployments behind a proxy can configure the exact browser origin.
