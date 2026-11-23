@@ -8545,6 +8545,20 @@
       }
     },
     openTrackMenu,
+    openCurrentTrackMenu: (event) => {
+      if (event && typeof event.stopPropagation === 'function') {
+        event.stopPropagation();
+      }
+      const cur = currentTrack();
+      if (!cur) return showToast('Play a track first');
+      if (!state.trackMap.has(cur.id)) state.trackMap.set(cur.id, cur);
+      let posEvent = event;
+      if (event && event.currentTarget && event.clientX === 0 && event.clientY === 0) {
+        const r = event.currentTarget.getBoundingClientRect();
+        posEvent = { clientX: r.left, clientY: r.top, stopPropagation: () => {} };
+      }
+      openTrackMenu(posEvent, cur.id);
+    },
     closeTrackMenu,
     shareEntity,
     shareTrack: (tid) => {
