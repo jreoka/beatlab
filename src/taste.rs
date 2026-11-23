@@ -389,9 +389,12 @@ pub fn classify_moods(title: &str, album: &str, genre: &str, tags: &str) -> Vec<
 #[derive(Debug, Default, Clone)]
 pub struct TasteProfile {
     pub artist_affinity: HashMap<String, f64>,
+    pub artist_slug_affinity: HashMap<String, f64>,
+    pub artist_slug_ext_ids: HashMap<String, HashSet<String>>,
     pub genre_affinity: HashMap<String, f64>,
     pub mood_affinity: HashMap<Mood, f64>,
     pub playlist_artist_affinity: HashMap<String, f64>,
+    pub playlist_artist_slug_affinity: HashMap<String, f64>,
     pub playlist_genre_affinity: HashMap<String, f64>,
     pub playlist_mood_affinity: HashMap<Mood, f64>,
     pub related_artist_affinity: HashMap<String, f64>,
@@ -6187,6 +6190,13 @@ impl TasteEngine {
             for t in self.matching_catalog_tracks(&intent, 65) {
                 search_pool.push(t);
             }
+        } else {
+            let lex_q = intent.entity_query.as_deref().unwrap_or(&intent.normalized);
+            if !lex_q.trim().is_empty() {
+                if let Ok(cat_hits) = self.store.search_tracks(lex_q, 30, 0) {
+                    search_pool.extend(cat_hits);
+                }
+            }
         }
 
         if intent.is_theme_mix && !intent.genres.is_empty() {
@@ -6898,6 +6908,14 @@ struct EvaluatedSearchTrack {
     disliked: bool,
 }
 
+fn signed_sat(v: f64, scale: f64, cap: f64) -> f64 {
+    if v == 0.0 || scale <= 0.0 {
+        0.0
+    } else {
+        (v / scale).tanh() * cap
+    }
+}
+
 fn evaluate_search_candidates(
     intent: &SearchIntent,
     deduped: Vec<Track>,
@@ -6908,6 +6926,7 @@ fn evaluate_search_candidates(
 ) -> Vec<EvaluatedSearchTrack> {
     let lex_query = intent.entity_query.as_deref().unwrap_or(&intent.normalized);
     let lex_query_low = lex_query.to_lowercase();
+    let lex_query_words = crate::store::normalize_search_words(&lex_query_low);
     let mut evals: Vec<EvaluatedSearchTrack> = Vec::with_capacity(deduped.len());
 
     for t in deduped {
@@ -6929,27 +6948,59 @@ fn evaluate_search_candidates(
         let disliked = is_strongly_disliked(&t, &sctx.prof, &sctx.stats);
 
         let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
-        let fctx = build_track_affinities(&t, &sctx.prof);
+        let mut fctx = build_track_affinities(&t, &sctx.prof);
+        // Fresh remote search results often lack track-level genre tags; fall back to known
+        // artist genres so user genre taste still prioritizes the kind of music they listen to.
+        if fctx.genre_affinity == 0.0 && !ag.is_empty() {
+            let ag_list = split_genres(ag);
+            fctx.genre_affinity = ag_list
+                .iter()
+                .filter_map(|g| sctx.prof.genre_affinity.get(g))
+                .fold(0.0f64, |acc, v| if v.abs() > acc.abs() { *v } else { acc });
+            if fctx.playlist_genre_affinity == 0.0 {
+                fctx.playlist_genre_affinity = ag_list
+                    .iter()
+                    .filter_map(|g| sctx.prof.playlist_genre_affinity.get(g))
+                    .fold(0.0f64, |a, b| a.max(*b));
+            }
+        }
         let align = compute_taste_alignment(&t, &sctx.prof, &fctx);
 
-        let taste_aff = fctx.artist_affinity * 0.85
-            + fctx.genre_affinity * 0.65
-            + fctx.mood_affinity * 0.45
-            + fctx.playlist_artist_affinity * 0.5
-            + fctx.playlist_genre_affinity * 0.4
+        // Smoothly bounded personal taste signal: strong enough that within the same lexical
+        // tier a user's favorite artist or preferred genre decisively beats a more popular
+        // mainstream song, while capped so it can never lift an unrelated song above a direct
+        // title/artist match.
+        let play_history_term = if st.play_count > st.skip_count {
+            (((st.play_count - st.skip_count) as f64) / 3.0).tanh() * 2.5
+        } else {
+            0.0
+        };
+        let raw_taste_aff = signed_sat(fctx.artist_affinity, 3.5, 9.0)
+            + signed_sat(fctx.playlist_artist_affinity, 2.0, 3.5)
+            + signed_sat(fctx.genre_affinity, 5.0, 4.5)
+            + signed_sat(fctx.playlist_genre_affinity, 4.0, 2.0)
+            + signed_sat(fctx.mood_affinity, 6.0, 2.0)
             + if align.rel_a > 0.0 {
-                (align.rel_a / 1.8).tanh() * 1.4
+                (align.rel_a / 1.8).tanh() * 2.5
             } else {
                 0.0
             }
             + if align.rel_t > 0.0 {
-                (align.rel_t / 1.5).tanh() * 1.1
+                (align.rel_t / 1.5).tanh() * 2.0
             } else {
                 0.0
             }
-            + if fctx.followed_artist { 1.4 } else { 0.0 }
-            + if fctx.saved_album { 0.9 } else { 0.0 }
-            + if sctx.prof.starred.contains(&t.id) { 1.8 } else { 0.0 };
+            + if fctx.followed_artist { 3.5 } else { 0.0 }
+            + if fctx.saved_album { 1.8 } else { 0.0 }
+            + if sctx.prof.starred.contains(&t.id) { 3.5 } else { 0.0 }
+            + if sctx.prof.manual_playlist_ids.contains(&t.id) {
+                2.0
+            } else {
+                0.0
+            }
+            + play_history_term;
+        let taste_aff = raw_taste_aff.clamp(-14.0, 18.0);
+
         // Already scaled by model trust and clamped to ±4, so it can reorder within a
         // lexical tier but never lift a loose hit above an exact song/artist match.
         let neural_term = if disliked {
@@ -6977,10 +7028,23 @@ fn evaluate_search_candidates(
 
         let tl = t.title.to_lowercase();
         let al = primary_artist(&t.artist).to_lowercase();
-        let is_exact_entity = !is_junk && (tl == lex_query_low || al == lex_query_low);
+        let tl_words = crate::store::normalize_search_words(&t.title);
+        let core_tl_words =
+            crate::store::normalize_search_words(&crate::models::core_song_title(&t.title));
+        let al_words = crate::store::normalize_search_words(&primary_artist(&t.artist));
+
+        let is_exact_entity = !is_junk
+            && (tl == lex_query_low
+                || al == lex_query_low
+                || (!lex_query_words.is_empty()
+                    && (tl_words == lex_query_words || al_words == lex_query_words)));
+        let is_exact_core_title = !is_junk
+            && !is_exact_entity
+            && !lex_query_words.is_empty()
+            && core_tl_words == lex_query_words;
 
         // Pin exact song/artist matches at the top for entity searches while letting
-        // listening taste refine broad/ambiguous queries and tie-breaks.
+        // listening taste decisively win within the same lexical match tier.
         let lex_anchor = if intent.is_theme_mix {
             if is_exact_entity {
                 28.0
@@ -6990,15 +7054,17 @@ fn evaluate_search_candidates(
                 0.0
             }
         } else if is_exact_entity {
-            28.0 + (lex - 250.0).max(0.0) / 50.0
+            56.0 + (lex - 250.0).max(0.0) / 50.0
+        } else if is_exact_core_title {
+            54.0 + (lex - 250.0).max(0.0) / 50.0
         } else if lex >= 450.0 {
-            19.0 + (lex - 450.0) / 50.0
+            44.0 + (lex - 450.0) / 50.0
         } else if lex >= 280.0 {
-            10.5 + (lex - 280.0) / 35.0
+            30.0 + (lex - 280.0) / 35.0
         } else if lex > 0.0 {
-            lex / 55.0
+            12.0 + (lex / 25.0).min(12.0)
         } else {
-            -4.5
+            -6.0
         };
 
         let intent_fit = era_match * 4.5
@@ -7014,7 +7080,7 @@ fn evaluate_search_candidates(
             + if intent.is_theme_mix {
                 intent_fit
             } else {
-                era_match * 1.5 + theme_match * 1.5 + curated_prior * 0.6 + pop_bonus * 0.55
+                era_match * 1.5 + theme_match * 1.5 + curated_prior * 0.6 + pop_bonus * 0.40
             }
             + taste_aff
             + neural_term
@@ -7046,15 +7112,36 @@ fn apply_track_affinity_delta(prof: &mut TasteProfile, t: &Track, w: f64, playli
     let artist_id = t.artist_id();
     let has_ext_id = artist_id.starts_with("ar:dz:") || artist_id.starts_with("ar:ytm:");
     let a_key = slug(&primary_artist(&t.artist));
-    let target_artist = if playlist_layer {
-        &mut prof.playlist_artist_affinity
+    if playlist_layer {
+        if has_ext_id {
+            *prof.playlist_artist_affinity.entry(artist_id.clone()).or_insert(0.0) += w;
+        } else if !a_key.is_empty() {
+            *prof.playlist_artist_affinity.entry(a_key.clone()).or_insert(0.0) += w;
+        }
+        if !a_key.is_empty() {
+            *prof.playlist_artist_slug_affinity.entry(a_key.clone()).or_insert(0.0) += w;
+            if has_ext_id {
+                prof.artist_slug_ext_ids
+                    .entry(a_key)
+                    .or_default()
+                    .insert(artist_id);
+            }
+        }
     } else {
-        &mut prof.artist_affinity
-    };
-    if has_ext_id {
-        *target_artist.entry(artist_id).or_insert(0.0) += w;
-    } else if !a_key.is_empty() {
-        *target_artist.entry(a_key).or_insert(0.0) += w;
+        if has_ext_id {
+            *prof.artist_affinity.entry(artist_id.clone()).or_insert(0.0) += w;
+        } else if !a_key.is_empty() {
+            *prof.artist_affinity.entry(a_key.clone()).or_insert(0.0) += w;
+        }
+        if !a_key.is_empty() {
+            *prof.artist_slug_affinity.entry(a_key.clone()).or_insert(0.0) += w;
+            if has_ext_id {
+                prof.artist_slug_ext_ids
+                    .entry(a_key)
+                    .or_default()
+                    .insert(artist_id);
+            }
+        }
     }
 
     let target_genre = if playlist_layer {
@@ -7080,24 +7167,42 @@ fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
     let artist_id = t.artist_id();
     let has_ext_id = artist_id.starts_with("ar:dz:") || artist_id.starts_with("ar:ytm:");
     let artist_slug = slug(&primary_artist(&t.artist));
+    let ext_provider_conflict = |ext_id: &str, slug_key: &str| -> bool {
+        let Some(known) = prof.artist_slug_ext_ids.get(slug_key) else {
+            return false;
+        };
+        let prefix = if ext_id.starts_with("ar:dz:") {
+            Some("ar:dz:")
+        } else if ext_id.starts_with("ar:ytm:") {
+            Some("ar:ytm:")
+        } else {
+            None
+        };
+        if let Some(p) = prefix {
+            known.iter().any(|k| k.starts_with(p) && k != ext_id)
+        } else {
+            false
+        }
+    };
     let artist_affinity = if has_ext_id {
         prof.artist_affinity
             .get(&artist_id)
             .copied()
             .unwrap_or_else(|| {
-                let any_ext_in_prof = prof
-                    .artist_affinity
-                    .keys()
-                    .any(|k| k.starts_with("ar:dz:") || k.starts_with("ar:ytm:"));
-                if any_ext_in_prof {
+                if ext_provider_conflict(&artist_id, &artist_slug) {
                     0.0
                 } else {
-                    prof.artist_affinity.get(&artist_slug).copied().unwrap_or(0.0)
+                    prof.artist_slug_affinity
+                        .get(&artist_slug)
+                        .or_else(|| prof.artist_affinity.get(&artist_slug))
+                        .copied()
+                        .unwrap_or(0.0)
                 }
             })
     } else {
         prof.artist_affinity
             .get(&artist_id)
+            .or_else(|| prof.artist_slug_affinity.get(&artist_slug))
             .or_else(|| prof.artist_affinity.get(&artist_slug))
             .copied()
             .unwrap_or(0.0)
@@ -7106,10 +7211,21 @@ fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
         prof.playlist_artist_affinity
             .get(&artist_id)
             .copied()
-            .unwrap_or(0.0)
+            .unwrap_or_else(|| {
+                if ext_provider_conflict(&artist_id, &artist_slug) {
+                    0.0
+                } else {
+                    prof.playlist_artist_slug_affinity
+                        .get(&artist_slug)
+                        .or_else(|| prof.playlist_artist_affinity.get(&artist_slug))
+                        .copied()
+                        .unwrap_or(0.0)
+                }
+            })
     } else {
         prof.playlist_artist_affinity
             .get(&artist_id)
+            .or_else(|| prof.playlist_artist_slug_affinity.get(&artist_slug))
             .or_else(|| prof.playlist_artist_affinity.get(&artist_slug))
             .copied()
             .unwrap_or(0.0)
@@ -13563,5 +13679,193 @@ mod tests {
                 list.iter().map(|t| &t.id).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn search_ranks_exact_title_phrase_first_even_when_user_heavily_listens_to_query_artist() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("reona_fan", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let amore = Track {
+            id: "ytm:amore".into(),
+            source: "ytm".into(),
+            title: "Amore".into(),
+            artist: "ReoNa".into(),
+            album: "Amore".into(),
+            genre: "J-Pop".into(),
+            bitrate: 256,
+            meta: r#"{"rank":820000}"#.into(),
+            ..Default::default()
+        };
+        let lost = Track {
+            id: "ytm:lost".into(),
+            source: "ytm".into(),
+            title: "Lost -Game size-".into(),
+            artist: "ReoNa".into(),
+            album: "TSUKIHIME".into(),
+            genre: "J-Pop".into(),
+            bitrate: 256,
+            meta: r#"{"rank":700000}"#.into(),
+            ..Default::default()
+        };
+        let game_of_love = Track {
+            id: "ytm:gol".into(),
+            source: "ytm".into(),
+            title: "Game of Love".into(),
+            artist: "Elza Kanzaki".into(),
+            album: "ELZA2".into(),
+            genre: "J-Pop".into(),
+            bitrate: 256,
+            meta: r#"{"rank":120000}"#.into(),
+            ..Default::default()
+        };
+        store
+            .upsert_tracks(&[amore.clone(), lost.clone(), game_of_love.clone()])
+            .unwrap();
+
+        // User heavily listens to ReoNa (even stars Amore).
+        store.star_track(u.id, &amore.id).unwrap();
+        for _ in 0..25 {
+            store.record_event(u.id, &amore.id, "complete", 1.0).unwrap();
+            store.record_event(u.id, &lost.id, "complete", 1.0).unwrap();
+        }
+
+        let res = taste.search_and_refine(
+            u.id,
+            "game of love reona",
+            vec![amore.clone(), lost.clone(), game_of_love.clone()],
+            vec![],
+        );
+        assert_eq!(
+            res.tracks.first().map(|t| t.id.as_str()),
+            Some("ytm:gol"),
+            "exact title match 'Game of Love' must rank #1, got: {:?}",
+            res.tracks
+                .iter()
+                .map(|t| (&t.id, &t.title, &t.artist))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn search_prioritizes_user_listened_artist_and_genre_over_more_popular_pop_artist() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("listener", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        // User listens a ton to Artist 123 (on YTM) and J-Rock in general.
+        let past_track = Track {
+            id: "ytm:a123_prev".into(),
+            source: "ytm".into(),
+            title: "Previous Favorite".into(),
+            artist: "Artist 123".into(),
+            album: "First Album".into(),
+            genre: "J-Rock".into(),
+            meta: r#"{"ytm_artist_id":"UC_a123"}"#.into(),
+            ..Default::default()
+        };
+        // Search result for Artist 123 comes from Deezer (different source ID) and is NOT popular.
+        let a123_stay = Track {
+            id: "dz:a123_stay".into(),
+            source: "deezer".into(),
+            title: "Stay".into(),
+            artist: "Artist 123".into(),
+            album: "Second Album".into(),
+            genre: "J-Rock".into(),
+            bitrate: 256,
+            meta: r#"{"deezer_artist_id":"99123","rank":80000}"#.into(),
+            ..Default::default()
+        };
+        // Mega-popular mainstream pop song with the exact same title.
+        let pop_stay = Track {
+            id: "dz:pop876_stay".into(),
+            source: "deezer".into(),
+            title: "Stay".into(),
+            artist: "Pop Artist 876".into(),
+            album: "Top 40 Hits".into(),
+            genre: "Pop".into(),
+            bitrate: 320,
+            meta: r#"{"deezer_artist_id":"99876","rank":995000}"#.into(),
+            ..Default::default()
+        };
+        // Another unheard J-Rock artist with the same title (tests genre-taste preference).
+        let jrock_other = Track {
+            id: "dz:jrock_new".into(),
+            source: "deezer".into(),
+            title: "Stay".into(),
+            artist: "Unheard J-Rock Band".into(),
+            album: "Indie EP".into(),
+            genre: "J-Rock".into(),
+            bitrate: 256,
+            meta: r#"{"deezer_artist_id":"99555","rank":100000}"#.into(),
+            ..Default::default()
+        };
+        store
+            .upsert_tracks(&[
+                past_track.clone(),
+                a123_stay.clone(),
+                pop_stay.clone(),
+                jrock_other.clone(),
+            ])
+            .unwrap();
+
+        for _ in 0..8 {
+            store
+                .record_event(u.id, &past_track.id, "complete", 1.0)
+                .unwrap();
+        }
+
+        // 1. User's listened artist ranks #1 over mega-popular pop artist.
+        let res = taste.search_and_refine(
+            u.id,
+            "stay",
+            vec![pop_stay.clone(), a123_stay.clone()],
+            vec![],
+        );
+        assert_eq!(
+            res.tracks.first().map(|t| t.id.as_str()),
+            Some("dz:a123_stay"),
+            "user's heavily listened artist should outrank popular pop artist, got: {:?}",
+            res.tracks
+                .iter()
+                .map(|t| (&t.id, &t.artist))
+                .collect::<Vec<_>>()
+        );
+
+        // 2. Even when remote search only returns an unheard J-Rock artist and a mega-popular
+        //    pop hit, the catalog pulls in the user's listened artist (#1) and the preferred
+        //    J-Rock genre (#2) still outranks the unrelated popular pop hit (#3).
+        let res_genre = taste.search_and_refine(
+            u.id,
+            "stay",
+            vec![pop_stay.clone(), jrock_other.clone()],
+            vec![],
+        );
+        let ids: Vec<&str> = res_genre.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["dz:a123_stay", "dz:jrock_new", "dz:pop876_stay"],
+            "expected listened artist #1, preferred genre #2, popular pop #3, got: {:?}",
+            res_genre
+                .tracks
+                .iter()
+                .map(|t| (&t.id, &t.artist, &t.genre))
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -5635,6 +5635,53 @@ fn row_to_playlist(row: &Row) -> rusqlite::Result<Playlist> {
     })
 }
 
+pub(crate) fn normalize_search_words(s: &str) -> Vec<String> {
+    let cleaned = s
+        .to_lowercase()
+        .replace(['\'', '\u{2019}', '\u{2018}'], "");
+    cleaned
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn contains_word_phrase(hay_words: &[String], needle_words: &[String]) -> bool {
+    if needle_words.is_empty() || needle_words.len() > hay_words.len() {
+        return false;
+    }
+    hay_words
+        .windows(needle_words.len())
+        .any(|w| w == needle_words)
+}
+
+fn is_search_stopword(w: &str) -> bool {
+    matches!(
+        w,
+        "a" | "an"
+            | "the"
+            | "of"
+            | "in"
+            | "on"
+            | "at"
+            | "to"
+            | "for"
+            | "and"
+            | "or"
+            | "by"
+            | "is"
+            | "it"
+            | "my"
+            | "me"
+            | "we"
+            | "be"
+            | "no"
+            | "so"
+            | "do"
+            | "go"
+    )
+}
+
 pub fn search_match_score(t: &Track, query: &str) -> i32 {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -5649,57 +5696,184 @@ pub fn search_match_score(t: &Track, query: &str) -> i32 {
     let abl = t.album.to_lowercase();
     let gl = t.genre.to_lowercase();
     let hay = format!("{} {} {} {}", tl, al, abl, gl);
-    let matched = tokens.iter().filter(|tok| hay.contains(**tok)).count();
-    if matched < tokens.len() {
-        return 0;
-    }
 
-    let mut score = 50 + (t.quality_score() / 10);
+    let q_words = normalize_search_words(&q);
+    let tl_words = normalize_search_words(&t.title);
+    let core_tl = crate::models::core_song_title(&t.title);
+    let core_tl_words = normalize_search_words(&core_tl);
+    let al_words = normalize_search_words(&t.artist);
+    let primary_al_words = normalize_search_words(&primary_artist(&t.artist));
+    let abl_words = normalize_search_words(&t.album);
+    let gl_words = normalize_search_words(&t.genre);
 
-    let artist_title = format!("{} {}", al, tl);
-    let title_artist = format!("{} {}", tl, al);
-    if tl == q || artist_title == q || title_artist == q {
-        score += 550;
-    } else if tl.starts_with(&q) {
-        score += 320;
-    } else if tl.contains(&q) {
-        score += 180;
-    }
+    let hay_norm = format!(
+        "{} {} {} {}",
+        tl_words.join(" "),
+        al_words.join(" "),
+        abl_words.join(" "),
+        gl_words.join(" ")
+    );
 
-    if al == q {
-        score += 320;
-    } else if al.contains(&q) {
-        score += 150;
-    } else if !al.is_empty() {
-        // Reward artist+title combined queries (e.g. "daft punk one more time").
-        let artist_words: Vec<&str> = al.split_whitespace().collect();
-        if !artist_words.is_empty() && artist_words.iter().all(|w| tokens.contains(w)) {
-            score += 240;
-            let non_artist_tokens: Vec<&str> = tokens
+    let matched_all = tokens.iter().all(|tok| hay.contains(*tok))
+        || (!q_words.is_empty() && q_words.iter().all(|w| hay_norm.contains(w.as_str())));
+
+    let mut score = if matched_all {
+        let mut s = 50 + (t.quality_score() / 10);
+
+        let artist_title = format!("{} {}", al, tl);
+        let title_artist = format!("{} {}", tl, al);
+        let mut artist_title_words = primary_al_words.clone();
+        artist_title_words.extend(tl_words.iter().cloned());
+        let mut title_artist_words = tl_words.clone();
+        title_artist_words.extend(primary_al_words.iter().cloned());
+
+        let mut artist_core_words = primary_al_words.clone();
+        artist_core_words.extend(core_tl_words.iter().cloned());
+        let mut core_artist_words = core_tl_words.clone();
+        core_artist_words.extend(primary_al_words.iter().cloned());
+
+        if tl == q
+            || (!q_words.is_empty() && tl_words == q_words)
+            || artist_title == q
+            || title_artist == q
+            || (!q_words.is_empty()
+                && (artist_title_words == q_words || title_artist_words == q_words))
+        {
+            s += 550;
+        } else if !q_words.is_empty()
+            && !core_tl_words.is_empty()
+            && (core_tl_words == q_words
+                || artist_core_words == q_words
+                || core_artist_words == q_words)
+        {
+            s += 520;
+        } else if tl.starts_with(&q) || (!q_words.is_empty() && tl_words.starts_with(&q_words)) {
+            s += 320;
+        } else if contains_word_phrase(&tl_words, &q_words) || tl.contains(&q) {
+            s += 180;
+        }
+
+        if al == q || (!q_words.is_empty() && (primary_al_words == q_words || al_words == q_words))
+        {
+            s += 320;
+        } else if al.contains(&q) || contains_word_phrase(&al_words, &q_words) {
+            s += 150;
+        } else if !primary_al_words.is_empty()
+            && primary_al_words.iter().all(|w| q_words.contains(w))
+        {
+            // Reward artist+title combined queries (e.g. "daft punk one more time").
+            s += 240;
+            let non_artist_words: Vec<String> = q_words
                 .iter()
-                .copied()
-                .filter(|tok| !artist_words.contains(tok))
+                .filter(|w| !primary_al_words.contains(*w))
+                .cloned()
                 .collect();
-            if !non_artist_tokens.is_empty() {
-                let rem = non_artist_tokens.join(" ");
-                let core_tl = crate::models::core_song_title(&t.title).to_lowercase();
-                if tl == rem || core_tl == rem {
-                    score += 360;
-                } else if tl.starts_with(&rem) || core_tl.starts_with(&rem) {
-                    score += 260;
-                } else if non_artist_tokens.iter().all(|tok| tl.contains(*tok)) {
-                    score += 160;
+            if !non_artist_words.is_empty() {
+                if tl_words == non_artist_words {
+                    s += 360;
+                } else if core_tl_words == non_artist_words {
+                    s += 340;
+                } else if tl_words.starts_with(&non_artist_words)
+                    || core_tl_words.starts_with(&non_artist_words)
+                {
+                    s += 260;
+                } else if contains_word_phrase(&tl_words, &non_artist_words) {
+                    s += 220;
+                } else if non_artist_words
+                    .iter()
+                    .all(|w| tl_words.contains(w) || tl.contains(w.as_str()))
+                {
+                    s += 160;
                 }
             }
         }
-    }
 
-    if abl.contains(&q) {
-        score += 80;
-    }
+        if abl.contains(&q) || contains_word_phrase(&abl_words, &q_words) {
+            s += 80;
+        }
+        s
+    } else if q_words.len() >= 2 && !tl_words.is_empty() {
+        // Partial-token match: reward when the track's full (or core) title appears
+        // word-for-word as a contiguous phrase inside a longer query (e.g. searching
+        // "game of love reona" when the track is titled "Game of Love" by "Elza Kanzaki").
+        let title_phrase_match = if contains_word_phrase(&q_words, &tl_words) {
+            Some((&tl_words, true))
+        } else if !core_tl_words.is_empty() && contains_word_phrase(&q_words, &core_tl_words) {
+            Some((&core_tl_words, false))
+        } else {
+            None
+        };
+
+        if let Some((phrase_words, is_exact_full_title)) = title_phrase_match {
+            let substantial = if phrase_words.len() >= 2 {
+                phrase_words
+                    .iter()
+                    .any(|w| !is_search_stopword(w) && w.len() >= 2)
+            } else {
+                let w = &phrase_words[0];
+                !is_search_stopword(w) && w.len() >= 4 && q_words.len() <= 3
+            };
+            if substantial {
+                let coverage = (phrase_words.len() as f64) / (q_words.len().max(1) as f64);
+                let base = if is_exact_full_title { 410 } else { 385 };
+                let cov_bonus = (coverage * 110.0).round() as i32;
+                base + cov_bonus + (t.quality_score() / 10)
+            } else {
+                return 0;
+            }
+        } else {
+            // Fallback: a multi-word contiguous slice of the query (>= 2 words, covering
+            // at least half the query) matches contiguously inside the track's title
+            // (e.g. "game of love reona" matching "Game of Love - Opening Theme").
+            let mut best_len = 0usize;
+            let mut best_at_start = false;
+            for start in 0..q_words.len() {
+                for end in (start + 2)..=q_words.len() {
+                    let slice = &q_words[start..end];
+                    let len = end - start;
+                    if len < best_len {
+                        continue;
+                    }
+                    if !slice
+                        .iter()
+                        .any(|w| !is_search_stopword(w) && w.len() >= 2)
+                    {
+                        continue;
+                    }
+                    let at_start = tl_words.starts_with(slice) || core_tl_words.starts_with(slice);
+                    if at_start
+                        || contains_word_phrase(&tl_words, slice)
+                        || contains_word_phrase(&core_tl_words, slice)
+                    {
+                        if len > best_len || (len == best_len && at_start && !best_at_start) {
+                            best_len = len;
+                            best_at_start = at_start;
+                        }
+                    }
+                }
+            }
+            if best_len >= 2 && (best_len * 2) >= q_words.len() {
+                let coverage = (best_len as f64) / (q_words.len().max(1) as f64);
+                260 + (coverage * 120.0).round() as i32
+                    + if best_at_start { 40 } else { 0 }
+                    + (t.quality_score() / 10)
+            } else {
+                return 0;
+            }
+        }
+    } else {
+        return 0;
+    };
 
     // Demote parody/karaoke/tribute/ringtone clutter unless explicitly searched.
-    for junk in ["parody", "karaoke", "tribute", "made famous by", "ringtone", "8-bit"] {
+    for junk in [
+        "parody",
+        "karaoke",
+        "tribute",
+        "made famous by",
+        "ringtone",
+        "8-bit",
+    ] {
         if (tl.contains(junk) || al.contains(junk)) && !q.contains(junk) {
             score -= 260;
         }
@@ -6710,6 +6884,35 @@ mod tests {
             "orig={}, parody={}",
             search_match_score(&orig, q),
             search_match_score(&parody, q)
+        );
+    }
+
+    #[test]
+    fn search_match_rewards_exact_title_phrase_with_alias_or_extra_query_token() {
+        let game_of_love = sample_track("ytm:gol", "Game of Love", "Elza Kanzaki", "ELZA2");
+        let amore = sample_track("ytm:am", "Amore", "ReoNa", "Amore");
+        let lost = sample_track("ytm:lost", "Lost -Game size-", "ReoNa", "TSUKIHIME");
+        let you = sample_track("ytm:you", "You", "Elza Kanzaki", "ELZA2");
+        let q = "game of love reona";
+
+        let s_gol = search_match_score(&game_of_love, q);
+        let s_amore = search_match_score(&amore, q);
+        let s_lost = search_match_score(&lost, q);
+        let s_you = search_match_score(&you, q);
+
+        assert!(s_gol >= 450, "exact title phrase should score high, got {}", s_gol);
+        assert_eq!(s_amore, 0, "unrelated artist-only track should not match");
+        assert_eq!(s_lost, 0, "single-word partial overlap should not match");
+        assert_eq!(s_you, 0, "unrelated track should not match");
+
+        // Guard: short single-word title should not match unrelated longer queries.
+        assert_eq!(search_match_score(&you, "you only live once"), 0);
+
+        // Apostrophe normalization: "dont stop me now" matches "Don't Stop Me Now".
+        let queen = sample_track("dz:q", "Don't Stop Me Now", "Queen", "Jazz");
+        assert!(
+            search_match_score(&queen, "dont stop me now") >= 550,
+            "apostrophe-normalized exact title should match strongly"
         );
     }
 
