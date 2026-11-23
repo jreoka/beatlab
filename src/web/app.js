@@ -7564,12 +7564,7 @@
     const data = state.social.profileData;
     const u = data && data.user && data.user.username === username ? data.user : { username };
     const isSelf = !!(data && data.isSelf && data.user && data.user.username === username);
-    // Share the section being viewed when it has a public counterpart
-    // (there's no public Radio page, so that falls back to the overview).
-    const publicTab = data && data.user && data.user.username === username && ['stats', 'playlists', 'followers', 'following'].includes(data.tab)
-      ? `/${data.tab}`
-      : '';
-    const url = `${location.origin}/u/${encodeURIComponent(username)}${publicTab}`;
+    const url = `${location.origin}/u/${encodeURIComponent(username)}`;
     state.currentShareUrl = url;
     const nativeShareBtn =
       typeof navigator.share === 'function'

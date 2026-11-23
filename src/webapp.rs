@@ -5561,6 +5561,7 @@ fn public_profile_cache() -> &'static std::sync::Mutex<HashMap<String, (std::tim
 #[derive(Deserialize)]
 pub struct PublicProfileQuery {
     pub range: Option<String>,
+    pub metric: Option<String>,
 }
 
 /// `/u/{username}` — public profile overview.
@@ -5570,7 +5571,7 @@ pub async fn public_profile_page(
     Query(q): Query<PublicProfileQuery>,
     headers: HeaderMap,
 ) -> Response {
-    render_public_profile(&state, &headers, &reference, None, q.range.as_deref()).await
+    render_public_profile(&state, &headers, &reference, None, q.range.as_deref(), q.metric.as_deref()).await
 }
 
 /// `/u/{username}/{tab}` — stats, playlists, followers or following.
@@ -5580,7 +5581,7 @@ pub async fn public_profile_tab_page(
     Query(q): Query<PublicProfileQuery>,
     headers: HeaderMap,
 ) -> Response {
-    render_public_profile(&state, &headers, &reference, Some(&tab), q.range.as_deref()).await
+    render_public_profile(&state, &headers, &reference, Some(&tab), q.range.as_deref(), q.metric.as_deref()).await
 }
 
 /// Public, sign-in-free profile pages. They show the same privacy-safe data
@@ -5592,6 +5593,7 @@ async fn render_public_profile(
     reference: &str,
     tab_slug: Option<&str>,
     range: Option<&str>,
+    metric: Option<&str>,
 ) -> Response {
     use crate::profile_page::{ProfileBody, ProfileTab};
     let html_response = |status: StatusCode, html: String| {
@@ -5627,8 +5629,13 @@ async fn render_public_profile(
     }
 
     let stats_range = crate::stats::StatsRange::from_str(range);
+    let stats_metric = if metric.map(|m| m.eq_ignore_ascii_case("mins")).unwrap_or(false) {
+        "mins"
+    } else {
+        "streams"
+    };
     let origin = request_origin(headers);
-    let cache_key = format!("{}|{}|{}|{}", origin, target.id, tab.slug(), stats_range.key());
+    let cache_key = format!("{}|{}|{}|{}|{}", origin, target.id, tab.slug(), stats_range.key(), stats_metric);
     if let Ok(cache) = public_profile_cache().lock() {
         if let Some((at, html)) = cache.get(&cache_key) {
             if at.elapsed() < PUBLIC_PROFILE_CACHE_TTL {
@@ -5682,8 +5689,9 @@ async fn render_public_profile(
             )
         }
         ProfileTab::Stats => {
-            let Ok(stats) = tokio::task::spawn_blocking(move || {
-                crate::stats::build_public_range_stats(&store, &target_user, stats_range, now)
+            state.taste.enrich_user_listened_tracks(target.id).await;
+            let Ok(mut stats) = tokio::task::spawn_blocking(move || {
+                crate::stats::build_user_stats(&store, &target_user, stats_range, 0, now)
             })
             .await
             else {
@@ -5692,7 +5700,15 @@ async fn render_public_profile(
                     "Failed to compute stats".to_string(),
                 );
             };
-            crate::profile_page::render_profile_page(&origin, &target, &ProfileBody::Stats(&stats))
+            // Match the in-app profile stats privacy boundary: omit the
+            // per-track activity log and hidden-track count.
+            stats.recent_events.clear();
+            stats.library.hidden_tracks = 0;
+            crate::profile_page::render_profile_page(
+                &origin,
+                &target,
+                &ProfileBody::Stats { stats: &stats, metric: stats_metric },
+            )
         }
         ProfileTab::Playlists => {
             let playlists = public_playlists(100);

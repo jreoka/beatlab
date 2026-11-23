@@ -2520,7 +2520,7 @@ a {
   border-radius: var(--radius);
   margin: 12px 0;
 }
-.share-preview-card img {
+.share-preview-card > img {
   width: 56px;
   height: 56px;
   border-radius: var(--radius-sm);
@@ -4888,6 +4888,7 @@ html.is-standalone .topbar {
   width: 168px;
   height: 168px;
   border-radius: 50%;
+  overflow: hidden;
   display: grid;
   place-items: center;
   font-size: 72px;
