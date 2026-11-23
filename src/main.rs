@@ -34,6 +34,8 @@ use std::time::Duration;
 use store::Store;
 use subsonic::AppState;
 use taste::TasteEngine;
+use tower_http::compression::predicate::{Predicate, SizeAbove};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -173,6 +175,8 @@ async fn main() -> models::AppResult<()> {
         taste: taste.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    tokio::spawn(webapp::prewarm_charts(state.clone()));
 
     // Fast startup catalog warming + continuous RoPE-QKVO/XSA/GEGLU Transformer training & curation
     let warm_taste = taste.clone();
@@ -397,6 +401,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/admin/users/{id}/delete", post(admin::delete_user))
         .route("/api/admin/users/{id}/restore", post(admin::restore_user))
         .route("/api/admin/users/{id}/purge", post(admin::purge_user))
+        .layer(compression_layer())
         .layer(cors)
         .with_state(state);
 
@@ -733,4 +738,29 @@ mod tests {
 
         server.abort();
     }
+}
+
+/// gzip/brotli for text responses (app.js, CSS, HTML, JSON, XML). Audio, video and
+/// images are already compressed and served with byte ranges, so they are never touched.
+fn compression_layer() -> CompressionLayer<impl Predicate> {
+    let text_only = |_: axum::http::StatusCode,
+                     _: axum::http::Version,
+                     headers: &axum::http::HeaderMap,
+                     _: &axum::http::Extensions| {
+        if headers.contains_key(header::CONTENT_RANGE) {
+            return false;
+        }
+        let ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        ct.starts_with("text/")
+            || ct.starts_with("application/json")
+            || ct.starts_with("application/javascript")
+            || ct.starts_with("application/xml")
+            || ct.starts_with("application/manifest+json")
+            || ct.starts_with("image/svg+xml")
+    };
+    CompressionLayer::new().compress_when(SizeAbove::new(1024).and(text_only))
 }

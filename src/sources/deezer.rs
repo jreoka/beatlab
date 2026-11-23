@@ -36,6 +36,9 @@ pub struct DeezerSource {
     album_info_cache: Arc<std::sync::Mutex<HashMap<u64, (String, i32)>>>,
     bucket: Arc<std::sync::Mutex<TokenBucket>>,
     blocked_until: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// URLs with a background refresh in flight, so a burst of page loads on a stale
+    /// entry triggers one upstream request instead of one per visitor.
+    refreshing: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 /// Search and chart results drift; entity lookups (albums, artists, playlists) barely do.
@@ -46,6 +49,10 @@ fn json_cache_ttl(url: &str) -> Duration {
         Duration::from_secs(6 * 60 * 60)
     }
 }
+
+/// Past its TTL an entry is still served (stale-while-revalidate) for this long while a
+/// background task refreshes it, so pages never block on Deezer for data we already have.
+const DZ_JSON_STALE_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct DeezerGenre {
@@ -72,6 +79,7 @@ impl DeezerSource {
                 last: Instant::now(),
             })),
             blocked_until: Arc::new(std::sync::Mutex::new(None)),
+            refreshing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -119,17 +127,47 @@ impl DeezerSource {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
-        {
+        let cached = {
             let guard = self.json_cache.read().await;
-            if let Some((ts, cached)) = guard.get(url) {
-                if ts.elapsed() < json_cache_ttl(url) {
-                    if let Ok(parsed) = serde_json::from_value::<T>(cached.clone()) {
-                        return Some(parsed);
-                    }
+            guard
+                .get(url)
+                .filter(|(ts, _)| ts.elapsed() < DZ_JSON_STALE_MAX)
+                .map(|(ts, v)| (ts.elapsed() < json_cache_ttl(url), v.clone()))
+        };
+        if let Some((fresh, value)) = cached {
+            if let Ok(parsed) = serde_json::from_value::<T>(value) {
+                if !fresh {
+                    self.spawn_refresh(url);
                 }
+                return Some(parsed);
             }
         }
 
+        let val = self.fetch_and_cache(url).await?;
+        serde_json::from_value::<T>(val).ok()
+    }
+
+    /// Re-fetch a stale cache entry in the background (at most one in flight per URL).
+    fn spawn_refresh(&self, url: &str) {
+        {
+            let mut inflight = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+            if !inflight.insert(url.to_string()) {
+                return;
+            }
+        }
+        let this = self.clone();
+        let url = url.to_string();
+        tokio::spawn(async move {
+            let _ = this.fetch_and_cache(&url).await;
+            this.refreshing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&url);
+        });
+    }
+
+    /// Request `url` from Deezer (throttled, with retries) and store the JSON in the cache.
+    async fn fetch_and_cache(&self, url: &str) -> Option<serde_json::Value> {
         for attempt in 0..3 {
             if self.is_blocked() {
                 return None;
@@ -193,10 +231,10 @@ impl DeezerSource {
                 warn!(code, msg, url, "deezer API error");
                 return None;
             }
-            if let Ok(parsed) = serde_json::from_value::<T>(val.clone()) {
+            {
                 let mut guard = self.json_cache.write().await;
                 if guard.len() >= DZ_JSON_CACHE_MAX {
-                    guard.retain(|k, (ts, _)| ts.elapsed() < json_cache_ttl(k));
+                    guard.retain(|_, (ts, _)| ts.elapsed() < DZ_JSON_STALE_MAX);
                     if guard.len() >= DZ_JSON_CACHE_MAX {
                         // Evict the oldest quarter rather than dropping everything at once.
                         let mut ages: Vec<(Instant, String)> =
@@ -207,10 +245,9 @@ impl DeezerSource {
                         }
                     }
                 }
-                guard.insert(url.to_string(), (Instant::now(), val));
-                return Some(parsed);
+                guard.insert(url.to_string(), (Instant::now(), val.clone()));
             }
-            return None;
+            return Some(val);
         }
         None
     }

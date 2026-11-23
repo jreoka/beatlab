@@ -2128,6 +2128,78 @@ async fn build_new_releases(
     (items, unseen.len(), Utc::now().timestamp())
 }
 
+/// How long a page waits on upstream catalog APIs before rendering from stored data.
+const UPSTREAM_PAGE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Run `fut` in its own task and wait at most `UPSTREAM_PAGE_WAIT` for it. On timeout the
+/// task keeps running, so its result still lands in the caches/store for the next request.
+async fn bounded_upstream<T, F>(fut: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    tokio::time::timeout(UPSTREAM_PAGE_WAIT, tokio::spawn(fut))
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+async fn fetch_home_charts(
+    state: &AppState,
+) -> (Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>) {
+    tokio::join!(
+        state.sources.deezer.fetch_chart_tracks(20),
+        state.sources.deezer.fetch_chart_albums(12),
+        state.sources.deezer.fetch_chart_artists(12),
+    )
+}
+
+async fn fetch_explore_charts(
+    state: &AppState,
+) -> (
+    Vec<crate::sources::deezer::DeezerGenre>,
+    Vec<Track>,
+    Vec<AlbumSummary>,
+    Vec<ArtistSummary>,
+) {
+    tokio::join!(
+        state.sources.deezer.fetch_genres(),
+        state.sources.deezer.fetch_chart_tracks(30),
+        state.sources.deezer.fetch_chart_albums(18),
+        state.sources.deezer.fetch_chart_artists(14),
+    )
+}
+
+/// Persist chart results so pages can render them when Deezer is slow or unreachable.
+fn record_charts(
+    state: &AppState,
+    tracks: &[Track],
+    albums: &[AlbumSummary],
+    artists: &[ArtistSummary],
+) {
+    if !tracks.is_empty() {
+        let _ = state.store.upsert_tracks(tracks);
+        let _ = state.store.record_chart_tracks(tracks, 1);
+    }
+    for a in albums {
+        let _ = state.store.upsert_album_meta(a);
+    }
+    state.store.record_chart_albums(albums);
+    for ar in artists {
+        let _ = state.store.upsert_artist_meta(ar);
+    }
+    state.store.record_chart_artists(artists);
+}
+
+/// Warm the Deezer cache and stored charts at startup so the first visitor after a
+/// machine restart doesn't pay for the upstream round trips.
+pub async fn prewarm_charts(state: AppState) {
+    let (t, al, ar) = fetch_home_charts(&state).await;
+    record_charts(&state, &t, &al, &ar);
+    let (_, t, al, ar) = fetch_explore_charts(&state).await;
+    record_charts(&state, &t, &al, &ar);
+}
+
 pub async fn home(
     State(state): State<AppState>,
     Query(q): Query<HomeQuery>,
@@ -2145,23 +2217,15 @@ pub async fn home(
 
     // Fetch external charts first so fresh accounts immediately have popular
     // tracks, albums, and artists available before auto-mixes & picks are built.
-    let (chart_tracks, chart_albums, chart_artists) = tokio::join!(
-        state.sources.deezer.fetch_chart_tracks(20),
-        state.sources.deezer.fetch_chart_albums(12),
-        state.sources.deezer.fetch_chart_artists(12),
-    );
-    if !chart_tracks.is_empty() {
-        let _ = state.store.upsert_tracks(&chart_tracks);
-        let _ = state.store.record_chart_tracks(&chart_tracks, 1);
-    }
-    for a in &chart_albums {
-        let _ = state.store.upsert_album_meta(a);
-    }
-    state.store.record_chart_albums(&chart_albums);
-    for ar in &chart_artists {
-        let _ = state.store.upsert_artist_meta(ar);
-    }
-    state.store.record_chart_artists(&chart_artists);
+    // If Deezer is slow (cold cache), fall back to the charts stored from earlier fetches.
+    let st = state.clone();
+    let (chart_tracks, chart_albums, chart_artists) = bounded_upstream(async move {
+        let (t, al, ar) = fetch_home_charts(&st).await;
+        record_charts(&st, &t, &al, &ar);
+        (t, al, ar)
+    })
+    .await
+    .unwrap_or_default();
 
     // Ensure auto-mixes exist and refresh cleanly whenever user feedback/playlists changed them.
     if state.store.count_tracks().unwrap_or(0) > 0 {
@@ -2272,24 +2336,14 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     };
     let uid = user.id;
     let is_fresh = !state.store.has_listening_history(uid).unwrap_or(false);
-    let (dz_genres, chart_tracks, chart_albums, chart_artists) = tokio::join!(
-        state.sources.deezer.fetch_genres(),
-        state.sources.deezer.fetch_chart_tracks(30),
-        state.sources.deezer.fetch_chart_albums(18),
-        state.sources.deezer.fetch_chart_artists(14),
-    );
-    if !chart_tracks.is_empty() {
-        let _ = state.store.upsert_tracks(&chart_tracks);
-        let _ = state.store.record_chart_tracks(&chart_tracks, 1);
-    }
-    for a in &chart_albums {
-        let _ = state.store.upsert_album_meta(a);
-    }
-    state.store.record_chart_albums(&chart_albums);
-    for ar in &chart_artists {
-        let _ = state.store.upsert_artist_meta(ar);
-    }
-    state.store.record_chart_artists(&chart_artists);
+    let st = state.clone();
+    let (dz_genres, chart_tracks, chart_albums, chart_artists) = bounded_upstream(async move {
+        let (g, t, al, ar) = fetch_explore_charts(&st).await;
+        record_charts(&st, &t, &al, &ar);
+        (g, t, al, ar)
+    })
+    .await
+    .unwrap_or_default();
 
     let moods: Vec<Value> = Mood::ALL
         .iter()
