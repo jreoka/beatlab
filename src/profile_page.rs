@@ -613,7 +613,7 @@ fn render_stats_heatmap(heatmap: &HeatmapStats) -> String {
                 .iter()
                 .map(|(d, in_range, streams, secs)| {
                     if !*in_range {
-                        return r#"<div class="stats-hm-cell empty"></div>"#.to_string();
+                        return r#"<div class="stats-hm-cell hm-empty"></div>"#.to_string();
                     }
                     let lvl = if *streams == 0 {
                         0
@@ -1698,7 +1698,7 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
     .stats-clock-svg {{ width:100%; max-width:268px; height:auto; display:block; }}
     .stats-clock-hit {{ cursor:pointer; }}
     .stats-clock-hit:hover {{ fill:rgba(255,255,255,.06); }}
-    .stats-hm-scroll {{ overflow-x:auto; padding-bottom:6px; }}
+    .stats-hm-scroll {{ overflow-x:auto; overflow-y:hidden; padding-bottom:6px; }}
     .stats-hm-inner {{ width:max-content; display:flex; flex-direction:column; gap:4px; }}
     .stats-hm-months-row, .stats-hm-body {{ display:flex; align-items:flex-start; gap:6px; }}
     .stats-hm-months-row {{ align-items:center; }}
@@ -1709,7 +1709,7 @@ pub fn render_profile_page(origin: &str, u: &PublicUser, body: &ProfileBody) -> 
     .stats-hm-grid {{ display:grid; gap:3px; }}
     .stats-hm-col {{ display:grid; grid-template-rows:repeat(7,12px); gap:3px; }}
     .stats-hm-cell {{ width:12px; height:12px; border-radius:2px; background:#181c26; border:1px solid rgba(255,255,255,.03); }}
-    .stats-hm-cell.empty {{ background:transparent; border-color:transparent; }}
+    .stats-hm-cell.hm-empty {{ background:transparent; border-color:transparent; }}
     .stats-hm-cell.lv-0 {{ background:#181c26; }}
     .stats-hm-cell.lv-1 {{ background:#0e4429; }}
     .stats-hm-cell.lv-2 {{ background:#147a3b; }}
@@ -2240,6 +2240,9 @@ mod tests {
         let html = render_stats_heatmap(&hm);
         assert!(!html.contains(r#"<div class="stats-hm-month">Nov</div><div class="stats-hm-month">Dec</div>"#));
         assert!(html.contains("grid-template-columns:repeat(53,12px)"));
+        // Out-of-range cells must not share the `.empty` card class.
+        assert!(html.contains(r#"class="stats-hm-cell hm-empty""#));
+        assert!(!html.contains(r#"class="stats-hm-cell empty""#));
     }
 
     #[test]
