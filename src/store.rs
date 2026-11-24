@@ -5668,6 +5668,315 @@ pub(crate) fn normalize_search_words(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn is_latin_letter(c: char) -> bool {
+    matches!(
+        c,
+        'A'..='Z'
+            | 'a'..='z'
+            | '\u{00C0}'..='\u{00D6}'
+            | '\u{00D8}'..='\u{00F6}'
+            | '\u{00F8}'..='\u{024F}'
+            | '\u{1E00}'..='\u{1EFF}'
+    )
+}
+
+fn is_non_latin_letter(c: char) -> bool {
+    c.is_alphabetic() && !is_latin_letter(c)
+}
+
+fn has_non_latin_script(s: &str) -> bool {
+    s.chars().any(is_non_latin_letter)
+}
+
+fn is_pure_latin_segment(s: &str) -> bool {
+    s.chars().any(is_latin_letter) && !has_non_latin_script(s)
+}
+
+fn is_title_edition_tag(words: &[String]) -> bool {
+    let Some(first) = words.first() else {
+        return true;
+    };
+    if matches!(
+        first.as_str(),
+        "feat" | "ft" | "featuring" | "with" | "prod" | "from" | "ost" | "cv"
+    ) {
+        return true;
+    }
+    words.iter().all(|w| {
+        let is_year = w.len() == 4
+            && w.chars().all(|c| c.is_ascii_digit())
+            && (w.starts_with("19") || w.starts_with("20"));
+        is_year
+            || matches!(
+                w.as_str(),
+                "ver"
+                    | "version"
+                    | "edit"
+                    | "mix"
+                    | "remix"
+                    | "remaster"
+                    | "remastered"
+                    | "live"
+                    | "acoustic"
+                    | "unplugged"
+                    | "demo"
+                    | "instrumental"
+                    | "karaoke"
+                    | "cover"
+                    | "covers"
+                    | "radio"
+                    | "single"
+                    | "album"
+                    | "explicit"
+                    | "clean"
+                    | "mono"
+                    | "stereo"
+                    | "deluxe"
+                    | "official"
+                    | "audio"
+                    | "video"
+                    | "lyric"
+                    | "lyrics"
+                    | "hd"
+                    | "4k"
+                    | "hq"
+                    | "mv"
+                    | "pv"
+                    | "tv"
+                    | "size"
+                    | "short"
+                    | "full"
+                    | "game"
+                    | "anime"
+                    | "movie"
+                    | "film"
+                    | "opening"
+                    | "ending"
+                    | "theme"
+                    | "op"
+                    | "ed"
+                    | "ost"
+                    | "soundtrack"
+                    | "english"
+                    | "japanese"
+                    | "korean"
+                    | "chinese"
+                    | "eng"
+                    | "jpn"
+                    | "jp"
+                    | "kr"
+                    | "cn"
+                    | "original"
+                    | "extended"
+                    | "piano"
+                    | "guitar"
+                    | "vocal"
+                    | "orchestral"
+                    | "symphonic"
+                    | "ballad"
+                    | "slowed"
+                    | "reverb"
+                    | "nightcore"
+                    | "sped"
+                    | "speed"
+                    | "up"
+                    | "8d"
+                    | "a"
+                    | "the"
+                    | "of"
+                    | "in"
+                    | "on"
+                    | "at"
+                    | "to"
+                    | "for"
+            )
+    })
+}
+
+fn split_outer_and_brackets(title: &str) -> (String, Vec<String>) {
+    let mut outer = String::with_capacity(title.len());
+    let mut groups: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for ch in title.chars() {
+        match ch {
+            '(' | '[' | '\u{3010}' | '\u{300C}' | '\u{300E}' => {
+                if depth == 0 {
+                    outer.push(' ');
+                    cur.clear();
+                } else {
+                    cur.push(ch);
+                }
+                depth += 1;
+            }
+            ')' | ']' | '\u{3011}' | '\u{300D}' | '\u{300F}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        let trimmed = cur.trim();
+                        if !trimmed.is_empty() {
+                            groups.push(trimmed.to_string());
+                        }
+                        cur.clear();
+                    } else {
+                        cur.push(ch);
+                    }
+                }
+            }
+            _ => {
+                if depth == 0 {
+                    outer.push(ch);
+                } else {
+                    cur.push(ch);
+                }
+            }
+        }
+    }
+    (outer, groups)
+}
+
+fn split_title_segments(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        let next = chars.get(i + 1).copied();
+        let is_hard_sep = matches!(
+            ch,
+            '/' | '|' | '\u{FF0F}' | '\u{301C}' | '\u{FF5E}' | '~' | '\u{2014}' | '\u{2013}' | '\u{FF0D}' | '\u{FF1A}'
+        );
+        let is_colon_sep = ch == ':' && next.map_or(true, char::is_whitespace);
+        let is_dash_sep = ch == '-'
+            && (prev.map_or(true, |c| c.is_whitespace() || is_non_latin_letter(c))
+                || next.map_or(true, |c| c.is_whitespace() || is_non_latin_letter(c)));
+        if is_hard_sep || is_colon_sep || is_dash_sep {
+            let trimmed = cur.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    let trimmed = cur.trim();
+    if !trimmed.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+    parts
+}
+
+/// True when a track title explicitly labels itself a cover (e.g. "Mugen (Cover)",
+/// "MUGEN (English Cover)", "Mugen - Piano Cover") without matching songs like "Take Cover".
+pub(crate) fn is_explicit_cover_title(title: &str) -> bool {
+    let (outer, groups) = split_outer_and_brackets(title);
+    for g in &groups {
+        let words = normalize_search_words(g);
+        if words.iter().any(|w| w == "cover" || w == "covers") {
+            return true;
+        }
+    }
+    let segs = split_title_segments(&outer);
+    if segs.len() >= 2 {
+        for seg in segs.iter().skip(1) {
+            let words = normalize_search_words(seg);
+            if words.iter().any(|w| w == "cover" || w == "covers") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Extracts exact alternative title word sequences for dual-script / bilingual titles
+/// such as "夢幻 - MUGEN", "永久 -トコシエ- - Tokoshie", "夢幻 (MUGEN)", or "紅蓮華 / Gurenge".
+pub(crate) fn title_alias_word_variants(title: &str) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut push_unique = |w: Vec<String>| {
+        if !w.is_empty() && !out.contains(&w) {
+            out.push(w);
+        }
+    };
+
+    let (outer, groups) = split_outer_and_brackets(title);
+    let segs = split_title_segments(&outer);
+    if segs.len() >= 2 {
+        let any_non_latin = segs.iter().any(|s| has_non_latin_script(s));
+        let any_latin = segs.iter().any(|s| is_pure_latin_segment(s));
+        if any_non_latin && any_latin {
+            for seg in &segs {
+                let words = normalize_search_words(seg);
+                if !words.is_empty() && !is_title_edition_tag(&words) {
+                    push_unique(words.clone());
+                }
+                if !is_explicit_cover_title(seg) {
+                    let core_words = normalize_search_words(&crate::models::core_song_title(seg));
+                    if !core_words.is_empty()
+                        && core_words != words
+                        && !is_title_edition_tag(&core_words)
+                    {
+                        push_unique(core_words);
+                    }
+                }
+            }
+        }
+    }
+
+    let outer_non_latin = has_non_latin_script(&outer);
+    let outer_pure_latin = is_pure_latin_segment(&outer);
+    if outer_non_latin || outer_pure_latin {
+        for g in &groups {
+            if outer_non_latin && is_pure_latin_segment(g) {
+                let gw = normalize_search_words(g);
+                if !gw.is_empty()
+                    && !is_title_edition_tag(&gw)
+                    && !gw.iter().any(|w| w == "cover" || w == "covers")
+                {
+                    push_unique(gw);
+                    let ow = normalize_search_words(&outer);
+                    if !ow.is_empty() {
+                        push_unique(ow);
+                    }
+                }
+            } else if outer_pure_latin && has_non_latin_script(g) {
+                let gw = normalize_search_words(g);
+                if !gw.is_empty() {
+                    push_unique(gw);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Extracts exact core title word sequences when a track title appends a separator-delimited
+/// edition/version subtitle (e.g. "Gurenge - From THE FIRST TAKE", "Mugen - Anime Ver.").
+pub(crate) fn core_title_word_variants(title: &str) -> Vec<Vec<String>> {
+    if is_explicit_cover_title(title) {
+        return Vec::new();
+    }
+    let (outer, _) = split_outer_and_brackets(title);
+    let segs = split_title_segments(&outer);
+    if segs.len() < 2 {
+        return Vec::new();
+    }
+    let trailing_all_edition = segs.iter().skip(1).all(|seg| {
+        let w = normalize_search_words(seg);
+        is_title_edition_tag(&w)
+    });
+    if !trailing_all_edition {
+        return Vec::new();
+    }
+    let head = normalize_search_words(&segs[0]);
+    if head.is_empty() || is_title_edition_tag(&head) {
+        Vec::new()
+    } else {
+        vec![head]
+    }
+}
+
 fn contains_word_phrase(hay_words: &[String], needle_words: &[String]) -> bool {
     if needle_words.is_empty() || needle_words.len() > hay_words.len() {
         return false;
@@ -5723,6 +6032,9 @@ pub fn search_match_score(t: &Track, query: &str) -> i32 {
     let tl_words = normalize_search_words(&t.title);
     let core_tl = crate::models::core_song_title(&t.title);
     let core_tl_words = normalize_search_words(&core_tl);
+    let title_aliases = title_alias_word_variants(&t.title);
+    let core_title_variants = core_title_word_variants(&t.title);
+    let explicit_cover = is_explicit_cover_title(&t.title) && !q.contains("cover");
     let al_words = normalize_search_words(&t.artist);
     let primary_al_words = normalize_search_words(&primary_artist(&t.artist));
     let abl_words = normalize_search_words(&t.album);
@@ -5754,22 +6066,55 @@ pub fn search_match_score(t: &Track, query: &str) -> i32 {
         let mut core_artist_words = core_tl_words.clone();
         core_artist_words.extend(primary_al_words.iter().cloned());
 
-        if tl == q
-            || (!q_words.is_empty() && tl_words == q_words)
-            || artist_title == q
-            || title_artist == q
-            || (!q_words.is_empty()
-                && (artist_title_words == q_words || title_artist_words == q_words))
+        let matches_exact_alias = !explicit_cover
+            && !q_words.is_empty()
+            && title_aliases.iter().any(|alias| {
+                if alias == &q_words {
+                    return true;
+                }
+                let mut a_al = primary_al_words.clone();
+                a_al.extend(alias.iter().cloned());
+                let mut al_a = alias.clone();
+                al_a.extend(primary_al_words.iter().cloned());
+                a_al == q_words || al_a == q_words
+            });
+        let matches_core_variant = !explicit_cover
+            && !q_words.is_empty()
+            && core_title_variants.iter().any(|cv| {
+                if cv == &q_words {
+                    return true;
+                }
+                let mut a_cv = primary_al_words.clone();
+                a_cv.extend(cv.iter().cloned());
+                let mut cv_a = cv.clone();
+                cv_a.extend(primary_al_words.iter().cloned());
+                a_cv == q_words || cv_a == q_words
+            });
+
+        if !explicit_cover
+            && (tl == q
+                || (!q_words.is_empty() && tl_words == q_words)
+                || artist_title == q
+                || title_artist == q
+                || (!q_words.is_empty()
+                    && (artist_title_words == q_words || title_artist_words == q_words))
+                || matches_exact_alias)
         {
             s += 550;
-        } else if !q_words.is_empty()
-            && !core_tl_words.is_empty()
-            && (core_tl_words == q_words
-                || artist_core_words == q_words
-                || core_artist_words == q_words)
+        } else if !explicit_cover
+            && ((!q_words.is_empty()
+                && !core_tl_words.is_empty()
+                && (core_tl_words == q_words
+                    || artist_core_words == q_words
+                    || core_artist_words == q_words))
+                || matches_core_variant)
         {
             s += 520;
-        } else if tl.starts_with(&q) || (!q_words.is_empty() && tl_words.starts_with(&q_words)) {
+        } else if tl.starts_with(&q)
+            || (!q_words.is_empty()
+                && (tl_words.starts_with(&q_words)
+                    || title_aliases.iter().any(|a| a.starts_with(&q_words))))
+        {
             s += 320;
         } else if contains_word_phrase(&tl_words, &q_words) || tl.contains(&q) {
             s += 180;
@@ -5791,9 +6136,13 @@ pub fn search_match_score(t: &Track, query: &str) -> i32 {
                 .cloned()
                 .collect();
             if !non_artist_words.is_empty() {
-                if tl_words == non_artist_words {
+                if tl_words == non_artist_words
+                    || title_aliases.iter().any(|a| a == &non_artist_words)
+                {
                     s += 360;
-                } else if core_tl_words == non_artist_words {
+                } else if core_tl_words == non_artist_words
+                    || core_title_variants.iter().any(|v| v == &non_artist_words)
+                {
                     s += 340;
                 } else if tl_words.starts_with(&non_artist_words)
                     || core_tl_words.starts_with(&non_artist_words)
@@ -5815,13 +6164,23 @@ pub fn search_match_score(t: &Track, query: &str) -> i32 {
         }
         s
     } else if q_words.len() >= 2 && !tl_words.is_empty() {
-        // Partial-token match: reward when the track's full (or core) title appears
+        // Partial-token match: reward when the track's full (or core/alias) title appears
         // word-for-word as a contiguous phrase inside a longer query (e.g. searching
         // "game of love reona" when the track is titled "Game of Love" by "Elza Kanzaki").
         let title_phrase_match = if contains_word_phrase(&q_words, &tl_words) {
             Some((&tl_words, true))
+        } else if let Some(alias) = title_aliases
+            .iter()
+            .find(|a| !a.is_empty() && contains_word_phrase(&q_words, a))
+        {
+            Some((alias, true))
         } else if !core_tl_words.is_empty() && contains_word_phrase(&q_words, &core_tl_words) {
             Some((&core_tl_words, false))
+        } else if let Some(cv) = core_title_variants
+            .iter()
+            .find(|v| !v.is_empty() && contains_word_phrase(&q_words, v))
+        {
+            Some((cv, false))
         } else {
             None
         };
@@ -5899,6 +6258,9 @@ pub fn search_match_score(t: &Track, query: &str) -> i32 {
         if (tl.contains(junk) || al.contains(junk)) && !q.contains(junk) {
             score -= 260;
         }
+    }
+    if explicit_cover {
+        score -= 140;
     }
 
     score.max(1)
@@ -6946,6 +7308,72 @@ mod tests {
             search_match_score(&queen, "dont stop me now") >= 550,
             "apostrophe-normalized exact title should match strongly"
         );
+    }
+
+    #[test]
+    fn search_match_recognizes_dual_script_title_aliases_and_demotes_unrequested_covers() {
+        let mugen_jp = sample_track("ytm:mfs", "夢幻 - MUGEN", "MY FIRST STORY, HYDE", "MUGEN");
+        let mugen_plain = sample_track("ytm:gen", "Mugen", "Genfukei", "Mugen");
+        let mugen_cover = sample_track(
+            "ytm:cov1",
+            "Mugen (Cover)",
+            "Brianna Knickerbocker",
+            "Mugen (Cover)",
+        );
+        let mugen_eng_cover = sample_track(
+            "ytm:cov2",
+            "MUGEN (English Cover)",
+            "Seishirou Scarlatti",
+            "MUGEN (English Cover)",
+        );
+        let mugen_parens = sample_track("ytm:par", "夢幻 (MUGEN)", "MY FIRST STORY, HYDE", "MUGEN");
+        let tokoshie = sample_track(
+            "ytm:tok",
+            "永久 -トコシエ- - Tokoshie",
+            "HYDE, MY FIRST STORY",
+            "Tokoshie",
+        );
+        let gurenge_ft = sample_track(
+            "ytm:ft",
+            "Gurenge - From THE FIRST TAKE",
+            "LiSA",
+            "Gurenge",
+        );
+
+        assert_eq!(
+            search_match_score(&mugen_jp, "mugen"),
+            search_match_score(&mugen_plain, "mugen"),
+            "dual-script alias '夢幻 - MUGEN' should tie exact 'Mugen' lexically"
+        );
+        assert!(
+            search_match_score(&mugen_jp, "夢幻") >= 600,
+            "native-script alias should match strongly"
+        );
+        assert!(
+            search_match_score(&mugen_parens, "mugen") >= 600,
+            "parenthetical dual-script alias '夢幻 (MUGEN)' should match strongly"
+        );
+        assert!(
+            search_match_score(&tokoshie, "tokoshie") >= 600,
+            "multi-segment dual-script alias '永久 -トコシエ- - Tokoshie' should match strongly"
+        );
+        assert!(
+            search_match_score(&gurenge_ft, "gurenge") >= 550,
+            "edition suffix '- From THE FIRST TAKE' should match core title strongly"
+        );
+        assert!(
+            search_match_score(&mugen_plain, "mugen") > search_match_score(&mugen_cover, "mugen") + 200,
+            "original must score far above unrequested '(Cover)'"
+        );
+        assert!(
+            search_match_score(&mugen_plain, "mugen")
+                > search_match_score(&mugen_eng_cover, "mugen") + 200,
+            "original must score far above unrequested '(English Cover)'"
+        );
+        assert!(!is_explicit_cover_title("Take Cover"));
+        assert!(!is_explicit_cover_title("Cover Me"));
+        assert!(is_explicit_cover_title("Mugen (Cover)"));
+        assert!(is_explicit_cover_title("MUGEN (English Cover)"));
     }
 
     #[test]

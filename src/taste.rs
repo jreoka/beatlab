@@ -406,6 +406,8 @@ pub struct TasteProfile {
     pub followed_artists: HashSet<String>,
     pub saved_albums: HashSet<String>,
     pub starred: HashSet<String>,
+    pub starred_song_keys: HashSet<String>,
+    pub played_song_keys: HashMap<String, i32>,
     pub ratings: HashMap<String, i32>,
     pub hidden_ids: HashSet<String>,
     pub hidden_keys: HashSet<String>,
@@ -1143,11 +1145,15 @@ impl TasteEngine {
                 _ => 0.15,
             };
             apply_track_affinity_delta(&mut prof, t, base_w * decay, false);
+            if matches!(ev.kind.as_str(), "complete" | "play" | "mix_play" | "search_pick") {
+                *prof.played_song_keys.entry(t.song_key()).or_insert(0) += 1;
+            }
         }
 
         // 2. Persistent stars & explicit ratings anchor taste beyond the 900-event window
         for sid in &starred {
             if let Some(t) = track_map.get(sid) {
+                prof.starred_song_keys.insert(t.song_key());
                 apply_track_affinity_delta(&mut prof, t, 1.8, false);
             }
         }
@@ -6017,11 +6023,17 @@ impl TasteEngine {
                     .find(|a| !entity_slug.is_empty() && slug(&a.name) == entity_slug)
             });
 
+        let entity_words = crate::store::normalize_search_words(&entity_low);
         let top_exact_title = top_track
             .map(|t| {
                 let tl = t.title.to_lowercase();
                 let core_tl = crate::models::core_song_title(&t.title);
-                tl == entity_low || (!entity_slug.is_empty() && slug(&core_tl) == entity_slug)
+                tl == entity_low
+                    || (!entity_slug.is_empty() && slug(&core_tl) == entity_slug)
+                    || (!entity_words.is_empty()
+                        && crate::store::title_alias_word_variants(&t.title)
+                            .iter()
+                            .any(|a| a == &entity_words))
             })
             .unwrap_or(false);
 
@@ -6193,7 +6205,7 @@ impl TasteEngine {
         } else {
             let lex_q = intent.entity_query.as_deref().unwrap_or(&intent.normalized);
             if !lex_q.trim().is_empty() {
-                if let Ok(cat_hits) = self.store.search_tracks(lex_q, 30, 0) {
+                if let Ok(cat_hits) = self.store.search_tracks(lex_q, 50, 0) {
                     search_pool.extend(cat_hits);
                 }
             }
@@ -6326,9 +6338,14 @@ impl TasteEngine {
                 }
                 let exact_art =
                     !entity_slug.is_empty() && slug(&primary_artist(&t.artist)) == entity_slug;
+                let entity_words = crate::store::normalize_search_words(&entity_low);
                 let exact_title = t.title.to_lowercase() == entity_low
                     || (!entity_slug.is_empty()
-                        && slug(&crate::models::core_song_title(&t.title)) == entity_slug);
+                        && slug(&crate::models::core_song_title(&t.title)) == entity_slug)
+                    || (!entity_words.is_empty()
+                        && crate::store::title_alias_word_variants(&t.title)
+                            .iter()
+                            .any(|a| a == &entity_words));
                 if mix_ctx.anchor_artist.is_some() || force_entity {
                     let lex = search_match_score(t, entity_q);
                     let slug_match = !entity_slug.is_empty()
@@ -6519,10 +6536,15 @@ fn mix_query_evidence(
     if !intent.is_theme_mix {
         let q = intent.entity_query.as_deref().unwrap_or(&intent.normalized);
         let q_slug = slug(q);
-        if !q_slug.is_empty() {
+        let q_words = crate::store::normalize_search_words(q);
+        if !q_slug.is_empty() || !q_words.is_empty() {
             let a_slug = slug(&primary_artist(&t.artist));
             let t_slug = slug(&crate::models::core_song_title(&t.title));
-            if a_slug == q_slug || t_slug == q_slug {
+            let alias_match = !q_words.is_empty()
+                && crate::store::title_alias_word_variants(&t.title)
+                    .iter()
+                    .any(|a| a == &q_words);
+            if (!q_slug.is_empty() && (a_slug == q_slug || t_slug == q_slug)) || alias_match {
                 ev += 0.7;
             }
         }
@@ -6948,6 +6970,23 @@ fn evaluate_search_candidates(
         let disliked = is_strongly_disliked(&t, &sctx.prof, &sctx.stats);
 
         let st = sctx.stats.get(&t.id).copied().unwrap_or_default();
+        let song_key = t.song_key();
+        let is_starred =
+            sctx.prof.starred.contains(&t.id) || sctx.prof.starred_song_keys.contains(&song_key);
+        let in_manual_playlist = sctx.prof.manual_playlist_ids.contains(&t.id)
+            || sctx.prof.manual_playlist_song_keys.contains(&song_key);
+        let net_plays = if st.play_count > st.skip_count {
+            st.play_count - st.skip_count
+        } else if st.skip_count == 0 {
+            sctx.prof
+                .played_song_keys
+                .get(&song_key)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let is_personal_track = is_starred || in_manual_playlist || net_plays > 0;
         let mut fctx = build_track_affinities(&t, &sctx.prof);
         // Fresh remote search results often lack track-level genre tags; fall back to known
         // artist genres so user genre taste still prioritizes the kind of music they listen to.
@@ -6970,8 +7009,8 @@ fn evaluate_search_candidates(
         // tier a user's favorite artist or preferred genre decisively beats a more popular
         // mainstream song, while capped so it can never lift an unrelated song above a direct
         // title/artist match.
-        let play_history_term = if st.play_count > st.skip_count {
-            (((st.play_count - st.skip_count) as f64) / 3.0).tanh() * 2.5
+        let play_history_term = if net_plays > 0 {
+            ((net_plays as f64) / 3.0).tanh() * 2.5
         } else {
             0.0
         };
@@ -6992,12 +7031,8 @@ fn evaluate_search_candidates(
             }
             + if fctx.followed_artist { 3.5 } else { 0.0 }
             + if fctx.saved_album { 1.8 } else { 0.0 }
-            + if sctx.prof.starred.contains(&t.id) { 3.5 } else { 0.0 }
-            + if sctx.prof.manual_playlist_ids.contains(&t.id) {
-                2.0
-            } else {
-                0.0
-            }
+            + if is_starred { 3.5 } else { 0.0 }
+            + if in_manual_playlist { 2.0 } else { 0.0 }
             + play_history_term;
         let taste_aff = raw_taste_aff.clamp(-14.0, 18.0);
 
@@ -7006,7 +7041,7 @@ fn evaluate_search_candidates(
         let neural_term = if disliked {
             0.0
         } else {
-            neural_by_key.get(&t.song_key()).copied().unwrap_or(0.0)
+            neural_by_key.get(&song_key).copied().unwrap_or(0.0)
         };
         let pop_bonus = parse_rank_bonus(&t.meta);
         let quality_bonus = (t.quality_score() as f64) / 360.0;
@@ -7022,7 +7057,7 @@ fn evaluate_search_candidates(
             && (fctx.artist_affinity >= 1.2
                 || fctx.genre_affinity >= 1.2
                 || fctx.followed_artist
-                || sctx.prof.starred.contains(&t.id)
+                || is_personal_track
                 || align.rel_a >= 1.2
                 || align.rel_t >= 1.2);
 
@@ -7031,17 +7066,31 @@ fn evaluate_search_candidates(
         let tl_words = crate::store::normalize_search_words(&t.title);
         let core_tl_words =
             crate::store::normalize_search_words(&crate::models::core_song_title(&t.title));
+        let title_aliases = crate::store::title_alias_word_variants(&t.title);
+        let core_title_variants = crate::store::core_title_word_variants(&t.title);
+        let is_unrequested_cover =
+            crate::store::is_explicit_cover_title(&t.title) && !lex_query_low.contains("cover");
+        let cover_penalty = if is_unrequested_cover && !is_personal_track {
+            8.0
+        } else {
+            0.0
+        };
         let al_words = crate::store::normalize_search_words(&primary_artist(&t.artist));
 
         let is_exact_entity = !is_junk
+            && !is_unrequested_cover
             && (tl == lex_query_low
                 || al == lex_query_low
                 || (!lex_query_words.is_empty()
-                    && (tl_words == lex_query_words || al_words == lex_query_words)));
+                    && (tl_words == lex_query_words
+                        || al_words == lex_query_words
+                        || title_aliases.iter().any(|a| a == &lex_query_words))));
         let is_exact_core_title = !is_junk
+            && !is_unrequested_cover
             && !is_exact_entity
             && !lex_query_words.is_empty()
-            && core_tl_words == lex_query_words;
+            && (core_tl_words == lex_query_words
+                || core_title_variants.iter().any(|v| v == &lex_query_words));
 
         // Pin exact song/artist matches at the top for entity searches while letting
         // listening taste decisively win within the same lexical match tier.
@@ -7086,7 +7135,8 @@ fn evaluate_search_candidates(
             + neural_term
             + quality_bonus
             - skip_penalty
-            - junk_penalty;
+            - junk_penalty
+            - cover_penalty;
 
         evals.push(EvaluatedSearchTrack {
             track: t,
@@ -7108,10 +7158,57 @@ fn evaluate_search_candidates(
     evals
 }
 
+fn collab_artist_slugs(artist: &str) -> Vec<String> {
+    let low = artist.to_lowercase();
+    let has_comma_list = artist.contains(", ")
+        && !low.contains(" & ")
+        && !low.contains(" and ");
+    let has_collab_sep = has_comma_list
+        || low.contains(" feat. ")
+        || low.contains(" feat ")
+        || low.contains(" ft. ")
+        || low.contains(" ft ")
+        || low.contains(" featuring ")
+        || artist.contains(" × ");
+    if !has_collab_sep {
+        return Vec::new();
+    }
+    let normalized = artist
+        .replace(" feat. ", "\u{001F}")
+        .replace(" Feat. ", "\u{001F}")
+        .replace(" FEAT. ", "\u{001F}")
+        .replace(" feat ", "\u{001F}")
+        .replace(" ft. ", "\u{001F}")
+        .replace(" Ft. ", "\u{001F}")
+        .replace(" ft ", "\u{001F}")
+        .replace(" featuring ", "\u{001F}")
+        .replace(" × ", "\u{001F}");
+    let mut slugs = Vec::new();
+    for chunk in normalized.split('\u{001F}') {
+        let parts: Vec<&str> = if has_comma_list {
+            chunk.split(", ").collect()
+        } else {
+            vec![chunk]
+        };
+        for p in parts {
+            let s = slug(&primary_artist(p));
+            if s.len() >= 2 && !slugs.contains(&s) {
+                slugs.push(s);
+            }
+        }
+    }
+    if slugs.len() >= 2 {
+        slugs
+    } else {
+        Vec::new()
+    }
+}
+
 fn apply_track_affinity_delta(prof: &mut TasteProfile, t: &Track, w: f64, playlist_layer: bool) {
     let artist_id = t.artist_id();
     let has_ext_id = artist_id.starts_with("ar:dz:") || artist_id.starts_with("ar:ytm:");
     let a_key = slug(&primary_artist(&t.artist));
+    let collab_slugs = collab_artist_slugs(&t.artist);
     if playlist_layer {
         if has_ext_id {
             *prof.playlist_artist_affinity.entry(artist_id.clone()).or_insert(0.0) += w;
@@ -7122,9 +7219,14 @@ fn apply_track_affinity_delta(prof: &mut TasteProfile, t: &Track, w: f64, playli
             *prof.playlist_artist_slug_affinity.entry(a_key.clone()).or_insert(0.0) += w;
             if has_ext_id {
                 prof.artist_slug_ext_ids
-                    .entry(a_key)
+                    .entry(a_key.clone())
                     .or_default()
                     .insert(artist_id);
+            }
+        }
+        for cs in collab_slugs {
+            if cs != a_key {
+                *prof.playlist_artist_slug_affinity.entry(cs).or_insert(0.0) += w * 0.7;
             }
         }
     } else {
@@ -7137,9 +7239,14 @@ fn apply_track_affinity_delta(prof: &mut TasteProfile, t: &Track, w: f64, playli
             *prof.artist_slug_affinity.entry(a_key.clone()).or_insert(0.0) += w;
             if has_ext_id {
                 prof.artist_slug_ext_ids
-                    .entry(a_key)
+                    .entry(a_key.clone())
                     .or_default()
                     .insert(artist_id);
+            }
+        }
+        for cs in collab_slugs {
+            if cs != a_key {
+                *prof.artist_slug_affinity.entry(cs).or_insert(0.0) += w * 0.7;
             }
         }
     }
@@ -7184,7 +7291,7 @@ fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
             false
         }
     };
-    let artist_affinity = if has_ext_id {
+    let mut artist_affinity = if has_ext_id {
         prof.artist_affinity
             .get(&artist_id)
             .copied()
@@ -7207,7 +7314,7 @@ fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
             .copied()
             .unwrap_or(0.0)
     };
-    let playlist_artist_affinity = if has_ext_id {
+    let mut playlist_artist_affinity = if has_ext_id {
         prof.playlist_artist_affinity
             .get(&artist_id)
             .copied()
@@ -7230,6 +7337,33 @@ fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
             .copied()
             .unwrap_or(0.0)
     };
+    let collab_slugs = collab_artist_slugs(&t.artist);
+    if !collab_slugs.is_empty() {
+        let best_collab = collab_slugs
+            .iter()
+            .filter_map(|cs| {
+                prof.artist_slug_affinity
+                    .get(cs)
+                    .or_else(|| prof.artist_affinity.get(cs))
+                    .copied()
+            })
+            .fold(0.0f64, f64::max);
+        if best_collab > 0.0 {
+            artist_affinity = artist_affinity.max(best_collab * 0.85);
+        }
+        let best_pl_collab = collab_slugs
+            .iter()
+            .filter_map(|cs| {
+                prof.playlist_artist_slug_affinity
+                    .get(cs)
+                    .or_else(|| prof.playlist_artist_affinity.get(cs))
+                    .copied()
+            })
+            .fold(0.0f64, f64::max);
+        if best_pl_collab > 0.0 {
+            playlist_artist_affinity = playlist_artist_affinity.max(best_pl_collab * 0.85);
+        }
+    }
 
     let genres = split_genres(&t.genre);
     let genre_affinity = genres
@@ -7267,7 +7401,10 @@ fn build_track_affinities(t: &Track, prof: &TasteProfile) -> TrackAffinities {
         prof.followed_artists.contains(&artist_id)
             || prof.followed_artists.contains(&format!("ar:{}", artist_slug))
             || prof.followed_artists.contains(&artist_slug)
-    };
+    } || collab_slugs.iter().any(|cs| {
+        prof.followed_artists.contains(&format!("ar:{}", cs))
+            || prof.followed_artists.contains(cs)
+    });
     let saved_album = prof.saved_albums.contains(&t.album_id());
 
     TrackAffinities {
@@ -13865,6 +14002,135 @@ mod tests {
                 .tracks
                 .iter()
                 .map(|t| (&t.id, &t.artist, &t.genre))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn search_prioritizes_listened_dual_script_title_over_unrelated_exact_matches() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("cross", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str, artist: &str, album: &str| Track {
+            id: id.into(),
+            source: "ytm".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: album.into(),
+            bitrate: 256,
+            ..Default::default()
+        };
+
+        let mfs_mugen = mk("ytm:mfs_mugen", "夢幻 - MUGEN", "MY FIRST STORY, HYDE", "MUGEN");
+        let hyde_tokoshie = mk(
+            "ytm:tokoshie",
+            "永久 -トコシエ- - Tokoshie",
+            "HYDE, MY FIRST STORY",
+            "Tokoshie",
+        );
+        let genfukei = mk("ytm:gen", "Mugen", "Genfukei", "Mugen");
+        let danie = mk("ytm:danie", "Mugen", "Danie Green", "Mugen");
+        let cover1 = mk(
+            "ytm:cov1",
+            "Mugen (Cover)",
+            "Brianna Knickerbocker",
+            "Mugen (Cover)",
+        );
+        let cover2 = mk(
+            "ytm:cov2",
+            "MUGEN (English Cover)",
+            "Seishirou Scarlatti",
+            "MUGEN (English Cover)",
+        );
+        let mfs_solo = mk("ytm:mfs_solo", "I'm a mess", "MY FIRST STORY", "I'm a mess");
+        store
+            .upsert_tracks(&[
+                mfs_mugen.clone(),
+                hyde_tokoshie.clone(),
+                genfukei.clone(),
+                danie.clone(),
+                cover1.clone(),
+                cover2.clone(),
+                mfs_solo.clone(),
+            ])
+            .unwrap();
+
+        // Scenario A: User starred and listens to 夢幻 - MUGEN.
+        store.star_track(u.id, &mfs_mugen.id).unwrap();
+        store.star_track(u.id, &hyde_tokoshie.id).unwrap();
+        for _ in 0..5 {
+            store.record_event(u.id, &mfs_mugen.id, "complete", 1.0).unwrap();
+        }
+
+        let res = taste.search_and_refine(
+            u.id,
+            "mugen",
+            vec![
+                genfukei.clone(),
+                danie.clone(),
+                cover1.clone(),
+                cover2.clone(),
+                mfs_mugen.clone(),
+                hyde_tokoshie.clone(),
+            ],
+            vec![],
+        );
+        let ids: Vec<&str> = res.tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids.first().copied(),
+            Some("ytm:mfs_mugen"),
+            "listened dual-script song '夢幻 - MUGEN' must rank #1 for 'mugen', got: {:?}",
+            ids
+        );
+        let pos_gen = ids.iter().position(|&id| id == "ytm:gen").unwrap();
+        let pos_cov1 = ids.iter().position(|&id| id == "ytm:cov1").unwrap();
+        let pos_cov2 = ids.iter().position(|&id| id == "ytm:cov2").unwrap();
+        assert!(
+            pos_gen < pos_cov1 && pos_gen < pos_cov2,
+            "original 'Mugen' must outrank unrequested covers: {:?}",
+            ids
+        );
+
+        // Searching "tokoshie" also puts 永久 -トコシエ- - Tokoshie #1.
+        let tok_res = taste.search_and_refine(
+            u.id,
+            "tokoshie",
+            vec![genfukei.clone(), hyde_tokoshie.clone()],
+            vec![],
+        );
+        assert_eq!(
+            tok_res.tracks.first().map(|t| t.id.as_str()),
+            Some("ytm:tokoshie")
+        );
+
+        // Scenario B: A user who only listens to solo "MY FIRST STORY" (never played the collab)
+        // still gets "夢幻 - MUGEN" by "MY FIRST STORY, HYDE" at #1 via collab artist affinity.
+        let (u2, _) = store.authenticate_or_create_user("mfs_fan", "pw").unwrap();
+        for _ in 0..6 {
+            store.record_event(u2.id, &mfs_solo.id, "complete", 1.0).unwrap();
+        }
+        let res_collab = taste.search_and_refine(
+            u2.id,
+            "mugen",
+            vec![genfukei.clone(), danie.clone(), mfs_mugen.clone()],
+            vec![],
+        );
+        assert_eq!(
+            res_collab.tracks.first().map(|t| t.id.as_str()),
+            Some("ytm:mfs_mugen"),
+            "solo artist affinity should carry over to 'MY FIRST STORY, HYDE' collab: {:?}",
+            res_collab
+                .tracks
+                .iter()
+                .map(|t| (&t.id, &t.title, &t.artist))
                 .collect::<Vec<_>>()
         );
     }

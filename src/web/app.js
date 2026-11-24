@@ -1405,9 +1405,9 @@
 
     const isInteractive = (target) => {
       if (window.innerWidth <= 780) {
-        return !!target.closest('button, a, input, label, .pb-progress-row');
+        return !!target.closest('button, a, input, label, .pb-progress-row, .pb-vol-wrap');
       }
-      return !!target.closest('button, a, input, label, .pb-title, .pb-artist, .pb-progress-row');
+      return !!target.closest('button, a, input, label, .pb-title, .pb-artist, .pb-progress-row, .pb-vol-wrap');
     };
 
     bar.addEventListener('pointerdown', (e) => {
@@ -3108,7 +3108,7 @@
           <div class="hero-actions">
             <button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play</button>
             <button class="btn-secondary" onclick="App.playShuffledIds(${idsJson})">Shuffle</button>
-            <button id="save-alb-btn" class="btn-secondary ${alb.isSaved ? 'active' : ''}" onclick="App.toggleSaveAlbum(${esc(JSON.stringify(alb.id))}, ${!alb.isSaved})">${ICONS.heart} ${alb.isSaved ? 'Saved' : 'Save Album'}</button>
+            <button id="save-alb-btn" class="btn-secondary ${alb.isSaved ? 'active' : ''}" data-album-id="${esc(alb.id)}" data-saved="${alb.isSaved ? '1' : '0'}" onclick="App.toggleSaveAlbum(${esc(JSON.stringify(alb.id))})">${ICONS.heart} ${alb.isSaved ? 'Saved' : 'Save Album'}</button>
             <button class="btn-secondary" onclick="App.shareAlbum(${esc(JSON.stringify(alb.id))}, ${esc(JSON.stringify(alb.name))}, ${esc(JSON.stringify(alb.artist))}, ${esc(JSON.stringify(alb.coverUrl))})">${ICONS.share} Share</button>
           </div>
         </div>
@@ -3169,7 +3169,7 @@
           <div class="hero-actions">
             ${top.length ? `<button class="btn-primary" onclick="App.playListByIds(${idsJson}, 0)">${ICONS.play} Play Top Tracks</button>` : ''}
             ${top[0] ? `<button class="btn-secondary" onclick="App.startRadioForId(${esc(JSON.stringify(top[0].id))})">Artist Radio</button>` : ''}
-            <button class="btn-secondary ${art.isFollowed ? 'active' : ''}" onclick="App.toggleFollowArtist(${esc(JSON.stringify(art.id))}, ${!art.isFollowed})">${art.isFollowed ? '✓ Following' : '+ Follow'}</button>
+            <button id="follow-art-btn" class="btn-secondary ${art.isFollowed ? 'active' : ''}" data-artist-id="${esc(art.id)}" data-followed="${art.isFollowed ? '1' : '0'}" onclick="App.toggleFollowArtist(${esc(JSON.stringify(art.id))})">${art.isFollowed ? '✓ Following' : '+ Follow'}</button>
             <button class="btn-secondary" onclick="App.shareArtist(${esc(JSON.stringify(art.id))}, ${esc(JSON.stringify(art.name))}, ${esc(JSON.stringify(art.coverUrl))})">${ICONS.share} Share</button>
           </div>
         </div>
@@ -6049,13 +6049,44 @@
     wireSeekSlider($('pb-seek'));
     wireSeekSlider($('fs-seek'));
 
-    $('pb-volume').addEventListener('input', (e) => {
-      state.volume = parseFloat(e.target.value);
-      state.muted = state.volume === 0;
+    const applyVolumeValue = (val) => {
+      const clamped = Math.max(0, Math.min(1, Number(val) || 0));
+      state.volume = clamped;
+      state.muted = clamped === 0;
+      $('pb-volume').value = String(clamped);
       applyOutputVolume();
-      localStorage.setItem('beatlab_vol', String(state.volume));
+      localStorage.setItem('beatlab_vol', String(clamped));
       updateVolumeIcon();
+    };
+
+    $('pb-volume').addEventListener('input', (e) => {
+      applyVolumeValue(parseFloat(e.target.value));
     });
+
+    const volWrap = $('pb-volume').closest('.pb-vol-wrap');
+    if (volWrap) {
+      const setVolFromClientX = (clientX) => {
+        const rect = $('pb-volume').getBoundingClientRect();
+        if (rect.width <= 0) return;
+        const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        applyVolumeValue(Math.round(ratio * 100) / 100);
+      };
+      volWrap.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0 && e.pointerType === 'mouse') return;
+        if (e.target === $('pb-volume')) return;
+        e.preventDefault();
+        setVolFromClientX(e.clientX);
+        const onMove = (ev) => setVolFromClientX(ev.clientX);
+        const onUp = () => {
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          window.removeEventListener('pointercancel', onUp);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -8978,27 +9009,67 @@
       showToast('Select and copy manually');
     },
     toggleSaveAlbum: async (id, saved) => {
-      haptic(saved ? 'success' : 'tap');
+      const btn = $('save-alb-btn');
+      const matchesBtn = btn && btn.dataset.albumId === id;
+      if (matchesBtn && btn.dataset.busy === '1') return;
+      const prev = matchesBtn ? btn.dataset.saved === '1' : !saved;
+      const next = typeof saved === 'boolean' ? saved : !prev;
+      const paintBtn = (isSaved) => {
+        if (!matchesBtn) return;
+        btn.dataset.saved = isSaved ? '1' : '0';
+        btn.classList.toggle('active', isSaved);
+        btn.innerHTML = `${ICONS.heart} ${isSaved ? 'Saved' : 'Save Album'}`;
+      };
+      haptic(next ? 'success' : 'tap');
+      if (matchesBtn) btn.dataset.busy = '1';
+      paintBtn(next);
       try {
         await api('/api/web/star', {
           method: 'POST',
-          body: JSON.stringify({ id, starred: saved, kind: 'album' }),
+          body: JSON.stringify({ id, starred: next, kind: 'album' }),
         });
-        renderAlbum(id);
+        if (state.searchState?.albums) {
+          for (const a of state.searchState.albums) {
+            if (a.id === id) a.isSaved = next;
+          }
+        }
       } catch (e) {
+        paintBtn(prev);
         showToast(e.message);
+      } finally {
+        if (matchesBtn) delete btn.dataset.busy;
       }
     },
     toggleFollowArtist: async (id, followed) => {
-      haptic(followed ? 'success' : 'tap');
+      const btn = $('follow-art-btn');
+      const matchesBtn = btn && btn.dataset.artistId === id;
+      if (matchesBtn && btn.dataset.busy === '1') return;
+      const prev = matchesBtn ? btn.dataset.followed === '1' : !followed;
+      const next = typeof followed === 'boolean' ? followed : !prev;
+      const paintBtn = (isFollowed) => {
+        if (!matchesBtn) return;
+        btn.dataset.followed = isFollowed ? '1' : '0';
+        btn.classList.toggle('active', isFollowed);
+        btn.textContent = isFollowed ? '✓ Following' : '+ Follow';
+      };
+      haptic(next ? 'success' : 'tap');
+      if (matchesBtn) btn.dataset.busy = '1';
+      paintBtn(next);
       try {
         await api('/api/web/star', {
           method: 'POST',
-          body: JSON.stringify({ id, starred: followed, kind: 'artist' }),
+          body: JSON.stringify({ id, starred: next, kind: 'artist' }),
         });
-        renderArtist(id);
+        if (state.searchState?.artists) {
+          for (const a of state.searchState.artists) {
+            if (a.id === id) a.isFollowed = next;
+          }
+        }
       } catch (e) {
+        paintBtn(prev);
         showToast(e.message);
+      } finally {
+        if (matchesBtn) delete btn.dataset.busy;
       }
     },
     promptCreatePlaylist: (initialTrackId = null) => {

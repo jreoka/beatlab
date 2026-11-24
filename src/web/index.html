@@ -364,7 +364,9 @@
       <button class="icon-btn" title="Mute (M)" onclick="App.toggleMute()">
         <svg id="vol-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/></svg>
       </button>
-      <input id="pb-volume" class="vol-slider" type="range" min="0" max="1" step="0.01" value="0.9" />
+      <div class="pb-vol-wrap">
+        <input id="pb-volume" class="vol-slider" type="range" min="0" max="1" step="0.01" value="0.9" aria-label="Volume" />
+      </div>
       <button id="btn-expand-player" class="icon-btn" title="Expand player" onclick="App.toggleFullscreen()">
         <svg class="expand-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 15.5 7-7 7 7"/></svg>
       </button>
