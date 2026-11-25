@@ -1901,7 +1901,7 @@ pub async fn passkey_delete(
 
 /// Builds the personalised "New Releases" feed: recent albums from artists the
 /// user follows or listens to. Fresh releases are pulled from Deezer in
-/// parallel (only releases from the last ~month); a short timeout keeps the
+/// parallel (only releases from the last two weeks); a short timeout keeps the
 /// home tab responsive.
 ///
 /// The last good result is kept per account, so artists whose lookup misses
@@ -1976,12 +1976,13 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
     let live = albums.len();
 
     // Merge in the last good shelf. Everything in it is still a real release
-    // from the last month, so it is always safe to keep showing; this covers
+    // from the last two weeks, so it is always safe to keep showing; this covers
     // artists that missed the deadline and Deezer failing fast (an error looks
     // exactly like "no releases", so a live result alone can't be trusted to
     // clear the shelf). Entries age out once they leave the release window.
     let last_key = format!("newrel:last:{uid}");
-    let window_start = Utc::now().timestamp() - 31 * 86_400;
+    let window_start =
+        Utc::now().timestamp() - crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS * 86_400;
     let stored: Vec<AlbumSummary> = state
         .store
         .kv_get(&last_key)
@@ -2111,62 +2112,17 @@ async fn pick_artist_candidate(
     Some(candidates.swap_remove(first))
 }
 
-/// Builds the new-releases shelf and advances the per-account "seen" marker so
-/// the NEW badge only highlights arrivals since the last Home visit.
-async fn build_new_releases(
-    state: &AppState,
-    uid: i64,
-    saved: &HashSet<String>,
-) -> (Vec<Value>, usize, i64) {
+/// Builds the new-releases shelf. It only changes when a release arrives or
+/// ages out of the window; viewing it doesn't alter anything.
+async fn build_new_releases(state: &AppState, uid: i64, saved: &HashSet<String>) -> Vec<Value> {
     let new_releases = collect_new_releases(state, uid, 8).await;
     for a in &new_releases {
         let _ = state.store.upsert_album_meta(a);
     }
-
-    let seen_key = format!("newrel:seen:{uid}");
-    let previous_ids: Option<Vec<String>> = state
-        .store
-        .kv_get(&seen_key)
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok());
-    let previous_set: Option<HashSet<String>> = previous_ids
-        .as_ref()
-        .map(|ids| ids.iter().cloned().collect());
-    let unseen: HashSet<String> = match &previous_set {
-        Some(prev) => new_releases
-            .iter()
-            .filter(|a| !prev.contains(&a.id))
-            .map(|a| a.id.clone())
-            .collect(),
-        // First visit: everything is "already seen" so we don't claim 12 new drops.
-        None => HashSet::new(),
-    };
-    let items: Vec<Value> = new_releases
+    new_releases
         .iter()
-        .map(|a| {
-            let mut value = album_json(a, saved.contains(&a.id));
-            if let Value::Object(map) = &mut value {
-                map.insert("isNew".to_string(), json!(unseen.contains(&a.id)));
-            }
-            value
-        })
-        .collect();
-
-    let mut known = previous_ids.unwrap_or_default();
-    let mut known_set: HashSet<String> = known.iter().cloned().collect();
-    for a in &new_releases {
-        if known_set.insert(a.id.clone()) {
-            known.push(a.id.clone());
-        }
-    }
-    if known.len() > 1000 {
-        known = known.split_off(known.len() - 1000);
-    }
-    state.store.kv_set(
-        &seen_key,
-        &serde_json::to_string(&known).unwrap_or_else(|_| "[]".to_string()),
-    );
-
-    (items, unseen.len(), Utc::now().timestamp())
+        .map(|a| album_json(a, saved.contains(&a.id)))
+        .collect()
 }
 
 /// How long a page waits on upstream catalog APIs before rendering from stored data.
@@ -2330,8 +2286,7 @@ pub async fn home(
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
 
-    let (new_releases_json, new_release_unseen, new_release_checked_at) =
-        build_new_releases(&state, uid, &saved).await;
+    let new_releases_json = build_new_releases(&state, uid, &saved).await;
 
     let moods: Vec<Value> = Mood::ALL
         .iter()
@@ -2356,8 +2311,6 @@ pub async fn home(
     json_res(json!({
         "quickPicks": to_web_tracks(&state, uid, &quick_picks),
         "newReleases": new_releases_json,
-        "newReleaseUnseen": new_release_unseen,
-        "newReleaseCheckedAt": new_release_checked_at,
         "recent": to_web_tracks(&state, uid, &recent),
         "mixedForYou": json!(state.taste.mixed_for_you_cards(uid)),
         "madeForYou": auto_mixes,

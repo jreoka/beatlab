@@ -2102,11 +2102,11 @@
     sync();
   }
 
-  function newReleasesSectionHtml(newReleases, unseen) {
+  function newReleasesSectionHtml(newReleases) {
     if (!newReleases.length) return '';
     return `<section class="section" id="new-releases-section">
       <div class="section-head">
-        <h2>New Releases${unseen > 0 ? ` <span class="new-count-pill">${unseen} new</span>` : ''}</h2>
+        <h2>New Releases</h2>
       </div>
       <div class="card-grid rail">${newReleases.slice(0, 8).map(renderNewReleaseCard).join('')}</div>
     </section>`;
@@ -2137,7 +2137,7 @@
       }
 
       // New releases from artists the user listens to sit right under Quick Picks.
-      html += newReleasesSectionHtml(newReleases, d.newReleaseUnseen || 0);
+      html += newReleasesSectionHtml(newReleases);
 
       if (mixedForYou.length > 0) {
         html += `<section class="section">
@@ -4443,7 +4443,6 @@
     return `<div class="media-card new-release-card" data-share-kind="album" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
-        ${a.isNew ? '<span class="new-release-badge">NEW</span>' : ''}
         <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(a.name)}</div>

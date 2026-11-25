@@ -14,6 +14,8 @@ use tracing::warn;
 /// Deezer allows 50 requests per 5 seconds per IP and bans IPs that keep exceeding it.
 /// A token bucket keeps us well under that: short bursts of up to 25, then 5/s.
 const DZ_BUCKET_CAPACITY: f64 = 25.0;
+/// How far back the home "New Releases" shelf looks, in days.
+pub const NEW_RELEASE_WINDOW_DAYS: i64 = 14;
 const DZ_BUCKET_REFILL_PER_SEC: f64 = 5.0;
 /// After Deezer refuses us outright (HTTP 403), stop calling it for a while instead of
 /// hammering a blocked endpoint; callers fall back to other sources immediately.
@@ -555,10 +557,12 @@ impl DeezerSource {
             return Vec::new();
         };
 
-        // Only genuinely new drops: released within the last ~month (and not
+        // Only genuinely new drops: released within the last two weeks (and not
         // pre-announced future dates). ISO dates compare lexicographically.
         let today = Utc::now().date_naive();
-        let cutoff = (today - chrono::Duration::days(31)).format("%Y-%m-%d").to_string();
+        let cutoff = (today - chrono::Duration::days(NEW_RELEASE_WINDOW_DAYS))
+            .format("%Y-%m-%d")
+            .to_string();
         let today_str = today.format("%Y-%m-%d").to_string();
         let mut entries: Vec<(String, DzAlbum)> = parsed
             .data
