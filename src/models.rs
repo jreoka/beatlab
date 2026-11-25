@@ -217,6 +217,10 @@ impl Track {
         extract_meta_id_field(&self.meta, "deezer_album_id")
     }
 
+    pub fn itunes_album_id(&self) -> Option<String> {
+        extract_meta_id_field(&self.meta, "itunes_album_id")
+    }
+
     pub fn ytm_artist_id(&self) -> Option<String> {
         extract_meta_id_field(&self.meta, "ytm_artist_id")
     }
@@ -266,6 +270,9 @@ impl Track {
     }
 
     pub fn album_id(&self) -> String {
+        if let Some(it_alb) = self.itunes_album_id() {
+            return format!("al:it-{}", it_alb);
+        }
         let alb = if self.album.trim().is_empty() {
             &self.title
         } else {

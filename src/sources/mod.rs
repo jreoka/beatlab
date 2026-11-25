@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod deezer;
+pub mod itunes;
 pub mod local;
 pub mod soulseek;
 pub mod ytm;
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use archive::ArchiveSource;
 use deezer::DeezerSource;
+use itunes::ItunesSource;
 use local::LocalSource;
 use soulseek::SoulseekSource;
 use ytm::YtmSource;
@@ -59,6 +61,7 @@ struct CachedCatalogSearch {
 #[derive(Clone)]
 pub struct SourceRegistry {
     pub deezer: DeezerSource,
+    pub itunes: ItunesSource,
     pub ytm: YtmSource,
     pub archive: ArchiveSource,
     pub local: Arc<LocalSource>,
@@ -77,6 +80,7 @@ impl SourceRegistry {
     ) -> Self {
         Self {
             deezer,
+            itunes: ItunesSource::new(),
             ytm,
             archive,
             local,

@@ -3659,6 +3659,33 @@ impl TasteEngine {
 
         let local_summary = self.store.album_summary_by_id(0, album_id).ok().flatten();
 
+        // Hydrate iTunes-discovered albums (e.g. from New Releases when Deezer is
+        // blocked) directly via Apple's Lookup API, preserving full tracklists and
+        // YTM/Soulseek playback resolution.
+        if let Some(it_id) = album_id
+            .strip_prefix("al:it-")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            if let Some((mut meta, it_tracks)) = self.sources.itunes.fetch_album(it_id).await {
+                if let Some(ref em) = existing_meta {
+                    if !em.artist_id.is_empty() {
+                        meta.artist_id = em.artist_id.clone();
+                    }
+                }
+                let _ = self.store.upsert_album_meta(&meta);
+                let _ = self.store.upsert_tracks(&it_tracks);
+                let official_keys: HashSet<String> =
+                    it_tracks.iter().map(|t| t.song_key()).collect();
+                let local_same: Vec<Track> = existing_tracks
+                    .into_iter()
+                    .filter(|t| official_keys.contains(&t.song_key()))
+                    .collect();
+                let merged = merge_tracks_dedup(it_tracks, local_same);
+                let final_tracks = self.upgrade_album_from_soulseek(&meta, merged).await;
+                return Some((meta, final_tracks));
+            }
+        }
+
         // Known Deezer album ID, if any local data already links one.
         let mut dz_album_id = existing_meta
             .as_ref()

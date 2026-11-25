@@ -2013,7 +2013,9 @@ fn ensure_new_releases_refresh(
 
 /// Runs a complete personalised "New Releases" sweep for `uid` across their
 /// followed, starred, saved-album, and recently listened artists, merging into
-/// the persisted shelf (`newrel:last:{uid}`).
+/// the persisted shelf (`newrel:last:{uid}`). Uses Deezer when reachable and
+/// automatically falls back to Apple's public iTunes catalog API when Deezer
+/// refuses server IPs (HTTP 403) or fails to answer.
 async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     let artists = state
         .store
@@ -2030,60 +2032,79 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     // Song titles the user played or starred, per artist, so ambiguous names
     // ("Eve") and localized names ("幾田りら" / "米津玄師") resolve accurately.
     let mut hint_titles: HashMap<String, Vec<String>> = HashMap::new();
-    if artists.iter().any(|a| a.deezer_id.is_empty()) {
-        for (t, _) in state.store.user_recent_tracks(uid, 500, 0).unwrap_or_default() {
-            let primary = crate::models::primary_artist(&t.artist);
-            let key = slug(if primary.is_empty() { &t.artist } else { &primary });
-            let titles = hint_titles.entry(key).or_default();
-            if titles.len() < 15 && !titles.contains(&t.title) {
-                titles.push(t.title.clone());
-            }
+    for (t, _) in state.store.user_recent_tracks(uid, 500, 0).unwrap_or_default() {
+        let primary = crate::models::primary_artist(&t.artist);
+        let key = slug(if primary.is_empty() { &t.artist } else { &primary });
+        let titles = hint_titles.entry(key).or_default();
+        if titles.len() < 15 && !titles.contains(&t.title) {
+            titles.push(t.title.clone());
         }
-        for (t, _) in state.store.starred_tracks(uid).unwrap_or_default() {
-            let primary = crate::models::primary_artist(&t.artist);
-            let key = slug(if primary.is_empty() { &t.artist } else { &primary });
-            let titles = hint_titles.entry(key).or_default();
-            if titles.len() < 15 && !titles.contains(&t.title) {
-                titles.push(t.title.clone());
-            }
+    }
+    for (t, _) in state.store.starred_tracks(uid).unwrap_or_default() {
+        let primary = crate::models::primary_artist(&t.artist);
+        let key = slug(if primary.is_empty() { &t.artist } else { &primary });
+        let titles = hint_titles.entry(key).or_default();
+        if titles.len() < 15 && !titles.contains(&t.title) {
+            titles.push(t.title.clone());
         }
     }
 
-    let handles: Vec<_> = artists
-        .iter()
-        .map(|artist| {
-            let dz = state.sources.deezer.clone();
-            let store = state.store.clone();
-            let mut id = artist.deezer_id.clone();
-            let name = artist.name.clone();
-            let hints = hint_titles.get(&slug(&name)).cloned().unwrap_or_default();
-            tokio::spawn(async move {
-                if id.is_empty() {
-                    match resolve_deezer_artist_by_name(&dz, &store, &name, &hints).await {
-                        ResolveArtist::Found(found) => id = found,
-                        ResolveArtist::NotFound => return Some(Vec::new()),
-                        ResolveArtist::TransientError => return None,
-                    }
-                }
-                dz.fetch_artist_releases_checked(&id, &name, 4).await
-            })
-        })
-        .collect();
-    let total = handles.len();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let total = artists.len();
     let mut answered = 0usize;
     let mut albums: Vec<AlbumSummary> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
-    for handle in handles {
-        if let Ok(Ok(Some(batch))) = tokio::time::timeout_at(deadline, handle).await {
-            answered += 1;
-            for album in batch {
-                if seen_ids.insert(album.id.clone())
-                    && seen_keys.insert(new_releases_dedup_key(&album))
-                {
-                    albums.push(album);
+    let mut source_used = "deezer";
+
+    if !state.sources.deezer.is_blocked() {
+        let handles: Vec<_> = artists
+            .iter()
+            .map(|artist| {
+                let dz = state.sources.deezer.clone();
+                let store = state.store.clone();
+                let mut id = artist.deezer_id.clone();
+                let name = artist.name.clone();
+                let hints = hint_titles.get(&slug(&name)).cloned().unwrap_or_default();
+                tokio::spawn(async move {
+                    if id.is_empty() {
+                        match resolve_deezer_artist_by_name(&dz, &store, &name, &hints).await {
+                            ResolveArtist::Found(found) => id = found,
+                            ResolveArtist::NotFound => return Some(Vec::new()),
+                            ResolveArtist::TransientError => return None,
+                        }
+                    }
+                    dz.fetch_artist_releases_checked(&id, &name, 4).await
+                })
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+        for handle in handles {
+            if let Ok(Ok(Some(batch))) = tokio::time::timeout_at(deadline, handle).await {
+                answered += 1;
+                for album in batch {
+                    if seen_ids.insert(album.id.clone())
+                        && seen_keys.insert(new_releases_dedup_key(&album))
+                    {
+                        albums.push(album);
+                    }
                 }
+            }
+        }
+    }
+
+    // Fallback to Apple's iTunes catalog API whenever Deezer is 403-blocked or
+    // failed to answer any artists (common on cloud datacenter IPs).
+    let mut itunes_incomplete = false;
+    if answered == 0 && !state.sources.itunes.is_blocked() {
+        source_used = "itunes";
+        let (it_answered, it_albums, remaining) =
+            collect_itunes_new_releases(state, &artists, &hint_titles).await;
+        answered = it_answered;
+        itunes_incomplete = remaining > 0;
+        for album in it_albums {
+            if seen_ids.insert(album.id.clone()) && seen_keys.insert(new_releases_dedup_key(&album))
+            {
+                albums.push(album);
             }
         }
     }
@@ -2117,20 +2138,210 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     if let Ok(raw) = serde_json::to_string(&albums) {
         state.store.kv_set(&last_key, &raw);
     }
-    // Only mark the shelf freshly checked when Deezer actually answered a
-    // meaningful share of artists (or produced releases) and isn't 403-blocked.
-    if !state.sources.deezer.is_blocked() && (!albums.is_empty() || answered * 2 >= total) {
+    // Mark the shelf freshly checked once the active source actually answered.
+    // If iTunes only resolved a partial cold batch (rate-limit budget), keep it
+    // fresh briefly if we already have releases, or retry on the next visit if empty.
+    let source_ok = if source_used == "itunes" {
+        !state.sources.itunes.is_blocked() && (!albums.is_empty() || (!itunes_incomplete && answered > 0))
+    } else {
+        !state.sources.deezer.is_blocked() && (!albums.is_empty() || answered * 2 >= total)
+    };
+    if source_ok {
         state.store.kv_set(&fetched_key, &fetched_val);
     }
 
     tracing::info!(
         uid,
+        source = source_used,
         artists = total,
         answered,
         live,
         shown = albums.len().min(8),
         "home new releases"
     );
+}
+
+/// Resolves artists via Apple's iTunes catalog (caching IDs permanently in SQLite)
+/// and fetches their recent releases in batched multi-ID lookups (12 artists/request).
+/// Caps uncached artist searches per sweep to stay comfortably inside Apple's rate limit.
+async fn collect_itunes_new_releases(
+    state: &AppState,
+    artists: &[ArtistSummary],
+    hint_titles: &HashMap<String, Vec<String>>,
+) -> (usize, Vec<AlbumSummary>, usize) {
+    const MAX_UNCACHED_LOOKUPS_PER_SWEEP: usize = 12;
+
+    let mut resolved: Vec<(u64, String, String)> = Vec::new();
+    let mut uncached_used = 0usize;
+    let mut remaining_uncached = 0usize;
+    let now = Utc::now().timestamp();
+
+    for artist in artists {
+        let name = artist.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let cache_key = format!("itartist:byname1:{name}");
+        if let Some(raw) = state.store.kv_get(&cache_key) {
+            if let Some((ts, id_str)) = raw.split_once('|') {
+                if let Ok(it_id) = id_str.parse::<u64>() {
+                    if it_id > 0 {
+                        resolved.push((it_id, artist.id.clone(), name.to_string()));
+                        continue;
+                    }
+                }
+                if id_str.is_empty() && ts.parse::<i64>().map_or(false, |t| now - t < 86_400) {
+                    continue;
+                }
+            }
+        }
+        if uncached_used >= MAX_UNCACHED_LOOKUPS_PER_SWEEP || state.sources.itunes.is_blocked() {
+            remaining_uncached += 1;
+            continue;
+        }
+        uncached_used += 1;
+        let hints = hint_titles.get(&slug(name)).cloned().unwrap_or_default();
+        if let ResolveArtist::Found(it_id_str) =
+            resolve_itunes_artist_by_name(&state.sources.itunes, &state.store, name, &hints).await
+        {
+            if let Ok(it_id) = it_id_str.parse::<u64>() {
+                if it_id > 0 {
+                    resolved.push((it_id, artist.id.clone(), name.to_string()));
+                }
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return (0, Vec::new(), remaining_uncached);
+    }
+    let (answered, albums) = state
+        .sources
+        .itunes
+        .fetch_artists_recent_releases(&resolved, 4)
+        .await;
+    (answered, albums, remaining_uncached)
+}
+
+async fn resolve_itunes_artist_by_name(
+    it: &crate::sources::itunes::ItunesSource,
+    store: &crate::store::Store,
+    name: &str,
+    played_titles: &[String],
+) -> ResolveArtist {
+    let name = name.trim();
+    if slug(name).is_empty() {
+        return ResolveArtist::NotFound;
+    }
+    let cache_key = format!("itartist:byname1:{name}");
+    let now = Utc::now().timestamp();
+    let Some(raw_results) = it.search_artists(name, 8).await else {
+        return ResolveArtist::TransientError;
+    };
+    let found = pick_itunes_artist_from_search(it, name, raw_results, played_titles).await;
+    match found {
+        Some(a) => {
+            store.kv_set(&cache_key, &format!("{now}|{}", a.id));
+            ResolveArtist::Found(a.id.to_string())
+        }
+        None => {
+            store.kv_set(&cache_key, &format!("{now}|"));
+            ResolveArtist::NotFound
+        }
+    }
+}
+
+async fn pick_itunes_artist_from_search(
+    it: &crate::sources::itunes::ItunesSource,
+    name: &str,
+    raw_results: Vec<crate::sources::itunes::ItunesArtist>,
+    played_titles: &[String],
+) -> Option<crate::sources::itunes::ItunesArtist> {
+    let wanted = name.to_lowercase();
+    let key_name = slug(name);
+    let query_ascii = name.is_ascii();
+
+    let exact: Vec<crate::sources::itunes::ItunesArtist> = raw_results
+        .iter()
+        .filter(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name)
+        .cloned()
+        .collect();
+
+    // Cross-script fallback: handles BOTH "幾田りら" -> "Lilas Ikuta" AND
+    // "Hina Aoki" -> "青木陽菜" where Apple stores the artist in the other script.
+    let cross_script_top: Option<crate::sources::itunes::ItunesArtist> = raw_results
+        .first()
+        .filter(|a| a.name.is_ascii() != query_ascii && is_solo_artist_name(&a.name))
+        .cloned();
+
+    let mut candidates = exact.clone();
+    if let Some(ref cs) = cross_script_top {
+        if !candidates.iter().any(|c| c.id == cs.id) {
+            candidates.push(cs.clone());
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return candidates.pop();
+    }
+
+    let exact_case: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.name.trim() == name)
+        .map(|(i, _)| i)
+        .collect();
+    if exact_case.len() == 1 && cross_script_top.is_none() {
+        return Some(candidates.swap_remove(exact_case[0]));
+    }
+
+    let played: Vec<String> = played_titles
+        .iter()
+        .map(|t| slug(t))
+        .filter(|t| t.len() >= 3)
+        .collect();
+    if !played.is_empty() {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, cand) in candidates.iter().enumerate().take(3) {
+            let songs = it.fetch_artist_top_songs(cand.id, 25).await;
+            let hits = songs
+                .iter()
+                .map(|t| slug(t))
+                .filter(|t| t.len() >= 3)
+                .filter(|t| {
+                    played
+                        .iter()
+                        .any(|p| t == p || t.starts_with(p.as_str()) || p.starts_with(t.as_str()))
+                })
+                .count();
+            if hits > 0 && best.map_or(true, |(_, b)| hits > b) {
+                best = Some((i, hits));
+            }
+        }
+        if let Some((i, _)) = best {
+            return Some(candidates.swap_remove(i));
+        }
+    }
+
+    pick_itunes_artist_fallback(name, exact, cross_script_top, candidates)
+}
+
+fn pick_itunes_artist_fallback(
+    name: &str,
+    exact: Vec<crate::sources::itunes::ItunesArtist>,
+    cross_script_top: Option<crate::sources::itunes::ItunesArtist>,
+    mut candidates: Vec<crate::sources::itunes::ItunesArtist>,
+) -> Option<crate::sources::itunes::ItunesArtist> {
+    if exact.is_empty() {
+        if let Some(cs) = cross_script_top {
+            return Some(cs);
+        }
+    }
+    let exact_case_idx = candidates.iter().position(|a| a.name.trim() == name);
+    let first = exact_case_idx.unwrap_or(0);
+    Some(candidates.swap_remove(first))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -7694,5 +7905,44 @@ mod tests {
         store.kv_set("newrel:fetched:1", &format!("{}|{win}", now - 1200));
         assert!(new_releases_is_fresh(&store, 1, true));
         assert!(!new_releases_is_fresh(&store, 1, false));
+    }
+
+    #[test]
+    fn itunes_artist_fallback_handles_bidirectional_cross_script_and_exact_case() {
+        let mk = |id: u64, name: &str| crate::sources::itunes::ItunesArtist {
+            id,
+            name: name.into(),
+            genre: "J-Pop".into(),
+        };
+
+        // Japanese query -> romanized iTunes artist ("幾田りら" -> "Lilas Ikuta").
+        let ikuta = pick_itunes_artist_fallback(
+            "幾田りら",
+            vec![],
+            Some(mk(1489581870, "Lilas Ikuta")),
+            vec![mk(1489581870, "Lilas Ikuta")],
+        )
+        .unwrap();
+        assert_eq!(ikuta.id, 1489581870);
+
+        // Romanized query -> Japanese iTunes artist ("Hina Aoki" -> "青木陽菜").
+        let aoki = pick_itunes_artist_fallback(
+            "Hina Aoki",
+            vec![],
+            Some(mk(1696262485, "青木陽菜")),
+            vec![mk(1696262485, "青木陽菜")],
+        )
+        .unwrap();
+        assert_eq!(aoki.id, 1696262485);
+
+        // Exact-case wins ("HACHI" vs "Hachi").
+        let hachi = pick_itunes_artist_fallback(
+            "HACHI",
+            vec![mk(727267782, "Hachi"), mk(1523621267, "HACHI")],
+            None,
+            vec![mk(727267782, "Hachi"), mk(1523621267, "HACHI")],
+        )
+        .unwrap();
+        assert_eq!(hachi.id, 1523621267);
     }
 }
