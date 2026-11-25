@@ -94,6 +94,20 @@ async fn main() -> models::AppResult<()> {
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Store::open(&data_dir.join("beatlab.db"))?;
+
+    // Rips that reach the catalog without a DATE tag (soulseek, local files,
+    // archive.org) inherit the release year from their streaming twin before
+    // any list is served, so lossless/hi-res rows aren't the only blank ones.
+    let healing = store.clone();
+    match tokio::task::spawn_blocking(move || healing.backfill_track_years())
+        .await
+        .unwrap_or(Ok(0))
+    {
+        Ok(n) if n > 0 => info!(tracks = n, "backfilled missing release years"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e.to_string(), "release year backfill failed"),
+    }
+
     admin::bootstrap_admin_accounts(&store, std::env::var("ADMIN_PASSWORD").ok().as_deref());
 
     // Passkeys are bound to the public origin. `BEATLAB_ORIGIN` wins over `URL`

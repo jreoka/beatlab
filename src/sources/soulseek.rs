@@ -1848,6 +1848,7 @@ fn parse_search_response(compressed: &[u8], peer_hint: Option<&str>) -> Option<(
         }
 
         let (artist, album, title, track_no) = parse_slsk_path(&filename);
+        let year = year_from_slsk_path(&filename);
         let stream_url = format!("slsk://{}/{}", peer, filename);
         let id = format!("soulseek:{}", hash_str(&stream_url));
         let moods = classify_moods_str(&title, &album, "", "");
@@ -1860,7 +1861,7 @@ fn parse_search_response(compressed: &[u8], peer_hint: Option<&str>) -> Option<(
             album,
             genre: String::new(),
             moods,
-            year: 0,
+            year,
             track_no,
             disc_no: 1,
             duration,
@@ -2097,6 +2098,67 @@ pub fn clean_slsk_title_and_artist(
 /// Parses a Soulseek virtual path into `(artist, album, title, track_no)`, cleaning share
 /// bucket folders (`complete`, `music`), release tags (`[2020.07.22]`, `[FLAC]`, `[9a149]`),
 /// and disc subfolders (`CD1`, `Disc 1`).
+/// Release year buried in a peer's share path. Scene folders almost always
+/// carry one — `Artist/Album (1999)/01 - Song.flac`,
+/// `@@peer/[2020.07.22] ReoNa | ANIMA [FLAC]/01.flac` — and it is the only
+/// metadata soulseek hands us, so lossless rips would otherwise ship with no
+/// year at all.
+pub fn year_from_slsk_path(raw: &str) -> i32 {
+    let norm = raw.replace('\\', "/");
+    let segments: Vec<&str> = norm
+        .split('/')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.starts_with("@@"))
+        .collect();
+    if segments.is_empty() {
+        return 0;
+    }
+    let (dirs, file) = segments.split_at(segments.len() - 1);
+    for dir in dirs {
+        if let Some(y) = year_in_path_segment(dir, true) {
+            return y;
+        }
+    }
+    // A bare number in the file name is far more often a track title ("1999")
+    // than a release date, so only bracketed years are trusted there.
+    file.first()
+        .and_then(|f| year_in_path_segment(f, false))
+        .unwrap_or(0)
+}
+
+/// Finds a plausible release year inside one path segment. `allow_bare` also
+/// accepts years flanked by spaces/dashes (`1999 - Artist`), which folder names
+/// use but track titles rarely do.
+fn year_in_path_segment(seg: &str, allow_bare: bool) -> Option<i32> {
+    // A segment made only of digits is more likely an album titled after a year
+    // ("1999", "1989") than a date, so require some letters alongside it.
+    if !seg.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let bytes = seg.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let surrounded = (0..4).all(|k| bytes[i + k].is_ascii_digit())
+            && (i == 0 || !bytes[i - 1].is_ascii_digit())
+            && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_digit());
+        if surrounded {
+            let y: i32 = seg[i..i + 4].parse().unwrap_or(0);
+            if (1900..=2100).contains(&y) {
+                let before = if i == 0 { 0 } else { bytes[i - 1] };
+                let after = if i + 4 == bytes.len() { 0 } else { bytes[i + 4] };
+                let wrapped = matches!(before, b'(' | b'[') || matches!(after, b')' | b']');
+                let spaced = matches!(before, b' ' | b'-' | b'_' | 0)
+                    && matches!(after, b' ' | b'-' | b'_' | b'.' | 0);
+                if wrapped || (allow_bare && spaced) {
+                    return Some(y);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn parse_slsk_path(raw: &str) -> (String, String, String, i32) {
     let norm = raw.replace('\\', "/");
     let mut dirs: Vec<&str> = norm
@@ -2228,6 +2290,35 @@ mod tests {
         assert_eq!(alb2, "HUMAN (SAO)");
         assert_eq!(t2, "HUMAN");
         assert_eq!(n2, 1);
+    }
+
+    #[test]
+    fn year_from_slsk_path_finds_release_year_without_mistaking_titles_for_dates() {
+        // Bracketed years in folders and file names.
+        assert_eq!(
+            year_from_slsk_path("peer\\Music\\Porter Robinson\\Nurture (2021)\\01 - Look at the Sky.flac"),
+            2021
+        );
+        assert_eq!(
+            year_from_slsk_path("@@peer\\[2020.07.22] ReoNa | ANIMA [FLAC]\\02 - ANIMA.flac"),
+            2020
+        );
+        assert_eq!(
+            year_from_slsk_path("@@peer\\ReoNa [9a149]\\[2023][XW] HUMAN (SAO) [24bit-48kHz]\\CD1\\01. HUMAN.flac"),
+            2023
+        );
+        // Bare years are only trusted in folder names.
+        assert_eq!(
+            year_from_slsk_path("peer\\1999 - Prince\\1999\\01 - Little Red Corvette.flac"),
+            1999
+        );
+        // A track titled "1999" must not be read as a date.
+        assert_eq!(
+            year_from_slsk_path("peer\\Prince\\1999\\1999.flac"),
+            0
+        );
+        // Nothing date-like at all.
+        assert_eq!(year_from_slsk_path("peer\\Artist\\Album\\01 - Song.flac"), 0);
     }
 
     #[test]

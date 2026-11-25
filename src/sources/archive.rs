@@ -45,12 +45,9 @@ fn parse_item_tracks(identifier: &str, md: &IaMetadata) -> Vec<Track> {
         .map(|s| decode_ia_text(&s))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown Artist".to_string());
-    let year = md
-        .metadata
-        .date
-        .as_str()
-        .get(..4)
-        .and_then(|s| s.parse::<i32>().ok())
+    let year = year_prefix(&md.metadata.year)
+        .or_else(|| year_prefix(&md.metadata.originaldate))
+        .or_else(|| year_prefix(&md.metadata.date))
         .unwrap_or(0);
     let genre = canonical_genre(&md.metadata.subject);
     let cover_url = pick_cover(identifier, &md.files);
@@ -494,6 +491,7 @@ struct IaMetadata {
 }
 
 #[derive(Deserialize)]
+#[derive(Default)]
 struct IaMetaInner {
     #[serde(default)]
     title: String,
@@ -501,6 +499,10 @@ struct IaMetaInner {
     creator: serde_json::Value,
     #[serde(default, deserialize_with = "de_flex_string")]
     date: String,
+    #[serde(default, deserialize_with = "de_flex_string")]
+    year: String,
+    #[serde(default, deserialize_with = "de_flex_string")]
+    originaldate: String,
     #[serde(default)]
     subject: serde_json::Value,
     #[serde(default)]
@@ -539,6 +541,15 @@ where
         serde_json::Value::Number(n) => n.to_string(),
         _ => String::new(),
     })
+}
+
+/// Leading four digits of an IA date field, if they spell a real year. Items
+/// spell the release date a dozen ways (`year`, `originaldate`, `date`), so the
+/// first one that parses wins.
+fn year_prefix(s: &str) -> Option<i32> {
+    let t = s.trim();
+    let y: i32 = t.get(..4)?.parse().ok()?;
+    (1900..=2100).contains(&y).then_some(y)
 }
 
 #[cfg(test)]
@@ -585,6 +596,7 @@ mod tests {
                 date: "2013-02-01".into(),
                 subject: serde_json::Value::Null,
                 collection: serde_json::json!(["audio"]),
+                ..Default::default()
             },
             files: vec![
                 sample_file("%D8%AA%D8%B3%D8%AC%D9%8A%D9%84%D9%8A #48.wav", "WAVE", ""),
@@ -605,6 +617,7 @@ mod tests {
                 date: "2025-01-01".into(),
                 subject: serde_json::json!("indie"),
                 collection: serde_json::json!(["netlabels"]),
+                ..Default::default()
             },
             files: vec![f],
         };
@@ -627,9 +640,20 @@ mod tests {
                 date: "2020".into(),
                 subject: serde_json::Value::Null,
                 collection: serde_json::json!(["community_audio"]),
+                ..Default::default()
             },
             files: vec![f],
         };
         assert!(parse_item_tracks("comm-1", &md).is_empty());
+    }
+
+    #[test]
+    fn year_prefix_reads_the_leading_four_digits_only_when_they_are_a_year() {
+        assert_eq!(year_prefix("1999"), Some(1999));
+        assert_eq!(year_prefix(" 1999-05-01 "), Some(1999));
+        assert_eq!(year_prefix("2013-02-01"), Some(2013));
+        assert_eq!(year_prefix("c1999"), None);
+        assert_eq!(year_prefix("0999"), None);
+        assert_eq!(year_prefix(""), None);
     }
 }

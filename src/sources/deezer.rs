@@ -819,7 +819,9 @@ impl DeezerSource {
         let mut missing_artists: Vec<String> = Vec::new();
         let mut seen_artists: HashSet<String> = HashSet::new();
         for t in tracks.iter() {
-            if !t.genre.trim().is_empty() {
+            // A track can already carry a genre and still be missing its release
+            // year — lossless/local rips usually have tags but no DATE.
+            if !t.genre.trim().is_empty() && t.year > 0 {
                 continue;
             }
             let pa = crate::models::primary_artist(&t.artist);
@@ -849,7 +851,9 @@ impl DeezerSource {
                     .collect();
 
             for t in tracks.iter_mut() {
-                if !t.genre.trim().is_empty() {
+                let needs_genre = t.genre.trim().is_empty();
+                let needs_year = t.year <= 0;
+                if !needs_genre && !needs_year {
                     continue;
                 }
                 let art_slug = slug(&crate::models::primary_artist(&t.artist));
@@ -870,7 +874,7 @@ impl DeezerSource {
                     .then(|| pool.iter().copied().find(|a| slug(&a.name) == want_alb_slug))
                     .flatten();
                 if let Some(alb) = exact_alb {
-                    if !alb.genre.trim().is_empty() {
+                    if needs_genre && !alb.genre.trim().is_empty() {
                         t.genre = alb.genre.clone();
                     }
                     if t.year <= 0 && alb.year > 0 {

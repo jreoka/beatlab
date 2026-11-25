@@ -27,6 +27,17 @@ fn prefixed_track_cols(alias: &str) -> String {
         .join(", ")
 }
 
+/// Normalised `(primary artist, album)` key used to recognise the same release
+/// across sources, so a year known for one copy can be copied to another.
+fn album_year_key(artist: &str, album: &str) -> String {
+    if album.trim().is_empty() {
+        return String::new();
+    }
+    let pa = primary_artist(artist);
+    let art_key = if pa.is_empty() { artist.trim() } else { pa.as_str() };
+    slug(&format!("{}|{}", art_key, album))
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct NeuralTrainingCorpus {
     pub user_ids: Vec<i64>,
@@ -3589,6 +3600,111 @@ impl Store {
         Ok(rows)
     }
 
+    /// Copies a release year onto rows that never got one, taking the year from
+    /// any other row with the same song key or the same artist/album, or from
+    /// the album metadata table. Soulseek/local/archive rips often land in the
+    /// catalog without a DATE tag while their streaming twin carries the year,
+    /// which left every lossless copy showing a blank. Cheap enough to run once
+    /// at startup; returns as soon as nothing is left to heal.
+    pub fn backfill_track_years(&self) -> AppResult<usize> {
+        let missing = {
+            let conn = self.lock();
+            conn.query_row("SELECT COUNT(*) FROM tracks WHERE year <= 0", [], |r| {
+                r.get::<_, i64>(0)
+            })?
+        };
+        if missing == 0 {
+            return Ok(0);
+        }
+
+        let mut song_years: HashMap<String, i32> = HashMap::new();
+        let mut album_years: HashMap<String, i32> = HashMap::new();
+        let mut updates: Vec<(i32, String)> = Vec::new();
+        {
+            let mut conn = self.lock();
+            {
+                let mut stmt =
+                    conn.prepare("SELECT title, artist, album, year FROM tracks WHERE year > 0")?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let title: String = r.get(0)?;
+                    let artist: String = r.get(1)?;
+                    let album: String = r.get(2)?;
+                    let year: i32 = r.get(3)?;
+                    if !(1900..=2100).contains(&year) {
+                        continue;
+                    }
+                    let probe = Track {
+                        title,
+                        artist: artist.clone(),
+                        album: album.clone(),
+                        ..Default::default()
+                    };
+                    song_years.entry(probe.song_key()).or_insert(year);
+                    let key = album_year_key(&artist, &album);
+                    if !key.is_empty() {
+                        album_years.entry(key).or_insert(year);
+                    }
+                }
+            }
+            {
+                // Albums resolved from Deezer/iTunes know their year even when no
+                // copy of a track on them does.
+                let mut stmt =
+                    conn.prepare("SELECT name, artist, year FROM albums_meta WHERE year > 0")?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let name: String = r.get(0)?;
+                    let artist: String = r.get(1)?;
+                    let year: i32 = r.get(2)?;
+                    if !(1900..=2100).contains(&year) {
+                        continue;
+                    }
+                    let key = album_year_key(&artist, &name);
+                    if !key.is_empty() {
+                        album_years.entry(key).or_insert(year);
+                    }
+                }
+            }
+            {
+                let mut stmt =
+                    conn.prepare("SELECT id, title, artist, album FROM tracks WHERE year <= 0")?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let id: String = r.get(0)?;
+                    let title: String = r.get(1)?;
+                    let artist: String = r.get(2)?;
+                    let album: String = r.get(3)?;
+                    let probe = Track {
+                        title,
+                        artist: artist.clone(),
+                        album: album.clone(),
+                        ..Default::default()
+                    };
+                    let year = song_years
+                        .get(&probe.song_key())
+                        .copied()
+                        .or_else(|| album_years.get(&album_year_key(&artist, &album)).copied());
+                    if let Some(y) = year {
+                        updates.push((y, id));
+                    }
+                }
+            }
+            if updates.is_empty() {
+                return Ok(0);
+            }
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare("UPDATE tracks SET year = ?1 WHERE id = ?2")?;
+                for (y, id) in &updates {
+                    stmt.execute(params![*y, id.as_str()])?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(updates.len())
+    }
+
     pub fn star_track(&self, user_id: i64, track_id: &str) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();
@@ -6412,6 +6528,40 @@ mod tests {
             deezer_id: id.trim_start_matches("dz:").into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn backfill_track_years_heals_rips_from_their_catalog_twin() {
+        let store = Store::open_memory().unwrap();
+        let twin = sample_track("dz:1", "Look at the Sky", "Porter Robinson", "Nurture");
+        let mut rip = sample_track("soulseek:1", "Look at the Sky", "Porter Robinson", "Nurture");
+        rip.source = "soulseek".into();
+        rip.year = 0;
+        store.upsert_tracks(&[twin, rip]).unwrap();
+
+        assert_eq!(store.backfill_track_years().unwrap(), 1);
+        assert_eq!(store.get_track("soulseek:1").unwrap().unwrap().year, 2020);
+        // Nothing left to heal on a second pass.
+        assert_eq!(store.backfill_track_years().unwrap(), 0);
+    }
+
+    #[test]
+    fn backfill_track_years_falls_back_to_album_metadata() {
+        let store = Store::open_memory().unwrap();
+        let mut rip = sample_track("local:1", "Deep Cut", "Someone", "Some Album");
+        rip.source = "local".into();
+        rip.year = 0;
+        store.upsert_tracks(&[rip]).unwrap();
+
+        let mut alb = AlbumSummary::default();
+        alb.id = "al:dz-1-some-album".into();
+        alb.name = "Some Album".into();
+        alb.artist = "Someone".into();
+        alb.year = 1997;
+        store.upsert_album_meta(&alb).unwrap();
+
+        assert_eq!(store.backfill_track_years().unwrap(), 1);
+        assert_eq!(store.get_track("local:1").unwrap().unwrap().year, 1997);
     }
 
     #[test]
