@@ -5343,20 +5343,28 @@ html, body {
   color: var(--bg);
 }
 
-/* Badges: monochrome, informational only */
+/* Badges: subtle tinted rectangular fills */
 .quality-badge,
 .quality-badge.lossless {
-  padding: 0;
-  background: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
   border: 0;
-  border-radius: 0;
+  border-radius: 4px;
   font-size: 10.5px;
   font-weight: 600;
-  letter-spacing: 0.02em;
-  color: var(--text-dim);
+  line-height: 1.3;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.quality-badge {
+  background: rgba(56, 189, 248, 0.16);
+  color: var(--accent-blue);
 }
 .quality-badge.lossless {
-  color: #d4a72c;
+  background: rgba(212, 167, 44, 0.18);
+  color: #e2b93b;
 }
 
 /* ---------------- Sidebar & Navigation ---------------- */
@@ -6714,9 +6722,6 @@ body:not(.audio-playing) .qp-wave span { animation-play-state: paused; }
   font-weight: 600;
   color: var(--fs-muted);
   white-space: nowrap;
-}
-.fs-topbar .quality-badge {
-  color: var(--fs-dim);
 }
 .fs-top-share {
   visibility: hidden;
