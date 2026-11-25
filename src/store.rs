@@ -851,6 +851,34 @@ impl Store {
         Ok(())
     }
 
+    /// Refresh `last_seen` (and connection metadata) for a bearer session,
+    /// throttled to once a minute unless IP or User-Agent changes.
+    pub fn touch_session(&self, token: &str, user_agent: &str, ip: &str) {
+        let tok = token.trim();
+        if tok.is_empty() {
+            return;
+        }
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        let existing: Option<(i64, String, String)> = conn
+            .query_row(
+                "SELECT last_seen, ip, user_agent FROM sessions WHERE token = ?1 AND revoked = 0",
+                params![tok],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some((last_seen, saved_ip, saved_ua)) = existing {
+            if now - last_seen >= 60 || saved_ip != ip || saved_ua != user_agent {
+                let _ = conn.execute(
+                    "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3 WHERE token = ?4",
+                    params![now, ip, user_agent, tok],
+                );
+            }
+        }
+    }
+
     /// Find and refresh a Subsonic client's session row, creating one on first
     /// sight. Returns its token and whether it has been revoked by the user.
     /// These clients re-send credentials on every request instead of using a
@@ -1005,6 +1033,12 @@ impl Store {
             "INSERT INTO api_keys(key, user_id, label, created) VALUES (?1, ?2, 'default', ?3)",
             params![key, user_id, now],
         )?;
+        // Navidrome sessions are minted from the API key, so rotating the key
+        // must immediately sign out every connected Navidrome client too.
+        conn.execute(
+            "DELETE FROM sessions WHERE user_id = ?1 AND kind = 'nd'",
+            params![user_id],
+        )?;
         Ok(key)
     }
 
@@ -1020,6 +1054,29 @@ impl Store {
                  WHERE k.key = ?1 AND u.deleted_at = 0",
                 params![key.trim()],
                 row_to_user,
+            )
+            .optional()?)
+    }
+
+    /// Look up an active (non-deleted) user together with their stored API key
+    /// by username. Used to verify Subsonic 1.13+ salted token auth (`t = md5(apiKey + s)`)
+    /// without ever touching or accepting the account password.
+    pub fn get_user_and_api_key_by_name(&self, name: &str) -> AppResult<Option<(User, String)>> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT u.id, u.username, u.password, u.created, k.key
+                 FROM users u
+                 JOIN api_keys k ON k.user_id = u.id
+                 WHERE lower(u.username) = lower(?1) AND u.deleted_at = 0
+                 ORDER BY k.created ASC
+                 LIMIT 1",
+                params![trimmed],
+                |r| Ok((row_to_user(r)?, r.get::<_, String>(4)?)),
             )
             .optional()?)
     }
@@ -3875,6 +3932,15 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn starred_at_map(&self, user_id: i64) -> AppResult<HashMap<String, i64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT track_id, at FROM stars WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map(params![user_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn starred_tracks(&self, user_id: i64) -> AppResult<Vec<(Track, i64)>> {
         let conn = self.lock();
         let sql = format!(
@@ -3916,6 +3982,15 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn saved_album_at_map(&self, user_id: i64) -> AppResult<HashMap<String, i64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT album_id, at FROM saved_albums WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map(params![user_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn follow_artist(&self, user_id: i64, artist_id: &str) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();
@@ -3941,6 +4016,15 @@ impl Store {
         let rows = stmt
             .query_map(params![user_id], |r| r.get::<_, String>(0))?
             .collect::<Result<HashSet<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn followed_artist_at_map(&self, user_id: i64) -> AppResult<HashMap<String, i64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT artist_id, at FROM followed_artists WHERE user_id = ?1")?;
+        let rows = stmt
+            .query_map(params![user_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?;
         Ok(rows)
     }
 

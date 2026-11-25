@@ -5696,6 +5696,13 @@
       renderQueuePanel();
       return;
     }
+    if (state.upcomingModeAbortController) {
+      try {
+        state.upcomingModeAbortController.abort();
+      } catch {}
+    }
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.upcomingModeAbortController = ctrl;
     const reqToken = ++state.radioReqToken;
     state.radioLoading = true;
     renderQueuePanel();
@@ -5707,15 +5714,27 @@
         } else if (cur?.id) {
           params.set('seed', cur.id);
         }
+        if (cur?.id) {
+          params.set('exclude', cur.id);
+        }
         params.set('mode', cleanMode);
         const recentParam = buildRecentRadioParam(cur?.id || '');
         if (recentParam) params.set('recent', recentParam);
-        const d = await api(`/api/web/radio?${params.toString()}`);
+        const d = await api(`/api/web/radio?${params.toString()}`, {
+          signal: ctrl ? ctrl.signal : undefined,
+        });
         if (reqToken !== state.radioReqToken) return;
         const recs = cacheTracks(d.tracks || []);
         const nowCur = currentTrack();
         const curId = nowCur?.id;
-        const filtered = curId ? recs.filter((r) => r.id !== curId) : recs;
+        const seenIds = new Set(curId ? [curId] : []);
+        const filtered = [];
+        for (const r of recs) {
+          if (r && r.id && !seenIds.has(r.id)) {
+            seenIds.add(r.id);
+            filtered.push(r);
+          }
+        }
         if (!filtered.length) {
           showToast('No matching upcoming tracks found');
           return;
@@ -5736,6 +5755,9 @@
           showToast(e.message);
         }
       } finally {
+        if (state.upcomingModeAbortController === ctrl) {
+          state.upcomingModeAbortController = null;
+        }
         if (state.radioInFlight === run) {
           state.radioInFlight = null;
         }

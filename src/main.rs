@@ -382,7 +382,10 @@ async fn main() -> models::AppResult<()> {
             put(navidrome::update_radio).delete(navidrome::delete_radio),
         )
         .route("/api/user", get(navidrome::list_users))
-        .route("/api/user/{id}", put(navidrome::update_user))
+        .route(
+            "/api/user/{id}",
+            get(navidrome::get_user).put(navidrome::update_user),
+        )
         .route("/api/keepalive/keepalive", get(navidrome::keepalive))
         // Administrator panel (gated by ADMIN_USERNAME at the API layer).
         // Every tab has its own path so it can be bookmarked, shared and

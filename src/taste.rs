@@ -5134,6 +5134,7 @@ struct RadioScope {
     topic_key: Option<&'static str>,
     genres: Vec<String>,
     artists: HashSet<String>,
+    related_artists: HashSet<String>,
 }
 
 impl RadioScope {
@@ -5170,6 +5171,17 @@ impl RadioScope {
                 .collect();
         }
         scope.genres = genres;
+
+        // Track on-scope related artists from the seed's radio neighborhood so
+        // untagged tracks (e.g. YTM) from those same artists can still qualify.
+        for t in sims {
+            if !scope.is_off_topic_or_clashing(t) {
+                let ak = slug(&primary_artist(&t.artist));
+                if !ak.is_empty() {
+                    scope.related_artists.insert(ak);
+                }
+            }
+        }
         scope
     }
 
@@ -5226,6 +5238,15 @@ impl RadioScope {
         scope
     }
 
+    fn record_related_artist(&mut self, t: &Track) {
+        if !self.is_off_topic_or_clashing(t) {
+            let ak = slug(&primary_artist(&t.artist));
+            if !ak.is_empty() {
+                self.related_artists.insert(ak);
+            }
+        }
+    }
+
     fn is_off_topic_or_clashing(&self, t: &Track) -> bool {
         if let Some(topic) = self.topic_key {
             return !track_matches_topic(t, topic);
@@ -5238,13 +5259,15 @@ impl RadioScope {
             return track_matches_topic(t, topic);
         }
         let pa = slug(&primary_artist(&t.artist));
+        let in_neighborhood = !pa.is_empty()
+            && (self.artists.contains(&pa) || self.related_artists.contains(&pa));
         if !self.genres.is_empty() {
             if has_genre_clash(t, "", &self.genres) {
                 return false;
             }
-            return !split_genres(&t.genre).is_empty() || (!pa.is_empty() && self.artists.contains(&pa));
+            return !split_genres(&t.genre).is_empty() || in_neighborhood;
         }
-        !pa.is_empty() && self.artists.contains(&pa)
+        in_neighborhood
     }
 }
 
@@ -5255,22 +5278,37 @@ impl TasteEngine {
         sctx: &ScoringContext,
         scope: &RadioScope,
         exclude_ids: &HashSet<String>,
+        exclude_keys: &HashSet<String>,
         want_familiar: bool,
         count: usize,
     ) -> Vec<Track> {
-        let primary = if want_familiar {
-            self.for_you_tracks(user_id, (count * 5).max(80))
+        let mut primary = if want_familiar {
+            let mut fam_pool = self.for_you_tracks(user_id, (count * 5).max(90));
+            if user_id > 0 {
+                for (t, _) in self.store.starred_tracks(user_id).unwrap_or_default() {
+                    fam_pool.push(t);
+                }
+                for (t, _) in self
+                    .store
+                    .user_frequent_tracks(user_id, 120, 0)
+                    .unwrap_or_default()
+                {
+                    fam_pool.push(t);
+                }
+            }
+            fam_pool
         } else {
-            self.discover_weekly(user_id, (count * 5).max(80))
+            self.discover_weekly(user_id, (count * 5).max(90))
         };
         let catalog = self
             .store
-            .candidate_tracks_for_user(user_id, 600)
+            .candidate_tracks_for_user(user_id, 1800)
             .unwrap_or_default();
-        let mut seen = HashSet::new();
+        let mut seen_ids = HashSet::new();
+        let mut seen_keys = exclude_keys.clone();
         let mut out = Vec::new();
-        for t in primary.into_iter().chain(catalog) {
-            if exclude_ids.contains(&t.id) || !seen.insert(t.id.clone()) {
+        for t in primary.drain(..).chain(catalog) {
+            if exclude_ids.contains(&t.id) || !seen_ids.insert(t.id.clone()) {
                 continue;
             }
             if is_strongly_disliked(&t, &sctx.prof, &sctx.stats) {
@@ -5282,12 +5320,137 @@ impl TasteEngine {
             if !scope.matches_external_candidate(&t) {
                 continue;
             }
+            if !seen_keys.insert(t.song_key()) {
+                continue;
+            }
             out.push(t);
-            if out.len() >= count * 3 {
+            if out.len() >= count * 4 {
                 break;
             }
         }
         out
+    }
+
+    fn resolve_excluded_song_keys(&self, exclude_ids: &HashSet<String>) -> HashSet<String> {
+        if exclude_ids.is_empty() {
+            return HashSet::new();
+        }
+        let ids: Vec<String> = exclude_ids.iter().take(120).cloned().collect();
+        self.store
+            .get_tracks_by_ids(&ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.song_key())
+            .collect()
+    }
+
+    /// Expands a radio candidate pool via up to 2 parallel live-radio hop rounds
+    /// on distinct on-scope related artists until the pool has enough artist-diverse
+    /// candidates (unheard-only for Discover, or all eligible for Default/Familiar)
+    /// to fill `target_count` after `dedup_and_interleave(..., 2)`.
+    async fn expand_radio_pool_with_hops(
+        &self,
+        scope: &mut RadioScope,
+        sctx: &ScoringContext,
+        pool: &mut Vec<Track>,
+        fallback_seed_pool: &[Track],
+        seen_ids: &mut HashSet<String>,
+        seen_keys: &mut HashSet<String>,
+        hopped_artists: &mut HashSet<String>,
+        unheard_only: bool,
+        target_count: usize,
+    ) {
+        let capacity_of = |items: &[Track]| -> usize {
+            if unheard_only {
+                let unheard: Vec<Track> = items
+                    .iter()
+                    .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .cloned()
+                    .collect();
+                interleaved_capacity(&unheard, target_count, 2)
+            } else {
+                interleaved_capacity(items, target_count, 2)
+            }
+        };
+
+        for _round in 0..2 {
+            if capacity_of(pool) >= target_count {
+                break;
+            }
+
+            let mut hop_seeds: Vec<Track> = Vec::new();
+            // For Discover, prefer hopping from unheard related-artist tracks first
+            // so the next radio neighborhood skews toward fresh discoveries.
+            if unheard_only {
+                for t in pool.iter() {
+                    if is_familiar_track(t, &sctx.prof, &sctx.stats)
+                        || scope.is_off_topic_or_clashing(t)
+                    {
+                        continue;
+                    }
+                    let ak = slug(&primary_artist(&t.artist));
+                    if !ak.is_empty() && hopped_artists.insert(ak) {
+                        hop_seeds.push(t.clone());
+                        if hop_seeds.len() >= 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if hop_seeds.len() < 2 {
+                for t in pool.iter().chain(fallback_seed_pool.iter()) {
+                    if scope.is_off_topic_or_clashing(t) {
+                        continue;
+                    }
+                    let ak = slug(&primary_artist(&t.artist));
+                    if !ak.is_empty() && hopped_artists.insert(ak) {
+                        hop_seeds.push(t.clone());
+                        if hop_seeds.len() >= 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if hop_seeds.is_empty() {
+                break;
+            }
+
+            let per_hop = (target_count * 2).max(24);
+            let futs = hop_seeds.into_iter().map(|hs| async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    self.similar_songs_async(&hs, per_hop),
+                )
+                .await
+                .unwrap_or_default()
+            });
+            let batches = futures::future::join_all(futs).await;
+            let mut added_any = false;
+            for batch in batches {
+                for t in batch {
+                    if scope.is_off_topic_or_clashing(&t)
+                        || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                    {
+                        continue;
+                    }
+                    if seen_ids.contains(&t.id) {
+                        continue;
+                    }
+                    let key = t.song_key();
+                    if seen_keys.contains(&key) {
+                        continue;
+                    }
+                    seen_ids.insert(t.id.clone());
+                    seen_keys.insert(key);
+                    scope.record_related_artist(&t);
+                    pool.push(t);
+                    added_any = true;
+                }
+            }
+            if !added_any {
+                break;
+            }
+        }
     }
 
     pub async fn recommend_for_playlist(
@@ -5405,7 +5568,7 @@ impl TasteEngine {
         mode: RadioMode,
     ) -> Vec<Track> {
         let recs = self
-            .recommend_for_playlist(user_id, playlist_id, count * 2)
+            .recommend_for_playlist(user_id, playlist_id, (count * 3).max(48))
             .await;
         let pl = self.store.get_playlist(playlist_id).ok().flatten();
         let pl_tracks = self.store.playlist_tracks(playlist_id).unwrap_or_default();
@@ -5413,13 +5576,19 @@ impl TasteEngine {
             .as_ref()
             .map(|p| (p.name.as_str(), p.comment.as_str()))
             .unwrap_or(("", ""));
-        let scope = RadioScope::from_playlist(pl_name, pl_comment, &pl_tracks);
+        let mut scope = RadioScope::from_playlist(pl_name, pl_comment, &pl_tracks);
         let sctx = self.build_scoring_context(user_id);
         let recent_penalties = self.build_recent_heard_penalties(user_id, &sctx, client_recent);
+        let excluded_keys = self.resolve_excluded_song_keys(exclude_ids);
 
         let mut familiar: Vec<Track> = pl_tracks
-            .into_iter()
-            .filter(|t| !exclude_ids.contains(&t.id) && !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
+            .iter()
+            .filter(|t| {
+                !exclude_ids.contains(&t.id)
+                    && !excluded_keys.contains(&t.song_key())
+                    && !is_strongly_disliked(t, &sctx.prof, &sctx.stats)
+            })
+            .cloned()
             .collect();
         familiar.sort_by(|a, b| {
             let sa = score_track_core(a, &sctx.prof, &sctx.stats, ScoreMode::Supermix)
@@ -5431,9 +5600,10 @@ impl TasteEngine {
 
         let mut fresh_scored: Vec<(f64, Track)> = recs
             .into_iter()
-            .filter(|t| !exclude_ids.contains(&t.id))
+            .filter(|t| !exclude_ids.contains(&t.id) && !excluded_keys.contains(&t.song_key()))
             .enumerate()
             .map(|(idx, t)| {
+                scope.record_related_artist(&t);
                 let order_prior = -(idx as f64) * 0.2;
                 let fam_adj = if mode == RadioMode::Discover
                     && is_familiar_track(&t, &sctx.prof, &sctx.stats)
@@ -5450,62 +5620,105 @@ impl TasteEngine {
         let fresh: Vec<Track> = fresh_scored.into_iter().map(|(_, t)| t).collect();
 
         let mut combined = Vec::new();
+        let mut seen_ids: HashSet<String> = exclude_ids.clone();
+        let mut seen_keys: HashSet<String> = excluded_keys.clone();
         match mode {
             RadioMode::Familiar => {
-                combined.extend(familiar);
-                if combined.len() < count {
-                    let mut seen: HashSet<String> = combined.iter().map(|t| t.id.clone()).collect();
-                    for t in self.scoped_external_candidates(
-                        user_id,
-                        &sctx,
-                        &scope,
-                        exclude_ids,
-                        true,
-                        count,
-                    ) {
-                        if seen.insert(t.id.clone()) {
-                            combined.push(t);
-                        }
-                    }
-                }
-                combined.extend(fresh);
-            }
-            RadioMode::Discover => {
-                let unheard_fresh: Vec<Track> = fresh
-                    .iter()
-                    .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
-                    .cloned()
-                    .collect();
-                let mut seen: HashSet<String> = HashSet::new();
-                for t in unheard_fresh {
-                    if seen.insert(t.id.clone()) {
+                for t in familiar {
+                    let key = t.song_key();
+                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
                         combined.push(t);
                     }
                 }
-                if combined.len() < count {
+                if interleaved_capacity(&combined, count, 2) < count {
                     for t in self.scoped_external_candidates(
                         user_id,
                         &sctx,
                         &scope,
-                        exclude_ids,
+                        &seen_ids,
+                        &seen_keys,
+                        true,
+                        count * 2,
+                    ) {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                            combined.push(t);
+                        }
+                    }
+                }
+                for t in fresh {
+                    let key = t.song_key();
+                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                        combined.push(t);
+                    }
+                }
+                if interleaved_capacity(&combined, count, 2) < count {
+                    let mut hopped = HashSet::new();
+                    self.expand_radio_pool_with_hops(
+                        &mut scope,
+                        &sctx,
+                        &mut combined,
+                        &pl_tracks,
+                        &mut seen_ids,
+                        &mut seen_keys,
+                        &mut hopped,
                         false,
                         count,
+                    )
+                    .await;
+                }
+            }
+            RadioMode::Discover => {
+                for t in fresh
+                    .iter()
+                    .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
+                {
+                    let key = t.song_key();
+                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                        combined.push(t.clone());
+                    }
+                }
+                // Expand via parallel live radio hops on diverse on-scope seeds whenever
+                // Discover doesn't yet have enough artist-diverse unheard tracks.
+                if interleaved_capacity(&combined, count, 2) < count {
+                    let mut hopped = HashSet::new();
+                    self.expand_radio_pool_with_hops(
+                        &mut scope,
+                        &sctx,
+                        &mut combined,
+                        &pl_tracks,
+                        &mut seen_ids,
+                        &mut seen_keys,
+                        &mut hopped,
+                        true,
+                        count,
+                    )
+                    .await;
+                    combined.retain(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats));
+                }
+                if interleaved_capacity(&combined, count, 2) < count {
+                    for t in self.scoped_external_candidates(
+                        user_id,
+                        &sctx,
+                        &scope,
+                        &seen_ids,
+                        &seen_keys,
+                        false,
+                        count * 2,
                     ) {
-                        if seen.insert(t.id.clone()) {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
                             combined.push(t);
                         }
                     }
                 }
-                if combined.len() < count {
-                    for t in fresh {
-                        if seen.insert(t.id.clone()) {
-                            combined.push(t);
-                        }
-                    }
-                }
-                if combined.len() < count {
-                    for t in familiar {
-                        if seen.insert(t.id.clone()) {
+                // Only fall back to familiar tracks if Discover found literally zero unheard tracks.
+                if combined.is_empty() {
+                    let mut fb_ids = exclude_ids.clone();
+                    let mut fb_keys = excluded_keys.clone();
+                    for t in fresh.into_iter().chain(familiar) {
+                        let key = t.song_key();
+                        if fb_ids.insert(t.id.clone()) && fb_keys.insert(key) {
                             combined.push(t);
                         }
                     }
@@ -5515,20 +5728,69 @@ impl TasteEngine {
                 // Interleave ~3 fresh discoveries per 1 familiar playlist track so radio feels cohesive yet new.
                 let mut fi = fresh.into_iter();
                 let mut ki = familiar.into_iter();
-                while combined.len() < count * 2 {
+                while combined.len() < count * 3 {
                     let mut pushed = false;
                     for _ in 0..3 {
                         if let Some(t) = fi.next() {
+                            let key = t.song_key();
+                            if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                                combined.push(t);
+                                pushed = true;
+                            }
+                        }
+                    }
+                    if let Some(t) = ki.next() {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
                             combined.push(t);
                             pushed = true;
                         }
                     }
-                    if let Some(t) = ki.next() {
-                        combined.push(t);
-                        pushed = true;
-                    }
                     if !pushed {
                         break;
+                    }
+                }
+                if interleaved_capacity(&combined, count, 2) < count {
+                    let mut hopped = HashSet::new();
+                    self.expand_radio_pool_with_hops(
+                        &mut scope,
+                        &sctx,
+                        &mut combined,
+                        &pl_tracks,
+                        &mut seen_ids,
+                        &mut seen_keys,
+                        &mut hopped,
+                        false,
+                        count,
+                    )
+                    .await;
+                }
+                if interleaved_capacity(&combined, count, 2) < count {
+                    for t in self
+                        .scoped_external_candidates(
+                            user_id,
+                            &sctx,
+                            &scope,
+                            &seen_ids,
+                            &seen_keys,
+                            false,
+                            count * 2,
+                        )
+                        .into_iter()
+                        .chain(self.scoped_external_candidates(
+                            user_id,
+                            &sctx,
+                            &scope,
+                            &seen_ids,
+                            &seen_keys,
+                            true,
+                            count,
+                        ))
+                    {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                            combined.push(t);
+                        }
                     }
                 }
             }
@@ -5540,22 +5802,25 @@ impl TasteEngine {
                     &sctx,
                     &scope,
                     exclude_ids,
+                    &excluded_keys,
                     false,
-                    count,
+                    count * 2,
                 ),
                 RadioMode::Familiar => self.scoped_external_candidates(
                     user_id,
                     &sctx,
                     &scope,
                     exclude_ids,
+                    &excluded_keys,
                     true,
-                    count,
+                    count * 2,
                 ),
                 RadioMode::Default => self
                     .for_you_tracks(user_id, (count * 5).max(80))
                     .into_iter()
                     .filter(|t| {
                         !exclude_ids.contains(&t.id)
+                            && !excluded_keys.contains(&t.song_key())
                             && ((scope.topic_key.is_none() && scope.genres.is_empty())
                                 || scope.matches_external_candidate(t))
                     })
@@ -5563,7 +5828,7 @@ impl TasteEngine {
             };
             return self.rank_fallback_with_recent(fallback, &recent_penalties, count);
         }
-        dedup_and_interleave(combined, count, 2)
+        dedup_and_interleave_fill(combined, count)
     }
 
     #[cfg(test)]
@@ -5597,17 +5862,31 @@ impl TasteEngine {
     ) -> Vec<Track> {
         let sctx = self.build_scoring_context(user_id);
         let recent_penalties = self.build_recent_heard_penalties(user_id, &sctx, client_recent);
+        let excluded_keys = self.resolve_excluded_song_keys(exclude_ids);
 
         if let Some(s) = seed {
-            let sims = self.similar_songs_async(s, (count * 2).max(20)).await;
-            let scope = RadioScope::from_seed(s, &sims);
+            let sims = self.similar_songs_async(s, (count * 2).max(24)).await;
+            let mut scope = RadioScope::from_seed(s, &sims);
             let mut filtered: Vec<Track> = Vec::new();
             let mut seen_ids: HashSet<String> = exclude_ids.clone();
+            let mut seen_keys: HashSet<String> = excluded_keys.clone();
             seen_ids.insert(s.id.clone());
+            seen_keys.insert(s.song_key());
+
             for t in &sims {
-                if seen_ids.insert(t.id.clone()) {
-                    filtered.push(t.clone());
+                if is_strongly_disliked(t, &sctx.prof, &sctx.stats) {
+                    continue;
                 }
+                if seen_ids.contains(&t.id) {
+                    continue;
+                }
+                let key = t.song_key();
+                if seen_keys.contains(&key) {
+                    continue;
+                }
+                seen_ids.insert(t.id.clone());
+                seen_keys.insert(key);
+                filtered.push(t.clone());
             }
 
             if scope.topic_key.is_some() || !scope.genres.is_empty() {
@@ -5621,33 +5900,26 @@ impl TasteEngine {
                 }
             }
 
-            // If exclusions consumed most of the seed artist's direct radio, chain 1 hop
-            // via a related artist track so autoplay stays on-vibe instead of jumping genres.
-            if filtered.len() < count {
-                let seed_artist = slug(&primary_artist(&s.artist));
-                let hop_seed = filtered
-                    .iter()
-                    .find(|t| {
-                        slug(&primary_artist(&t.artist)) != seed_artist
-                            && !scope.is_off_topic_or_clashing(t)
-                    })
-                    .or_else(|| {
-                        sims.iter().find(|t| {
-                            t.id != s.id
-                                && slug(&primary_artist(&t.artist)) != seed_artist
-                                && !scope.is_off_topic_or_clashing(t)
-                        })
-                    })
-                    .cloned();
-                if let Some(next_seed) = hop_seed {
-                    let hop_sims = self.similar_songs_async(&next_seed, (count * 2).max(20)).await;
-                    for t in hop_sims {
-                        if !scope.is_off_topic_or_clashing(&t) && seen_ids.insert(t.id.clone()) {
-                            filtered.push(t);
-                        }
-                    }
-                }
+            // Expand via parallel live radio hops on distinct related artists whenever the
+            // mode-specific eligible pool doesn't yet have enough artist-diverse tracks to
+            // fill `count` (crucial for Discover, where familiar tracks are stripped out).
+            let mut hopped_artists = HashSet::new();
+            let seed_artist = slug(&primary_artist(&s.artist));
+            if !seed_artist.is_empty() {
+                hopped_artists.insert(seed_artist);
             }
+            self.expand_radio_pool_with_hops(
+                &mut scope,
+                &sctx,
+                &mut filtered,
+                &sims,
+                &mut seen_ids,
+                &mut seen_keys,
+                &mut hopped_artists,
+                mode == RadioMode::Discover,
+                count,
+            )
+            .await;
 
             if mode == RadioMode::Familiar {
                 for t in self.scoped_external_candidates(
@@ -5655,10 +5927,39 @@ impl TasteEngine {
                     &sctx,
                     &scope,
                     &seen_ids,
+                    &seen_keys,
                     true,
-                    count,
+                    count * 2,
                 ) {
-                    if seen_ids.insert(t.id.clone()) {
+                    let key = t.song_key();
+                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                        filtered.push(t);
+                    }
+                }
+            } else if mode == RadioMode::Default && interleaved_capacity(&filtered, count, 2) < count {
+                for t in self
+                    .scoped_external_candidates(
+                        user_id,
+                        &sctx,
+                        &scope,
+                        &seen_ids,
+                        &seen_keys,
+                        false,
+                        count * 2,
+                    )
+                    .into_iter()
+                    .chain(self.scoped_external_candidates(
+                        user_id,
+                        &sctx,
+                        &scope,
+                        &seen_ids,
+                        &seen_keys,
+                        true,
+                        count,
+                    ))
+                {
+                    let key = t.song_key();
+                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
                         filtered.push(t);
                     }
                 }
@@ -5666,28 +5967,27 @@ impl TasteEngine {
 
             if !filtered.is_empty() {
                 if user_id <= 0 && recent_penalties.is_empty() && mode == RadioMode::Default {
-                    return dedup_and_interleave(filtered, count, 2);
+                    return dedup_and_interleave_fill(filtered, count);
                 }
-                let mut eligible: Vec<Track> = filtered
-                    .into_iter()
-                    .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
-                    .collect();
+                let mut eligible = filtered;
                 if mode == RadioMode::Discover {
                     let mut unheard: Vec<Track> = eligible
                         .iter()
                         .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
                         .cloned()
                         .collect();
-                    if unheard.len() < count {
+                    if interleaved_capacity(&unheard, count, 2) < count {
                         for t in self.scoped_external_candidates(
                             user_id,
                             &sctx,
                             &scope,
                             &seen_ids,
+                            &seen_keys,
                             false,
-                            count,
+                            count * 2,
                         ) {
-                            if seen_ids.insert(t.id.clone()) {
+                            let key = t.song_key();
+                            if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
                                 unheard.push(t);
                             }
                         }
@@ -5746,7 +6046,7 @@ impl TasteEngine {
                 if !scored.is_empty() {
                     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
-                    return dedup_and_interleave(ranked, count, 2);
+                    return dedup_and_interleave_fill(ranked, count);
                 }
             }
             let scoped_fallback: Vec<Track> = match mode {
@@ -5755,22 +6055,26 @@ impl TasteEngine {
                     &sctx,
                     &scope,
                     exclude_ids,
+                    &excluded_keys,
                     false,
-                    count,
+                    count * 2,
                 ),
                 RadioMode::Familiar => self.scoped_external_candidates(
                     user_id,
                     &sctx,
                     &scope,
                     exclude_ids,
+                    &excluded_keys,
                     true,
-                    count,
+                    count * 2,
                 ),
                 RadioMode::Default => self
                     .for_you_tracks(user_id, (count * 5).max(80))
                     .into_iter()
                     .filter(|t| {
-                        !exclude_ids.contains(&t.id) && scope.matches_external_candidate(t)
+                        !exclude_ids.contains(&t.id)
+                            && !excluded_keys.contains(&t.song_key())
+                            && scope.matches_external_candidate(t)
                     })
                     .collect(),
             };
@@ -5779,23 +6083,106 @@ impl TasteEngine {
             }
         }
         let picks: Vec<Track> = match mode {
-            RadioMode::Discover => self.discover_weekly(user_id, count * 2),
-            RadioMode::Familiar => {
-                let mut fam: Vec<Track> = self
-                    .for_you_tracks(user_id, count * 3)
+            RadioMode::Discover => {
+                let mut disc: Vec<Track> = self
+                    .discover_weekly(user_id, (count * 4).max(72))
                     .into_iter()
-                    .filter(|t| is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .filter(|t| {
+                        !exclude_ids.contains(&t.id) && !excluded_keys.contains(&t.song_key())
+                    })
                     .collect();
-                if fam.is_empty() {
-                    fam = self.for_you_tracks(user_id, count * 2);
+                if interleaved_capacity(&disc, count, 2) < count {
+                    let mut seen_ids: HashSet<String> = exclude_ids.clone();
+                    let mut seen_keys: HashSet<String> = excluded_keys.clone();
+                    for t in &disc {
+                        seen_ids.insert(t.id.clone());
+                        seen_keys.insert(t.song_key());
+                    }
+                    let extra = self
+                        .store
+                        .candidate_tracks_for_user(user_id, 1800)
+                        .unwrap_or_default();
+                    let mut extra_scored: Vec<(f64, Track)> = extra
+                        .into_iter()
+                        .filter(|t| {
+                            !seen_ids.contains(&t.id)
+                                && !seen_keys.contains(&t.song_key())
+                                && !is_familiar_track(t, &sctx.prof, &sctx.stats)
+                                && !is_strongly_disliked(t, &sctx.prof, &sctx.stats)
+                        })
+                        .map(|t| {
+                            let s = score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Discover);
+                            (s, t)
+                        })
+                        .collect();
+                    extra_scored.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    for (_, t) in extra_scored {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                            disc.push(t);
+                            if disc.len() >= count * 4 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                disc
+            }
+            RadioMode::Familiar => {
+                let mut seen_ids: HashSet<String> = exclude_ids.clone();
+                let mut seen_keys: HashSet<String> = excluded_keys.clone();
+                let mut fam: Vec<Track> = Vec::new();
+                let base_for_you = self.for_you_tracks(user_id, (count * 4).max(72));
+                for t in base_for_you
+                    .iter()
+                    .filter(|t| is_familiar_track(t, &sctx.prof, &sctx.stats))
+                {
+                    let key = t.song_key();
+                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                        fam.push(t.clone());
+                    }
+                }
+                if user_id > 0 && interleaved_capacity(&fam, count, 2) < count {
+                    for (t, _) in self
+                        .store
+                        .starred_tracks(user_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain(
+                            self.store
+                                .user_frequent_tracks(user_id, 120, 0)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(t, _)| (t, 0)),
+                        )
+                    {
+                        if is_strongly_disliked(&t, &sctx.prof, &sctx.stats) {
+                            continue;
+                        }
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                            fam.push(t);
+                        }
+                    }
+                }
+                if interleaved_capacity(&fam, count, 2) < count {
+                    for t in base_for_you {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                            fam.push(t);
+                        }
+                    }
                 }
                 fam
             }
-            RadioMode::Default => self.for_you_tracks(user_id, count * 2),
-        }
-        .into_iter()
-        .filter(|t| !exclude_ids.contains(&t.id))
-        .collect();
+            RadioMode::Default => self
+                .for_you_tracks(user_id, (count * 4).max(72))
+                .into_iter()
+                .filter(|t| !exclude_ids.contains(&t.id) && !excluded_keys.contains(&t.song_key()))
+                .collect(),
+        };
         self.rank_fallback_with_recent(picks, &recent_penalties, count)
     }
 
@@ -5806,7 +6193,7 @@ impl TasteEngine {
         count: usize,
     ) -> Vec<Track> {
         if picks.is_empty() || recent_penalties.is_empty() {
-            return dedup_and_interleave(picks, count, 2);
+            return dedup_and_interleave_fill(picks, count);
         }
         let total = picks.len().max(1) as f64;
         let mut scored: Vec<(f64, Track)> = picks
@@ -5819,7 +6206,7 @@ impl TasteEngine {
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
-        dedup_and_interleave(ranked, count, 2)
+        dedup_and_interleave_fill(ranked, count)
     }
 
     fn build_recent_heard_penalties(
@@ -9452,7 +9839,9 @@ fn is_familiar_track(
     let st = stats.get(&t.id).copied().unwrap_or_default();
     let key = t.song_key();
     st.play_count > 0
+        || prof.played_song_keys.get(&key).copied().unwrap_or(0) > 0
         || prof.starred.contains(&t.id)
+        || prof.starred_song_keys.contains(&key)
         || prof.playlist_track_counts.get(&t.id).copied().unwrap_or(0) > 0
         || prof.manual_playlist_song_keys.contains(&key)
         || prof.ratings.contains_key(&t.id)
@@ -9807,6 +10196,59 @@ fn score_against_centroid(t: &Track, c: &PlaylistCentroid) -> f64 {
 }
 
 /// Deduplicates tracks by `song_key()`, limits tracks per primary artist to `max_per_artist`
+/// Counts how many tracks will survive `dedup_and_interleave(tracks, limit, max_per_artist)`.
+/// Used by radio modes to decide whether more live radio hops or catalog fallbacks are needed
+/// BEFORE final ranking, avoiding short queues (e.g. Discover returning 8-9 instead of 18).
+fn interleaved_capacity(tracks: &[Track], limit: usize, max_per_artist: usize) -> usize {
+    if limit == 0 || max_per_artist == 0 {
+        return 0;
+    }
+    let mut seen_keys = HashSet::new();
+    let mut artist_counts: HashMap<String, usize> = HashMap::new();
+    let mut title_counts: HashSet<String> = HashSet::new();
+    let mut total = 0usize;
+    for t in tracks {
+        if !seen_keys.insert(t.song_key()) {
+            continue;
+        }
+        let tk = slug(&crate::models::core_song_title(&t.title));
+        if !tk.is_empty() && title_counts.contains(&tk) {
+            continue;
+        }
+        let ak = slug(&primary_artist(&t.artist));
+        let cnt = artist_counts.entry(ak).or_insert(0);
+        if *cnt >= max_per_artist {
+            continue;
+        }
+        *cnt += 1;
+        if !tk.is_empty() {
+            title_counts.insert(tk);
+        }
+        total += 1;
+        if total >= limit {
+            break;
+        }
+    }
+    total
+}
+
+/// Interleaves tracks with `max_per_artist = 2` for artist variety, relaxing to 3 (then 4)
+/// only if the pool has enough unique songs to fill `limit` but fewer distinct artists.
+fn dedup_and_interleave_fill(tracks: Vec<Track>, limit: usize) -> Vec<Track> {
+    if limit == 0 || tracks.is_empty() {
+        return vec![];
+    }
+    let strict = dedup_and_interleave(tracks.clone(), limit, 2);
+    if strict.len() >= limit || tracks.len() <= strict.len() {
+        return strict;
+    }
+    let relaxed = dedup_and_interleave(tracks.clone(), limit, 3);
+    if relaxed.len() >= limit || relaxed.len() == strict.len() {
+        return relaxed;
+    }
+    dedup_and_interleave(tracks, limit, 4)
+}
+
 /// (with an optional higher cap for an anchor artist), and interleaves artists using a lookahead
 /// cooldown window so identical artists never cluster back-to-back.
 fn dedup_and_interleave(tracks: Vec<Track>, limit: usize, max_per_artist: usize) -> Vec<Track> {
@@ -13624,6 +14066,169 @@ mod tests {
             "Playlist Discover Christmas radio leaked J-Pop: {:?}",
             pl_disc_ids
         );
+    }
+
+    #[tokio::test]
+    async fn default_familiar_and_discover_all_fill_18_tracks_even_with_heavy_listening_history() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("radio18", "pw").unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-radio18-{}", uuid::Uuid::new_v4()));
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str, artist: &str, genre: &str| Track {
+            id: id.into(),
+            source: "local".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: format!("{artist} Album"),
+            genre: genre.into(),
+            moods: "upbeat".into(),
+            duration: 210,
+            format: "flac".into(),
+            bitrate: 900,
+            ..Default::default()
+        };
+
+        let seed = mk("loc:seed", "Neon Drive", "Synth Artist 0", "Electronic");
+        let mut tracks = vec![seed.clone()];
+        // 20 familiar Electronic tracks across 10 artists (including a cross-source duplicate).
+        for i in 0..20 {
+            tracks.push(mk(
+                &format!("loc:fam-{i}"),
+                &format!("Familiar Track {i}"),
+                &format!("Synth Artist {}", (i % 10) + 1),
+                "Electronic",
+            ));
+        }
+        // Cross-source copy of Familiar Track 0 (same song_key, different ID) — Discover must skip it!
+        tracks.push(mk(
+            "loc:fam-0-alt",
+            "Familiar Track 0",
+            "Synth Artist 1",
+            "Electronic",
+        ));
+        // 22 unheard Electronic tracks across 8 artists (2-3 songs per artist).
+        for i in 0..22 {
+            tracks.push(mk(
+                &format!("loc:new-{i}"),
+                &format!("Fresh Discovery {i}"),
+                &format!("New Synth {}", (i % 8) + 1),
+                "Electronic",
+            ));
+        }
+        // Off-genre tracks that must NOT leak into Electronic radio.
+        for i in 0..10 {
+            tracks.push(mk(
+                &format!("loc:metal-{i}"),
+                &format!("Brutal Riff {i}"),
+                &format!("Metal Band {i}"),
+                "Heavy Metal",
+            ));
+        }
+        store.upsert_tracks(&tracks).unwrap();
+
+        for i in 0..20 {
+            let tid = format!("loc:fam-{i}");
+            taste.record_event(u.id, &tid, "play", 1.0);
+            taste.record_event(u.id, &tid, "complete", 1.0);
+            store.star_track(u.id, &tid).unwrap();
+        }
+        taste.mark_taste_dirty(u.id);
+
+        // 1. Track-seeded Default, Familiar, and Discover MUST all return 18 tracks.
+        let def = taste
+            .radio_next_tracks_with_mode(u.id, Some(&seed), &HashSet::new(), &[], 18, RadioMode::Default)
+            .await;
+        let fam = taste
+            .radio_next_tracks_with_mode(u.id, Some(&seed), &HashSet::new(), &[], 18, RadioMode::Familiar)
+            .await;
+        let disc = taste
+            .radio_next_tracks_with_mode(u.id, Some(&seed), &HashSet::new(), &[], 18, RadioMode::Discover)
+            .await;
+
+        assert_eq!(def.len(), 18, "Default should fill 18 upcoming tracks");
+        assert_eq!(fam.len(), 18, "Familiar should fill 18 upcoming tracks");
+        assert_eq!(disc.len(), 18, "Discover should fill 18 upcoming tracks");
+
+        // Discover must exclude familiar tracks, cross-source duplicates of familiar tracks, and Heavy Metal.
+        for t in &disc {
+            assert!(
+                !t.id.starts_with("loc:fam-"),
+                "Discover leaked familiar track (or cross-source dup): {}",
+                t.id
+            );
+            assert!(
+                !t.id.starts_with("loc:metal-"),
+                "Discover leaked off-genre track: {}",
+                t.id
+            );
+        }
+        // Familiar must surface familiar tracks at the top.
+        let fam_familiar_count = fam.iter().filter(|t| t.id.starts_with("loc:fam-")).count();
+        assert!(
+            fam_familiar_count >= 12,
+            "Familiar should prioritize familiar tracks, got {fam_familiar_count}"
+        );
+
+        // 2. Playlist-seeded Default, Familiar, and Discover MUST all return 18 tracks.
+        let pl = store
+            .create_playlist(
+                u.id,
+                "Synth Nights",
+                "Electronic vibes",
+                false,
+                &[seed.id.clone(), "loc:fam-0".into(), "loc:fam-1".into()],
+            )
+            .unwrap();
+        let excl = HashSet::from([seed.id.clone()]);
+        let pl_def = taste
+            .playlist_radio_tracks_with_mode(u.id, &pl.id, &excl, &[], 18, RadioMode::Default)
+            .await;
+        let pl_fam = taste
+            .playlist_radio_tracks_with_mode(u.id, &pl.id, &excl, &[], 18, RadioMode::Familiar)
+            .await;
+        let pl_disc = taste
+            .playlist_radio_tracks_with_mode(u.id, &pl.id, &excl, &[], 18, RadioMode::Discover)
+            .await;
+
+        assert_eq!(pl_def.len(), 18, "Playlist Default should fill 18 tracks");
+        assert_eq!(pl_fam.len(), 18, "Playlist Familiar should fill 18 tracks");
+        assert_eq!(pl_disc.len(), 18, "Playlist Discover should fill 18 tracks");
+        for t in &pl_disc {
+            assert!(
+                !t.id.starts_with("loc:fam-"),
+                "Playlist Discover leaked familiar track: {}",
+                t.id
+            );
+        }
+
+        // 3. Seedless (no active seed) Default, Familiar, and Discover MUST also fill 18 tracks.
+        let sl_def = taste
+            .radio_next_tracks_with_mode(u.id, None, &HashSet::new(), &[], 18, RadioMode::Default)
+            .await;
+        let sl_fam = taste
+            .radio_next_tracks_with_mode(u.id, None, &HashSet::new(), &[], 18, RadioMode::Familiar)
+            .await;
+        let sl_disc = taste
+            .radio_next_tracks_with_mode(u.id, None, &HashSet::new(), &[], 18, RadioMode::Discover)
+            .await;
+        assert_eq!(sl_def.len(), 18, "Seedless Default should fill 18 tracks");
+        assert_eq!(sl_fam.len(), 18, "Seedless Familiar should fill 18 tracks");
+        assert_eq!(sl_disc.len(), 18, "Seedless Discover should fill 18 tracks");
+        for t in &sl_disc {
+            assert!(
+                !t.id.starts_with("loc:fam-"),
+                "Seedless Discover leaked familiar track: {}",
+                t.id
+            );
+        }
     }
 
     #[test]

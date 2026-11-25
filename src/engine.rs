@@ -728,10 +728,14 @@ impl StreamEngine {
         };
 
         let safe_offset = sanitize_time_offset(time_offset);
+        // Avoid pointless up-transcoding of lossy streams when the requested
+        // maxBitRate already fits the source bitrate and no format/offset change
+        // was asked for — preserving original quality and HTTP Range seeking.
+        let needs_bitrate_cap = max_bitrate
+            .filter(|&b| b > 0)
+            .is_some_and(|cap| track.is_lossless() || track.bitrate <= 0 || track.bitrate > cap);
         let need_transcode = self.ffmpeg_available
-            && (safe_offset > 0.5
-                || want_fmt.is_some()
-                || max_bitrate.map(|b| b > 0).unwrap_or(false));
+            && (safe_offset > 0.5 || want_fmt.is_some() || needs_bitrate_cap);
 
         if need_transcode {
             let (fmt, br) = choose_transcode_params(

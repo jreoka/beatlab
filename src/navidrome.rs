@@ -1,6 +1,10 @@
 use crate::models::{AlbumSummary, ArtistSummary, PlayQueueState, Playlist, RadioStation, Track, User, UserTrackStats};
 use crate::store::SessionMeta;
-use crate::subsonic::{client_ip, user_agent, AppState};
+use crate::subsonic::{
+    adjust_auto_playlist_summary, client_ip, dedup_tracks_by_song_key, filter_visible_tracks,
+    hydrate_album_user_stats, hydrate_genre_tracks, refresh_user_mixes, resolve_genre_name,
+    unified_catalog_search, user_agent, AppState,
+};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -78,8 +82,9 @@ pub struct MoveTrackReq {
 pub struct SaveQueueReq {
     #[serde(default)]
     pub ids: Vec<String>,
+    /// Navidrome clients send either a track ID string or a 0-based numeric index here.
     #[serde(default)]
-    pub current: Option<String>,
+    pub current: Option<Value>,
     #[serde(default, rename = "currentId")]
     pub current_id: Option<String>,
     #[serde(default)]
@@ -141,6 +146,9 @@ pub fn require_nd_user(state: &AppState, headers: &HeaderMap) -> Result<User, Re
         return Err(json_err(StatusCode::UNAUTHORIZED, "Missing authorization token"));
     };
     if let Ok(Some(u)) = state.store.get_session_user(&token) {
+        state
+            .store
+            .touch_session(&token, &user_agent(headers), &client_ip(headers));
         return Ok(u);
     }
     if let Ok(Some(u)) = state.store.get_user_by_api_key(&token) {
@@ -260,21 +268,34 @@ fn iso_opt(ts: i64) -> Option<String> {
     })
 }
 
+fn iso_opt_or_now(ts: i64) -> String {
+    let effective = if ts > 0 { ts } else { Utc::now().timestamp() };
+    DateTime::<Utc>::from_timestamp(effective, 0)
+        .unwrap_or_default()
+        .to_rfc3339()
+}
+
 fn track_to_nd(
     t: &Track,
-    starred: bool,
+    starred_at: Option<i64>,
     stats: Option<&UserTrackStats>,
     rating: i32,
 ) -> Value {
     let st = stats.copied().unwrap_or_default();
+    let album_artist = {
+        let pa = crate::models::primary_artist(&t.artist);
+        if pa.is_empty() { t.artist.clone() } else { pa }
+    };
+    let starred = starred_at.is_some();
     json!({
         "id": t.id,
+        "libraryId": 1,
         "title": t.title,
         "album": t.album,
         "albumId": t.album_id(),
         "artist": t.artist,
         "artistId": t.artist_id(),
-        "albumArtist": crate::models::primary_artist(&t.artist),
+        "albumArtist": album_artist,
         "albumArtistId": t.artist_id(),
         "hasCoverArt": !t.cover_url.is_empty(),
         "trackNumber": t.track_no,
@@ -287,14 +308,16 @@ fn track_to_nd(
         "sampleRate": t.sample_rate,
         "bitDepth": t.bit_depth,
         "channels": 2,
+        "bpm": 0,
         "genre": t.genre,
         "genres": if t.genre.is_empty() { Value::Array(vec![]) } else { json!([{ "id": crate::models::slug(&t.genre), "name": t.genre }]) },
         "orderTitle": t.title.to_lowercase(),
         "orderAlbumName": t.album.to_lowercase(),
         "orderArtistName": t.artist.to_lowercase(),
+        "orderAlbumArtistName": album_artist.to_lowercase(),
         "compilation": false,
         "starred": starred,
-        "starredAt": if starred { iso_opt(t.created) } else { None },
+        "starredAt": starred_at.map(iso_opt_or_now),
         "playCount": st.play_count,
         "playDate": iso_opt(st.last_played),
         "rating": rating,
@@ -303,9 +326,11 @@ fn track_to_nd(
     })
 }
 
-fn album_to_nd(a: &AlbumSummary, saved: bool) -> Value {
+fn album_to_nd(a: &AlbumSummary, saved_at: Option<i64>, rating: i32) -> Value {
+    let saved = saved_at.is_some();
     json!({
         "id": a.id,
+        "libraryId": 1,
         "name": a.name,
         "albumArtist": a.artist,
         "albumArtistId": a.artist_id,
@@ -316,24 +341,35 @@ fn album_to_nd(a: &AlbumSummary, saved: bool) -> Value {
         "minYear": a.year,
         "songCount": a.song_count,
         "duration": a.duration as f64,
+        "size": 0,
         "playCount": a.play_count,
         "playDate": iso_opt(a.last_played),
+        "rating": rating,
         "starred": saved,
+        "starredAt": saved_at.map(iso_opt_or_now),
         "genre": a.genre,
         "genres": if a.genre.is_empty() { Value::Array(vec![]) } else { json!([{ "id": crate::models::slug(&a.genre), "name": a.genre }]) },
+        "orderAlbumName": a.name.to_lowercase(),
+        "orderArtistName": a.artist.to_lowercase(),
+        "orderAlbumArtistName": a.artist.to_lowercase(),
         "compilation": false,
         "createdAt": iso_opt(a.created),
         "updatedAt": iso_opt(a.created),
     })
 }
 
-fn artist_to_nd(a: &ArtistSummary, followed: bool) -> Value {
+fn artist_to_nd(a: &ArtistSummary, followed_at: Option<i64>) -> Value {
+    let followed = followed_at.is_some();
     json!({
         "id": a.id,
+        "libraryId": 1,
         "name": a.name,
+        "orderArtistName": a.name.to_lowercase(),
         "albumCount": a.album_count,
         "songCount": a.song_count,
+        "biography": a.bio,
         "starred": followed,
+        "starredAt": followed_at.map(iso_opt_or_now),
         "smallImageUrl": a.cover_url,
         "mediumImageUrl": a.cover_url,
         "largeImageUrl": a.cover_url,
@@ -357,6 +393,36 @@ fn playlist_to_nd(p: &Playlist) -> Value {
     })
 }
 
+fn radio_to_nd(s: &RadioStation) -> Value {
+    json!({
+        "id": s.id,
+        "name": s.name,
+        "streamUrl": s.stream_url,
+        "homePageUrl": s.home_page_url,
+    })
+}
+
+fn album_ratings_map(state: &AppState, ratings: &HashMap<String, i32>) -> HashMap<String, i32> {
+    if ratings.is_empty() {
+        return HashMap::new();
+    }
+    let mut accum: HashMap<String, (i64, i64)> = HashMap::new();
+    for (tid, &r) in ratings {
+        if r <= 0 {
+            continue;
+        }
+        if let Ok(Some(t)) = state.store.get_track(tid) {
+            let e = accum.entry(t.album_id()).or_insert((0, 0));
+            e.0 += r as i64;
+            e.1 += 1;
+        }
+    }
+    accum
+        .into_iter()
+        .map(|(aid, (sum, cnt))| (aid, ((sum as f64 / cnt.max(1) as f64).round() as i32).clamp(0, 5)))
+        .collect()
+}
+
 pub async fn list_songs(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
@@ -368,24 +434,63 @@ pub async fn list_songs(
     };
     let q = parse_query(raw.as_deref());
     let (start, count) = slice_params(&q, 50);
-    let starred = state.store.starred_ids(user.id).unwrap_or_default();
+    let starred = state.store.starred_at_map(user.id).unwrap_or_default();
     let stats = state.store.track_stats_map(user.id).unwrap_or_default();
     let ratings = state.store.user_ratings(user.id).unwrap_or_default();
+    let only_starred = q.get("starred").map(|v| v == "true").unwrap_or(false);
 
     let mut list: Vec<Track> = if let Some(aid) = q.get("album_id").filter(|s| !s.is_empty()) {
-        state.store.album_tracks(aid).unwrap_or_default()
-    } else if let Some(arid) = q.get("artist_id").filter(|s| !s.is_empty()) {
-        state.store.artist_tracks(arid).unwrap_or_default()
+        if let Some((_, tracks)) = state.taste.get_or_hydrate_album(aid).await {
+            tracks
+        } else {
+            state.store.album_tracks(aid).unwrap_or_default()
+        }
+    } else if let Some(arid) = q
+        .get("artist_id")
+        .or_else(|| q.get("album_artist_id"))
+        .filter(|s| !s.is_empty())
+    {
+        let mut tracks = Vec::new();
+        if let Some((_, top, _, _)) = state.taste.get_or_hydrate_artist(arid, user.id).await {
+            tracks.extend(top);
+        }
+        tracks.extend(state.store.artist_tracks(arid).unwrap_or_default());
+        dedup_tracks_by_song_key(tracks)
     } else if let Some(term) = q.get("title").or_else(|| q.get("q")).filter(|s| !s.is_empty()) {
-        state.store.search_tracks(term, 300, 0).unwrap_or_default()
-    } else if let Some(g) = q.get("genre").or_else(|| q.get("genre_id")).filter(|s| !s.is_empty()) {
-        state.store.tracks_by_genre(g, 300, 0).unwrap_or_default()
+        unified_catalog_search(&state, user.id, term).await.0
+    } else if let Some(g) = q
+        .get("genre")
+        .or_else(|| q.get("genre_id"))
+        .filter(|s| !s.is_empty())
+    {
+        hydrate_genre_tracks(&state, user.id, g, 300, 0).await
+    } else if only_starred {
+        state
+            .store
+            .starred_tracks(user.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
     } else {
-        state.store.all_tracks(1000, 0).unwrap_or_default()
+        filter_visible_tracks(
+            &state,
+            user.id,
+            state.store.all_tracks(1000, 0).unwrap_or_default(),
+        )
     };
 
-    if q.get("starred").map(|v| v == "true").unwrap_or(false) {
-        list.retain(|t| starred.contains(&t.id));
+    if only_starred {
+        list.retain(|t| starred.contains_key(&t.id));
+    }
+    if q.get("has_rating").map(|v| v == "true").unwrap_or(false) {
+        list.retain(|t| ratings.get(&t.id).copied().unwrap_or(0) > 0);
+    }
+    if let Some(min_r) = q.get("rating").and_then(|s| s.parse::<i32>().ok()).filter(|&r| r > 0) {
+        list.retain(|t| ratings.get(&t.id).copied().unwrap_or(0) >= min_r);
+    }
+    if let Some(yr) = q.get("year").and_then(|s| s.parse::<i32>().ok()).filter(|&y| y > 0) {
+        list.retain(|t| t.year == yr);
     }
 
     let sort = q.get("_sort").map(|s| s.as_str()).unwrap_or("");
@@ -395,13 +500,39 @@ pub async fn list_songs(
         .unwrap_or(false);
     match sort {
         "title" => list.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
-        "artist" => list.sort_by(|a, b| a.artist.to_lowercase().cmp(&b.artist.to_lowercase())),
-        "album" => list.sort_by(|a, b| a.album.to_lowercase().cmp(&b.album.to_lowercase())),
+        "artist" | "album_artist" => {
+            list.sort_by(|a, b| a.artist.to_lowercase().cmp(&b.artist.to_lowercase()))
+        }
+        "album" => list.sort_by(|a, b| {
+            a.album
+                .to_lowercase()
+                .cmp(&b.album.to_lowercase())
+                .then_with(|| a.disc_no.cmp(&b.disc_no))
+                .then_with(|| a.track_no.cmp(&b.track_no))
+        }),
+        "track" | "disc_number" => list.sort_by(|a, b| {
+            a.disc_no
+                .cmp(&b.disc_no)
+                .then_with(|| a.track_no.cmp(&b.track_no))
+                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        }),
+        "duration" => list.sort_by_key(|t| t.duration),
+        "year" => list.sort_by_key(|t| t.year),
+        "rating" => list.sort_by_key(|t| ratings.get(&t.id).copied().unwrap_or(0)),
         "play_count" => list.sort_by_key(|t| stats.get(&t.id).map(|s| s.play_count).unwrap_or(0)),
-        "play_date" => list.sort_by_key(|t| stats.get(&t.id).map(|s| s.last_played).unwrap_or(0)),
+        "play_date" | "recently_played" => {
+            list.sort_by_key(|t| stats.get(&t.id).map(|s| s.last_played).unwrap_or(0))
+        }
+        "recently_added" | "created_at" => list.sort_by_key(|t| t.created),
+        "starred_at" => list.sort_by_key(|t| starred.get(&t.id).copied().unwrap_or(0)),
+        "random" => {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            list.shuffle(&mut rng);
+        }
         _ => {}
     }
-    if desc && !sort.is_empty() {
+    if desc && !sort.is_empty() && sort != "random" {
         list.reverse();
     }
 
@@ -413,7 +544,7 @@ pub async fn list_songs(
         .map(|t| {
             track_to_nd(
                 &t,
-                starred.contains(&t.id),
+                starred.get(&t.id).copied(),
                 stats.get(&t.id),
                 ratings.get(&t.id).copied().unwrap_or(0),
             )
@@ -434,10 +565,10 @@ pub async fn get_song(
     let Some(t) = state.store.get_track(&id).ok().flatten() else {
         return json_err(StatusCode::NOT_FOUND, "Song not found");
     };
-    let starred = state.store.starred_ids(user.id).unwrap_or_default();
+    let starred = state.store.starred_at_map(user.id).unwrap_or_default();
     let stats = state.store.get_user_track_stats(user.id, &t.id).ok();
     let rating = state.store.user_ratings(user.id).ok().and_then(|m| m.get(&t.id).copied()).unwrap_or(0);
-    json_ok(track_to_nd(&t, starred.contains(&t.id), stats.as_ref(), rating), None)
+    json_ok(track_to_nd(&t, starred.get(&t.id).copied(), stats.as_ref(), rating), None)
 }
 
 pub async fn list_albums(
@@ -451,32 +582,93 @@ pub async fn list_albums(
     };
     let q = parse_query(raw.as_deref());
     let (start, count) = slice_params(&q, 50);
-    let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
-    let mut list = state.store.build_album_summaries(user.id).unwrap_or_default();
+    let saved = state.store.saved_album_at_map(user.id).unwrap_or_default();
+    let ratings = state.store.user_ratings(user.id).unwrap_or_default();
+    let album_ratings = album_ratings_map(&state, &ratings);
 
-    if let Some(term) = q.get("name").or_else(|| q.get("q")).filter(|s| !s.is_empty()) {
-        let low = term.to_lowercase();
-        list.retain(|a| a.name.to_lowercase().contains(&low) || a.artist.to_lowercase().contains(&low));
-    }
-    if let Some(arid) = q.get("artist_id").filter(|s| !s.is_empty()) {
-        list.retain(|a| &a.artist_id == arid);
+    let mut list: Vec<AlbumSummary> = if let Some(arid) = q
+        .get("artist_id")
+        .or_else(|| q.get("album_artist_id"))
+        .filter(|s| !s.is_empty())
+    {
+        if let Some((_, _, mut albums, _)) = state.taste.get_or_hydrate_artist(arid, user.id).await {
+            let user_stats: HashMap<String, (i64, i64)> = state
+                .store
+                .build_album_summaries(user.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| (a.id, (a.play_count, a.last_played)))
+                .collect();
+            for a in &mut albums {
+                if let Some(&(pc, lp)) = user_stats.get(&a.id) {
+                    if a.play_count == 0 {
+                        a.play_count = pc;
+                    }
+                    if a.last_played == 0 {
+                        a.last_played = lp;
+                    }
+                }
+            }
+            albums
+        } else {
+            state
+                .store
+                .build_album_summaries(user.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| &a.artist_id == arid)
+                .collect()
+        }
+    } else if let Some(term) = q.get("name").or_else(|| q.get("q")).filter(|s| !s.is_empty()) {
+        unified_catalog_search(&state, user.id, term).await.1
+    } else {
+        state.store.build_album_summaries(user.id).unwrap_or_default()
+    };
+
+    if let Some(g) = q
+        .get("genre")
+        .or_else(|| q.get("genre_id"))
+        .filter(|s| !s.is_empty())
+    {
+        let resolved = resolve_genre_name(&state, g).to_lowercase();
+        list.retain(|a| a.genre.to_lowercase().contains(&resolved));
     }
     if q.get("starred").map(|v| v == "true").unwrap_or(false) {
-        list.retain(|a| saved.contains(&a.id));
+        list.retain(|a| saved.contains_key(&a.id));
+    }
+    if q.get("recently_played").map(|v| v == "true").unwrap_or(false) {
+        list.retain(|a| a.last_played > 0);
+    }
+    if q.get("has_rating").map(|v| v == "true").unwrap_or(false) {
+        list.retain(|a| album_ratings.get(&a.id).copied().unwrap_or(0) > 0);
     }
 
     let sort = q.get("_sort").map(|s| s.as_str()).unwrap_or("");
     let desc = q.get("_order").map(|o| o.eq_ignore_ascii_case("DESC")).unwrap_or(false);
     match sort {
         "name" => list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-        "artist" => list.sort_by(|a, b| a.artist.to_lowercase().cmp(&b.artist.to_lowercase())),
-        "max_year" => list.sort_by_key(|a| a.year),
+        "artist" | "album_artist" => list.sort_by(|a, b| {
+            a.artist
+                .to_lowercase()
+                .cmp(&b.artist.to_lowercase())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+        "max_year" | "min_year" | "year" => list.sort_by_key(|a| a.year),
         "play_count" => list.sort_by_key(|a| a.play_count),
-        "play_date" => list.sort_by_key(|a| a.last_played),
-        "recently_added" => list.sort_by_key(|a| a.created),
+        "play_date" | "recently_played" => list.sort_by_key(|a| a.last_played),
+        "recently_added" | "created_at" => list.sort_by_key(|a| (a.song_count > 0, a.created)),
+        "duration" => list.sort_by_key(|a| a.duration),
+        "song_count" => list.sort_by_key(|a| a.song_count),
+        "rating" => list.sort_by_key(|a| album_ratings.get(&a.id).copied().unwrap_or(0)),
+        "starred_at" => list.sort_by_key(|a| saved.get(&a.id).copied().unwrap_or(0)),
+        "random" => {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            list.shuffle(&mut rng);
+        }
         _ => {}
     }
-    if desc && !sort.is_empty() {
+    if desc && !sort.is_empty() && sort != "random" {
         list.reverse();
     }
 
@@ -486,8 +678,9 @@ pub async fn list_albums(
         .skip(start)
         .take(count)
         .map(|a| {
-            let is_saved = saved.contains(&a.id);
-            album_to_nd(&a, is_saved)
+            let saved_at = saved.get(&a.id).copied();
+            let r = album_ratings.get(&a.id).copied().unwrap_or(0);
+            album_to_nd(&a, saved_at, r)
         })
         .collect();
     json_ok(Value::Array(items), Some(total))
@@ -502,12 +695,25 @@ pub async fn get_album(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some((alb, _)) = state.taste.get_or_hydrate_album(&id).await else {
+    let Some((mut alb, tracks)) = state.taste.get_or_hydrate_album(&id).await else {
         return json_err(StatusCode::NOT_FOUND, "Album not found");
     };
-    let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
-    let is_saved = saved.contains(&alb.id);
-    json_ok(album_to_nd(&alb, is_saved), None)
+    let saved = state.store.saved_album_at_map(user.id).unwrap_or_default();
+    let stats = state.store.track_stats_map(user.id).unwrap_or_default();
+    let ratings = state.store.user_ratings(user.id).unwrap_or_default();
+    hydrate_album_user_stats(&mut alb, &tracks, &stats);
+    let rated_vals: Vec<i32> = tracks
+        .iter()
+        .filter_map(|t| ratings.get(&t.id).copied().filter(|&r| r > 0))
+        .collect();
+    let avg_rating = if rated_vals.is_empty() {
+        0
+    } else {
+        let sum: i64 = rated_vals.iter().map(|&r| r as i64).sum();
+        ((sum as f64 / rated_vals.len() as f64).round() as i32).clamp(0, 5)
+    };
+    let saved_at = saved.get(&alb.id).copied();
+    json_ok(album_to_nd(&alb, saved_at, avg_rating), None)
 }
 
 pub async fn list_artists(
@@ -521,15 +727,37 @@ pub async fn list_artists(
     };
     let q = parse_query(raw.as_deref());
     let (start, count) = slice_params(&q, 50);
-    let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
-    let mut list = state.store.build_artist_summaries().unwrap_or_default();
+    let followed = state.store.followed_artist_at_map(user.id).unwrap_or_default();
 
-    if let Some(term) = q.get("name").or_else(|| q.get("q")).filter(|s| !s.is_empty()) {
-        let low = term.to_lowercase();
-        list.retain(|a| a.name.to_lowercase().contains(&low));
-    }
+    let mut list = if let Some(term) = q.get("name").or_else(|| q.get("q")).filter(|s| !s.is_empty()) {
+        unified_catalog_search(&state, user.id, term).await.2
+    } else {
+        state.store.build_artist_summaries().unwrap_or_default()
+    };
+
     if q.get("starred").map(|v| v == "true").unwrap_or(false) {
-        list.retain(|a| followed.contains(&a.id));
+        list.retain(|a| followed.contains_key(&a.id));
+    }
+
+    let sort = q.get("_sort").map(|s| s.as_str()).unwrap_or("");
+    let desc = q
+        .get("_order")
+        .map(|o| o.eq_ignore_ascii_case("DESC"))
+        .unwrap_or(false);
+    match sort {
+        "name" => list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        "album_count" => list.sort_by_key(|a| a.album_count),
+        "song_count" => list.sort_by_key(|a| a.song_count),
+        "starred_at" => list.sort_by_key(|a| followed.get(&a.id).copied().unwrap_or(0)),
+        "random" => {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            list.shuffle(&mut rng);
+        }
+        _ => {}
+    }
+    if desc && !sort.is_empty() && sort != "random" {
+        list.reverse();
     }
 
     let total = list.len();
@@ -538,8 +766,8 @@ pub async fn list_artists(
         .skip(start)
         .take(count)
         .map(|a| {
-            let is_f = followed.contains(&a.id);
-            artist_to_nd(&a, is_f)
+            let f_at = followed.get(&a.id).copied();
+            artist_to_nd(&a, f_at)
         })
         .collect();
     json_ok(Value::Array(items), Some(total))
@@ -557,9 +785,9 @@ pub async fn get_artist(
     let Some((art, _, _, _)) = state.taste.get_or_hydrate_artist(&id, user.id).await else {
         return json_err(StatusCode::NOT_FOUND, "Artist not found");
     };
-    let followed = state.store.followed_artist_ids(user.id).unwrap_or_default();
-    let is_f = followed.contains(&art.id);
-    json_ok(artist_to_nd(&art, is_f), None)
+    let followed = state.store.followed_artist_at_map(user.id).unwrap_or_default();
+    let f_at = followed.get(&art.id).copied();
+    json_ok(artist_to_nd(&art, f_at), None)
 }
 
 pub async fn list_genres(
@@ -594,12 +822,36 @@ pub async fn list_playlists(
         Ok(u) => u,
         Err(r) => return r,
     };
-    if state.store.count_tracks().unwrap_or(0) > 0 {
-        state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
-    }
+    refresh_user_mixes(&state, user.id).await;
     let q = parse_query(raw.as_deref());
     let (start, count) = slice_params(&q, 100);
-    let list = state.store.list_playlists(user.id, true).unwrap_or_default();
+    let mut list = state.store.list_playlists(user.id, true).unwrap_or_default();
+    for p in &mut list {
+        adjust_auto_playlist_summary(&state, user.id, p);
+    }
+    if let Some(term) = q.get("name").or_else(|| q.get("q")).filter(|s| !s.is_empty()) {
+        let low = term.to_lowercase();
+        list.retain(|p| p.name.to_lowercase().contains(&low) || p.comment.to_lowercase().contains(&low));
+    }
+    let sort = q.get("_sort").map(|s| s.as_str()).unwrap_or("");
+    let desc = q
+        .get("_order")
+        .map(|o| o.eq_ignore_ascii_case("DESC"))
+        .unwrap_or(false);
+    match sort {
+        "name" => list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        "songCount" | "song_count" => list.sort_by_key(|p| p.track_count),
+        "duration" => list.sort_by_key(|p| p.duration),
+        "updatedAt" | "updated_at" => list.sort_by_key(|p| p.changed),
+        "createdAt" | "created_at" => list.sort_by_key(|p| p.created),
+        "ownerName" | "owner_name" => {
+            list.sort_by(|a, b| a.owner_name.to_lowercase().cmp(&b.owner_name.to_lowercase()))
+        }
+        _ => {}
+    }
+    if desc && !sort.is_empty() {
+        list.reverse();
+    }
     let total = list.len();
     let items: Vec<Value> = list
         .into_iter()
@@ -625,12 +877,16 @@ pub async fn get_playlist(
     if !p.public && p.user_id != user.id {
         return json_err(StatusCode::FORBIDDEN, "Permission denied");
     }
-    let p = if p.is_auto && p.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
+    let mut p = if p.is_auto && p.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
+        if p.kind.starts_with("mixed_for_you:") {
+            state.taste.refresh_mixed_for_you_if_stale_async(user.id).await;
+        }
         state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
         state.store.get_playlist(&id).ok().flatten().unwrap_or(p)
     } else {
         p
     };
+    adjust_auto_playlist_summary(&state, user.id, &mut p);
     json_ok(playlist_to_nd(&p), None)
 }
 
@@ -729,12 +985,20 @@ pub async fn get_playlist_tracks(
         return json_err(StatusCode::FORBIDDEN, "Permission denied");
     }
     if p.is_auto && p.user_id == user.id && state.store.count_tracks().unwrap_or(0) > 0 {
+        if p.kind.starts_with("mixed_for_you:") {
+            state.taste.refresh_mixed_for_you_if_stale_async(user.id).await;
+        }
         state.taste.refresh_auto_playlists_if_stale_async(user.id, 900).await;
     }
     let q = parse_query(raw.as_deref());
     let (start, count) = slice_params(&q, 500);
-    let tracks = state.store.playlist_tracks(&id).unwrap_or_default();
-    let starred = state.store.starred_ids(user.id).unwrap_or_default();
+    let raw_tracks = state.store.playlist_tracks(&id).unwrap_or_default();
+    let tracks = if p.is_auto {
+        filter_visible_tracks(&state, user.id, raw_tracks)
+    } else {
+        raw_tracks
+    };
+    let starred = state.store.starred_at_map(user.id).unwrap_or_default();
     let stats = state.store.track_stats_map(user.id).unwrap_or_default();
     let ratings = state.store.user_ratings(user.id).unwrap_or_default();
     let total = tracks.len();
@@ -746,7 +1010,7 @@ pub async fn get_playlist_tracks(
         .map(|(pos, t)| {
             let mut val = track_to_nd(
                 &t,
-                starred.contains(&t.id),
+                starred.get(&t.id).copied(),
                 stats.get(&t.id),
                 ratings.get(&t.id).copied().unwrap_or(0),
             );
@@ -896,11 +1160,19 @@ pub async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Res
             None,
         );
     };
-    let starred = state.store.starred_ids(user.id).unwrap_or_default();
+    let starred = state.store.starred_at_map(user.id).unwrap_or_default();
     let stats = state.store.track_stats_map(user.id).unwrap_or_default();
+    let ratings = state.store.user_ratings(user.id).unwrap_or_default();
     let items: Vec<Value> = tracks
         .iter()
-        .map(|t| track_to_nd(t, starred.contains(&t.id), stats.get(&t.id), 0))
+        .map(|t| {
+            track_to_nd(
+                t,
+                starred.get(&t.id).copied(),
+                stats.get(&t.id),
+                ratings.get(&t.id).copied().unwrap_or(0),
+            )
+        })
         .collect();
     json_ok(
         json!({
@@ -925,12 +1197,25 @@ pub async fn save_queue(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let cur_id = req.current_id.or(req.current).unwrap_or_default();
-    let cur_idx = req
-        .ids
-        .iter()
-        .position(|id| id == &cur_id)
-        .unwrap_or(0);
+    let (cur_id, cur_idx) = if let Some(cid) = req.current_id.filter(|s| !s.is_empty()) {
+        let idx = req.ids.iter().position(|id| id == &cid).unwrap_or(0);
+        (cid, idx)
+    } else if let Some(cur) = req.current {
+        match cur {
+            Value::Number(n) => {
+                let idx = n.as_u64().unwrap_or(0) as usize;
+                let cid = req.ids.get(idx).cloned().unwrap_or_default();
+                (cid, idx)
+            }
+            Value::String(cid) => {
+                let idx = req.ids.iter().position(|id| id == &cid).unwrap_or(0);
+                (cid, idx)
+            }
+            _ => (req.ids.first().cloned().unwrap_or_default(), 0),
+        }
+    } else {
+        (req.ids.first().cloned().unwrap_or_default(), 0)
+    };
     let _ = state.store.save_play_queue(
         user.id,
         &PlayQueueState {
@@ -952,17 +1237,7 @@ pub async fn list_radios(State(state): State<AppState>, headers: HeaderMap) -> R
     };
     let stations = state.store.list_radio_stations(user.id).unwrap_or_default();
     let total = stations.len();
-    let items: Vec<Value> = stations
-        .into_iter()
-        .map(|s| {
-            json!({
-                "id": s.id,
-                "name": s.name,
-                "streamUrl": s.stream_url,
-                "homePageUrl": s.home_page_url,
-            })
-        })
-        .collect();
+    let items: Vec<Value> = stations.iter().map(radio_to_nd).collect();
     json_ok(Value::Array(items), Some(total))
 }
 
@@ -984,7 +1259,7 @@ pub async fn create_radio(
             home_page_url: req.home_page_url,
         },
     ) {
-        Ok(s) => json_ok(json!(s), None),
+        Ok(s) => json_ok(radio_to_nd(&s), None),
         Err(e) => json_err(StatusCode::BAD_REQUEST, &e.to_string()),
     }
 }
@@ -1008,7 +1283,7 @@ pub async fn update_radio(
             home_page_url: req.home_page_url,
         },
     ) {
-        Ok(s) => json_ok(json!(s), None),
+        Ok(s) => json_ok(radio_to_nd(&s), None),
         Err(e) => json_err(StatusCode::BAD_REQUEST, &e.to_string()),
     }
 }
@@ -1040,6 +1315,30 @@ pub async fn list_users(State(state): State<AppState>, headers: HeaderMap) -> Re
             "createdAt": iso_opt(user.created),
         }]),
         Some(1),
+    )
+}
+
+pub async fn get_user(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_nd_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if id != user.id.to_string() {
+        return json_err(StatusCode::FORBIDDEN, "Can only view your own account");
+    }
+    json_ok(
+        json!({
+            "id": user.id.to_string(),
+            "userName": user.username,
+            "name": user.username,
+            "isAdmin": false,
+            "createdAt": iso_opt(user.created),
+        }),
+        None,
     )
 }
 
@@ -1277,5 +1576,160 @@ mod tests {
         )
         .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn navidrome_login_subsonic_token_works_and_key_rotation_revokes_session() {
+        let st = nd_test_state();
+        let user = st.store.create_user("rotuser", "accountpass").unwrap();
+        let api_key = st.store.get_or_create_api_key(user.id).unwrap();
+
+        let resp = login(
+            State(st.clone()),
+            HeaderMap::new(),
+            Json(LoginReq {
+                username: "rotuser".into(),
+                password: api_key,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let nd_token = body["token"].as_str().unwrap().to_string();
+        let sub_salt = body["subsonicSalt"].as_str().unwrap().to_string();
+        let sub_tok = body["subsonicToken"].as_str().unwrap().to_string();
+
+        // The subsonicToken/subsonicSalt issued by /auth/login MUST authenticate on /rest/ping.
+        let ping = crate::subsonic::dispatch(
+            State(st.clone()),
+            Path("ping.view".into()),
+            RawQuery(Some(format!(
+                "u=rotuser&t={}&s={}&f=json&v=1.16.1&c=Feishin",
+                sub_tok, sub_salt
+            ))),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        let ping_json: Value =
+            serde_json::from_slice(&to_bytes(ping.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(ping_json["subsonic-response"]["status"], "ok");
+
+        // Rotating the API key immediately revokes the Navidrome session AND the old subsonic token.
+        let _ = st.store.regenerate_api_key(user.id).unwrap();
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-nd-authorization", format!("Bearer {}", nd_token).parse().unwrap());
+        let after_nd = keepalive(State(st.clone()), hdrs).await;
+        assert_eq!(after_nd.status(), StatusCode::UNAUTHORIZED);
+
+        let after_sub = crate::subsonic::dispatch(
+            State(st),
+            Path("ping.view".into()),
+            RawQuery(Some(format!(
+                "u=rotuser&t={}&s={}&f=json&v=1.16.1&c=Feishin",
+                sub_tok, sub_salt
+            ))),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        let after_sub_json: Value =
+            serde_json::from_slice(&to_bytes(after_sub.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(after_sub_json["subsonic-response"]["error"]["code"], 40);
+    }
+
+    #[tokio::test]
+    async fn navidrome_radio_camel_case_queue_numeric_current_and_sorting() {
+        let st = nd_test_state();
+        st.store
+            .upsert_tracks(&[Track {
+                id: "t2".into(),
+                source: "local".into(),
+                title: "Die For You".into(),
+                artist: "The Weeknd".into(),
+                album: "Starboy".into(),
+                genre: "Pop".into(),
+                year: 2016,
+                track_no: 2,
+                duration: 260,
+                ..Default::default()
+            }])
+            .unwrap();
+        let user = st.store.create_user("nduser", "pw123").unwrap();
+        let tok = st.store.create_session(user.id, "nd").unwrap();
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-nd-authorization", format!("Bearer {}", tok).parse().unwrap());
+
+        // Radio creation returns camelCase fields matching list_radios.
+        let r = create_radio(
+            State(st.clone()),
+            hdrs.clone(),
+            Json(RadioReq {
+                name: "Lo-Fi".into(),
+                stream_url: "https://stream.example/lofi".into(),
+                home_page_url: "https://example.com".into(),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let rjson: Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert_eq!(rjson["streamUrl"], "https://stream.example/lofi");
+        assert_eq!(rjson["homePageUrl"], "https://example.com");
+        assert!(rjson.get("stream_url").is_none());
+
+        // Queue accepts numeric `current` index and returns ratings on get_queue.
+        let _ = st.store.set_rating(user.id, "t2", 4);
+        let qsave = save_queue(
+            State(st.clone()),
+            hdrs.clone(),
+            Json(SaveQueueReq {
+                ids: vec!["t1".into(), "t2".into()],
+                current: Some(json!(1)),
+                current_id: None,
+                position: 42_000,
+            }),
+        )
+        .await;
+        assert_eq!(qsave.status(), StatusCode::OK);
+        let qget = get_queue(State(st.clone()), hdrs.clone()).await;
+        let qjson: Value =
+            serde_json::from_slice(&to_bytes(qget.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(qjson["current"], 1);
+        assert_eq!(qjson["currentId"], "t2");
+        assert_eq!(qjson["items"][1]["rating"], 4);
+
+        // list_songs supports has_rating=true and _sort=rating&_order=DESC.
+        let songs = list_songs(
+            State(st.clone()),
+            RawQuery(Some("has_rating=true&_sort=rating&_order=DESC".into())),
+            hdrs.clone(),
+        )
+        .await;
+        let sjson: Value =
+            serde_json::from_slice(&to_bytes(songs.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let arr = sjson.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "t2");
+
+        // list_albums supports recently_played=true.
+        let empty_recent = list_albums(
+            State(st.clone()),
+            RawQuery(Some("recently_played=true".into())),
+            hdrs.clone(),
+        )
+        .await;
+        let erjson: Value =
+            serde_json::from_slice(&to_bytes(empty_recent.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(erjson.as_array().unwrap().len(), 0);
     }
 }

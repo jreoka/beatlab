@@ -347,6 +347,7 @@ impl DeezerSource {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub async fn search_all(
         &self,
         query: &str,
