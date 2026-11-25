@@ -2791,7 +2791,7 @@
           <div class="top-result-card" data-tid="${esc(topTrack.id)}" onclick="App.playSearchTrack(${esc(JSON.stringify(topTrack.id))})">
             <img src="${esc(topTrack.coverUrl)}" alt="" />
             <div class="top-result-title">${esc(topTrack.title)}</div>
-            <div class="card-sub">${esc(topTrack.artist)} · ${esc(topTrack.album)}</div>
+            <div class="card-sub">${esc(topTrack.artist)} · ${esc(topTrack.album)}${yearTag(topTrack.year)}</div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
               <span class="top-result-type">SONG · ${esc(topTrack.qualityBadge)}</span>
               ${topTrack.isTasteMatch ? `<span class="taste-pill">For You</span>` : ''}
@@ -2895,10 +2895,10 @@
       if (discs.length > 1) {
         for (const dn of discs) {
           html += `<div class="disc-divider">Disc ${dn}</div>`;
-          html += renderTrackRows(tracks.filter((t) => (t.discNo || 1) === dn), tracks, null, false, '', true);
+          html += renderTrackRows(tracks.filter((t) => (t.discNo || 1) === dn), tracks, null, false, '', true, false, false);
         }
       } else {
-        html += renderTrackRows(tracks, null, null, false, '', true);
+        html += renderTrackRows(tracks, null, null, false, '', true, false, false);
       }
       html += `</div>`;
       $('main-view').innerHTML = html;
@@ -4428,6 +4428,14 @@
   // ---------------------------------------------------------------------------
   // Reusable UI Renderers
   // ---------------------------------------------------------------------------
+  // Small "· 1999" marker for song surfaces. Empty when the year is unknown so
+  // no stray separators ever show up.
+  function yearTag(year) {
+    const y = parseInt(year, 10);
+    if (!Number.isFinite(y) || y < 1900 || y > 2100) return '';
+    return `<span class="year-tag">&middot; ${y}</span>`;
+  }
+
   function renderQuickTile(t) {
     const cur = currentTrack();
     const playing = cur && cur.id === t.id ? ' playing' : '';
@@ -4449,7 +4457,7 @@
         <button class="card-play-fab">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(t.title)}</div>
-      <div class="card-sub">${esc(t.artist)}</div>
+      <div class="card-sub">${esc(t.artist)}${yearTag(t.year)}</div>
     </div>`;
   }
 
@@ -4525,7 +4533,8 @@
     singleRadio = false,
     searchQuery = '',
     useTrackNo = false,
-    useInstantMix = false
+    useInstantMix = false,
+    showYear = true
   ) {
     const queueList = fullContext || tracks;
     const idsJson = singleRadio ? '' : esc(JSON.stringify(queueList.map((t) => t.id)));
@@ -4569,6 +4578,7 @@
               <div class="tr-sub">
                 <span class="clickable" onclick="event.stopPropagation();App.navigate('artist/${encodeURIComponent(t.artistId)}')">${esc(t.artist)}</span>
                 ${t.album ? ` · <span class="clickable" onclick="event.stopPropagation();App.navigate('album/${encodeURIComponent(t.albumId)}')">${esc(t.album)}</span>` : ''}
+                ${showYear ? yearTag(t.year) : ''}
               </div>
             </div>
           </div>
@@ -5210,7 +5220,7 @@
       setFsTint(track.coverUrl);
     }
     setMarqueeText($('pb-title'), track.title);
-    $('pb-artist').textContent = track.artist;
+    $('pb-artist').innerHTML = `${esc(track.artist)}${yearTag(track.year)}`;
     $('pb-like').classList.toggle('active', !!track.isStarred);
     $('pb-quality').textContent = track.qualityBadge;
     $('pb-quality').classList.remove('hidden');
@@ -5221,9 +5231,9 @@
     if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = '0%';
 
     setMarqueeText($('fs-title'), track.title);
-    $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(track.artist)}</span>${track.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(track.album)}</span>` : ''}`;
+    $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(track.artist)}</span>${track.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(track.album)}</span>` : ''}${yearTag(track.year)}`;
     if ($('fs-mini-title')) $('fs-mini-title').textContent = track.title;
-    if ($('fs-mini-artist')) $('fs-mini-artist').textContent = track.artist;
+    if ($('fs-mini-artist')) $('fs-mini-artist').innerHTML = `${esc(track.artist)}${yearTag(track.year)}`;
     if ($('fs-like')) $('fs-like').classList.toggle('active', !!track.isStarred);
     if ($('fs-quality')) {
       $('fs-quality').textContent = track.qualityBadge;
@@ -6078,7 +6088,7 @@
       <img src="${esc(t.coverUrl)}" alt="" />
       <div class="q-item-info">
         <div class="q-item-title">${esc(t.title)}</div>
-        <div class="q-item-sub">${esc(t.artist)}</div>
+        <div class="q-item-sub">${esc(t.artist)}${yearTag(t.year)}</div>
       </div>
       ${!active ? `<button class="icon-btn" title="Remove from queue" onclick="event.stopPropagation();App.removeFromQueue(${idx})">${ICONS.close}</button>` : ''}
     </div>`;
@@ -6261,7 +6271,7 @@
         <img src="${esc(t.coverUrl)}" alt="" />
         <div class="ctx-sheet-meta">
           <div class="ctx-sheet-title">${esc(t.title)}</div>
-          <div class="ctx-sheet-sub">${esc(t.artist)}</div>
+          <div class="ctx-sheet-sub">${esc(t.artist)}${yearTag(t.year)}</div>
         </div>
         <button class="icon-btn" title="Close" onclick="App.closeTrackMenu()">${ICONS.close}</button>
       </div>

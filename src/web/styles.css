@@ -2242,6 +2242,15 @@ a {
   text-overflow: ellipsis;
   cursor: pointer;
 }
+/* Release year marker ("· 1999") — inherits the surrounding text colour and
+   sits one step back so it reads as quiet metadata, not as part of the line. */
+.year-tag {
+  color: inherit;
+  opacity: 0.78;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
 .pb-title:hover, .pb-artist:hover {
   text-decoration: underline;
 }
