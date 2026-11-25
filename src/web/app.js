@@ -4433,7 +4433,7 @@
   function yearTag(year) {
     const y = parseInt(year, 10);
     if (!Number.isFinite(y) || y < 1900 || y > 2100) return '';
-    return `<span class="year-tag">&middot; ${y}</span>`;
+    return `<span class="year-tag">&nbsp;&middot;&nbsp;${y}</span>`;
   }
 
   function renderQuickTile(t) {
