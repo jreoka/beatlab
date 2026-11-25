@@ -459,16 +459,18 @@ pub fn disambiguate_batch_tracks(
             })
             .or_insert_with(|| Some(dz_id.to_string()));
 
-        let sl = crate::models::slug(&pa);
-        if !sl.is_empty() {
-            slug_to_dz
-                .entry(sl)
-                .and_modify(|cur| {
-                    if cur.as_deref() != Some(dz_id) {
-                        *cur = None;
-                    }
-                })
-                .or_insert_with(|| Some(dz_id.to_string()));
+        if crate::models::allow_case_insensitive_artist_merge(&pa) {
+            let sl = crate::models::slug(&pa);
+            if !sl.is_empty() {
+                slug_to_dz
+                    .entry(sl)
+                    .and_modify(|cur| {
+                        if cur.as_deref() != Some(dz_id) {
+                            *cur = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(dz_id.to_string()));
+            }
         }
     };
 
@@ -512,9 +514,11 @@ pub fn disambiguate_batch_tracks(
             t.set_deezer_artist_id(dz_id);
             continue;
         }
-        let sl = crate::models::slug(&pa);
-        if let Some(Some(dz_id)) = slug_to_dz.get(&sl) {
-            t.set_deezer_artist_id(dz_id);
+        if crate::models::allow_case_insensitive_artist_merge(&pa) {
+            let sl = crate::models::slug(&pa);
+            if let Some(Some(dz_id)) = slug_to_dz.get(&sl) {
+                t.set_deezer_artist_id(dz_id);
+            }
         }
     }
 }

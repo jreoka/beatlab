@@ -1,8 +1,8 @@
 use crate::auth::{hash_recovery_code, RESTORE_WINDOW_SECS};
 use crate::models::{
-    err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
-    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, PublicUser,
-    ShareRecord, Track, User, UserEventRow, UserProfile, UserTrackStats,
+    allow_case_insensitive_artist_merge, err_msg, primary_artist, slug, validate_credentials,
+    AlbumSummary, AppResult, ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist,
+    PublicUser, ShareRecord, Track, User, UserEventRow, UserProfile, UserTrackStats,
 };
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, ToSql};
@@ -588,6 +588,7 @@ impl Store {
         migrate_legacy_moods(&mut conn)?;
         migrate_artist_disambiguation(&mut conn)?;
         migrate_artist_disambiguation_v2(&mut conn)?;
+        migrate_artist_disambiguation_v3(&mut conn)?;
 
         Ok(())
     }
@@ -6232,13 +6233,18 @@ impl ArtistResolver {
         if key_name.is_empty() {
             return;
         }
-        let sl = slug(key_name);
+        let allow_ci = allow_case_insensitive_artist_merge(key_name);
+        let sl = if allow_ci { slug(key_name) } else { String::new() };
         if id.starts_with("ar:dz:") {
             Self::record_unique(&mut self.dz_exact, key_name.to_string(), id);
-            Self::record_unique(&mut self.dz_slug, sl, id);
+            if allow_ci {
+                Self::record_unique(&mut self.dz_slug, sl, id);
+            }
         } else if id.starts_with("ar:ytm:") {
             Self::record_unique(&mut self.ytm_exact, key_name.to_string(), id);
-            Self::record_unique(&mut self.ytm_slug, sl, id);
+            if allow_ci {
+                Self::record_unique(&mut self.ytm_slug, sl, id);
+            }
         }
     }
 
@@ -6311,16 +6317,19 @@ impl ArtistResolver {
         if key_name.is_empty() {
             return raw_id.to_string();
         }
+        let allow_ci = allow_case_insensitive_artist_merge(key_name);
         match self.dz_exact.get(key_name) {
             Some(Some(dz_ar_id)) => return dz_ar_id.clone(),
             Some(None) => return raw_id.to_string(),
             None => {
-                let sl = slug(key_name);
-                if !sl.is_empty() {
-                    match self.dz_slug.get(&sl) {
-                        Some(Some(dz_ar_id)) => return dz_ar_id.clone(),
-                        Some(None) => return raw_id.to_string(),
-                        None => {}
+                if allow_ci {
+                    let sl = slug(key_name);
+                    if !sl.is_empty() {
+                        match self.dz_slug.get(&sl) {
+                            Some(Some(dz_ar_id)) => return dz_ar_id.clone(),
+                            Some(None) => return raw_id.to_string(),
+                            None => {}
+                        }
                     }
                 }
             }
@@ -6330,10 +6339,12 @@ impl ArtistResolver {
                 Some(Some(ytm_ar_id)) => return ytm_ar_id.clone(),
                 Some(None) => return raw_id.to_string(),
                 None => {
-                    let sl = slug(key_name);
-                    if !sl.is_empty() {
-                        if let Some(Some(ytm_ar_id)) = self.ytm_slug.get(&sl) {
-                            return ytm_ar_id.clone();
+                    if allow_ci {
+                        let sl = slug(key_name);
+                        if !sl.is_empty() {
+                            if let Some(Some(ytm_ar_id)) = self.ytm_slug.get(&sl) {
+                                return ytm_ar_id.clone();
+                            }
                         }
                     }
                 }
@@ -6516,6 +6527,132 @@ fn migrate_artist_disambiguation_v2(conn: &mut Connection) -> AppResult<()> {
         [],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Scrubs mismatched `deezer_artist_id` values previously stamped onto non-Deezer
+/// tracks (e.g. YTM `"ASU"` linked to Deezer `"Asu"` by a loose case-insensitive
+/// slug match) and invalidates cached New Releases shelves/lookups so they rebuild
+/// cleanly with homonym-safe artist resolution.
+fn migrate_artist_disambiguation_v3(conn: &mut Connection) -> AppResult<()> {
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'artist_disambig_v3'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+
+    let dz_names: HashMap<String, String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, deezer_id FROM artists_meta WHERE id LIKE 'ar:dz:%' OR deezer_id <> ''",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for (id, name, dz_id) in rows.flatten() {
+            let clean_name = name.trim().to_string();
+            if clean_name.is_empty() {
+                continue;
+            }
+            if let Some(d) = id.strip_prefix("ar:dz:") {
+                if !d.trim().is_empty() {
+                    map.insert(d.trim().to_string(), clean_name.clone());
+                }
+            }
+            if !dz_id.trim().is_empty() {
+                map.insert(dz_id.trim().to_string(), clean_name);
+            }
+        }
+        map
+    };
+
+    let candidates: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, artist, meta FROM tracks
+             WHERE source <> 'deezer' AND id NOT LIKE 'dz:%' AND meta LIKE '%deezer_artist_id%'",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.flatten().collect()
+    };
+
+    let mut updates: Vec<(String, String)> = Vec::new();
+    for (tid, artist, meta_raw) in candidates {
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&meta_raw) else {
+            continue;
+        };
+        let Some(obj) = val.as_object_mut() else {
+            continue;
+        };
+        let dz_id = obj.get("deezer_artist_id").and_then(|v| {
+            v.as_i64()
+                .filter(|n| *n > 0)
+                .map(|n| n.to_string())
+                .or_else(|| {
+                    v.as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "0")
+                        .map(str::to_string)
+                })
+        });
+        let Some(dz_id) = dz_id else {
+            continue;
+        };
+        let Some(dz_name) = dz_names.get(&dz_id) else {
+            continue;
+        };
+        let pa = primary_artist(&artist);
+        let track_artist = if pa.is_empty() { artist.trim() } else { pa.as_str() };
+        if track_artist.is_empty() || allow_case_insensitive_artist_merge(track_artist) {
+            continue;
+        }
+        if track_artist != dz_name.as_str() && slug(track_artist) == slug(dz_name) {
+            obj.remove("deezer_artist_id");
+            if let Ok(cleaned) = serde_json::to_string(&val) {
+                updates.push((tid, cleaned));
+            }
+        }
+    }
+
+    let tx = conn.transaction()?;
+    for (tid, new_meta) in &updates {
+        tx.execute(
+            "UPDATE tracks SET meta = ?1 WHERE id = ?2",
+            params![new_meta, tid],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM kv WHERE key LIKE 'newrel:last:%'
+            OR key LIKE 'newrel:fetched:%'
+            OR key LIKE 'dzartist:byname3:%'
+            OR key LIKE 'itartist:byname1:%'",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO kv(key, value) VALUES ('artist_disambig_v3', '1')",
+        [],
+    )?;
+    tx.commit()?;
+    if !updates.is_empty() {
+        tracing::info!(
+            cleaned_tracks = updates.len(),
+            "scrubbed mismatched short-name deezer_artist_id links"
+        );
+    }
     Ok(())
 }
 
@@ -7871,6 +8008,86 @@ mod tests {
         assert!(be_summary.is_some());
         assert_eq!(be_summary.unwrap().id, "ar:dz:5482289");
         assert_eq!(store.artist_tracks("ar:ytm:UC_BLUE_ENC").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn short_homonym_artist_names_do_not_merge_across_casing_differences() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("tester", "secret123").unwrap();
+
+        // Romanian "Asu" exists in artists_meta (e.g. from an earlier Deezer search).
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:1666391".into(),
+                name: "Asu".into(),
+                deezer_id: "1666391".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // User listens to Japanese "ASU" on YTM.
+        let mut asu_jp = sample_track("ytm:asu_fake", "Fake", "ASU", "ASU");
+        asu_jp.source = "ytm".into();
+        asu_jp.meta = r#"{"ytm_artist_id":"UC_ASU_JP"}"#.into();
+        store.upsert_tracks(&[asu_jp]).unwrap();
+        store.record_event(u.id, "ytm:asu_fake", "play", 1.0).unwrap();
+
+        // ArtistResolver must keep "ASU" separate from Deezer's "Asu" (1666391).
+        let relevant = store.relevant_artists_for_releases(u.id, 10).unwrap();
+        assert_eq!(relevant.len(), 1);
+        assert_eq!(relevant[0].id, "ar:ytm:UC_ASU_JP");
+        assert_eq!(relevant[0].name, "ASU");
+        assert!(relevant[0].deezer_id.is_empty());
+    }
+
+    #[test]
+    fn migrate_artist_disambiguation_v3_scrubs_mismatched_short_deezer_links() {
+        let store = Store::open_memory().unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:1666391".into(),
+                name: "Asu".into(),
+                deezer_id: "1666391".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert_artist_meta(&ArtistSummary {
+                id: "ar:dz:5482289".into(),
+                name: "Blue Encount".into(),
+                deezer_id: "5482289".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut bad_track = sample_track("ytm:asu1", "Fake", "ASU", "ASU");
+        bad_track.source = "ytm".into();
+        bad_track.meta = r#"{"ytm_artist_id":"UC_ASU_JP","deezer_artist_id":1666391}"#.into();
+
+        let mut good_track = sample_track("ytm:be1", "Polaris", "BLUE ENCOUNT", "VECTOR");
+        good_track.source = "ytm".into();
+        good_track.meta = r#"{"ytm_artist_id":"UC_BLUE_ENC","deezer_artist_id":5482289}"#.into();
+
+        store.upsert_tracks(&[bad_track, good_track]).unwrap();
+        store.kv_set("newrel:last:1", "[]");
+        store.kv_set("newrel:fetched:1", "9999999999|30");
+
+        {
+            let mut conn = store.lock();
+            conn.execute("DELETE FROM kv WHERE key = 'artist_disambig_v3'", [])
+                .unwrap();
+            migrate_artist_disambiguation_v3(&mut conn).unwrap();
+        }
+
+        let cleaned = store.get_track("ytm:asu1").unwrap().unwrap();
+        assert!(cleaned.deezer_artist_id().is_none());
+        assert_eq!(cleaned.ytm_artist_id().as_deref(), Some("UC_ASU_JP"));
+
+        let untouched = store.get_track("ytm:be1").unwrap().unwrap();
+        assert_eq!(untouched.deezer_artist_id().as_deref(), Some("5482289"));
+
+        assert!(store.kv_get("newrel:last:1").is_none());
+        assert!(store.kv_get("newrel:fetched:1").is_none());
     }
 
     #[test]

@@ -1919,7 +1919,7 @@ fn new_releases_dedup_key(a: &AlbumSummary) -> String {
 }
 
 fn stored_new_releases(store: &crate::store::Store, uid: i64, limit: usize) -> Vec<AlbumSummary> {
-    let last_key = format!("newrel:last:{uid}");
+    let last_key = format!("newrel:last2:{uid}");
     let window_start = new_releases_window_start();
     let stored: Vec<AlbumSummary> = store
         .kv_get(&last_key)
@@ -2030,30 +2030,82 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     }
 
     // Song titles the user played or starred, per artist, so ambiguous names
-    // ("Eve") and localized names ("幾田りら" / "米津玄師") resolve accurately.
-    let mut hint_titles: HashMap<String, Vec<String>> = HashMap::new();
-    for (t, _) in state.store.user_recent_tracks(uid, 500, 0).unwrap_or_default() {
-        let primary = crate::models::primary_artist(&t.artist);
-        let key = slug(if primary.is_empty() { &t.artist } else { &primary });
-        let titles = hint_titles.entry(key).or_default();
-        if titles.len() < 15 && !titles.contains(&t.title) {
-            titles.push(t.title.clone());
+    // ("Eve", "ASU") and localized names ("幾田りら" / "米津玄師") resolve accurately
+    // without cross-contaminating homonyms with different capitalization.
+    let mut hint_titles_by_id: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hint_titles_exact: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hint_titles_slug: HashMap<String, Vec<String>> = HashMap::new();
+    let mut record_hint = |t: &Track| {
+        let aid = t.artist_id();
+        if !aid.is_empty() {
+            let titles = hint_titles_by_id.entry(aid).or_default();
+            if titles.len() < 15 && !titles.contains(&t.title) {
+                titles.push(t.title.clone());
+            }
         }
+        let primary = crate::models::primary_artist(&t.artist);
+        let name = if primary.is_empty() {
+            t.artist.trim()
+        } else {
+            primary.as_str()
+        };
+        if !name.is_empty() {
+            let titles = hint_titles_exact.entry(name.to_string()).or_default();
+            if titles.len() < 15 && !titles.contains(&t.title) {
+                titles.push(t.title.clone());
+            }
+            if crate::models::allow_case_insensitive_artist_merge(name) {
+                let titles = hint_titles_slug.entry(slug(name)).or_default();
+                if titles.len() < 15 && !titles.contains(&t.title) {
+                    titles.push(t.title.clone());
+                }
+            }
+        }
+    };
+    for (t, _) in state.store.user_recent_tracks(uid, 500, 0).unwrap_or_default() {
+        record_hint(&t);
     }
     for (t, _) in state.store.starred_tracks(uid).unwrap_or_default() {
-        let primary = crate::models::primary_artist(&t.artist);
-        let key = slug(if primary.is_empty() { &t.artist } else { &primary });
-        let titles = hint_titles.entry(key).or_default();
-        if titles.len() < 15 && !titles.contains(&t.title) {
-            titles.push(t.title.clone());
-        }
+        record_hint(&t);
     }
+    let hints_for_artist = |artist: &ArtistSummary| -> Vec<String> {
+        let mut out = Vec::new();
+        for src in [
+            hint_titles_by_id.get(&artist.id),
+            hint_titles_exact.get(artist.name.trim()),
+            crate::models::allow_case_insensitive_artist_merge(&artist.name)
+                .then(|| hint_titles_slug.get(&slug(&artist.name)))
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for title in src {
+                if out.len() < 15 && !out.contains(title) {
+                    out.push(title.clone());
+                }
+            }
+        }
+        out
+    };
 
     let total = artists.len();
     let mut answered = 0usize;
     let mut albums: Vec<AlbumSummary> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut valid_artist_ids: HashSet<String> = artists.iter().map(|a| a.id.clone()).collect();
+    let valid_artist_names: HashSet<String> = artists
+        .iter()
+        .map(|a| a.name.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    for a in &artists {
+        let dz = a.deezer_id.trim();
+        if !dz.is_empty() && dz != "0" {
+            valid_artist_ids.insert(format!("ar:dz:{dz}"));
+        }
+    }
     let mut source_used = "deezer";
 
     if !state.sources.deezer.is_blocked() {
@@ -2064,23 +2116,31 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
                 let store = state.store.clone();
                 let mut id = artist.deezer_id.clone();
                 let name = artist.name.clone();
-                let hints = hint_titles.get(&slug(&name)).cloned().unwrap_or_default();
+                let hints = hints_for_artist(artist);
                 tokio::spawn(async move {
                     if id.is_empty() {
-                        match resolve_deezer_artist_by_name(&dz, &store, &name, &hints).await {
+                        match resolve_deezer_artist_by_name(&dz, &store, uid, &name, &hints).await {
                             ResolveArtist::Found(found) => id = found,
-                            ResolveArtist::NotFound => return Some(Vec::new()),
+                            ResolveArtist::NotFound => return Some((None, Vec::new())),
                             ResolveArtist::TransientError => return None,
                         }
                     }
-                    dz.fetch_artist_releases_checked(&id, &name, 4).await
+                    let resolved_id = (!id.is_empty()).then(|| format!("ar:dz:{id}"));
+                    dz.fetch_artist_releases_checked(&id, &name, 4)
+                        .await
+                        .map(|batch| (resolved_id, batch))
                 })
             })
             .collect();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
         for handle in handles {
-            if let Ok(Ok(Some(batch))) = tokio::time::timeout_at(deadline, handle).await {
+            if let Ok(Ok(Some((resolved_id, batch)))) =
+                tokio::time::timeout_at(deadline, handle).await
+            {
                 answered += 1;
+                if let Some(rid) = resolved_id {
+                    valid_artist_ids.insert(rid);
+                }
                 for album in batch {
                     if seen_ids.insert(album.id.clone())
                         && seen_keys.insert(new_releases_dedup_key(&album))
@@ -2097,8 +2157,9 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     let mut itunes_incomplete = false;
     if answered == 0 && !state.sources.itunes.is_blocked() {
         source_used = "itunes";
+        let hints_per_artist: Vec<Vec<String>> = artists.iter().map(&hints_for_artist).collect();
         let (it_answered, it_albums, remaining) =
-            collect_itunes_new_releases(state, &artists, &hint_titles).await;
+            collect_itunes_new_releases(state, uid, &artists, &hints_per_artist).await;
         answered = it_answered;
         itunes_incomplete = remaining > 0;
         for album in it_albums {
@@ -2110,11 +2171,11 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     }
     let live = albums.len();
 
-    // Merge in the last good shelf. Everything in it is still a real release
-    // inside the release window, so a transient failure on one artist never
-    // wipes out releases we already discovered. Entries age out naturally once
-    // they leave the release window.
-    let last_key = format!("newrel:last:{uid}");
+    // Merge in the last good shelf, retaining only releases still inside the
+    // window AND belonging to artists currently in this user's pool. That way a
+    // transient failure on one artist never wipes out real releases, while
+    // unfollowed or previously mis-resolved artists drop off immediately.
+    let last_key = format!("newrel:last2:{uid}");
     let window_start = new_releases_window_start();
     let stored: Vec<AlbumSummary> = state
         .store
@@ -2123,6 +2184,11 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
         .unwrap_or_default();
     for album in stored {
         if album.created < window_start {
+            continue;
+        }
+        let artist_still_relevant = valid_artist_ids.contains(&album.artist_id)
+            || valid_artist_names.contains(album.artist.trim());
+        if !artist_still_relevant {
             continue;
         }
         if seen_ids.insert(album.id.clone()) && seen_keys.insert(new_releases_dedup_key(&album)) {
@@ -2161,13 +2227,30 @@ async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     );
 }
 
+fn itunes_artist_cache_key(uid: i64, name: &str) -> String {
+    if crate::models::allow_case_insensitive_artist_merge(name) {
+        format!("itartist:byname2:{name}")
+    } else {
+        format!("itartist:byname2:u{uid}:{name}")
+    }
+}
+
+fn deezer_artist_cache_key(uid: i64, name: &str) -> String {
+    if crate::models::allow_case_insensitive_artist_merge(name) {
+        format!("dzartist:byname4:{name}")
+    } else {
+        format!("dzartist:byname4:u{uid}:{name}")
+    }
+}
+
 /// Resolves artists via Apple's iTunes catalog (caching IDs permanently in SQLite)
 /// and fetches their recent releases in batched multi-ID lookups (12 artists/request).
 /// Caps uncached artist searches per sweep to stay comfortably inside Apple's rate limit.
 async fn collect_itunes_new_releases(
     state: &AppState,
+    uid: i64,
     artists: &[ArtistSummary],
-    hint_titles: &HashMap<String, Vec<String>>,
+    hints_per_artist: &[Vec<String>],
 ) -> (usize, Vec<AlbumSummary>, usize) {
     const MAX_UNCACHED_LOOKUPS_PER_SWEEP: usize = 12;
 
@@ -2176,12 +2259,12 @@ async fn collect_itunes_new_releases(
     let mut remaining_uncached = 0usize;
     let now = Utc::now().timestamp();
 
-    for artist in artists {
+    for (idx, artist) in artists.iter().enumerate() {
         let name = artist.name.trim();
         if name.is_empty() {
             continue;
         }
-        let cache_key = format!("itartist:byname1:{name}");
+        let cache_key = itunes_artist_cache_key(uid, name);
         if let Some(raw) = state.store.kv_get(&cache_key) {
             if let Some((ts, id_str)) = raw.split_once('|') {
                 if let Ok(it_id) = id_str.parse::<u64>() {
@@ -2200,9 +2283,13 @@ async fn collect_itunes_new_releases(
             continue;
         }
         uncached_used += 1;
-        let hints = hint_titles.get(&slug(name)).cloned().unwrap_or_default();
+        let hints = hints_per_artist
+            .get(idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if let ResolveArtist::Found(it_id_str) =
-            resolve_itunes_artist_by_name(&state.sources.itunes, &state.store, name, &hints).await
+            resolve_itunes_artist_by_name(&state.sources.itunes, &state.store, uid, name, hints)
+                .await
         {
             if let Ok(it_id) = it_id_str.parse::<u64>() {
                 if it_id > 0 {
@@ -2226,6 +2313,7 @@ async fn collect_itunes_new_releases(
 async fn resolve_itunes_artist_by_name(
     it: &crate::sources::itunes::ItunesSource,
     store: &crate::store::Store,
+    uid: i64,
     name: &str,
     played_titles: &[String],
 ) -> ResolveArtist {
@@ -2233,7 +2321,7 @@ async fn resolve_itunes_artist_by_name(
     if slug(name).is_empty() {
         return ResolveArtist::NotFound;
     }
-    let cache_key = format!("itartist:byname1:{name}");
+    let cache_key = itunes_artist_cache_key(uid, name);
     let now = Utc::now().timestamp();
     let Some(raw_results) = it.search_artists(name, 8).await else {
         return ResolveArtist::TransientError;
@@ -2260,10 +2348,18 @@ async fn pick_itunes_artist_from_search(
     let wanted = name.to_lowercase();
     let key_name = slug(name);
     let query_ascii = name.is_ascii();
+    let allow_ci = crate::models::allow_case_insensitive_artist_merge(name);
 
     let exact: Vec<crate::sources::itunes::ItunesArtist> = raw_results
         .iter()
-        .filter(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name)
+        .filter(|a| {
+            let low = a.name.trim().to_lowercase();
+            if query_ascii && !allow_ci {
+                low == wanted
+            } else {
+                low == wanted || slug(&a.name) == key_name
+            }
+        })
         .cloned()
         .collect();
 
@@ -2283,29 +2379,36 @@ async fn pick_itunes_artist_from_search(
     if candidates.is_empty() {
         return None;
     }
-    if candidates.len() == 1 {
-        return candidates.pop();
-    }
 
-    let exact_case: Vec<usize> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.name.trim() == name)
-        .map(|(i, _)| i)
-        .collect();
-    if exact_case.len() == 1 && cross_script_top.is_none() {
-        return Some(candidates.swap_remove(exact_case[0]));
-    }
+    // Prioritize exact-case matches first so track-overlap verification inspects
+    // them before any differently-cased homonyms.
+    candidates.sort_by_key(|a| if a.name.trim() == name { 0u8 } else { 1u8 });
 
     let played: Vec<String> = played_titles
         .iter()
         .map(|t| slug(t))
         .filter(|t| t.len() >= 3)
         .collect();
-    if !played.is_empty() {
+    let had_played_hints = !played.is_empty();
+
+    if candidates.len() == 1 && (!query_ascii || allow_ci || !had_played_hints) {
+        if !query_ascii || allow_ci || candidates[0].name.trim() == name {
+            return candidates.pop();
+        }
+        return None;
+    }
+
+    let exact_case_count = candidates.iter().filter(|a| a.name.trim() == name).count();
+    if !had_played_hints && exact_case_count == 1 && cross_script_top.is_none() {
+        if let Some(i) = candidates.iter().position(|a| a.name.trim() == name) {
+            return Some(candidates.swap_remove(i));
+        }
+    }
+
+    if had_played_hints {
         let mut best: Option<(usize, usize)> = None;
-        for (i, cand) in candidates.iter().enumerate().take(3) {
-            let songs = it.fetch_artist_top_songs(cand.id, 25).await;
+        for (i, cand) in candidates.iter().enumerate().take(5) {
+            let songs = it.fetch_artist_top_songs(cand.id, 30).await;
             let hits = songs
                 .iter()
                 .map(|t| slug(t))
@@ -2325,7 +2428,7 @@ async fn pick_itunes_artist_from_search(
         }
     }
 
-    pick_itunes_artist_fallback(name, exact, cross_script_top, candidates)
+    pick_itunes_artist_fallback(name, exact, cross_script_top, candidates, had_played_hints)
 }
 
 fn pick_itunes_artist_fallback(
@@ -2333,11 +2436,34 @@ fn pick_itunes_artist_fallback(
     exact: Vec<crate::sources::itunes::ItunesArtist>,
     cross_script_top: Option<crate::sources::itunes::ItunesArtist>,
     mut candidates: Vec<crate::sources::itunes::ItunesArtist>,
+    had_played_hints: bool,
 ) -> Option<crate::sources::itunes::ItunesArtist> {
+    if candidates.is_empty() {
+        return None;
+    }
     if exact.is_empty() {
         if let Some(cs) = cross_script_top {
             return Some(cs);
         }
+    }
+    // For short single-word ASCII names ("ASU", "Eve", "LiSA", "HACHI"), never
+    // blindly fall back to a differently-cased homonym (e.g. "ASU" -> "Asu") or
+    // guess among multiple exact-case homonyms when played-track verification
+    // found zero matches.
+    if name.is_ascii() && !crate::models::allow_case_insensitive_artist_merge(name) {
+        let exact_case: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.name.trim() == name)
+            .map(|(i, _)| i)
+            .collect();
+        if exact_case.is_empty() {
+            return None;
+        }
+        if exact_case.len() > 1 && had_played_hints {
+            return None;
+        }
+        return Some(candidates.swap_remove(exact_case[0]));
     }
     let exact_case_idx = candidates.iter().position(|a| a.name.trim() == name);
     let first = exact_case_idx.unwrap_or(0);
@@ -2392,6 +2518,7 @@ fn is_solo_artist_name(name: &str) -> bool {
 async fn resolve_deezer_artist_by_name(
     dz: &crate::sources::deezer::DeezerSource,
     store: &crate::store::Store,
+    uid: i64,
     name: &str,
     played_titles: &[String],
 ) -> ResolveArtist {
@@ -2400,8 +2527,8 @@ async fn resolve_deezer_artist_by_name(
     if key_name.is_empty() {
         return ResolveArtist::NotFound;
     }
-    // v3: handles non-ASCII/romanized artists and avoids caching transient errors.
-    let cache_key = format!("dzartist:byname3:{name}");
+    // v4: homonym-safe for short ASCII names + per-user cache isolation.
+    let cache_key = deezer_artist_cache_key(uid, name);
     let now = Utc::now().timestamp();
     if let Some(raw) = store.kv_get(&cache_key) {
         if let Some((ts, id)) = raw.split_once('|') {
@@ -2441,10 +2568,18 @@ async fn pick_artist_from_search(
     let non_ascii = !name.is_ascii();
     let wanted = name.to_lowercase();
     let key_name = slug(name);
+    let allow_ci = crate::models::allow_case_insensitive_artist_merge(name);
 
     let mut exact: Vec<ArtistSummary> = raw_results
         .iter()
-        .filter(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name)
+        .filter(|a| {
+            let low = a.name.trim().to_lowercase();
+            if !non_ascii && !allow_ci {
+                low == wanted
+            } else {
+                low == wanted || slug(&a.name) == key_name
+            }
+        })
         .cloned()
         .collect();
     if exact.iter().any(|a| a.album_count > 0) {
@@ -2480,30 +2615,38 @@ async fn pick_artist_from_search(
     if candidates.is_empty() {
         return None;
     }
-    if candidates.len() == 1 {
-        return candidates.pop();
-    }
 
-    // If ASCII and there is a unique exact-case match ("LiSA" vs "LISA"), use it directly.
-    let exact_case: Vec<usize> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.name.trim() == name)
-        .map(|(i, _)| i)
-        .collect();
-    if !non_ascii && exact_case.len() == 1 {
-        return Some(candidates.swap_remove(exact_case[0]));
-    }
+    // Prioritize exact-case matches first so track-overlap verification inspects
+    // them before any differently-cased homonyms.
+    candidates.sort_by_key(|a| if a.name.trim() == name { 0u8 } else { 1u8 });
 
-    // Check top-track overlap with songs the user actually played/starred.
     let played: Vec<String> = played_titles
         .iter()
         .map(|t| slug(t))
         .filter(|t| t.len() >= 3)
         .collect();
-    if !played.is_empty() {
+    let had_played_hints = !played.is_empty();
+
+    if candidates.len() == 1 && (non_ascii || allow_ci || !had_played_hints) {
+        if non_ascii || allow_ci || candidates[0].name.trim() == name {
+            return candidates.pop();
+        }
+        return None;
+    }
+
+    // If ASCII and there is a unique exact-case match ("LiSA" vs "LISA") with no
+    // played-track hints to cross-check, use it directly.
+    let exact_case_count = candidates.iter().filter(|a| a.name.trim() == name).count();
+    if !non_ascii && !had_played_hints && exact_case_count == 1 {
+        if let Some(i) = candidates.iter().position(|a| a.name.trim() == name) {
+            return Some(candidates.swap_remove(i));
+        }
+    }
+
+    // Check top-track overlap with songs the user actually played/starred.
+    if had_played_hints {
         let mut best: Option<(usize, usize)> = None;
-        for (i, cand) in candidates.iter().enumerate().take(4) {
+        for (i, cand) in candidates.iter().enumerate().take(5) {
             let top = dz.fetch_artist_top_tracks(&cand.deezer_id, 25).await;
             let hits = top
                 .iter()
@@ -2524,7 +2667,7 @@ async fn pick_artist_from_search(
         }
     }
 
-    pick_artist_fallback(name, exact, top_solo, candidates)
+    pick_artist_fallback(name, exact, top_solo, candidates, had_played_hints)
 }
 
 fn pick_artist_fallback(
@@ -2532,7 +2675,11 @@ fn pick_artist_fallback(
     exact: Vec<ArtistSummary>,
     top_solo: Option<ArtistSummary>,
     mut candidates: Vec<ArtistSummary>,
+    had_played_hints: bool,
 ) -> Option<ArtistSummary> {
+    if candidates.is_empty() {
+        return None;
+    }
     if !name.is_ascii() {
         if let Some(top) = top_solo {
             let best_exact_albums = exact.iter().map(|a| a.album_count).max().unwrap_or(0);
@@ -2543,6 +2690,25 @@ fn pick_artist_fallback(
                 return Some(top);
             }
         }
+    }
+    // For short single-word ASCII names ("ASU", "Eve", "LiSA", "HACHI"), never
+    // blindly fall back to a differently-cased homonym (e.g. "ASU" -> "Asu") or
+    // guess among multiple exact-case homonyms when played-track verification
+    // found zero matches.
+    if name.is_ascii() && !crate::models::allow_case_insensitive_artist_merge(name) {
+        let exact_case: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.name.trim() == name)
+            .map(|(i, _)| i)
+            .collect();
+        if exact_case.is_empty() {
+            return None;
+        }
+        if exact_case.len() > 1 && had_played_hints {
+            return None;
+        }
+        return Some(candidates.swap_remove(exact_case[0]));
     }
     let exact_case_idx = candidates.iter().position(|a| a.name.trim() == name);
     let first = exact_case_idx.unwrap_or(0);
@@ -7871,6 +8037,7 @@ mod tests {
             vec![],
             Some(mk("106606492", "Lilas Ikuta", 31)),
             vec![mk("106606492", "Lilas Ikuta", 31)],
+            false,
         )
         .unwrap();
         assert_eq!(ikuta.deezer_id, "106606492");
@@ -7881,6 +8048,7 @@ mod tests {
             vec![mk("7232650", "米津玄師", 0)],
             Some(mk("5289039", "Kenshi Yonezu", 37)),
             vec![mk("7232650", "米津玄師", 0), mk("5289039", "Kenshi Yonezu", 37)],
+            false,
         )
         .unwrap();
         assert_eq!(yonezu.deezer_id, "5289039");
@@ -7894,6 +8062,7 @@ mod tests {
                 mk("77044752", "Official髭男dism", 3),
                 mk("7579730", "OFFICIAL HIGE DANDISM", 48),
             ],
+            false,
         )
         .unwrap();
         assert_eq!(higedan.deezer_id, "7579730");
@@ -7904,9 +8073,30 @@ mod tests {
             vec![mk("14559887", "LISA", 12), mk("418196", "LiSA", 35)],
             None,
             vec![mk("14559887", "LISA", 12), mk("418196", "LiSA", 35)],
+            false,
         )
         .unwrap();
         assert_eq!(lisa.deezer_id, "418196");
+
+        // Short ASCII query with NO exact-case match ("ASU" vs Romanian "Asu") must reject.
+        assert!(pick_artist_fallback(
+            "ASU",
+            vec![mk("1666391", "Asu", 229)],
+            None,
+            vec![mk("1666391", "Asu", 229)],
+            true,
+        )
+        .is_none());
+
+        // Short ASCII query with multiple exact-case homonyms ("Eve") and 0 track hits must reject.
+        assert!(pick_artist_fallback(
+            "Eve",
+            vec![mk("837", "Eve", 24), mk("69128312", "Eve", 39)],
+            None,
+            vec![mk("837", "Eve", 24), mk("69128312", "Eve", 39)],
+            true,
+        )
+        .is_none());
 
         // Collab/CV names are not treated as solo fallback candidates.
         assert!(!is_solo_artist_name("Ano x Lilas Ikuta"));
@@ -7951,6 +8141,7 @@ mod tests {
             vec![],
             Some(mk(1489581870, "Lilas Ikuta")),
             vec![mk(1489581870, "Lilas Ikuta")],
+            false,
         )
         .unwrap();
         assert_eq!(ikuta.id, 1489581870);
@@ -7961,6 +8152,7 @@ mod tests {
             vec![],
             Some(mk(1696262485, "青木陽菜")),
             vec![mk(1696262485, "青木陽菜")],
+            false,
         )
         .unwrap();
         assert_eq!(aoki.id, 1696262485);
@@ -7971,8 +8163,29 @@ mod tests {
             vec![mk(727267782, "Hachi"), mk(1523621267, "HACHI")],
             None,
             vec![mk(727267782, "Hachi"), mk(1523621267, "HACHI")],
+            false,
         )
         .unwrap();
         assert_eq!(hachi.id, 1523621267);
+
+        // Short ASCII query with no exact-case match ("ASU" vs "Asu") must reject.
+        assert!(pick_itunes_artist_fallback(
+            "ASU",
+            vec![mk(888433, "Asu"), mk(1291573687, "Asu")],
+            None,
+            vec![mk(888433, "Asu"), mk(1291573687, "Asu")],
+            true,
+        )
+        .is_none());
+
+        // Short ASCII query with multiple exact-case homonyms and 0 track hits must reject.
+        assert!(pick_itunes_artist_fallback(
+            "Eve",
+            vec![mk(108709, "Eve"), mk(1080967231, "Eve")],
+            None,
+            vec![mk(108709, "Eve"), mk(1080967231, "Eve")],
+            true,
+        )
+        .is_none());
     }
 }

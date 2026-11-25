@@ -596,6 +596,20 @@ pub fn slug(s: &str) -> String {
     }
 }
 
+/// Returns true when an artist name is distinctive enough that merging across
+/// casing differences (e.g. `"BLUE ENCOUNT"` <-> `"Blue Encount"`) without
+/// shared track IDs is safe. Short single-word names like `"ASU"` vs `"Asu"`,
+/// `"LISA"` vs `"LiSA"`, `"HACHI"` vs `"Hachi"`, or `"Eve"` frequently belong
+/// to unrelated artists across regions/genres and must require exact-case or
+/// track-level evidence instead.
+pub fn allow_case_insensitive_artist_merge(name: &str) -> bool {
+    let sl = slug(name);
+    if sl.is_empty() || sl == "unknown" {
+        return false;
+    }
+    sl.contains('-') || sl.chars().count() >= 6
+}
+
 /// Returns true for common share bucket folder names that are not artist names.
 pub fn is_generic_folder_name(s: &str) -> bool {
     let clean = strip_release_tags(s).trim().to_lowercase();

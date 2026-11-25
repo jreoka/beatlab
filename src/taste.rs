@@ -4082,17 +4082,19 @@ impl TasteEngine {
             .or_else(|| stored_for_id.iter().find_map(Track::deezer_artist_id));
 
         let pick_best_dz_candidate = |candidates: Vec<ArtistSummary>, want_name: &str| -> Option<String> {
-            let want_slug = slug(want_name);
+            let want_trimmed = want_name.trim();
+            let want_slug = slug(want_trimmed);
+            let allow_ci = crate::models::allow_case_insensitive_artist_merge(want_trimmed);
             let mut matching: Vec<(bool, u64, usize, bool, ArtistSummary)> = candidates
                 .into_iter()
                 .filter(|a| {
                     !a.deezer_id.is_empty()
                         && (a.id == artist_id
-                            || a.name == want_name
-                            || (!want_slug.is_empty() && slug(&a.name) == want_slug))
+                            || a.name.trim() == want_trimmed
+                            || (allow_ci && !want_slug.is_empty() && slug(&a.name) == want_slug))
                 })
                 .map(|a| {
-                    let exact = a.name == want_name;
+                    let exact = a.name.trim() == want_trimmed;
                     let fans = parse_deezer_fans(&a.bio).unwrap_or(0);
                     let albs = a.album_count;
                     let has_art = !a.cover_url.trim().is_empty();
