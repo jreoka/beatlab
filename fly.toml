@@ -16,6 +16,15 @@ primary_region = "ord"
   # BEATLAB_S3_ACCESS_KEY_ID = "..."
   # BEATLAB_S3_SECRET_ACCESS_KEY = "..."
   BEATLAB_S3_MAX_GB = "100"
+  # Optional OpenAI-compatible overnight LLM curator (customizes Home, Explore & Mixes daily)
+  # BEATLAB_LLM_ENDPOINT = "https://api.openai.com/v1"
+  # BEATLAB_LLM_API_KEY = "..."
+  # BEATLAB_LLM_MODEL = "gpt-4o-mini"
+  # BEATLAB_LLM_REFRESH_HOUR = "4"
+  # BEATLAB_LLM_TEMPERATURE = "0.85"
+  # BEATLAB_LLM_MAX_TOKENS = "2600"
+  # BEATLAB_LLM_TIMEOUT_SECS = "90"
+  # BEATLAB_LLM_SYSTEM_PROMPT = ""
   RUST_LOG = "info"
   # Keep yt-dlp's player/signature cache on the volume so restarts and
   # deploys don't make the first plays re-fetch it.

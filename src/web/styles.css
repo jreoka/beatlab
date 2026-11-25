@@ -5563,6 +5563,89 @@ html, body {
   color: var(--text);
   margin-bottom: 22px;
 }
+.page-greeting.has-edition {
+  margin-bottom: 8px;
+}
+.daily-edition-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+}
+.daily-edition-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.daily-edition-tagline,
+.explore-daily-tagline {
+  font-size: 13.5px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+.explore-daily-tagline {
+  margin: 0 0 22px;
+}
+.llm-section-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.llm-cat-kicker {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.llm-cat-sub {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin: 1px 0 0;
+}
+.llm-search-prompts {
+  margin-top: 26px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.llm-search-prompts-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.llm-prompt-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  max-width: 640px;
+}
+.llm-prompt-chip {
+  border: 0;
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.llm-prompt-chip:hover {
+  background: var(--surface-2);
+  color: var(--accent);
+}
 .section {
   margin-bottom: 36px;
 }

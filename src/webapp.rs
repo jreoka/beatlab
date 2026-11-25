@@ -2890,6 +2890,10 @@ pub async fn home(
     if let Some(tz) = q.tz {
         state.taste.set_user_tz_offset(uid, tz);
     }
+    if let Some(ref curator) = state.llm {
+        curator.maybe_spawn_refresh(&state.taste, uid);
+    }
+    let llm_exp = crate::llm::LlmCurator::load_experience(&state.store, uid);
     let is_fresh = !state.store.has_listening_history(uid).unwrap_or(false);
 
     // Fetch external charts first so fresh accounts immediately have popular
@@ -2968,22 +2972,7 @@ pub async fn home(
 
     let (new_releases_json, new_releases_pending) = build_new_releases(&state, uid, &saved).await;
 
-    let moods: Vec<Value> = Mood::ALL
-        .iter()
-        .map(|m| {
-            let (c1, c2) = m.gradient();
-            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
-            json!({
-                "slug": m.slug(),
-                "label": m.label(),
-                "subtitle": m.subtitle(),
-                "c1": c1,
-                "c2": c2,
-                "trackCount": track_count,
-                "covers": covers,
-            })
-        })
-        .collect();
+    let moods = build_moods_json(&state, uid, llm_exp.as_ref());
 
     let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
     let recommended_artists = state.taste.recommended_artists_for_user(uid, 12);
@@ -3001,7 +2990,70 @@ pub async fn home(
         "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
         "moods": moods,
+        "llm": llm_meta_json(llm_exp.as_ref()),
     }))
+}
+
+fn llm_meta_json(exp: Option<&crate::llm::DailyLlmExperience>) -> Value {
+    let Some(e) = exp else {
+        return Value::Null;
+    };
+    json!({
+        "editionTitle": e.edition_title,
+        "dateLabel": e.date_label,
+        "generatedAt": e.generated_at,
+        "homeTagline": e.home_tagline,
+        "exploreTagline": e.explore_tagline,
+        "sections": e.sections,
+        "searchPrompts": e.search_prompts,
+    })
+}
+
+fn build_moods_json(
+    state: &AppState,
+    uid: i64,
+    llm_exp: Option<&crate::llm::DailyLlmExperience>,
+) -> Vec<Value> {
+    let mut ordered_moods: Vec<(Mood, Option<&crate::llm::LlmMoodOverride>)> = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(exp) = llm_exp {
+        for ov in &exp.mood_overrides {
+            if let Some(m) = Mood::from_slug(&ov.slug) {
+                if seen.insert(m) {
+                    ordered_moods.push((m, Some(ov)));
+                }
+            }
+        }
+    }
+    for &m in Mood::ALL.iter() {
+        if seen.insert(m) {
+            ordered_moods.push((m, None));
+        }
+    }
+    ordered_moods
+        .into_iter()
+        .map(|(m, ov)| {
+            let (c1, c2) = m.gradient();
+            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, m);
+            let label = ov
+                .map(|o| o.label.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| m.label());
+            let subtitle = ov
+                .map(|o| o.subtitle.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| m.subtitle());
+            json!({
+                "slug": m.slug(),
+                "label": label,
+                "subtitle": subtitle,
+                "c1": c1,
+                "c2": c2,
+                "trackCount": track_count,
+                "covers": covers,
+            })
+        })
+        .collect()
 }
 
 pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -3010,6 +3062,10 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         Err(r) => return r,
     };
     let uid = user.id;
+    if let Some(ref curator) = state.llm {
+        curator.maybe_spawn_refresh(&state.taste, uid);
+    }
+    let llm_exp = crate::llm::LlmCurator::load_experience(&state.store, uid);
     let is_fresh = !state.store.has_listening_history(uid).unwrap_or(false);
     let st = state.clone();
     let (dz_genres, chart_tracks, chart_albums, chart_artists) = bounded_upstream(async move {
@@ -3020,22 +3076,45 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     .await
     .unwrap_or_default();
 
-    let moods: Vec<Value> = Mood::ALL
-        .iter()
-        .map(|m| {
-            let (c1, c2) = m.gradient();
-            let (track_count, covers) = state.taste.curated_mood_preview_for_user(uid, *m);
-            json!({
-                "slug": m.slug(),
-                "label": m.label(),
-                "subtitle": m.subtitle(),
-                "c1": c1,
-                "c2": c2,
-                "trackCount": track_count,
-                "covers": covers,
-            })
+    let moods = build_moods_json(&state, uid, llm_exp.as_ref());
+
+    let custom_categories: Vec<Value> = llm_exp
+        .as_ref()
+        .map(|exp| {
+            exp.explore_categories
+                .iter()
+                .map(|cat| {
+                    let mixes: Vec<Value> = cat
+                        .mixes
+                        .iter()
+                        .map(|m| {
+                            let (track_count, covers) =
+                                state.taste.curated_llm_explore_preview(uid, m);
+                            json!({
+                                "key": m.key,
+                                "kind": "llm",
+                                "kicker": m.kicker,
+                                "title": m.title,
+                                "subtitle": m.subtitle,
+                                "query": m.query,
+                                "c1": m.c1,
+                                "c2": m.c2,
+                                "trackCount": track_count,
+                                "covers": covers,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "slug": cat.slug,
+                        "kicker": cat.kicker,
+                        "title": cat.title,
+                        "subtitle": cat.subtitle,
+                        "mixes": mixes,
+                    })
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
 
     let mut decades: Vec<Value> = Vec::new();
     for spec in crate::taste::EXPLORE_MIX_SPECS {
@@ -3134,6 +3213,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 
     json_res(json!({
+        "customCategories": custom_categories,
         "moods": moods,
         "decades": decades,
         "discoveryPicks": to_web_tracks(&state, uid, &discovery_picks),
@@ -3144,6 +3224,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
         "charts": to_web_tracks(&state, uid, &visible_charts),
         "newAlbums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
         "curator": curator,
+        "llm": llm_meta_json(llm_exp.as_ref()),
     }))
 }
 
@@ -3178,29 +3259,57 @@ pub async fn explore_mix(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some(spec) = crate::taste::find_explore_mix_spec(&key) else {
-        return err_res(StatusCode::NOT_FOUND, "Explore mix not found");
-    };
-    let raw_tracks = state
-        .taste
-        .get_curated_explore_mix_tracks(user.id, spec, 35)
-        .await;
-    let tracks = filter_visible_tracks(&state, user.id, raw_tracks);
-    let total_duration: i32 = tracks.iter().map(|t| t.duration.max(0)).sum();
-    let match_ids = personal_match_ids(&state, user.id);
-    json_res(json!({
-        "mix": {
-            "key": spec.key,
-            "kind": spec.kind,
-            "title": spec.title,
-            "subtitle": spec.subtitle,
-            "query": spec.query,
-            "c1": spec.c1,
-            "c2": spec.c2,
-            "totalDuration": total_duration,
-        },
-        "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
-    }))
+    if let Some(spec) = crate::taste::find_explore_mix_spec(&key) {
+        let raw_tracks = state
+            .taste
+            .get_curated_explore_mix_tracks(user.id, spec, 35)
+            .await;
+        let tracks = filter_visible_tracks(&state, user.id, raw_tracks);
+        let total_duration: i32 = tracks.iter().map(|t| t.duration.max(0)).sum();
+        let match_ids = personal_match_ids(&state, user.id);
+        return json_res(json!({
+            "mix": {
+                "key": spec.key,
+                "kind": spec.kind,
+                "kicker": "ERA MIX",
+                "title": spec.title,
+                "subtitle": spec.subtitle,
+                "query": spec.query,
+                "c1": spec.c1,
+                "c2": spec.c2,
+                "totalDuration": total_duration,
+            },
+            "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
+        }));
+    }
+
+    if let Some(exp) = crate::llm::LlmCurator::load_experience(&state.store, user.id) {
+        if let Some(llm_spec) = exp.find_explore_mix(&key) {
+            let raw_tracks = state
+                .taste
+                .get_llm_explore_mix_tracks(user.id, llm_spec, 35)
+                .await;
+            let tracks = filter_visible_tracks(&state, user.id, raw_tracks);
+            let total_duration: i32 = tracks.iter().map(|t| t.duration.max(0)).sum();
+            let match_ids = personal_match_ids(&state, user.id);
+            return json_res(json!({
+                "mix": {
+                    "key": llm_spec.key,
+                    "kind": "llm",
+                    "kicker": llm_spec.kicker,
+                    "title": llm_spec.title,
+                    "subtitle": llm_spec.subtitle,
+                    "query": llm_spec.query,
+                    "c1": llm_spec.c1,
+                    "c2": llm_spec.c2,
+                    "totalDuration": total_duration,
+                },
+                "tracks": to_web_tracks_with_taste(&state, user.id, &tracks, &match_ids),
+            }));
+        }
+    }
+
+    err_res(StatusCode::NOT_FOUND, "Explore mix not found")
 }
 
 pub async fn mood_mix(
@@ -3217,12 +3326,27 @@ pub async fn mood_mix(
     };
     let tracks = state.taste.mood_mix_tracks(user.id, mood, 35).await;
     let (c1, c2) = mood.gradient();
+    let llm_ov = crate::llm::LlmCurator::load_experience(&state.store, user.id).and_then(|exp| {
+        exp.mood_overrides
+            .into_iter()
+            .find(|o| o.slug == mood.slug())
+    });
+    let label = llm_ov
+        .as_ref()
+        .map(|o| o.label.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| mood.label());
+    let subtitle = llm_ov
+        .as_ref()
+        .map(|o| o.subtitle.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| mood.subtitle());
     let match_ids = personal_match_ids(&state, user.id);
     json_res(json!({
         "mood": {
             "slug": mood.slug(),
-            "label": mood.label(),
-            "subtitle": mood.subtitle(),
+            "label": label,
+            "subtitle": subtitle,
             "c1": c1,
             "c2": c2,
         },
@@ -6805,6 +6929,7 @@ mod tests {
             sources,
             engine,
             taste,
+            llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         }
@@ -6948,6 +7073,7 @@ mod tests {
             sources,
             engine: engine.clone(),
             taste,
+            llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
@@ -7049,6 +7175,7 @@ mod tests {
             sources,
             engine: engine.clone(),
             taste,
+            llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
@@ -7398,6 +7525,7 @@ mod tests {
             sources,
             engine: engine.clone(),
             taste,
+            llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
@@ -7539,6 +7667,7 @@ mod tests {
             sources,
             engine: engine.clone(),
             taste,
+            llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
@@ -7719,6 +7848,7 @@ mod tests {
             sources: sources.clone(),
             engine,
             taste: std::sync::Arc::new(crate::taste::TasteEngine::new(store, sources)),
+            llm: None,
             now_playing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             new_releases_inflight: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
@@ -7837,6 +7967,7 @@ mod tests {
             sources,
             engine: engine.clone(),
             taste,
+            llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
@@ -7963,6 +8094,7 @@ mod tests {
             sources,
             engine: engine.clone(),
             taste,
+            llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };

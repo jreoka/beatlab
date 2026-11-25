@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod engine;
+mod llm;
 mod models;
 mod profile_page;
 mod remote_cache;
@@ -127,6 +128,17 @@ async fn main() -> models::AppResult<()> {
         info!(bucket = %remote.describe(), "S3 cool cache enabled — local disk is the hot tier");
     }
 
+    // Optional OpenAI-compatible overnight LLM curator (configured by server owner via env vars).
+    let llm_curator = crate::llm::LlmCurator::from_env()?.map(Arc::new);
+    if let Some(ref curator) = llm_curator {
+        info!(
+            endpoint = %curator.config.safe_endpoint_label(),
+            model = %curator.config.model,
+            refresh_hour = curator.config.refresh_hour,
+            "overnight LLM curator enabled"
+        );
+    }
+
     // Soft-deleted accounts, stale challenges and cool-cache quota are handled
     // once an hour.
     let cleanup_store = store.clone();
@@ -187,6 +199,7 @@ async fn main() -> models::AppResult<()> {
         sources,
         engine,
         taste: taste.clone(),
+        llm: llm_curator.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
         new_releases_inflight: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -195,14 +208,42 @@ async fn main() -> models::AppResult<()> {
 
     // Fast startup catalog warming + continuous RoPE-QKVO/XSA/GEGLU Transformer training & curation
     let warm_taste = taste.clone();
+    let warm_llm = llm_curator.clone();
     tokio::spawn(async move {
         warm_taste.warm_catalog().await;
+        if let Some(ref curator) = warm_llm {
+            if let Ok(uids) = warm_taste.store.all_user_ids() {
+                for uid in uids.into_iter().take(3) {
+                    match curator.refresh_user_experience(&warm_taste, uid, false).await {
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(user_id = uid, error = %e, "startup LLM customization failed"),
+                    }
+                }
+            }
+        }
         let mut interval = tokio::time::interval(Duration::from_secs(90));
         interval.tick().await;
         let mut tick: usize = 0;
         loop {
             interval.tick().await;
             warm_taste.curate_background_step(tick).await;
+            if let Some(ref curator) = warm_llm {
+                if let Ok(uids) = warm_taste.store.all_user_ids() {
+                    let mut refreshed = 0usize;
+                    for uid in uids {
+                        if refreshed >= 2 {
+                            break;
+                        }
+                        match curator.refresh_user_experience(&warm_taste, uid, false).await {
+                            Ok(true) => refreshed += 1,
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::warn!(user_id = uid, error = %e, "overnight LLM customization failed");
+                            }
+                        }
+                    }
+                }
+            }
             tick = tick.wrapping_add(1);
         }
     });
@@ -359,6 +400,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/admin/users", get(admin::users))
         .route("/api/admin/users/{id}", get(admin::user_detail))
         .route("/api/admin/cache/backfill", post(admin::backfill_cache))
+        .route("/api/admin/llm/refresh", post(admin::refresh_llm))
         .route("/api/admin/users/{id}/sessions/revoke", post(admin::revoke_sessions))
         .route("/api/admin/users/{id}/password/reset", post(admin::reset_password))
         .route("/api/admin/users/{id}/2fa/reset", post(admin::reset_2fa))

@@ -2144,7 +2144,7 @@
   const QP_PER_PAGE = 9;
   const QP_MAX_PAGES = 4;
 
-  function quickPicksSectionHtml(quickPicks) {
+  function quickPicksSectionHtml(quickPicks, title = 'Quick Picks') {
     const pages = [];
     for (let i = 0; i < quickPicks.length; i += QP_PER_PAGE) pages.push(quickPicks.slice(i, i + QP_PER_PAGE));
     const multi = pages.length > 1;
@@ -2155,7 +2155,7 @@
       </div>` : '';
     const dots = multi ? `<div class="qp-dots" id="qp-dots">${pages.map((_, i) => `<button class="qp-dot${i === 0 ? ' active' : ''}" data-page="${i}" aria-label="Page ${i + 1}"></button>`).join('')}</div>` : '';
     return `<section class="section quick-picks-section">
-      <div class="section-head"><h2>Quick Picks</h2>${nav}</div>
+      <div class="section-head"><h2>${esc(title)}</h2>${nav}</div>
       <div class="qp-pager" id="qp-pager">${pages.map((p) => `<div class="qp-page"><div class="quick-picks-grid">${p.map(renderQuickTile).join('')}</div></div>`).join('')}</div>
       ${dots}
     </section>`;
@@ -2217,11 +2217,23 @@
       const artists = d.artists || [];
       const recommendedArtists = d.recommendedArtists || [];
       const moods = d.moods || [];
+      const llm = d.llm || null;
+      const sec = (llm && llm.sections) || {};
+      const secTitle = (key, fallback) => (sec[key] && String(sec[key]).trim()) || fallback;
+      if (llm && Array.isArray(llm.searchPrompts) && llm.searchPrompts.length) {
+        state.llmSearchPrompts = llm.searchPrompts;
+      }
 
-      let html = `<h1 class="page-greeting">${greetingText()}, ${esc(state.user.username)}</h1>`;
+      let html = `<h1 class="page-greeting${llm ? ' has-edition' : ''}">${greetingText()}, ${esc(state.user.username)}</h1>`;
+      if (llm && (llm.editionTitle || llm.homeTagline)) {
+        html += `<div class="daily-edition-note">
+          ${llm.editionTitle ? `<span class="daily-edition-pill">${esc(llm.editionTitle)}</span>` : ''}
+          ${llm.homeTagline ? `<span class="daily-edition-tagline">${esc(llm.homeTagline)}</span>` : ''}
+        </div>`;
+      }
 
       if (quickPicks.length > 0) {
-        html += quickPicksSectionHtml(quickPicks);
+        html += quickPicksSectionHtml(quickPicks, secTitle('quickPicks', 'Quick Picks'));
       }
 
       // New releases from artists the user listens to sit right under Quick Picks.
@@ -2230,42 +2242,43 @@
       if (mixedForYou.length > 0) {
         html += `<section class="section">
           <div class="section-head">
-            <h2>Mixed for you</h2>          </div>
+            <h2>${esc(secTitle('mixedForYou', 'Mixed for you'))}</h2>
+          </div>
           <div class="mixed-for-you-grid rail">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;
       }
 
       if (mixes.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Made For You</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('madeForYou', 'Made For You'))}</h2></div>
           <div class="card-grid rail">${mixes.map(renderPlaylistCard).join('')}</div>
         </section>`;
       }
 
       if (recent.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Recently Played</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('recent', 'Recently Played'))}</h2></div>
           <div class="card-grid rail">${recent.slice(0, 8).map(renderTrackCard).join('')}</div>
         </section>`;
       }
 
       if (relatedTracks.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Related Tracks For You</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="section-head"><h2>${esc(secTitle('relatedTracks', 'Related Tracks For You'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
           <div class="track-table">${renderTrackRows(relatedTracks.slice(0, 10), relatedTracks)}</div>
         </section>`;
       }
 
       if (recommendedArtists.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Artists You Might Like</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('recommendedArtists', 'Artists You Might Like'))}</h2></div>
           <div class="card-grid rail">${recommendedArtists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
 
       if (moods.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Moods &amp; Vibes</h2><button class="text-btn" onclick="App.navigate('explore')">See all</button></div>
+          <div class="section-head"><h2>${esc(secTitle('moods', 'Moods & Vibes'))}</h2><button class="text-btn" onclick="App.navigate('explore')">See all</button></div>
           <div class="mood-grid">${moods.slice(0, 5).map(renderMoodTile).join('')}</div>
         </section>`;
       }
@@ -2327,10 +2340,11 @@
         ? `<img class="explore-single-art" src="${esc(covers[0])}" loading="lazy" alt="" />`
         : `<div class="explore-art-fallback" style="background:${esc(item.c2)};box-shadow:inset 0 -3px 0 ${esc(item.c1)}"><span>${esc(item.title.slice(0, 2).toUpperCase())}</span></div>`;
     const countLabel = item.trackCount > 0 ? `${item.trackCount} curated tracks` : 'Curating on demand';
+    const kicker = item.kicker || (item.kind === 'llm' ? 'CURATED MIX' : 'ERA MIX');
     return `<div class="explore-mix-card" style="border-color:${esc(item.c1)}44" onclick="App.navigate('explore-mix/${encodeURIComponent(item.key)}')">
       <div class="explore-mix-art" style="background:${esc(item.c2)}">${artHtml}</div>
       <div class="explore-mix-body">
-        <div class="explore-mix-kicker" style="color:${esc(item.c1)}">ERA MIX</div>
+        <div class="explore-mix-kicker" style="color:${esc(item.c1)}">${esc(kicker)}</div>
         <h3>${esc(item.title)}</h3>
         <p>${esc(item.subtitle)}</p>
         <div class="explore-mix-meta">${esc(countLabel)}</div>
@@ -2367,51 +2381,78 @@
       const charts = cacheTracks(d.charts || []);
       const discoveryPicks = cacheTracks(d.discoveryPicks || []);
       const relatedTracks = cacheTracks(d.relatedTracks || []);
+      const customCategories = d.customCategories || [];
       const decades = d.decades || [];
       const artists = d.artists || [];
       const recommendedArtists = d.recommendedArtists || [];
       const curator = d.curator || null;
+      const llm = d.llm || null;
+      const sec = (llm && llm.sections) || {};
+      const secTitle = (key, fallback) => (sec[key] && String(sec[key]).trim()) || fallback;
+      if (llm && Array.isArray(llm.searchPrompts) && llm.searchPrompts.length) {
+        state.llmSearchPrompts = llm.searchPrompts;
+      }
       const curatorBadge = curator
         ? `<span class="curator-pill" title="Server continuously curates moods, decades, and discovery pools in the background"><span class="curator-dot"></span>Live Curator · ${Number(curator.catalogTracks || 0).toLocaleString()} tracks · ${curator.readyMoods || 0}/${curator.totalMoods || 10} moods ready</span>`
         : '';
 
-      let html = `<div class="section-head" style="margin-bottom:18px;gap:12px;flex-wrap:wrap">
+      let html = `<div class="section-head" style="margin-bottom:${llm && llm.exploreTagline ? '8px' : '18px'};gap:12px;flex-wrap:wrap">
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <h1 class="page-greeting" style="margin-bottom:0">Explore</h1>
+          ${llm && llm.editionTitle ? `<span class="daily-edition-pill">${esc(llm.editionTitle)}</span>` : ''}
           ${curatorBadge}
         </div>
         <button class="btn-secondary" onclick="App.promptInstantMix()">Create Instant Mix</button>
       </div>`;
 
+      if (llm && llm.exploreTagline) {
+        html += `<p class="explore-daily-tagline">${esc(llm.exploreTagline)}</p>`;
+      }
+
+      for (const cat of customCategories) {
+        const catMixes = Array.isArray(cat.mixes) ? cat.mixes : [];
+        if (!catMixes.length) continue;
+        html += `<section class="section llm-explore-section">
+          <div class="section-head">
+            <div class="llm-section-title-group">
+              ${cat.kicker ? `<div class="llm-cat-kicker">${esc(cat.kicker)}</div>` : ''}
+              <h2>${esc(cat.title)}</h2>
+              ${cat.subtitle ? `<p class="llm-cat-sub">${esc(cat.subtitle)}</p>` : ''}
+            </div>
+          </div>
+          <div class="explore-mix-grid">${catMixes.map(renderExploreMixCard).join('')}</div>
+        </section>`;
+      }
+
       html += `<section class="section">
-        <div class="section-head"><h2>Moods &amp; Vibes</h2></div>
+        <div class="section-head"><h2>${esc(secTitle('moods', 'Moods & Vibes'))}</h2></div>
         <div class="mood-grid">${(d.moods || []).map(renderMoodTile).join('')}</div>
       </section>`;
 
       if (decades.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Decades &amp; Time Machine</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('decades', 'Decades & Time Machine'))}</h2></div>
           <div class="explore-mix-grid">${decades.map(renderExploreMixCard).join('')}</div>
         </section>`;
       }
 
       if (discoveryPicks.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Fresh Discovery Picks</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(discoveryPicks.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="section-head"><h2>${esc(secTitle('discovery', 'Fresh Discovery Picks'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(discoveryPicks.map((t) => t.id)))}, 0)">Play All</button></div>
           <div class="track-table">${renderTrackRows(discoveryPicks)}</div>
         </section>`;
       }
 
       if (relatedTracks.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Related Tracks</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="section-head"><h2>${esc(secTitle('relatedTracks', 'Related Tracks'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
           <div class="track-table">${renderTrackRows(relatedTracks)}</div>
         </section>`;
       }
 
       if (recommendedArtists.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Artists You Might Like</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('recommendedArtists', 'Artists You Might Like'))}</h2></div>
           <div class="card-grid">${recommendedArtists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
@@ -2478,10 +2519,11 @@
         : covers.length >= 1
           ? `<img class="hero-art" src="${esc(covers[0])}" alt="" />`
           : '';
+      const mixKicker = m.kicker || (m.kind === 'llm' ? 'CURATED MIX' : 'ERA MIX');
       let html = `<div class="hero-header" style="background:${esc(m.c2)};border-color:${esc(m.c1)}55;border-left:4px solid ${esc(m.c1)};">
         ${artHtml}
         <div class="hero-info">
-          <div class="hero-kicker" style="color:#fff">ERA MIX</div>
+          <div class="hero-kicker" style="color:#fff">${esc(mixKicker)}</div>
           <h1 class="hero-title">${esc(m.title)}</h1>
           <div class="hero-sub" style="color:rgba(255,255,255,0.88)">${esc(m.subtitle)} · ${tracks.length} tracks · ${fmtTotalDur(m.totalDuration || 0)}</div>
           <div class="hero-actions">
@@ -2508,6 +2550,18 @@
       state.searchState = null;
       state.searchFetchingQuery = '';
       state.searchLoadingUi = false;
+      const prompts = Array.isArray(state.llmSearchPrompts) ? state.llmSearchPrompts : [];
+      const promptsHtml = prompts.length
+        ? `<div class="llm-search-prompts">
+            <div class="llm-search-prompts-label">Curated vibes for today</div>
+            <div class="llm-prompt-row">${prompts
+              .map(
+                (p) =>
+                  `<button class="llm-prompt-chip" onclick="App.navigate('mix?q=${encodeURIComponent(p.query)}&mode=auto')">${esc(p.label)}</button>`
+              )
+              .join('')}</div>
+          </div>`
+        : '';
       $('main-view').innerHTML = `
         <div class="section-head" style="margin-bottom:18px">
           <h1 class="page-greeting" style="margin-bottom:0">Search</h1>
@@ -2518,6 +2572,7 @@
           <div style="margin-top:16px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
             <button class="btn-secondary" onclick="App.promptInstantMix()">Create Instant Mix</button>
           </div>
+          ${promptsHtml}
         </div>`;
       return;
     }
@@ -4823,7 +4878,9 @@
   }
 
   function renderPlaylistCard(p) {
-    const sub = `${p.trackCount} tracks · ${p.ownerName}`;
+    const sub = p.isAuto && p.comment
+      ? p.comment
+      : `${p.trackCount} tracks · ${p.ownerName}`;
     const pinned = isPlaylistPinned(p.id);
     return `<div class="media-card" data-share-kind="playlist" data-share-id="${esc(p.id)}" data-share-title="${esc(p.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(p.coverUrl)}" onclick="App.navigate('playlist/${encodeURIComponent(p.id)}')">
       <div class="card-art-wrap">

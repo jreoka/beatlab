@@ -1,4 +1,5 @@
 use crate::engine::StreamEngine;
+use crate::llm::LlmCurator;
 use crate::models::Track;
 use crate::sources::SourceRegistry;
 use crate::store::Store;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub sources: SourceRegistry,
     pub engine: Arc<StreamEngine>,
     pub taste: Arc<TasteEngine>,
+    pub llm: Option<Arc<LlmCurator>>,
     pub now_playing: NowPlayingMap,
     pub new_releases_inflight: NewReleasesInflight,
 }

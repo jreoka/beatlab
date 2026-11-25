@@ -403,9 +403,49 @@
         statCard('bolt', 'warn', 'Hot cache', Math.round(o.localCacheBytes / 1048576).toLocaleString() + ' MB', num(o.localCacheEntries) + ' files · ' + Math.round(o.cacheMaxBytes / 1073741824) + ' GB cap'),
         statCard('cloud', 'violet', 'Cool cache', o.remoteCacheEnabled ? Math.round(o.remoteCacheBytes / 1048576).toLocaleString() + ' MB' : 'Off', o.remoteCacheEnabled ? num(o.remoteCacheObjects) + ' objects' : 'Configure S3/R2 to enable'),
       ];
+      const llm = o.llm || { enabled: false };
+      let llmHtml = '';
+      if (llm.enabled) {
+        const refreshHr = String(llm.refreshHour != null ? llm.refreshHour : 4).padStart(2, '0') + ':00 local';
+        const errNote = llm.lastError && llm.lastError.message
+          ? '<div class="stat-row"><span class="label">Last error</span><span class="value" style="color:var(--danger)">' + esc(llm.lastError.message) + '</span></div>'
+          : '';
+        llmHtml =
+          '<div class="group-title">Overnight LLM Curator</div>' +
+          '<div class="card">' +
+            '<div class="tier-head"><span class="ico violet">' + icon('bolt') + '</span><div><div class="t">' + esc(llm.model || 'LLM Curator') + '</div><div class="st">' + esc(llm.endpoint || '') + '</div></div><span class="pill on">' + (llm.inFlight ? 'Running (' + llm.inFlight + ')' : 'Active') + '</span></div>' +
+            statRow('Customized today', num(llm.customizedToday) + ' / ' + num(llm.totalUsers) + ' users (' + num(llm.customizedUsers) + ' total)') +
+            statRow('Overnight refresh hour', refreshHr) +
+            statRow('Last edition generated', ago(llm.lastGeneratedAt)) +
+            errNote +
+            '<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn" onclick="refreshLlmNow()">' + icon('refresh') + 'Run daily customization now</button></div>' +
+          '</div>';
+      } else {
+        llmHtml =
+          '<div class="group-title">Overnight LLM Curator</div>' +
+          '<div class="card">' +
+            '<div class="tier-head"><span class="ico violet">' + icon('bolt') + '</span><div><div class="t">Daily Experience Curator</div><div class="st">OpenAI-compatible endpoint</div></div><span class="pill off">Off</span></div>' +
+            '<p class="muted" style="margin:0">Set <code>BEATLAB_LLM_MODEL</code>, <code>BEATLAB_LLM_ENDPOINT</code>, and <code>BEATLAB_LLM_API_KEY</code> env vars to customize mixes and Explore categories overnight for every user.</p>' +
+          '</div>';
+      }
       $('overview-cards').innerHTML =
         '<div class="group-title">People</div><div class="stats">' + people.join('') + '</div>' +
-        '<div class="group-title">Library &amp; storage</div><div class="stats">' + library.join('') + '</div>';
+        '<div class="group-title">Library &amp; storage</div><div class="stats">' + library.join('') + '</div>' +
+        llmHtml;
+    };
+
+    window.refreshLlmNow = async (userId) => {
+      const msg = userId
+        ? 'Run overnight LLM customization for this user now?'
+        : 'Run overnight LLM customization for all users now?';
+      if (!confirm(msg)) return;
+      try {
+        const res = await api('/api/admin/llm/refresh', {
+          method: 'POST',
+          body: JSON.stringify(userId ? { userId } : {}),
+        });
+        toast('LLM customization started for ' + num(res.targetUsers || 0) + ' user(s)');
+      } catch (e) { toast(e.message); }
     };
 
     // ---------- users ----------
@@ -586,6 +626,9 @@
         html += d.sessions.length
           ? d.sessions.map((s) => '<div class="list-row"><span>' + esc(s.userAgent || 'unknown') + ' <span class="muted">· ' + esc(s.ip || 'no IP') + '</span></span><span class="when">' + esc(ago(s.lastSeen)) + '</span></div>').join('')
           : '<p class="muted">No sessions.</p>';
+        if (state.overview && state.overview.llm && state.overview.llm.enabled) {
+          html += '<div class="modal-actions"><button type="button" class="btn" onclick="refreshLlmNow(' + u.id + ')">' + icon('refresh') + 'Run LLM customization for user</button></div>';
+        }
         $('modal-body').innerHTML = html;
         $('modal').classList.remove('hidden');
       } catch (e) { toast(e.message); }

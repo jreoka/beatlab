@@ -1821,8 +1821,27 @@ impl TasteEngine {
             ),
         ];
 
-        for (suffix, title, comment, kind, ids) in specs {
+        let llm_exp = crate::llm::LlmCurator::load_experience(&self.store, user_id);
+        for (suffix, default_title, default_comment, kind, ids) in specs {
             let pid = format!("auto-u{}-{}", user_id, suffix);
+            let (title, comment) = if let Some(ov) = llm_exp
+                .as_ref()
+                .and_then(|e| e.auto_mix_overrides.get(kind))
+            {
+                let t = if ov.title.trim().is_empty() {
+                    default_title
+                } else {
+                    ov.title.as_str()
+                };
+                let c = if ov.comment.trim().is_empty() {
+                    default_comment
+                } else {
+                    ov.comment.as_str()
+                };
+                (t, c)
+            } else {
+                (default_title, default_comment)
+            };
             if !ids.is_empty() {
                 let _ = self
                     .store
@@ -1921,7 +1940,7 @@ impl TasteEngine {
         }
     }
 
-    fn user_tz_offset_min(&self, user_id: i64) -> i32 {
+    pub fn user_tz_offset_min(&self, user_id: i64) -> i32 {
         self.store
             .kv_get(&format!("user:tz_offset_min:{user_id}"))
             .and_then(|v| v.parse::<i32>().ok())
@@ -1962,6 +1981,15 @@ impl TasteEngine {
         }
 
         let tz = self.user_tz_offset_min(user_id);
+        // When an overnight LLM edition already built today's custom Daily Mixes,
+        // keep them intact instead of overwriting them with generic mood mixes.
+        if self.store.kv_get(&format!("mix4u:mood:{user_id}")).as_deref() == Some("llm") {
+            let last_rebuilt = kv_ts(format!("mix4u:v4:rebuilt_at:{user_id}"));
+            if mix4u_day(now, tz) <= mix4u_day(last_rebuilt, tz) {
+                return false;
+            }
+        }
+
         let last_rebuilt = kv_ts(format!("mix4u:v4:rebuilt_at:{user_id}"));
         if mix4u_day(now, tz) > mix4u_day(last_rebuilt, tz) {
             return true;
@@ -2249,14 +2277,27 @@ impl TasteEngine {
             }
         });
 
+        let llm_exp = crate::llm::LlmCurator::load_experience(&self.store, user_id);
         let mut cards = Vec::with_capacity(mixes.len());
         for p in mixes {
             let mut parts = p.kind.split(':');
             let _ = parts.next();
-            let mood = Mood::from_slug(parts.next().unwrap_or("")).unwrap_or(Mood::Energy);
+            let mood_slug = parts.next().unwrap_or("");
+            let is_llm = mood_slug == "llm";
+            let mood = Mood::from_slug(mood_slug).unwrap_or(Mood::Energy);
             let part = parts.next().unwrap_or("");
             let is_super = part == "supermix";
-            let (c1, c2) = mood.gradient();
+            let llm_spec = if is_llm {
+                llm_exp.as_ref().and_then(|e| e.find_daily_mix(part))
+            } else {
+                None
+            };
+            let (default_c1, default_c2) = mood.gradient();
+            let (c1, c2) = if let Some(spec) = llm_spec {
+                (spec.c1.clone(), spec.c2.clone())
+            } else {
+                (default_c1.to_string(), default_c2.to_string())
+            };
             let tracks = self.filter_hidden_tracks_for_user(
                 user_id,
                 self.store.playlist_tracks(&p.id).unwrap_or_default(),
@@ -2289,34 +2330,52 @@ impl TasteEngine {
                 }
             }
 
+            let title = if let Some(spec) = llm_spec {
+                spec.title.clone()
+            } else if is_llm && !p.name.trim().is_empty() {
+                p.name.clone()
+            } else if is_super {
+                "Daily Supermix".to_string()
+            } else {
+                format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
+            };
+            let art_title = if let Some(spec) = llm_spec {
+                spec.art_title.clone()
+            } else if is_super {
+                "Daily Supermix".to_string()
+            } else {
+                "Daily Mix".to_string()
+            };
+            let subtitle = if let Some(spec) = llm_spec {
+                if !spec.subtitle.is_empty() && !artists.is_empty() {
+                    format!("{} · {}", spec.subtitle, artists.iter().take(2).cloned().collect::<Vec<_>>().join(", "))
+                } else if !spec.subtitle.is_empty() {
+                    spec.subtitle.clone()
+                } else if !artists.is_empty() {
+                    artists.join(", ")
+                } else {
+                    mood.subtitle().to_string()
+                }
+            } else if artists.is_empty() {
+                mood.subtitle().to_string()
+            } else {
+                artists.join(", ")
+            };
+
             cards.push(MixedForYouCard {
                 id: p.id,
-                // Named from the part, not the stored playlist name, so the rail
-                // never shows a stale name from before a rename.
-                title: if is_super {
-                    "Daily Supermix".to_string()
-                } else {
-                    format!("Daily Mix {}", part.parse::<usize>().unwrap_or(0))
-                },
-                art_title: if is_super {
-                    "Daily Supermix".to_string()
-                } else {
-                    "Daily Mix".to_string()
-                },
+                title,
+                art_title,
                 number: if is_super {
                     String::new()
                 } else {
                     format!("{:02}", part.parse::<usize>().unwrap_or(0))
                 },
                 is_super,
-                subtitle: if artists.is_empty() {
-                    mood.subtitle().to_string()
-                } else {
-                    artists.join(", ")
-                },
+                subtitle,
                 covers,
-                c1: c1.to_string(),
-                c2: c2.to_string(),
+                c1,
+                c2,
                 track_count: tracks.len(),
             });
         }
@@ -3016,6 +3075,448 @@ impl TasteEngine {
             self.save_curated_pool(&explore_user_cache_key(user_id, spec.key), &ids);
         }
         ranked
+    }
+
+    /// Preview (track count + up to 4 cover URLs) for a user's LLM-curated Explore mix.
+    pub fn curated_llm_explore_preview(
+        &self,
+        user_id: i64,
+        spec: &crate::llm::LlmExploreMixSpec,
+    ) -> (usize, Vec<String>) {
+        if user_id <= 0 {
+            return (0, Vec::new());
+        }
+        let ids = self.load_curated_pool_ids(
+            &crate::llm::llm_explore_pool_key(user_id, &spec.key),
+            48 * 3600,
+        );
+        if ids.is_empty() {
+            return (0, Vec::new());
+        }
+        let tracks = self.store.get_tracks_by_ids(&ids).unwrap_or_default();
+        let tracks = self.filter_hidden_tracks_for_user(user_id, tracks);
+        Self::preview_from_tracks(&tracks)
+    }
+
+    /// Return tracks for an LLM-curated Explore mix, using its overnight cached pool
+    /// when ready or curating on demand if not yet cached.
+    pub async fn get_llm_explore_mix_tracks(
+        &self,
+        user_id: i64,
+        spec: &crate::llm::LlmExploreMixSpec,
+        limit: usize,
+    ) -> Vec<Track> {
+        let pool_key = crate::llm::llm_explore_pool_key(user_id, &spec.key);
+        let cached_ids = self.load_curated_pool_ids(&pool_key, 36 * 3600);
+        if cached_ids.len() >= 8 {
+            let tracks = self.store.get_tracks_by_ids(&cached_ids).unwrap_or_default();
+            let visible = self.filter_hidden_tracks_for_user(user_id, tracks);
+            if visible.len() >= 8 {
+                return visible.into_iter().take(limit).collect();
+            }
+        }
+        let queries = vec![spec.query.clone()];
+        let empty_excl = HashSet::new();
+        let tracks = self
+            .curate_llm_mix_tracks(
+                user_id,
+                &queries,
+                &spec.seed_artists,
+                &spec.genres,
+                spec.mood.as_deref(),
+                spec.year_range,
+                "balanced",
+                &empty_excl,
+                limit,
+            )
+            .await;
+        if !tracks.is_empty() {
+            let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+            self.save_curated_pool(&pool_key, &ids);
+        }
+        tracks
+    }
+
+    /// Materialize a freshly generated `DailyLlmExperience` into real playlists and
+    /// cached Explore category pools in SQLite so every screen loads instantaneously.
+    pub async fn materialize_llm_experience(
+        &self,
+        user_id: i64,
+        exp: &crate::llm::DailyLlmExperience,
+    ) {
+        if user_id <= 0 {
+            return;
+        }
+
+        // 1. Materialize the 4 custom-named Daily Mixes ("Mixed for you" rail).
+        if !exp.daily_mixes.is_empty() {
+            // Clean up any legacy non-llm mixed_for_you playlists so the rail never mixes old & new.
+            if let Some(old_mood) = self.store.kv_get(&format!("mix4u:mood:{user_id}")) {
+                if old_mood != "llm" {
+                    for part in Self::MIXED_FOR_YOU_PARTS {
+                        let _ = self.store.delete_playlist(&Self::mixed_for_you_playlist_id(
+                            user_id, &old_mood, part,
+                        ));
+                    }
+                }
+            }
+
+            let mut used_keys: HashSet<String> = HashSet::new();
+            let mut built_any = false;
+            for spec in &exp.daily_mixes {
+                let is_super = spec.part == "supermix";
+                let target_len = if is_super { 40 } else { 30 };
+                let excl = if is_super {
+                    HashSet::new()
+                } else {
+                    used_keys.clone()
+                };
+                let tracks = self
+                    .curate_llm_mix_tracks(
+                        user_id,
+                        &spec.seed_queries,
+                        &spec.seed_artists,
+                        &spec.genres,
+                        spec.mood.as_deref(),
+                        spec.year_range,
+                        &spec.familiarity,
+                        &excl,
+                        target_len,
+                    )
+                    .await;
+                if tracks.is_empty() {
+                    continue;
+                }
+                if !is_super {
+                    for t in &tracks {
+                        used_keys.insert(t.song_key());
+                    }
+                }
+                let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+                let comment = if spec.subtitle.trim().is_empty() {
+                    format!("Curated for {}", exp.date_label)
+                } else {
+                    spec.subtitle.clone()
+                };
+                let _ = self.store.upsert_auto_playlist(
+                    &Self::mixed_for_you_playlist_id(user_id, "llm", &spec.part),
+                    user_id,
+                    &spec.title,
+                    &comment,
+                    &Self::mixed_for_you_kind("llm", &spec.part),
+                    &ids,
+                );
+                built_any = true;
+            }
+            if built_any {
+                self.store
+                    .kv_set(&format!("mix4u:mood:{user_id}"), "llm");
+                self.store.kv_set(
+                    &format!("mix4u:v4:rebuilt_at:{user_id}"),
+                    &Utc::now().timestamp().to_string(),
+                );
+            }
+        }
+
+        // 2. Rebuild standard auto-playlists so they pick up today's LLM custom titles & comments.
+        let engine_for_auto = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            engine_for_auto.rebuild_auto_playlists(user_id);
+        })
+        .await;
+
+        // 3. Pre-populate each custom Explore category mix overnight so cards have real
+        //    cover collages, track counts, and instant playback in the morning.
+        for cat in &exp.explore_categories {
+            for mix in &cat.mixes {
+                let queries = vec![mix.query.clone()];
+                let empty_excl = HashSet::new();
+                let tracks = self
+                    .curate_llm_mix_tracks(
+                        user_id,
+                        &queries,
+                        &mix.seed_artists,
+                        &mix.genres,
+                        mix.mood.as_deref(),
+                        mix.year_range,
+                        "balanced",
+                        &empty_excl,
+                        30,
+                    )
+                    .await;
+                if !tracks.is_empty() {
+                    let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+                    self.save_curated_pool(
+                        &crate::llm::llm_explore_pool_key(user_id, &mix.key),
+                        &ids,
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn curate_llm_mix_tracks(
+        &self,
+        user_id: i64,
+        seed_queries: &[String],
+        seed_artists: &[String],
+        genres: &[String],
+        mood_slug: Option<&str>,
+        year_range: Option<(i32, i32)>,
+        familiarity: &str,
+        exclude_song_keys: &HashSet<String>,
+        limit: usize,
+    ) -> Vec<Track> {
+        let mut raw_candidates: Vec<Track> = Vec::new();
+        let mut curated_source_ids: HashSet<String> = HashSet::new();
+
+        // 1. Fetch curated playlists & search tracks for LLM seed queries (bounded timeouts).
+        for q in seed_queries.iter().take(2) {
+            let trimmed = q.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let batches = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.sources.fetch_curated_mix_tracks(trimmed, 2, 20),
+            )
+            .await
+            .unwrap_or_default();
+            let mut got_batch = false;
+            for (_, batch) in batches {
+                if !batch.is_empty() {
+                    got_batch = true;
+                    for t in batch {
+                        curated_source_ids.insert(t.id.clone());
+                        raw_candidates.push(t);
+                    }
+                }
+            }
+            if !got_batch {
+                let dz = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    self.sources.deezer.search_tracks(trimmed, 16),
+                )
+                .await
+                .unwrap_or_default();
+                for t in dz {
+                    curated_source_ids.insert(t.id.clone());
+                    raw_candidates.push(t);
+                }
+            }
+            if let Ok(local_hits) = self.store.search_tracks(trimmed, 16, 0) {
+                raw_candidates.extend(local_hits);
+            }
+        }
+
+        // 2. Pull tracks for LLM seed artists from SQLite + Deezer.
+        for artist in seed_artists.iter().take(4) {
+            let clean = artist.trim();
+            if clean.is_empty() {
+                continue;
+            }
+            let local_artist_tracks = self.store.search_tracks(clean, 10, 0).unwrap_or_default();
+            let local_cnt = local_artist_tracks.len();
+            raw_candidates.extend(local_artist_tracks);
+            if local_cnt < 4 {
+                let remote = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    self.sources.deezer.search_tracks(clean, 8),
+                )
+                .await
+                .unwrap_or_default();
+                raw_candidates.extend(remote);
+            }
+        }
+
+        if !raw_candidates.is_empty() {
+            let _ = self.store.upsert_tracks(&raw_candidates);
+        }
+
+        // 3. Also pull matching tracks from the listener's own catalog & mood/genre pools.
+        let mood_opt = mood_slug.and_then(Mood::from_slug);
+        if let Some(m) = mood_opt {
+            let mood_ids = self.load_curated_pool_ids(&mood_cache_key(m), 24 * 3600);
+            if !mood_ids.is_empty() {
+                raw_candidates.extend(
+                    self.store
+                        .get_tracks_by_ids(&mood_ids[..mood_ids.len().min(30)])
+                        .unwrap_or_default(),
+                );
+            }
+        }
+
+        let user_cands = self
+            .store
+            .candidate_tracks_for_user(user_id, 600)
+            .unwrap_or_default();
+
+        let sctx = self.build_scoring_context(user_id);
+        let seed_artist_lows: Vec<String> = seed_artists
+            .iter()
+            .map(|a| primary_artist(a).to_lowercase())
+            .filter(|a| !a.is_empty())
+            .collect();
+        let genre_lows: Vec<String> = genres
+            .iter()
+            .map(|g| g.trim().to_lowercase())
+            .filter(|g| !g.is_empty())
+            .collect();
+
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut pool: Vec<Track> = Vec::new();
+
+        let mut admit = |t: Track, require_match: bool| {
+            if is_hidden_track(&t, &sctx.prof)
+                || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                || is_mood_clutter_track(&t)
+            {
+                return;
+            }
+            if require_match {
+                let pa = primary_artist(&t.artist).to_lowercase();
+                let artist_hit = seed_artist_lows
+                    .iter()
+                    .any(|sa| !pa.is_empty() && (pa == *sa || pa.contains(sa.as_str())));
+                let g_low = t.genre.to_lowercase();
+                let genre_hit = !genre_lows.is_empty()
+                    && genre_lows.iter().any(|want| {
+                        genre_variants(want)
+                            .iter()
+                            .any(|alias| contains_term(&g_low, alias))
+                    });
+                let mood_hit = mood_opt.map_or(false, |m| {
+                    t.mood_list().contains(&m)
+                        || classify_moods(&t.title, &t.album, &t.genre, "").contains(&m)
+                });
+                let year_hit = year_range
+                    .map_or(false, |(lo, hi)| t.year >= lo && t.year <= hi);
+                if !(artist_hit || genre_hit || mood_hit || year_hit) {
+                    return;
+                }
+            }
+            if seen_ids.insert(t.id.clone()) && seen_keys.insert(t.song_key()) {
+                pool.push(t);
+            }
+        };
+
+        for t in raw_candidates {
+            admit(t, false);
+        }
+        for t in user_cands {
+            admit(t, true);
+        }
+        drop(admit);
+
+        // Graceful fallback when sources are offline or the catalog is very small.
+        if pool.len() < 12 {
+            let fallback = if familiarity == "discovery" {
+                self.discover_weekly(user_id, limit)
+            } else {
+                self.for_you_tracks(user_id, limit)
+            };
+            for t in fallback {
+                if !is_hidden_track(&t, &sctx.prof)
+                    && !is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
+                    && !is_mood_clutter_track(&t)
+                    && seen_ids.insert(t.id.clone())
+                    && seen_keys.insert(t.song_key())
+                {
+                    pool.push(t);
+                }
+            }
+        }
+        if pool.is_empty() {
+            return Vec::new();
+        }
+
+        let score_mode = match familiarity {
+            "discovery" => ScoreMode::Discover,
+            _ => ScoreMode::Supermix,
+        };
+        let mood_cues: Vec<Mood> = mood_opt.into_iter().collect();
+        let primary_q = seed_queries.first().map(String::as_str);
+        let n_w = self.neural_blend_weight(0.65, &sctx);
+        let n_scores = if n_w > 0.0 {
+            self.neural_scores(user_id, &[], primary_q, &mood_cues, genres, &pool)
+        } else {
+            Vec::new()
+        };
+
+        let mut scored: Vec<(f64, Track)> = pool
+            .into_iter()
+            .enumerate()
+            .map(|(idx, t)| {
+                let mut s = score_track_core(&t, &sctx.prof, &sctx.stats, score_mode);
+                if let Some(&ns) = n_scores.get(idx) {
+                    s += ns * n_w;
+                }
+                let pa = primary_artist(&t.artist).to_lowercase();
+                if seed_artist_lows
+                    .iter()
+                    .any(|sa| !pa.is_empty() && (pa == *sa || pa.contains(sa.as_str())))
+                {
+                    s += 3.2;
+                }
+                let g_low = t.genre.to_lowercase();
+                if genre_lows.iter().any(|want| {
+                    genre_variants(want)
+                        .iter()
+                        .any(|alias| contains_term(&g_low, alias))
+                }) {
+                    s += 1.6;
+                }
+                if let Some(m) = mood_opt {
+                    if t.mood_list().contains(&m)
+                        || classify_moods(&t.title, &t.album, &t.genre, "").contains(&m)
+                    {
+                        s += 1.2;
+                    }
+                }
+                if let Some((lo, hi)) = year_range {
+                    if t.year >= lo && t.year <= hi {
+                        s += 1.8;
+                    } else if t.year > 0 {
+                        s -= 1.2;
+                    }
+                }
+                if curated_source_ids.contains(&t.id) {
+                    s += 0.9;
+                }
+                let familiar = is_familiar_track(&t, &sctx.prof, &sctx.stats);
+                match familiarity {
+                    "familiar" => {
+                        if familiar {
+                            s += 2.4;
+                        }
+                    }
+                    "discovery" => {
+                        if familiar {
+                            s -= 2.2;
+                        } else {
+                            s += 1.4;
+                        }
+                    }
+                    _ => {
+                        if familiar {
+                            s += 0.6;
+                        }
+                    }
+                }
+                // Strongly prefer tracks not already placed in another Daily Mix today.
+                if exclude_song_keys.contains(&t.song_key()) {
+                    s -= 8.0;
+                }
+                (s, t)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
+        dedup_and_interleave(ranked, limit, 2)
     }
 
     fn rank_explore_mix_tracks(

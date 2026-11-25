@@ -193,6 +193,7 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 .map(|(kind, objects, bytes)| json!({ "kind": kind, "objects": objects, "bytes": bytes }))
                 .collect::<Vec<_>>(),
             "maxTrackBytes": state.engine.max_track_bytes,
+            "llm": state.llm.as_ref().map(|l| l.status_snapshot(&state.store, &state.taste)).unwrap_or_else(|| json!({ "enabled": false })),
         })),
         Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -213,6 +214,15 @@ pub async fn config(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "cacheGb": std::env::var("BEATLAB_CACHE_GB").unwrap_or_else(|_| "5.0".to_string()),
         "listenAddr": std::env::var("BEATLAB_ADDR").unwrap_or_else(|_| "0.0.0.0:4533".to_string()),
         "webauthnEnabled": crate::auth::webauthn().is_some(),
+        "llmEnabled": state.llm.is_some(),
+        "llmEndpoint": state.llm.as_ref().map(|l| l.config.safe_endpoint_label()).unwrap_or_else(|| "(not configured)".to_string()),
+        "llmModel": state.llm.as_ref().map(|l| l.config.model.clone()).unwrap_or_else(|| "(not configured)".to_string()),
+        "llmApiKey": match state.llm.as_ref() {
+            Some(l) if !l.config.api_key.is_empty() => "(configured)",
+            Some(_) => "(none — custom endpoint)",
+            None => "(not set)",
+        },
+        "llmRefreshHour": state.llm.as_ref().map(|l| format!("{:02}:00 local", l.config.refresh_hour)).unwrap_or_else(|| "—".to_string()),
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -527,6 +537,68 @@ pub async fn backfill_cache(State(state): State<AppState>, headers: HeaderMap) -
         );
     });
     json_res(json!({ "ok": true, "started": true }))
+}
+
+#[derive(Deserialize, Default)]
+pub struct RefreshLlmReq {
+    #[serde(rename = "userId", default)]
+    pub user_id: Option<i64>,
+}
+
+/// Immediately triggers an overnight LLM customization refresh for a single user
+/// or for all active users.
+pub async fn refresh_llm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    req: Option<Json<RefreshLlmReq>>,
+) -> Response {
+    let admin = match require_admin(&state, &headers) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let Some(curator) = state.llm.clone() else {
+        return err_res(
+            StatusCode::BAD_REQUEST,
+            "LLM curator is not configured — set BEATLAB_LLM_MODEL (and BEATLAB_LLM_API_KEY / BEATLAB_LLM_ENDPOINT)",
+        );
+    };
+    let target_ids: Vec<i64> = match req.and_then(|j| j.0.user_id) {
+        Some(uid) if uid > 0 => vec![uid],
+        _ => state.store.all_user_ids().unwrap_or_default(),
+    };
+    let target_count = target_ids.len();
+    let taste = state.taste.clone();
+    let store = state.store.clone();
+    let ip = client_ip(&headers);
+    let admin_id = admin.id;
+    let admin_name = admin.username.clone();
+
+    tokio::spawn(async move {
+        let mut ok_count = 0usize;
+        let mut err_count = 0usize;
+        for uid in target_ids {
+            match curator.refresh_user_experience(&taste, uid, true).await {
+                Ok(true) => ok_count += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    err_count += 1;
+                    tracing::warn!(user_id = uid, error = %e, "manual admin LLM refresh failed");
+                }
+            }
+        }
+        store.record_security_event(
+            admin_id,
+            "admin_llm_refresh",
+            &format!("[admin of {admin_name}] Refreshed daily LLM experience for {ok_count}/{target_count} users ({err_count} errors)"),
+            &ip,
+        );
+    });
+
+    json_res(json!({
+        "ok": true,
+        "started": true,
+        "targetUsers": target_count,
+    }))
 }
 
 pub async fn purge_user(
