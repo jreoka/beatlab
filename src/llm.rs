@@ -6,11 +6,11 @@
 //! - `BEATLAB_LLM_API_KEY` (required for default OpenAI endpoint, optional for local custom endpoints)
 //! - `BEATLAB_LLM_REFRESH_HOUR` (optional local hour 0..23, default `4`)
 //! - `BEATLAB_LLM_TEMPERATURE` (optional float 0.0..2.0, default `0.85`)
-//! - `BEATLAB_LLM_MAX_TOKENS` (optional integer 512..16384, default `2600`)
-//! - `BEATLAB_LLM_TIMEOUT_SECS` (optional integer 10..300, default `90`)
+//! - `BEATLAB_LLM_MAX_TOKENS` (optional integer 512..32768, default `8192`)
+//! - `BEATLAB_LLM_TIMEOUT_SECS` (optional integer 10..300, default `120`)
 //! - `BEATLAB_LLM_SYSTEM_PROMPT` (optional extra editorial instructions from server owner)
 //! - `BEATLAB_LLM_EXTRA_HEADERS` (optional JSON object of extra HTTP headers)
-//! - `BEATLAB_LLM_REASONING_EFFORT` (optional `"low" | "medium" | "high"`)
+//! - `BEATLAB_LLM_REASONING_EFFORT` (optional `"none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`)
 //!
 //! Once per listener-day (turning over at `refresh_hour` in each user's local timezone),
 //! Beatlab summarizes the user's listening stats, top artists/tracks, genres, moods, and
@@ -125,20 +125,20 @@ impl LlmConfig {
 
         let max_tokens = env_nonempty("BEATLAB_LLM_MAX_TOKENS")
             .and_then(|s| s.parse::<u32>().ok())
-            .map(|v| v.clamp(512, 16384))
-            .unwrap_or(2600);
+            .map(|v| v.clamp(512, 32768))
+            .unwrap_or(8192);
 
         let timeout_secs = env_nonempty("BEATLAB_LLM_TIMEOUT_SECS")
             .and_then(|s| s.parse::<u64>().ok())
             .map(|v| v.clamp(10, 300))
-            .unwrap_or(90);
+            .unwrap_or(120);
 
         let extra_system_prompt = env_nonempty("BEATLAB_LLM_SYSTEM_PROMPT");
 
         let reasoning_effort = env_nonempty("BEATLAB_LLM_REASONING_EFFORT").map(|s| {
             let low = s.to_ascii_lowercase();
             match low.as_str() {
-                "low" | "medium" | "high" => low,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => low,
                 _ => s,
             }
         });
@@ -500,6 +500,9 @@ impl LlmCurator {
         let result = self.generate_and_materialize(taste, user_id, tz, now).await;
         match result {
             Ok(exp) => {
+                if let Ok(mut le) = self.last_error.lock() {
+                    *le = None;
+                }
                 taste.store.kv_set("llm:last_success_at", &now.to_string());
                 info!(
                     user_id,
@@ -593,6 +596,7 @@ impl LlmCurator {
             }
         }
 
+        let is_openrouter = is_openrouter_endpoint(&self.config.completions_url);
         let mut body = json!({
             "model": self.config.model,
             "messages": [
@@ -605,15 +609,110 @@ impl LlmCurator {
         });
         if let Some(ref effort) = self.config.reasoning_effort {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("reasoning_effort".to_string(), json!(effort));
+                if is_openrouter {
+                    obj.insert("reasoning".to_string(), json!({ "effort": effort }));
+                } else {
+                    obj.insert("reasoning_effort".to_string(), json!(effort));
+                }
             }
         }
 
+        let raw_text = self.send_with_compat_retry(&headers, &body).await?;
+        let first_outcome = parse_completion_outcome(&raw_text)?;
+
+        let first_empty = match first_outcome {
+            CompletionOutcome::Content {
+                content,
+                finish_reason,
+            } => {
+                // If the model hit the token cap before finishing the JSON object, retry with
+                // a larger token budget rather than failing with a parse error.
+                if finish_reason.as_deref() == Some("length")
+                    && extract_json_object(&content).is_none()
+                {
+                    EmptyCompletionInfo {
+                        finish_reason,
+                        has_reasoning: false,
+                        reasoning_text: None,
+                        completion_tokens: None,
+                        reasoning_tokens: None,
+                        truncated_content: true,
+                    }
+                } else {
+                    return Ok(content);
+                }
+            }
+            CompletionOutcome::Empty(info) => info,
+        };
+
+        warn!(
+            model = %self.config.model,
+            finish_reason = ?first_empty.finish_reason,
+            has_reasoning = first_empty.has_reasoning,
+            reasoning_tokens = ?first_empty.reasoning_tokens,
+            completion_tokens = ?first_empty.completion_tokens,
+            truncated_content = first_empty.truncated_content,
+            "LLM returned empty or truncated content; retrying with expanded token budget and plain prompt mode"
+        );
+
+        // Retry once with settings tuned for reasoning models and providers that misbehave
+        // under `response_format: json_object` or starve `content` on internal reasoning tokens:
+        // 1. Drop `response_format` (the prompt already strictly requests raw JSON).
+        // 2. Expand `max_tokens` to leave room for both thinking and the full JSON edition.
+        // 3. On OpenRouter, if reasoning tokens were consumed and no effort was configured,
+        //    hint `reasoning: { effort: "low" }` so thinking does not exhaust the output cap.
+        let mut retry_body = body.clone();
+        if let Some(obj) = retry_body.as_object_mut() {
+            obj.remove("response_format");
+            let boosted_tokens = self
+                .config
+                .max_tokens
+                .saturating_mul(2)
+                .clamp(8192, 16384)
+                .max(self.config.max_tokens)
+                .min(32768);
+            obj.insert("max_tokens".to_string(), json!(boosted_tokens));
+            if (first_empty.has_reasoning || first_empty.reasoning_tokens.unwrap_or(0) > 0)
+                && self.config.reasoning_effort.is_none()
+                && is_openrouter
+            {
+                obj.insert("reasoning".to_string(), json!({ "effort": "low" }));
+            }
+        }
+
+        let retry_raw = self.send_with_compat_retry(&headers, &retry_body).await?;
+        match parse_completion_outcome(&retry_raw)? {
+            CompletionOutcome::Content { content, .. } => Ok(content),
+            CompletionOutcome::Empty(retry_empty) => {
+                // Some reasoning models place the final JSON inside their reasoning channel
+                // while leaving `message.content` blank. Only accept it if it contains a real,
+                // parseable DailyLlmExperience payload.
+                for candidate in [
+                    retry_empty.reasoning_text.as_deref(),
+                    first_empty.reasoning_text.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(recovered) = extract_valid_experience_json(candidate) {
+                        warn!(
+                            model = %self.config.model,
+                            "recovered DailyLlmExperience JSON from reasoning channel after empty content"
+                        );
+                        return Ok(recovered.to_string());
+                    }
+                }
+                Err(err_msg(format_empty_content_error(&retry_empty)))
+            }
+        }
+    }
+
+    async fn send_with_compat_retry(&self, headers: &HeaderMap, body: &Value) -> AppResult<String> {
         let resp = self
             .http
             .post(&self.config.completions_url)
             .headers(headers.clone())
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(|e| err_msg(format!("LLM request failed: {e}")))?;
@@ -625,45 +724,65 @@ impl LlmCurator {
             .map_err(|e| err_msg(format!("Failed reading LLM response: {e}")))?;
 
         if status.is_success() {
-            return parse_completion_content(&text);
+            return Ok(text);
         }
 
         // Compatibility retry for OpenAI-compatible servers or reasoning models that reject
-        // `response_format`, `temperature`, or `max_tokens` (preferring `max_completion_tokens`).
+        // `response_format`, `temperature`, `reasoning`, or `max_tokens`.
         if status.as_u16() == 400 || status.as_u16() == 422 {
             let low = text.to_ascii_lowercase();
             let mut retry_body = body.clone();
             let mut changed = false;
             if let Some(obj) = retry_body.as_object_mut() {
-                if low.contains("response_format") || low.contains("json_object") {
-                    obj.remove("response_format");
+                if (low.contains("response_format") || low.contains("json_object"))
+                    && obj.remove("response_format").is_some()
+                {
                     changed = true;
                 }
-                if low.contains("max_completion_tokens") || low.contains("max_tokens") {
+                if low.contains("max_completion_tokens") {
                     if let Some(mt) = obj.remove("max_tokens") {
                         obj.insert("max_completion_tokens".to_string(), mt);
                         changed = true;
                     }
+                } else if low.contains("max_tokens") {
+                    let cur = obj.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if cur > 4096 {
+                        obj.insert("max_tokens".to_string(), json!(4096));
+                        changed = true;
+                    } else if let Some(mt) = obj.remove("max_tokens") {
+                        obj.insert("max_completion_tokens".to_string(), mt);
+                        changed = true;
+                    }
                 }
-                if low.contains("temperature") {
-                    obj.remove("temperature");
+                if low.contains("temperature") && obj.remove("temperature").is_some() {
                     changed = true;
                 }
-                if low.contains("reasoning_effort") {
-                    obj.remove("reasoning_effort");
-                    changed = true;
+                if low.contains("reasoning") {
+                    if obj.remove("reasoning_effort").is_some() {
+                        changed = true;
+                    }
+                    if obj.remove("reasoning").is_some() {
+                        changed = true;
+                    }
                 }
                 if !changed {
                     // Fallback: strip optional params that non-standard servers sometimes dislike.
-                    obj.remove("response_format");
-                    changed = true;
+                    if obj.remove("response_format").is_some() {
+                        changed = true;
+                    }
+                    if obj.remove("reasoning").is_some() {
+                        changed = true;
+                    }
+                    if obj.remove("reasoning_effort").is_some() {
+                        changed = true;
+                    }
                 }
             }
             if changed {
                 let retry_resp = self
                     .http
                     .post(&self.config.completions_url)
-                    .headers(headers)
+                    .headers(headers.clone())
                     .json(&retry_body)
                     .send()
                     .await
@@ -674,7 +793,7 @@ impl LlmCurator {
                     .await
                     .map_err(|e| err_msg(format!("Failed reading LLM retry response: {e}")))?;
                 if retry_status.is_success() {
-                    return parse_completion_content(&retry_text);
+                    return Ok(retry_text);
                 }
                 return Err(err_msg(format!(
                     "LLM API returned {}: {}",
@@ -735,36 +854,265 @@ impl LlmCurator {
     }
 }
 
-fn parse_completion_content(raw_body: &str) -> AppResult<String> {
+fn is_openrouter_endpoint(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.host_str().map(|h| {
+                h.eq_ignore_ascii_case("openrouter.ai")
+                    || h.to_ascii_lowercase().ends_with(".openrouter.ai")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug)]
+struct EmptyCompletionInfo {
+    finish_reason: Option<String>,
+    has_reasoning: bool,
+    reasoning_text: Option<String>,
+    completion_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    truncated_content: bool,
+}
+
+#[derive(Debug)]
+enum CompletionOutcome {
+    Content {
+        content: String,
+        finish_reason: Option<String>,
+    },
+    Empty(EmptyCompletionInfo),
+}
+
+fn extract_error_message(err_val: &Value) -> String {
+    if let Some(msg) = err_val.get("message").and_then(|v| v.as_str()) {
+        if !msg.trim().is_empty() {
+            return truncate_str(msg.trim(), 240);
+        }
+    }
+    if let Some(s) = err_val.as_str() {
+        if !s.trim().is_empty() {
+            return truncate_str(s.trim(), 240);
+        }
+    }
+    truncate_str(&err_val.to_string(), 240)
+}
+
+fn extract_reasoning_text(msg: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    for key in ["reasoning", "reasoning_content"] {
+        if let Some(s) = msg.get(key).and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(details) = msg.get("reasoning_details").and_then(|v| v.as_array()) {
+        for item in details {
+            for field in ["text", "summary", "content"] {
+                if let Some(s) = item.get(field).and_then(|v| v.as_str()) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn format_empty_content_error(info: &EmptyCompletionInfo) -> String {
+    let fr = info.finish_reason.as_deref().unwrap_or("unknown");
+    let reasoning_used = info.has_reasoning || info.reasoning_tokens.unwrap_or(0) > 0;
+    if fr == "length" && reasoning_used {
+        let detail = match (info.reasoning_tokens, info.completion_tokens) {
+            (Some(rt), Some(ct)) => format!(" ({rt}/{ct} tokens used on reasoning)"),
+            (Some(rt), None) => format!(" ({rt} reasoning tokens)"),
+            (None, Some(ct)) => format!(" ({ct} completion tokens)"),
+            (None, None) => String::new(),
+        };
+        format!(
+            "LLM exhausted max_tokens on reasoning with empty content{detail} — increase BEATLAB_LLM_MAX_TOKENS or set BEATLAB_LLM_REASONING_EFFORT=low"
+        )
+    } else if fr == "length" {
+        format!(
+            "LLM hit max_tokens limit before finishing output (finish_reason=length) — increase BEATLAB_LLM_MAX_TOKENS"
+        )
+    } else if reasoning_used {
+        format!(
+            "LLM message content was empty (finish_reason={fr}, reasoning returned without final answer)"
+        )
+    } else {
+        format!("LLM message content was empty (finish_reason={fr})")
+    }
+}
+
+fn parse_completion_outcome(raw_body: &str) -> AppResult<CompletionOutcome> {
     let val: Value = serde_json::from_str(raw_body)
         .map_err(|e| err_msg(format!("Invalid JSON from LLM endpoint: {e}")))?;
-    let Some(msg) = val
+
+    // OpenRouter and some gateways can return HTTP 200 with a top-level error object.
+    if let Some(err_val) = val.get("error").filter(|v| !v.is_null()) {
+        return Err(err_msg(format!(
+            "LLM provider error: {}",
+            extract_error_message(err_val)
+        )));
+    }
+
+    let Some(choice) = val
         .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|a| a.first())
-        .and_then(|c| c.get("message"))
     else {
-        return Err(err_msg("LLM response missing choices[0].message"));
+        return Err(err_msg("LLM response missing choices[0]"));
     };
 
-    if let Some(s) = msg.get("content").and_then(|v| v.as_str()) {
-        if !s.trim().is_empty() {
-            return Ok(s.to_string());
-        }
+    if let Some(err_val) = choice.get("error").filter(|v| !v.is_null()) {
+        return Err(err_msg(format!(
+            "LLM provider error: {}",
+            extract_error_message(err_val)
+        )));
     }
-    // Some OpenAI-compatible gateways return content as an array of parts: [{type:"text", text:"..."}]
-    if let Some(parts) = msg.get("content").and_then(|v| v.as_array()) {
-        let mut combined = String::new();
-        for p in parts {
-            if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
-                combined.push_str(t);
+
+    let finish_reason = choice
+        .get("finish_reason")
+        .or_else(|| choice.get("native_finish_reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let completion_tokens = val
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64());
+    let reasoning_tokens = val
+        .pointer("/usage/completion_tokens_details/reasoning_tokens")
+        .and_then(|v| v.as_u64());
+
+    if let Some(msg) = choice.get("message") {
+        if let Some(s) = msg.get("content").and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Ok(CompletionOutcome::Content {
+                    content: s.to_string(),
+                    finish_reason,
+                });
             }
         }
-        if !combined.trim().is_empty() {
-            return Ok(combined);
+        // Some OpenAI-compatible gateways return content as an array of parts: [{type:"text", text:"..."}]
+        if let Some(parts) = msg.get("content").and_then(|v| v.as_array()) {
+            let mut combined = String::new();
+            for p in parts {
+                if let Some(t) = p
+                    .get("text")
+                    .or_else(|| p.get("content"))
+                    .and_then(|v| v.as_str())
+                {
+                    combined.push_str(t);
+                }
+            }
+            if !combined.trim().is_empty() {
+                return Ok(CompletionOutcome::Content {
+                    content: combined,
+                    finish_reason,
+                });
+            }
+        }
+        if let Some(refusal) = msg.get("refusal").and_then(|v| v.as_str()) {
+            if !refusal.trim().is_empty() {
+                return Err(err_msg(format!(
+                    "LLM refused request: {}",
+                    truncate_str(refusal.trim(), 200)
+                )));
+            }
+        }
+
+        let reasoning_text = extract_reasoning_text(msg);
+        let has_reasoning = reasoning_text.is_some();
+        return Ok(CompletionOutcome::Empty(EmptyCompletionInfo {
+            finish_reason,
+            has_reasoning,
+            reasoning_text,
+            completion_tokens,
+            reasoning_tokens,
+            truncated_content: false,
+        }));
+    }
+
+    // Legacy completion-style fallback (`choices[0].text`).
+    if let Some(s) = choice.get("text").and_then(|v| v.as_str()) {
+        if !s.trim().is_empty() {
+            return Ok(CompletionOutcome::Content {
+                content: s.to_string(),
+                finish_reason,
+            });
         }
     }
-    Err(err_msg("LLM message content was empty"))
+
+    Err(err_msg("LLM response missing choices[0].message"))
+}
+
+/// Scan all balanced JSON objects in `raw` and return the last one that deserializes
+/// as a non-empty `RawLlmResponse`. Used strictly as a fallback when a reasoning model
+/// places the final JSON inside its reasoning channel and leaves `message.content` empty.
+fn extract_valid_experience_json(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let mut best: Option<&str> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut j = i;
+        let mut matched_end = None;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if escaped {
+                escaped = false;
+            } else if in_str {
+                match b {
+                    b'\\' => escaped = true,
+                    b'"' => in_str = false,
+                    _ => {}
+                }
+            } else {
+                match b {
+                    b'"' => in_str = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            matched_end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        if let Some(end) = matched_end {
+            let candidate = &raw[i..=end];
+            if let Ok(parsed) = serde_json::from_str::<RawLlmResponse>(candidate) {
+                if !parsed.daily_mixes.is_empty() || !parsed.explore_categories.is_empty() {
+                    best = Some(candidate);
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    best
 }
 
 /// Extract the first balanced JSON object from an LLM reply, stripping `<think>...`
@@ -2021,5 +2369,159 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn retries_on_reasoning_token_exhaustion_and_strips_response_format() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        // First call includes response_format and low max_tokens; simulate a
+                        // reasoning model burning its whole budget on thinking.
+                        assert!(payload.get("response_format").is_some());
+                        assert_eq!(payload["max_tokens"], 2600);
+                        Json(json!({
+                            "choices": [{
+                                "finish_reason": "length",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "reasoning": "Thinking through all 4 mixes and 3 categories..."
+                                }
+                            }],
+                            "usage": {
+                                "completion_tokens": 2600,
+                                "completion_tokens_details": {
+                                    "reasoning_tokens": 2600
+                                }
+                            }
+                        }))
+                    } else {
+                        // Retry must drop response_format and expand max_tokens.
+                        assert!(payload.get("response_format").is_none());
+                        assert!(payload["max_tokens"].as_u64().unwrap_or(0) >= 8192);
+                        Json(json!({
+                            "choices": [{
+                                "finish_reason": "stop",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "{\"editionTitle\":\"Recovered Edition\",\"homeTagline\":\"Fresh picks\"}"
+                                }
+                            }]
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = LlmConfig {
+            endpoint_base: format!("http://{addr}/v1"),
+            completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "sk-test".to_string(),
+            model: "baidu/ernie-5.5-flash-preview:free".to_string(),
+            refresh_hour: 4,
+            temperature: 0.85,
+            max_tokens: 2600,
+            timeout_secs: 15,
+            extra_system_prompt: None,
+            extra_headers: vec![],
+            reasoning_effort: None,
+        };
+        let curator = LlmCurator::new_with_config(cfg);
+        let out = curator
+            .call_chat_completions("sys", "usr")
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let parsed: Value = serde_json::from_str(extract_json_object(&out).unwrap()).unwrap();
+        assert_eq!(parsed["editionTitle"], "Recovered Edition");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovers_valid_experience_json_from_reasoning_channel_when_content_stays_empty() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "Let me draft a small note {\"note\": 1} and now the real edition:\n{\"editionTitle\":\"Nocturne\",\"dailyMixes\":[{\"part\":\"1\",\"title\":\"Midnight Pulse\",\"artTitle\":\"Pulse\",\"subtitle\":\"Warm synths\",\"c1\":\"#38bdf8\",\"c2\":\"#0c2d48\"}]}"
+                        }
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = LlmConfig {
+            endpoint_base: format!("http://{addr}/v1"),
+            completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: String::new(),
+            model: "reasoning-model".to_string(),
+            refresh_hour: 4,
+            temperature: 0.8,
+            max_tokens: 4096,
+            timeout_secs: 15,
+            extra_system_prompt: None,
+            extra_headers: vec![],
+            reasoning_effort: None,
+        };
+        let curator = LlmCurator::new_with_config(cfg);
+        let out = curator.call_chat_completions("sys", "usr").await.unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["editionTitle"], "Nocturne");
+        assert_eq!(parsed["dailyMixes"][0]["title"], "Midnight Pulse");
+        server.abort();
+    }
+
+    #[test]
+    fn parse_completion_outcome_surfaces_provider_errors_and_reasoning_starvation() {
+        let provider_err = json!({
+            "error": { "message": "Provider returned error: rate limited", "code": 429 }
+        })
+        .to_string();
+        let err = parse_completion_outcome(&provider_err).unwrap_err().to_string();
+        assert!(err.contains("rate limited"), "unexpected err: {err}");
+
+        let starved = json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "role": "assistant", "content": "", "reasoning": "thinking..." }
+            }],
+            "usage": {
+                "completion_tokens": 2600,
+                "completion_tokens_details": { "reasoning_tokens": 2600 }
+            }
+        })
+        .to_string();
+        let outcome = parse_completion_outcome(&starved).unwrap();
+        match outcome {
+            CompletionOutcome::Empty(info) => {
+                let msg = format_empty_content_error(&info);
+                assert!(msg.contains("2600/2600"), "unexpected msg: {msg}");
+                assert!(msg.contains("BEATLAB_LLM_MAX_TOKENS"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Empty outcome, got {other:?}"),
+        }
     }
 }
