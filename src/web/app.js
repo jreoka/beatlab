@@ -863,6 +863,11 @@
   }
 
   function updateVolumeIcon() {
+    const slider = $('pb-volume');
+    if (slider) {
+      const level = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
+      slider.style.setProperty('--pct', `${level * 100}%`);
+    }
     const icon = $('vol-icon');
     if (!icon) return;
     icon.innerHTML = state.muted || state.volume === 0 ? ICONS.volMuted : ICONS.volOn;

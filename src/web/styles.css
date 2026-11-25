@@ -6895,12 +6895,17 @@ body:not(.audio-playing) .fs-player .fs-cover {
   cursor: pointer;
 }
 .vol-slider {
+  --vol-fill: var(--text);
+  --vol-track: var(--surface-3);
   width: 88px;
   height: 44px;
   padding: 0;
   margin: 0;
-  background: linear-gradient(var(--surface-3), var(--surface-3)) center / 100% 3px no-repeat;
+  background: linear-gradient(to right, var(--vol-fill) var(--pct, 0%), var(--vol-track) var(--pct, 0%)) center / 100% 3px no-repeat;
   background-color: transparent;
+}
+.pb-vol-wrap:hover .vol-slider {
+  --vol-fill: var(--accent);
 }
 .seek-slider::-moz-range-track,
 .vol-slider::-moz-range-track {
