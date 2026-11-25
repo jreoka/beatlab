@@ -5158,7 +5158,7 @@
     });
   }
 
-  async function playQueueAt(index) {
+  async function playQueueAt(index, { allowAutoRadio = true } = {}) {
     if (index < 0 || index >= state.queue.length) return;
     const prevTrackObj = currentTrack();
     const track = state.queue[index];
@@ -5177,6 +5177,17 @@
     state.lastScrobbleCompleteId = '';
     state.compatAttemptedId = '';
 
+    const needsAutoRadio =
+      allowAutoRadio &&
+      !!state.autoplay &&
+      !state.radioLoading &&
+      !state.radioInFlight &&
+      state.queue.length - 1 <= index &&
+      (state.queue.length === 1 || state.repeat !== 'all');
+    if (needsAutoRadio) {
+      state.radioLoading = true;
+    }
+
     setAudioLoading(true);
     updateNowPlayingUI(track, true, isBurst);
     renderQueuePanel();
@@ -5184,6 +5195,10 @@
 
     // Highlight playing track in current view if visible
     syncPlayingTrackRows(track.id);
+
+    if (needsAutoRadio) {
+      appendRadioTracks(track.id);
+    }
 
     if (!isBurst) {
       commitTrackLoad(loadToken, track);
@@ -5772,6 +5787,7 @@
         }
         if (added > 0) {
           saveServerQueue();
+          scheduleWarmNextTrack();
         }
         return added;
       } catch {
@@ -5813,7 +5829,7 @@
       if (tracks.length) {
         const idx = setQueueWithShuffle(tracks, 0, false);
         state.radioPlaylistId = pid || null;
-        playQueueAt(idx);
+        playQueueAt(idx, { allowAutoRadio: false });
       } else {
         showToast('No radio tracks found for this playlist yet');
       }
@@ -5866,7 +5882,7 @@
       const queue = seed ? [seed, ...filtered] : filtered;
       if (queue.length) {
         const idx = setQueueWithShuffle(queue, 0, false);
-        playQueueAt(idx);
+        playQueueAt(idx, { allowAutoRadio: false });
       } else {
         renderQueuePanel();
       }
