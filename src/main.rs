@@ -174,6 +174,7 @@ async fn main() -> models::AppResult<()> {
         engine,
         taste: taste.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
+        new_releases_inflight: Arc::new(Mutex::new(HashMap::new())),
     };
 
     tokio::spawn(webapp::prewarm_charts(state.clone()));
@@ -232,6 +233,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/2fa/passkey/step-up/verify", post(webapp::passkey_stepup_verify))
         .route("/api/web/2fa/passkey/{id}", delete(webapp::passkey_delete))
         .route("/api/web/home", get(webapp::home))
+        .route("/api/web/home/new-releases", get(webapp::home_new_releases))
         .route("/api/web/explore", get(webapp::explore))
         .route("/api/web/explore/mix/{key}", get(webapp::explore_mix))
         .route("/api/web/mood/{slug}", get(webapp::mood_mix))

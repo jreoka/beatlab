@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 /// (user_id -> (track, started_at_unix, username))
 pub type NowPlayingMap = Arc<Mutex<HashMap<i64, (Track, i64, String)>>>;
 
+/// In-flight background "New Releases" refresh handles keyed by user ID.
+pub type NewReleasesInflight = Arc<Mutex<HashMap<i64, tokio::sync::watch::Receiver<bool>>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
@@ -17,6 +20,7 @@ pub struct AppState {
     pub engine: Arc<StreamEngine>,
     pub taste: Arc<TasteEngine>,
     pub now_playing: NowPlayingMap,
+    pub new_releases_inflight: NewReleasesInflight,
 }
 
 /// Internal header carrying the TCP peer address, stamped by `main::stamp_peer_ip`

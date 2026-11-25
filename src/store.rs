@@ -3710,16 +3710,26 @@ impl Store {
         }
         let followed = self.followed_artist_ids(user_id).unwrap_or_default();
         let listened = self.user_recent_tracks(user_id, 500, 0).unwrap_or_default();
+        let starred = self.starred_tracks(user_id).unwrap_or_default();
+        let saved_albums = self.saved_album_ids(user_id).unwrap_or_default();
         let metas = self.all_artist_metas_map()?;
+        let album_metas = if saved_albums.is_empty() {
+            HashMap::new()
+        } else {
+            self.all_album_metas_map().unwrap_or_default()
+        };
 
         // Artists played via YouTube Music (`ar:ytm:…`) or known only by name
         // (`ar:<slug>`) have no Deezer ID of their own, and `artists_meta`
         // stores Deezer IDs under the canonical `ar:dz:…` key. Map every raw ID
         // onto its Deezer artist where we can, so those plays still count and
         // duplicates (same artist from two sources) merge into one entry.
-        let listened_tracks: Vec<Track> = listened.iter().map(|(t, _)| t.clone()).collect();
-        let resolver = ArtistResolver::build(&listened_tracks, &metas);
+        let mut resolver_tracks: Vec<Track> = Vec::with_capacity(listened.len() + starred.len());
+        resolver_tracks.extend(listened.iter().map(|(t, _)| t.clone()));
+        resolver_tracks.extend(starred.iter().map(|(t, _)| t.clone()));
+        let resolver = ArtistResolver::build(&resolver_tracks, &metas);
 
+        let now = Utc::now().timestamp();
         let mut score: HashMap<String, f64> = HashMap::new();
         let mut names: HashMap<String, String> = HashMap::new();
         // Followed artists get a strong, stable boost so they lead the list.
@@ -3735,7 +3745,33 @@ impl Store {
             *score.entry(rid).or_insert(0.0) += 1000.0;
         }
 
-        // Artists from listening history, ranked by play count and recency.
+        // Saved albums signal deliberate interest in the artist.
+        for album_id in &saved_albums {
+            if let Some(alb) = album_metas.get(album_id) {
+                let pa = primary_artist(&alb.artist);
+                let name = if pa.is_empty() { alb.artist.clone() } else { pa };
+                let rid = resolver.resolve(&alb.artist_id, &name);
+                if !name.trim().is_empty() {
+                    names.entry(rid.clone()).or_insert(name);
+                }
+                *score.entry(rid).or_insert(0.0) += 12.0;
+            }
+        }
+
+        // Starred tracks also reflect artists the user cares about.
+        for (t, at) in &starred {
+            let rid = resolver.resolve_track(t);
+            let name = primary_artist(&t.artist);
+            let name = if name.is_empty() { t.artist.clone() } else { name };
+            if !name.trim().is_empty() {
+                names.entry(rid.clone()).or_insert(name);
+            }
+            let age_days = ((now - *at).max(0) as f64) / 86_400.0;
+            let recency = 1.0 + 1.5 * (-age_days / 60.0).exp();
+            *score.entry(rid).or_insert(0.0) += 4.0 * recency;
+        }
+
+        // Artists from listening history, ranked by play count and actual recency.
         for (t, st) in &listened {
             let rid = resolver.resolve_track(t);
             let name = primary_artist(&t.artist);
@@ -3744,8 +3780,9 @@ impl Store {
                 names.entry(rid.clone()).or_insert(name);
             }
             let plays = (st.play_count.max(0) as f64).ln_1p().min(8.0);
-            let recency = ((st.last_played.max(0) as f64) / 86_400.0).ln_1p().min(6.0);
-            *score.entry(rid).or_insert(0.0) += plays + recency;
+            let age_days = ((now - st.last_played).max(0) as f64) / 86_400.0;
+            let recency = 3.0 * (-age_days / 45.0).exp();
+            *score.entry(rid).or_insert(0.0) += plays * (1.0 + recency);
         }
 
         // Artists that still lack a Deezer ID are kept (with an empty
@@ -7571,6 +7608,62 @@ mod tests {
         assert_eq!(artists[0].id, "ar:dz:111", "followed artist should rank first");
         assert_eq!(artists[1].id, "ar:dz:222", "listened artist should follow");
         assert!(artists.iter().all(|a| !a.deezer_id.is_empty()));
+    }
+
+    #[test]
+    fn relevant_artists_for_releases_includes_starred_saved_and_prefers_recent_plays() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("recency_user", "pw").unwrap();
+
+        let mut recent_track = sample_track("dz:10", "Fresh Song", "Recent Artist", "Fresh Album");
+        recent_track.meta = r#"{"deezer_artist_id":10}"#.into();
+        let mut old_track = sample_track("dz:20", "Old Song", "Old Artist", "Old Album");
+        old_track.meta = r#"{"deezer_artist_id":20}"#.into();
+        let mut starred_track = sample_track("dz:30", "Loved Song", "Starred Artist", "Loved Album");
+        starred_track.meta = r#"{"deezer_artist_id":30}"#.into();
+        store
+            .upsert_tracks(&[
+                recent_track.clone(),
+                old_track.clone(),
+                starred_track.clone(),
+            ])
+            .unwrap();
+
+        store
+            .upsert_album_meta(&AlbumSummary {
+                id: "al:dz-40-saved".into(),
+                name: "Saved Album".into(),
+                artist_id: "ar:dz:40".into(),
+                artist: "Saved Album Artist".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Both listened artists played once, but Old Artist was played 180 days ago.
+        store.record_event(u.id, &recent_track.id, "play", 1.0).unwrap();
+        store.record_event(u.id, &old_track.id, "play", 1.0).unwrap();
+        {
+            let old_ts = Utc::now().timestamp() - 180 * 86_400;
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE user_track_stats SET last_played = ?1 WHERE user_id = ?2 AND track_id = ?3",
+                params![old_ts, u.id, old_track.id],
+            )
+            .unwrap();
+        }
+        store.star_track(u.id, &starred_track.id).unwrap();
+        store.save_album(u.id, "al:dz-40-saved").unwrap();
+
+        let artists = store.relevant_artists_for_releases(u.id, 10).unwrap();
+        let ids: Vec<&str> = artists.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"ar:dz:30"), "starred track artist should be included");
+        assert!(ids.contains(&"ar:dz:40"), "saved album artist should be included");
+        let recent_pos = ids.iter().position(|&id| id == "ar:dz:10").unwrap();
+        let old_pos = ids.iter().position(|&id| id == "ar:dz:20").unwrap();
+        assert!(
+            recent_pos < old_pos,
+            "recent play should rank ahead of 180-day-old play (ids={ids:?})"
+        );
     }
 
     #[test]

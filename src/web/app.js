@@ -2137,7 +2137,7 @@
       }
 
       // New releases from artists the user listens to sit right under Quick Picks.
-      html += newReleasesSectionHtml(newReleases);
+      html += `<div id="new-releases-slot">${newReleasesSectionHtml(newReleases)}</div>`;
 
       if (mixedForYou.length > 0) {
         html += `<section class="section">
@@ -2206,6 +2206,26 @@
       $('main-view').innerHTML = html;
       $('main-view').scrollTop = 0;
       bindQuickPicksPager();
+
+      if (d.newReleasesPending && !newReleases.length) {
+        (async () => {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              const nr = await api('/api/web/home/new-releases', { signal });
+              if (!isViewRequestCurrent(reqToken, signal)) return;
+              const items = nr.newReleases || [];
+              if (items.length > 0) {
+                const slot = $('new-releases-slot');
+                if (slot) slot.innerHTML = newReleasesSectionHtml(items);
+                return;
+              }
+              if (!nr.pending) return;
+            } catch {
+              return;
+            }
+          }
+        })();
+      }
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
     }
@@ -3232,6 +3252,10 @@
     }
   }
 
+  function isLibraryHash(hash) {
+    return hash === 'library' || hash === 'liked' || hash === 'history';
+  }
+
   async function renderLibrary(tab = 'playlists') {
     const { reqToken, signal } = beginViewRequest();
     state.libTab = tab;
@@ -3240,6 +3264,7 @@
       const lib = await api('/api/web/library', { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       state.playlists = lib.playlists || [];
+      renderSidebarPlaylistsDom();
       const liked = cacheTracks(lib.likedTracks || []);
       const recent = cacheTracks(lib.recentTracks || []);
       const frequent = cacheTracks(lib.frequentTracks || []);
@@ -3264,7 +3289,9 @@
         .join('')}</div>`;
 
       if (tab === 'playlists') {
-        html += `<div class="card-grid">${state.playlists.map(renderPlaylistCard).join('')}</div>`;
+        html += state.playlists.length
+          ? `<div class="card-grid">${state.playlists.map(renderPlaylistCard).join('')}</div>`
+          : `<p class="muted-center">No playlists yet. Create one or save an Instant Mix!</p>`;
       } else if (tab === 'liked') {
         html += liked.length
           ? `<div style="margin-bottom:14px"><button class="btn-primary" onclick="App.playListByIds(${esc(JSON.stringify(liked.map((t) => t.id)))}, 0)">${ICONS.play} Play Liked Songs</button></div><div class="track-table">${renderTrackRows(liked)}</div>`
@@ -8214,6 +8241,10 @@
     },
     setLibTab: (tab) => {
       haptic('tap');
+      const nextHash = tab === 'liked' ? '#liked' : tab === 'history' ? '#history' : '#library';
+      if (location.hash !== nextHash && history.replaceState) {
+        history.replaceState(null, '', nextHash);
+      }
       return renderLibrary(tab);
     },
     setStatsRange: (range) => {
@@ -9160,7 +9191,7 @@
       const curHash = location.hash.replace(/^#/, '');
       if (curHash === 'playlists') {
         renderPlaylistsView();
-      } else if (curHash === 'library' && state.libTab === 'playlists') {
+      } else if (isLibraryHash(curHash) && state.libTab === 'playlists') {
         renderLibrary('playlists');
       }
       showToast(pinnedNow ? 'Pinned to sidebar' : 'Unpinned from sidebar');
@@ -9182,6 +9213,13 @@
         haptic('warning');
         const pinnedIds = getPinnedPlaylistIds().filter((id) => id !== pid);
         savePinnedPlaylistIds(pinnedIds);
+        state.playlists = (state.playlists || []).filter((p) => p.id !== pid);
+        renderSidebarPlaylistsDom();
+        document
+          .querySelectorAll('#main-view .media-card[data-share-kind="playlist"]')
+          .forEach((el) => {
+            if (el.dataset.shareId === pid) el.remove();
+          });
         if (state.activeInstantMix?.mix?.savedPlaylistId === pid) {
           delete state.activeInstantMix.mix.savedPlaylistId;
         }
@@ -9189,15 +9227,24 @@
           delete state.searchState.instantMix.savedPlaylistId;
         }
         refreshActiveInstantMixCard();
-        await refreshSidebarPlaylists();
         showToast('Playlist deleted');
         const curHash = location.hash.replace(/^#/, '');
         if (curHash === `playlist/${encodeURIComponent(pid)}` || curHash === `playlist/${pid}`) {
           navigate('playlists');
+          await refreshSidebarPlaylists();
         } else if (curHash === 'playlists') {
-          renderPlaylistsView();
-        } else if (curHash === 'library' || curHash === '') {
-          renderLibrary(state.libTab);
+          await renderPlaylistsView();
+        } else if (isLibraryHash(curHash)) {
+          await renderLibrary(state.libTab || 'playlists');
+        } else if (
+          curHash === 'profile' ||
+          curHash.startsWith('profile/') ||
+          curHash.startsWith('user/')
+        ) {
+          renderCurrentHash();
+          await refreshSidebarPlaylists();
+        } else {
+          await refreshSidebarPlaylists();
         }
       } catch (err) {
         showToast(err.message);

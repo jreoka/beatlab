@@ -15,7 +15,7 @@ use tracing::warn;
 /// A token bucket keeps us well under that: short bursts of up to 25, then 5/s.
 const DZ_BUCKET_CAPACITY: f64 = 25.0;
 /// How far back the home "New Releases" shelf looks, in days.
-pub const NEW_RELEASE_WINDOW_DAYS: i64 = 14;
+pub const NEW_RELEASE_WINDOW_DAYS: i64 = 30;
 const DZ_BUCKET_REFILL_PER_SEC: f64 = 5.0;
 /// After Deezer refuses us outright (HTTP 403), stop calling it for a while instead of
 /// hammering a blocked endpoint; callers fall back to other sources immediately.
@@ -334,19 +334,31 @@ impl DeezerSource {
     }
 
     pub async fn search_artists(&self, query: &str, limit: usize) -> Vec<ArtistSummary> {
+        self.search_artists_checked(query, limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Like `search_artists`, but returns `None` when the upstream Deezer request
+    /// failed or was blocked, so callers don't cache transient failures as misses.
+    pub async fn search_artists_checked(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Option<Vec<ArtistSummary>> {
         let url = format!(
             "https://api.deezer.com/search/artist?q={}&limit={}",
             urlencoding::encode(query.trim()),
             limit.clamp(3, 30)
         );
-        let Some(parsed) = self.get_json::<DzDataList<DzArtist>>(&url).await else {
-            return vec![];
-        };
-        parsed
-            .data
-            .into_iter()
-            .filter_map(|a| a.into_summary())
-            .collect()
+        let parsed = self.get_json::<DzDataList<DzArtist>>(&url).await?;
+        Some(
+            parsed
+                .data
+                .into_iter()
+                .filter_map(|a| a.into_summary())
+                .collect(),
+        )
     }
 
     #[allow(dead_code)]
@@ -538,34 +550,54 @@ impl DeezerSource {
 
     /// Fetches an artist's most recent, genuine releases (albums/EPs/singles),
     /// newest first. Powers the personalised "New Releases" home feed.
-    pub async fn fetch_artist_releases(
+    /// Returns `None` when Deezer failed or was blocked, vs `Some(vec)` when
+    /// Deezer answered (even if the artist has no releases inside the window).
+    pub async fn fetch_artist_releases_checked(
         &self,
         deezer_artist_id: &str,
         artist_name: &str,
         limit: usize,
-    ) -> Vec<AlbumSummary> {
+    ) -> Option<Vec<AlbumSummary>> {
         let Ok(dz_id) = deezer_artist_id.trim().parse::<u64>() else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         if dz_id == 0 {
-            return Vec::new();
+            return Some(Vec::new());
         }
         // Deezer groups this list by type (albums, then EPs, then singles), not by
         // date, so read a full 100 to reach recent singles of prolific artists.
         let url = format!("https://api.deezer.com/artist/{}/albums?limit=100", dz_id);
-        let Some(parsed) = self.get_json::<DzDataList<DzAlbum>>(&url).await else {
-            return Vec::new();
-        };
+        let parsed = self.get_json::<DzDataList<DzAlbum>>(&url).await?;
+        let mut raw_albums = parsed.data;
+        // If a prolific artist has >=100 albums/EPs before singles even begin, fetch
+        // one extra page so their recent singles aren't cut off.
+        if !parsed.next.trim().is_empty()
+            && !raw_albums.is_empty()
+            && raw_albums
+                .last()
+                .map(|a| !a.record_type.eq_ignore_ascii_case("single"))
+                .unwrap_or(false)
+        {
+            let page2_url = format!(
+                "https://api.deezer.com/artist/{}/albums?limit=100&index=100",
+                dz_id
+            );
+            if let Some(page2) = self.get_json::<DzDataList<DzAlbum>>(&page2_url).await {
+                raw_albums.extend(page2.data);
+            }
+        }
 
-        // Only genuinely new drops: released within the last two weeks (and not
-        // pre-announced future dates). ISO dates compare lexicographically.
+        // Only genuinely new drops: released within the release window (and not
+        // far-future pre-announces; allow +1 day so release-day drops from ahead-of-UTC
+        // timezones like Japan/Australia appear immediately). ISO dates compare lexicographically.
         let today = Utc::now().date_naive();
         let cutoff = (today - chrono::Duration::days(NEW_RELEASE_WINDOW_DAYS))
             .format("%Y-%m-%d")
             .to_string();
-        let today_str = today.format("%Y-%m-%d").to_string();
-        let mut entries: Vec<(String, DzAlbum)> = parsed
-            .data
+        let max_date = (today + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut entries: Vec<(String, DzAlbum)> = raw_albums
             .into_iter()
             .filter(|a| a.id > 0)
             // Keep the artist's own releases, not compilations/appearances.
@@ -591,7 +623,7 @@ impl DeezerSource {
             let Some(date) = album.release_date.trim().get(..10).map(str::to_string) else {
                 continue;
             };
-            if date < cutoff || date > today_str {
+            if date < cutoff || date > max_date {
                 continue;
             }
             let released_ts = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
@@ -614,7 +646,20 @@ impl DeezerSource {
                 break;
             }
         }
-        out
+        Some(out)
+    }
+
+    /// Convenience wrapper around `fetch_artist_releases_checked`.
+    #[allow(dead_code)]
+    pub async fn fetch_artist_releases(
+        &self,
+        deezer_artist_id: &str,
+        artist_name: &str,
+        limit: usize,
+    ) -> Vec<AlbumSummary> {
+        self.fetch_artist_releases_checked(deezer_artist_id, artist_name, limit)
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn fetch_genres(&self) -> Vec<DeezerGenre> {
@@ -1174,10 +1219,21 @@ impl MusicSource for DeezerSource {
     }
 }
 
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct DzDataList<T> {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     data: Vec<T>,
+    #[serde(default, deserialize_with = "null_to_default")]
+    next: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1196,19 +1252,19 @@ struct DzGenreRaw {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DzArtist {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     picture_xl: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     picture_big: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     picture_medium: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     nb_album: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     nb_fan: usize,
 }
 
@@ -1262,21 +1318,23 @@ impl DzTrackAlbum {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DzAlbum {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     cover_xl: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     cover_big: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     cover_medium: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     release_date: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
+    record_type: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     genre_id: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     nb_tracks: usize,
     #[serde(default)]
     artist: Option<DzArtist>,
@@ -1582,5 +1640,31 @@ mod tests {
         assert!(playlist_title_relevance_score("Top J-Rock", "jrock").is_some());
         assert!(playlist_title_relevance_score("Pop Hits", "city pop").is_none());
         assert!(playlist_title_relevance_score("80s Japanese City Pop", "city pop").is_some());
+    }
+
+    #[test]
+    fn dz_album_deserializes_with_null_fields() {
+        let raw = r#"{
+            "data": [
+                {
+                    "id": 1140167251,
+                    "title": "Remedy / Double Wings",
+                    "cover_xl": null,
+                    "cover_big": "https://cdn.example/big.jpg",
+                    "cover_medium": null,
+                    "release_date": "2026-11-18",
+                    "record_type": null,
+                    "genre_id": null,
+                    "nb_tracks": null,
+                    "artist": null
+                }
+            ],
+            "next": null
+        }"#;
+        let parsed: DzDataList<DzAlbum> = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].id, 1140167251);
+        assert_eq!(parsed.data[0].release_date, "2026-11-18");
+        assert!(parsed.next.is_empty());
     }
 }

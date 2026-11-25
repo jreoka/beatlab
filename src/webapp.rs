@@ -1899,25 +1899,136 @@ pub async fn passkey_delete(
     json_res(json!({ "ok": true, "twoFactorEnabled": still_enabled }))
 }
 
-/// Builds the personalised "New Releases" feed: recent albums from artists the
-/// user follows or listens to. Fresh releases are pulled from Deezer in
-/// parallel (only releases from the last two weeks); a short timeout keeps the
-/// home tab responsive.
-///
-/// The last good result is kept per account, so artists whose lookup misses
-/// the deadline on a busy visit don't silently vanish from the shelf (a slow
-/// Deezer burst used to leave the whole section empty).
-async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<AlbumSummary> {
+const NEW_RELEASES_ARTIST_POOL: usize = 40;
+const NEW_RELEASES_TTL_NON_EMPTY_SECS: i64 = 3600;
+const NEW_RELEASES_TTL_EMPTY_SECS: i64 = 900;
+
+fn new_releases_window_start() -> i64 {
+    let cutoff = Utc::now().date_naive()
+        - chrono::Duration::days(crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS);
+    cutoff
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or_else(|| {
+            Utc::now().timestamp() - crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS * 86_400
+        })
+}
+
+fn new_releases_dedup_key(a: &AlbumSummary) -> String {
+    format!("{}|{}", a.artist_id, slug(&a.name))
+}
+
+fn stored_new_releases(store: &crate::store::Store, uid: i64, limit: usize) -> Vec<AlbumSummary> {
+    let last_key = format!("newrel:last:{uid}");
+    let window_start = new_releases_window_start();
+    let stored: Vec<AlbumSummary> = store
+        .kv_get(&last_key)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    for album in stored {
+        if album.created < window_start {
+            continue;
+        }
+        if seen_ids.insert(album.id.clone()) && seen_keys.insert(new_releases_dedup_key(&album)) {
+            out.push(album);
+        }
+    }
+    out.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.name.cmp(&b.name)));
+    out.truncate(limit);
+    out
+}
+
+fn new_releases_is_fresh(store: &crate::store::Store, uid: i64, has_items: bool) -> bool {
+    let key = format!("newrel:fetched:{uid}");
+    let Some(raw) = store.kv_get(&key) else {
+        return false;
+    };
+    let Some((ts_str, win_str)) = raw.split_once('|') else {
+        return false;
+    };
+    let Ok(ts) = ts_str.parse::<i64>() else {
+        return false;
+    };
+    let Ok(win) = win_str.parse::<i64>() else {
+        return false;
+    };
+    if win != crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS {
+        return false;
+    }
+    let ttl = if has_items {
+        NEW_RELEASES_TTL_NON_EMPTY_SECS
+    } else {
+        NEW_RELEASES_TTL_EMPTY_SECS
+    };
+    Utc::now().timestamp() - ts < ttl
+}
+
+/// Starts (or joins) the deduplicated background sweep that refreshes a user's
+/// "New Releases" shelf and persists the complete result to SQLite. Running the
+/// sweep detached from the HTTP handler ensures slow Deezer bursts or startup
+/// catalog warming never drop straggler artists on the floor.
+fn ensure_new_releases_refresh(
+    state: &AppState,
+    uid: i64,
+) -> tokio::sync::watch::Receiver<bool> {
+    let mut inflight = state
+        .new_releases_inflight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = inflight.get(&uid) {
+        if !*existing.borrow() {
+            return existing.clone();
+        }
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    inflight.insert(uid, rx.clone());
+    drop(inflight);
+
+    let st = state.clone();
+    tokio::spawn(async move {
+        struct InflightGuard {
+            map: crate::state::NewReleasesInflight,
+            uid: i64,
+            tx: tokio::sync::watch::Sender<bool>,
+        }
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+                g.remove(&self.uid);
+                let _ = self.tx.send(true);
+            }
+        }
+        let _guard = InflightGuard {
+            map: st.new_releases_inflight.clone(),
+            uid,
+            tx,
+        };
+        refresh_new_releases_for_user(&st, uid).await;
+    });
+    rx
+}
+
+/// Runs a complete personalised "New Releases" sweep for `uid` across their
+/// followed, starred, saved-album, and recently listened artists, merging into
+/// the persisted shelf (`newrel:last:{uid}`).
+async fn refresh_new_releases_for_user(state: &AppState, uid: i64) {
     let artists = state
         .store
-        .relevant_artists_for_releases(uid, 16)
+        .relevant_artists_for_releases(uid, NEW_RELEASES_ARTIST_POOL)
         .unwrap_or_default();
+    let now = Utc::now().timestamp();
+    let fetched_key = format!("newrel:fetched:{uid}");
+    let fetched_val = format!("{now}|{}", crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS);
     if artists.is_empty() {
-        return Vec::new();
+        state.store.kv_set(&fetched_key, &fetched_val);
+        return;
     }
 
-    // Song titles the user played, per artist, so a name shared by several
-    // Deezer artists (e.g. "Eve") resolves to the one they actually listen to.
+    // Song titles the user played or starred, per artist, so ambiguous names
+    // ("Eve") and localized names ("幾田りら" / "米津玄師") resolve accurately.
     let mut hint_titles: HashMap<String, Vec<String>> = HashMap::new();
     if artists.iter().any(|a| a.deezer_id.is_empty()) {
         for (t, _) in state.store.user_recent_tracks(uid, 500, 0).unwrap_or_default() {
@@ -1928,13 +2039,16 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
                 titles.push(t.title.clone());
             }
         }
+        for (t, _) in state.store.starred_tracks(uid).unwrap_or_default() {
+            let primary = crate::models::primary_artist(&t.artist);
+            let key = slug(if primary.is_empty() { &t.artist } else { &primary });
+            let titles = hint_titles.entry(key).or_default();
+            if titles.len() < 15 && !titles.contains(&t.title) {
+                titles.push(t.title.clone());
+            }
+        }
     }
 
-    // Each artist is fetched in its own task. We keep whatever finishes before
-    // the deadline; stragglers keep running detached so their responses land in
-    // the Deezer JSON cache and the next Home visit gets them instantly. (A
-    // single all-or-nothing timeout used to discard every result — and cancel
-    // the requests before they could be cached — whenever any one was slow.)
     let handles: Vec<_> = artists
         .iter()
         .map(|artist| {
@@ -1946,144 +2060,231 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
             tokio::spawn(async move {
                 if id.is_empty() {
                     match resolve_deezer_artist_by_name(&dz, &store, &name, &hints).await {
-                        Some(found) => id = found,
-                        None => return Vec::new(),
+                        ResolveArtist::Found(found) => id = found,
+                        ResolveArtist::NotFound => return Some(Vec::new()),
+                        ResolveArtist::TransientError => return None,
                     }
                 }
-                dz.fetch_artist_releases(&id, &name, 4).await
+                dz.fetch_artist_releases_checked(&id, &name, 4).await
             })
         })
         .collect();
     let total = handles.len();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut batches: Vec<Vec<AlbumSummary>> = Vec::with_capacity(total);
-    for handle in handles {
-        if let Ok(Ok(batch)) = tokio::time::timeout_at(deadline, handle).await {
-            batches.push(batch);
-        }
-    }
-    let answered = batches.len();
-
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut answered = 0usize;
     let mut albums: Vec<AlbumSummary> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for batch in batches {
-        for album in batch {
-            if seen.insert(album.id.clone()) {
-                albums.push(album);
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    for handle in handles {
+        if let Ok(Ok(Some(batch))) = tokio::time::timeout_at(deadline, handle).await {
+            answered += 1;
+            for album in batch {
+                if seen_ids.insert(album.id.clone())
+                    && seen_keys.insert(new_releases_dedup_key(&album))
+                {
+                    albums.push(album);
+                }
             }
         }
     }
     let live = albums.len();
 
     // Merge in the last good shelf. Everything in it is still a real release
-    // from the last two weeks, so it is always safe to keep showing; this covers
-    // artists that missed the deadline and Deezer failing fast (an error looks
-    // exactly like "no releases", so a live result alone can't be trusted to
-    // clear the shelf). Entries age out once they leave the release window.
+    // inside the release window, so a transient failure on one artist never
+    // wipes out releases we already discovered. Entries age out naturally once
+    // they leave the release window.
     let last_key = format!("newrel:last:{uid}");
-    let window_start =
-        Utc::now().timestamp() - crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS * 86_400;
+    let window_start = new_releases_window_start();
     let stored: Vec<AlbumSummary> = state
         .store
         .kv_get(&last_key)
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
     for album in stored {
-        if seen.insert(album.id.clone()) {
+        if album.created < window_start {
+            continue;
+        }
+        if seen_ids.insert(album.id.clone()) && seen_keys.insert(new_releases_dedup_key(&album)) {
             albums.push(album);
         }
     }
     albums.retain(|a| a.created >= window_start);
     albums.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.name.cmp(&b.name)));
-    albums.truncate(limit.max(24));
+    albums.truncate(24);
+    for a in &albums {
+        let _ = state.store.upsert_album_meta(a);
+    }
     if let Ok(raw) = serde_json::to_string(&albums) {
         state.store.kv_set(&last_key, &raw);
     }
-    albums.truncate(limit);
+    // Only mark the shelf freshly checked when Deezer actually answered a
+    // meaningful share of artists (or produced releases) and isn't 403-blocked.
+    if !state.sources.deezer.is_blocked() && (!albums.is_empty() || answered * 2 >= total) {
+        state.store.kv_set(&fetched_key, &fetched_val);
+    }
 
     tracing::info!(
         uid,
         artists = total,
         answered,
         live,
-        shown = albums.len(),
+        shown = albums.len().min(8),
         "home new releases"
     );
-    albums
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResolveArtist {
+    Found(String),
+    NotFound,
+    TransientError,
+}
+
+fn is_solo_artist_name(name: &str) -> bool {
+    let low = name.trim().to_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    for marker in [
+        " feat.",
+        " feat ",
+        " ft.",
+        " ft ",
+        " featuring ",
+        " & ",
+        " + ",
+        " x ",
+        " × ",
+        " cv:",
+        "(cv:",
+        "（cv:",
+        ", ",
+    ] {
+        if low.contains(marker) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Finds an artist's Deezer ID from their name (for artists known only via
-/// YouTube Music or by name). Only an exact, case-insensitive name match is
-/// accepted so we never show releases from a different artist. When several
-/// Deezer artists share the name, an exact-case match wins ("LiSA" vs
-/// "LISA"); otherwise the one whose top tracks overlap the songs the user
-/// played is chosen ("Eve" the J-pop artist vs "Eve" the rapper). Hits and
-/// misses are remembered so each name is searched at most once a day.
+/// YouTube Music or by name).
+///
+/// - For ASCII names, only exact case-insensitive/slug matches are accepted so
+///   unrelated artists ("ASCA" vs "Cascada") are never matched.
+/// - For non-ASCII names (e.g. Japanese/Korean/Chinese like "幾田りら", "米津玄師",
+///   "青木陽菜"), Deezer frequently indexes the artist's real catalog under their
+///   romanized name ("Lilas Ikuta", "Kenshi Yonezu", "Hina Aoki") while native-script
+///   entries are either absent or 0-album stubs, so Deezer's top solo candidate is
+///   also considered and verified against `played_titles` / discography size.
+/// - Transient Deezer errors are never cached as misses.
 async fn resolve_deezer_artist_by_name(
     dz: &crate::sources::deezer::DeezerSource,
     store: &crate::store::Store,
     name: &str,
     played_titles: &[String],
-) -> Option<String> {
+) -> ResolveArtist {
     let name = name.trim();
     let key_name = slug(name);
     if key_name.is_empty() {
-        return None;
+        return ResolveArtist::NotFound;
     }
-    // v2: keyed by the exact name, since case now matters for disambiguation.
-    let cache_key = format!("dzartist:byname2:{name}");
+    // v3: handles non-ASCII/romanized artists and avoids caching transient errors.
+    let cache_key = format!("dzartist:byname3:{name}");
     let now = Utc::now().timestamp();
     if let Some(raw) = store.kv_get(&cache_key) {
         if let Some((ts, id)) = raw.split_once('|') {
             if !id.is_empty() {
-                return Some(id.to_string());
+                return ResolveArtist::Found(id.to_string());
             }
             // Cached miss: retry after a day.
             if ts.parse::<i64>().map_or(false, |t| now - t < 86_400) {
-                return None;
+                return ResolveArtist::NotFound;
             }
         }
     }
-    let wanted = name.to_lowercase();
-    let candidates: Vec<ArtistSummary> = dz
-        .search_artists(name, 8)
-        .await
-        .into_iter()
-        .filter(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name)
-        .collect();
-    let found = pick_artist_candidate(dz, name, candidates, played_titles).await;
+    let Some(raw_results) = dz.search_artists_checked(name, 8).await else {
+        return ResolveArtist::TransientError;
+    };
+    let found = pick_artist_from_search(dz, name, raw_results, played_titles).await;
     match found {
         Some(a) => {
             let _ = store.upsert_artist_meta(&a);
             store.kv_set(&cache_key, &format!("{now}|{}", a.deezer_id));
-            Some(a.deezer_id)
+            ResolveArtist::Found(a.deezer_id)
         }
         None => {
             store.kv_set(&cache_key, &format!("{now}|"));
-            None
+            ResolveArtist::NotFound
         }
     }
 }
 
-/// Chooses between Deezer artists that all match a name.
-async fn pick_artist_candidate(
+/// Filters and ranks Deezer artist search results for `name`.
+async fn pick_artist_from_search(
     dz: &crate::sources::deezer::DeezerSource,
     name: &str,
-    mut candidates: Vec<ArtistSummary>,
+    raw_results: Vec<ArtistSummary>,
     played_titles: &[String],
 ) -> Option<ArtistSummary> {
-    if candidates.len() <= 1 {
+    let non_ascii = !name.is_ascii();
+    let wanted = name.to_lowercase();
+    let key_name = slug(name);
+
+    let mut exact: Vec<ArtistSummary> = raw_results
+        .iter()
+        .filter(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name)
+        .cloned()
+        .collect();
+    if exact.iter().any(|a| a.album_count > 0) {
+        exact.retain(|a| a.album_count > 0);
+    }
+
+    // For non-ASCII queries, Deezer often lists the artist's real catalog under
+    // their romanized name as the #1 search hit (e.g. "幾田りら" -> "Lilas Ikuta",
+    // "米津玄師" -> "Kenshi Yonezu") while the native-script entry is missing or a stub.
+    let top_solo: Option<ArtistSummary> = if non_ascii {
+        raw_results
+            .iter()
+            .take(2)
+            .find(|a| a.album_count > 0 && is_solo_artist_name(&a.name))
+            .cloned()
+    } else {
+        None
+    };
+
+    let mut candidates = exact.clone();
+    if non_ascii {
+        for cand in raw_results
+            .iter()
+            .take(2)
+            .filter(|a| a.album_count > 0 && is_solo_artist_name(&a.name))
+        {
+            if !candidates.iter().any(|c| c.deezer_id == cand.deezer_id) {
+                candidates.push(cand.clone());
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
         return candidates.pop();
     }
+
+    // If ASCII and there is a unique exact-case match ("LiSA" vs "LISA"), use it directly.
     let exact_case: Vec<usize> = candidates
         .iter()
         .enumerate()
         .filter(|(_, a)| a.name.trim() == name)
         .map(|(i, _)| i)
         .collect();
-    if exact_case.len() == 1 {
+    if !non_ascii && exact_case.len() == 1 {
         return Some(candidates.swap_remove(exact_case[0]));
     }
+
+    // Check top-track overlap with songs the user actually played/starred.
     let played: Vec<String> = played_titles
         .iter()
         .map(|t| slug(t))
@@ -2097,7 +2298,11 @@ async fn pick_artist_candidate(
                 .iter()
                 .map(|t| slug(&t.title))
                 .filter(|t| t.len() >= 3)
-                .filter(|t| played.iter().any(|p| t == p || t.starts_with(p.as_str()) || p.starts_with(t.as_str())))
+                .filter(|t| {
+                    played
+                        .iter()
+                        .any(|p| t == p || t.starts_with(p.as_str()) || p.starts_with(t.as_str()))
+                })
                 .count();
             if hits > 0 && best.map_or(true, |(_, b)| hits > b) {
                 best = Some((i, hits));
@@ -2107,22 +2312,120 @@ async fn pick_artist_candidate(
             return Some(candidates.swap_remove(i));
         }
     }
-    // No evidence either way: keep Deezer's own ranking, preferring exact case.
-    let first = exact_case.first().copied().unwrap_or(0);
+
+    pick_artist_fallback(name, exact, top_solo, candidates)
+}
+
+fn pick_artist_fallback(
+    name: &str,
+    exact: Vec<ArtistSummary>,
+    top_solo: Option<ArtistSummary>,
+    mut candidates: Vec<ArtistSummary>,
+) -> Option<ArtistSummary> {
+    if !name.is_ascii() {
+        if let Some(top) = top_solo {
+            let best_exact_albums = exact.iter().map(|a| a.album_count).max().unwrap_or(0);
+            if exact.is_empty()
+                || best_exact_albums == 0
+                || top.album_count >= best_exact_albums.saturating_mul(3)
+            {
+                return Some(top);
+            }
+        }
+    }
+    let exact_case_idx = candidates.iter().position(|a| a.name.trim() == name);
+    let first = exact_case_idx.unwrap_or(0);
     Some(candidates.swap_remove(first))
 }
 
-/// Builds the new-releases shelf. It only changes when a release arrives or
-/// ages out of the window; viewing it doesn't alter anything.
-async fn build_new_releases(state: &AppState, uid: i64, saved: &HashSet<String>) -> Vec<Value> {
-    let new_releases = collect_new_releases(state, uid, 8).await;
-    for a in &new_releases {
-        let _ = state.store.upsert_album_meta(a);
+/// Builds the new-releases shelf for `/api/web/home`.
+/// Returns `(items_json, pending)` where `pending == true` means a cold
+/// background sweep is still running and the client can fetch `/api/web/home/new-releases`
+/// once it completes.
+async fn build_new_releases(
+    state: &AppState,
+    uid: i64,
+    saved: &HashSet<String>,
+) -> (Vec<Value>, bool) {
+    let stored = stored_new_releases(&state.store, uid, 8);
+    if new_releases_is_fresh(&state.store, uid, !stored.is_empty()) {
+        let items = stored
+            .iter()
+            .map(|a| album_json(a, saved.contains(&a.id)))
+            .collect();
+        return (items, false);
     }
-    new_releases
+
+    let mut rx = ensure_new_releases_refresh(state, uid);
+    // If we already have valid recent releases persisted, return them right away
+    // and let the background sweep refresh silently without blocking Home.
+    if !stored.is_empty() {
+        let items = stored
+            .iter()
+            .map(|a| album_json(a, saved.contains(&a.id)))
+            .collect();
+        return (items, false);
+    }
+
+    // Cold shelf: wait briefly so fast lookups appear on the initial response,
+    // without stalling Home if Deezer is busy (e.g. startup catalog warming).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(2800),
+        rx.wait_for(|&done| done),
+    )
+    .await;
+    let fresh = stored_new_releases(&state.store, uid, 8);
+    let pending = !*rx.borrow();
+    let items = fresh
         .iter()
         .map(|a| album_json(a, saved.contains(&a.id)))
-        .collect()
+        .collect();
+    (items, pending)
+}
+
+/// Lightweight follow-up endpoint used by Home when a cold New Releases sweep
+/// was still running past the initial Home render budget.
+pub async fn home_new_releases(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let uid = user.id;
+    let stored = stored_new_releases(&state.store, uid, 8);
+    let existing_rx = {
+        let inflight = state
+            .new_releases_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        inflight.get(&uid).cloned()
+    };
+    let mut rx = match existing_rx {
+        Some(rx) => Some(rx),
+        None if !new_releases_is_fresh(&state.store, uid, !stored.is_empty()) => {
+            Some(ensure_new_releases_refresh(&state, uid))
+        }
+        None => None,
+    };
+    if let Some(ref mut r) = rx {
+        if !*r.borrow() {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                r.wait_for(|&done| done),
+            )
+            .await;
+        }
+    }
+    let fresh = stored_new_releases(&state.store, uid, 8);
+    let saved = state.store.saved_album_ids(uid).unwrap_or_default();
+    let pending = rx.as_ref().map_or(false, |r| !*r.borrow());
+    let items: Vec<Value> = fresh
+        .iter()
+        .map(|a| album_json(a, saved.contains(&a.id)))
+        .collect();
+    json_res(json!({
+        "newReleases": items,
+        "pending": pending,
+    }))
 }
 
 /// How long a page waits on upstream catalog APIs before rendering from stored data.
@@ -2286,7 +2589,7 @@ pub async fn home(
     let saved = state.store.saved_album_ids(uid).unwrap_or_default();
     let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
 
-    let new_releases_json = build_new_releases(&state, uid, &saved).await;
+    let (new_releases_json, new_releases_pending) = build_new_releases(&state, uid, &saved).await;
 
     let moods: Vec<Value> = Mood::ALL
         .iter()
@@ -2311,6 +2614,7 @@ pub async fn home(
     json_res(json!({
         "quickPicks": to_web_tracks(&state, uid, &quick_picks),
         "newReleases": new_releases_json,
+        "newReleasesPending": new_releases_pending,
         "recent": to_web_tracks(&state, uid, &recent),
         "mixedForYou": json!(state.taste.mixed_for_you_cards(uid)),
         "madeForYou": auto_mixes,
@@ -4255,6 +4559,9 @@ pub async fn toggle_star(
             } else {
                 let _ = state.store.unfollow_artist(user.id, &req.id);
             }
+            state
+                .store
+                .kv_set(&format!("newrel:fetched:{}", user.id), "");
             state.taste.mark_taste_dirty(user.id);
         }
         _ => {
@@ -6092,6 +6399,7 @@ mod tests {
             engine,
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -6234,6 +6542,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -6334,6 +6643,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -6682,6 +6992,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
 
         // Unauthenticated fails
@@ -6822,6 +7133,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
 
         let mut h1 = HeaderMap::new();
@@ -7001,6 +7313,7 @@ mod tests {
             engine,
             taste: std::sync::Arc::new(crate::taste::TasteEngine::new(store, sources)),
             now_playing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            new_releases_inflight: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let mut hdr = HeaderMap::new();
@@ -7118,6 +7431,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -7243,6 +7557,7 @@ mod tests {
             engine: engine.clone(),
             taste,
             now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
         };
         let (u, _) = store.authenticate_or_create_user("avataruser", "pw").unwrap();
         let tok = store.create_session(u.id, "web").unwrap();
@@ -7297,5 +7612,87 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn artist_resolution_handles_non_ascii_romanized_and_rejects_stubs() {
+        let mk = |id: &str, name: &str, albums: usize| ArtistSummary {
+            id: format!("ar:dz:{id}"),
+            name: name.into(),
+            deezer_id: id.into(),
+            album_count: albums,
+            ..Default::default()
+        };
+
+        // Pure non-ASCII query with romanized #1 hit on Deezer ("幾田りら" -> "Lilas Ikuta").
+        let ikuta = pick_artist_fallback(
+            "幾田りら",
+            vec![],
+            Some(mk("106606492", "Lilas Ikuta", 31)),
+            vec![mk("106606492", "Lilas Ikuta", 31)],
+        )
+        .unwrap();
+        assert_eq!(ikuta.deezer_id, "106606492");
+
+        // Non-ASCII query where exact-script match is a 0-album stub ("米津玄師" -> "Kenshi Yonezu").
+        let yonezu = pick_artist_fallback(
+            "米津玄師",
+            vec![mk("7232650", "米津玄師", 0)],
+            Some(mk("5289039", "Kenshi Yonezu", 37)),
+            vec![mk("7232650", "米津玄師", 0), mk("5289039", "Kenshi Yonezu", 37)],
+        )
+        .unwrap();
+        assert_eq!(yonezu.deezer_id, "5289039");
+
+        // Non-ASCII query where exact-script match is a small stub (3 albums vs 48).
+        let higedan = pick_artist_fallback(
+            "Official髭男dism",
+            vec![mk("77044752", "Official髭男dism", 3)],
+            Some(mk("7579730", "OFFICIAL HIGE DANDISM", 48)),
+            vec![
+                mk("77044752", "Official髭男dism", 3),
+                mk("7579730", "OFFICIAL HIGE DANDISM", 48),
+            ],
+        )
+        .unwrap();
+        assert_eq!(higedan.deezer_id, "7579730");
+
+        // ASCII exact-case disambiguation ("LiSA" vs "LISA").
+        let lisa = pick_artist_fallback(
+            "LiSA",
+            vec![mk("14559887", "LISA", 12), mk("418196", "LiSA", 35)],
+            None,
+            vec![mk("14559887", "LISA", 12), mk("418196", "LiSA", 35)],
+        )
+        .unwrap();
+        assert_eq!(lisa.deezer_id, "418196");
+
+        // Collab/CV names are not treated as solo fallback candidates.
+        assert!(!is_solo_artist_name("Ano x Lilas Ikuta"));
+        assert!(!is_solo_artist_name("要 楽奈(CV:青木陽菜)"));
+        assert!(is_solo_artist_name("Hina Aoki"));
+    }
+
+    #[test]
+    fn new_releases_freshness_respects_window_and_ttl() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let now = Utc::now().timestamp();
+        let win = crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS;
+
+        assert!(!new_releases_is_fresh(&store, 1, false));
+
+        // Old window value is treated as stale so window changes refresh immediately.
+        store.kv_set("newrel:fetched:1", &format!("{now}|{}", win - 1));
+        assert!(!new_releases_is_fresh(&store, 1, true));
+
+        // Matching window within TTL is fresh.
+        store.kv_set("newrel:fetched:1", &format!("{now}|{win}"));
+        assert!(new_releases_is_fresh(&store, 1, true));
+        assert!(new_releases_is_fresh(&store, 1, false));
+
+        // Empty shelf expires faster (15m) than a populated shelf (1h).
+        store.kv_set("newrel:fetched:1", &format!("{}|{win}", now - 1200));
+        assert!(new_releases_is_fresh(&store, 1, true));
+        assert!(!new_releases_is_fresh(&store, 1, false));
     }
 }
