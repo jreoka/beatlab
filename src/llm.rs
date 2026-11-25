@@ -374,18 +374,7 @@ impl LlmCurator {
         let Some(config) = LlmConfig::from_env()? else {
             return Ok(None);
         };
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .pool_max_idle_per_host(4)
-            .build()
-            .unwrap_or_default();
-        Ok(Some(Self {
-            config,
-            http,
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
-            last_error: Arc::new(Mutex::new(None)),
-        }))
+        Ok(Some(Self::new_with_config(config)))
     }
 
     pub fn new_with_config(config: LlmConfig) -> Self {
@@ -488,15 +477,22 @@ impl LlmCurator {
         }
         impl Drop for InFlightGuard {
             fn drop(&mut self) {
-                if let Ok(mut g) = self.set.lock() {
-                    g.remove(&self.uid);
-                }
+                // Tolerate a poisoned mutex (as the insert path does), otherwise a
+                // panic here would leave this user locked out of refreshes forever.
+                let mut g = self.set.lock().unwrap_or_else(|e| e.into_inner());
+                g.remove(&self.uid);
             }
         }
         let _guard = InFlightGuard {
             set: self.in_flight.clone(),
             uid: user_id,
         };
+
+        // A concurrent run may have finished between the freshness check above and
+        // acquiring the in-flight slot; skip generating a redundant edition.
+        if !force && !self.needs_refresh(&taste.store, user_id, tz) {
+            return Ok(false);
+        }
 
         let now = Utc::now().timestamp();
         taste.store.kv_set(&attempt_kv_key(user_id), &now.to_string());
@@ -562,6 +558,16 @@ impl LlmCurator {
         // Save the experience first so even if a source search times out partway,
         // custom sections & on-demand Explore mixes are already available.
         Self::save_experience(&taste.store, user_id, &experience);
+
+        // Record when this edition's day ends in the listener's local timezone, so the
+        // generic Mixed-for-you rebuild never overwrites the custom mixes mid-day —
+        // even when BEATLAB_LLM_REFRESH_HOUR differs from the mix turnover hour.
+        let fresh_until = (day_key + 1) * 86_400 + self.config.refresh_hour * 3600
+            - i64::from(tz_offset_min) * 60;
+        taste.store.kv_set(
+            &format!("mix4u:llm_fresh_until:{user_id}"),
+            &fresh_until.to_string(),
+        );
 
         // Materialize all custom Daily Mixes, Made For You copy overrides, and Explore category mixes.
         taste.materialize_llm_experience(user_id, &experience).await;
@@ -761,13 +767,17 @@ fn parse_completion_content(raw_body: &str) -> AppResult<String> {
     Err(err_msg("LLM message content was empty"))
 }
 
-/// Extract the outermost JSON object from an LLM reply, stripping `<think>...</think>` blocks
-/// and markdown code fences if present.
+/// Extract the first balanced JSON object from an LLM reply, stripping `<think>...`
+/// reasoning blocks and markdown code fences if present.
 pub fn extract_json_object(raw: &str) -> Option<&str> {
     let mut s = raw.trim();
-    // Strip reasoning tags if a thinking model emits them in content.
+    // Strip a reasoning block if a thinking model emits one before the payload,
+    // but keep the raw text when the JSON came first and any thinking trailed it.
     if let Some(end_think) = s.rfind("</think>") {
-        s = s[end_think + "</think>".len()..].trim();
+        let after = s[end_think + "</think>".len()..].trim();
+        if after.contains('{') {
+            s = after;
+        }
     }
     if let Some(rest) = s.strip_prefix("```") {
         // Strip opening fence line (e.g. ```json\n)
@@ -780,13 +790,48 @@ pub fn extract_json_object(raw: &str) -> Option<&str> {
             s = stripped.trim();
         }
     }
-    let start = s.find('{')?;
-    let end = s.rfind('}')?;
-    if end > start {
-        Some(&s[start..=end])
-    } else {
-        None
+    // Return the first balanced JSON object, scanning with string/escape awareness
+    // so trailing prose or stray braces cannot corrupt the extraction.
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut j = i;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if escaped {
+                escaped = false;
+            } else if in_str {
+                match b {
+                    b'\\' => escaped = true,
+                    b'"' => in_str = false,
+                    _ => {}
+                }
+            } else {
+                match b {
+                    b'"' => in_str = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(&s[i..=j]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        // Unbalanced from this opening brace; try the next candidate.
+        i += 1;
     }
+    None
 }
 
 struct UserTasteDigest {
@@ -1617,6 +1662,18 @@ mod tests {
         assert_eq!(
             extract_json_object(plain),
             Some("{\"a\": 1, \"b\": {\"c\": 2}}")
+        );
+        // Trailing prose with a stray brace must not extend the extracted object.
+        let trailing = "{\"a\": 1} } hope this helps!";
+        assert_eq!(extract_json_object(trailing), Some("{\"a\": 1}"));
+        // A thinking block *after* the JSON must not hide it.
+        let think_tail = "{\"b\": 2} <think>looks good</think>";
+        assert_eq!(extract_json_object(think_tail), Some("{\"b\": 2}"));
+        // Braces inside JSON strings must not confuse the scan.
+        let braces_in_str = "{\"msg\": \"a } b { c\"}";
+        assert_eq!(
+            extract_json_object(braces_in_str),
+            Some("{\"msg\": \"a } b { c\"}")
         );
     }
 

@@ -1983,10 +1983,22 @@ impl TasteEngine {
         let tz = self.user_tz_offset_min(user_id);
         // When an overnight LLM edition already built today's custom Daily Mixes,
         // keep them intact instead of overwriting them with generic mood mixes.
+        // The curator records when its edition's day ends in the listener's local
+        // timezone, which can differ from MIX4U_REFRESH_HOUR when
+        // BEATLAB_LLM_REFRESH_HOUR is customized.
         if self.store.kv_get(&format!("mix4u:mood:{user_id}")).as_deref() == Some("llm") {
-            let last_rebuilt = kv_ts(format!("mix4u:v4:rebuilt_at:{user_id}"));
-            if mix4u_day(now, tz) <= mix4u_day(last_rebuilt, tz) {
-                return false;
+            let fresh_until = kv_ts(format!("mix4u:llm_fresh_until:{user_id}"));
+            if fresh_until > 0 {
+                if now < fresh_until {
+                    return false;
+                }
+            } else {
+                // Editions materialized before fresh_until existed: fall back to the
+                // generic mix-day comparison.
+                let last_rebuilt = kv_ts(format!("mix4u:v4:rebuilt_at:{user_id}"));
+                if mix4u_day(now, tz) <= mix4u_day(last_rebuilt, tz) {
+                    return false;
+                }
             }
         }
 
