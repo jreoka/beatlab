@@ -5961,7 +5961,7 @@ html, body {
 /* ---------------- Panel shell (desktop / tablet) ----------------
    Sidebar, main column and queue are flat rounded panels sitting on a
    darker canvas, separated by gutters instead of divider lines. */
-@media (min-width: 781px) {
+@media (min-width: 780.02px) {
   html,
   body {
     background: var(--canvas);
@@ -5997,7 +5997,7 @@ html, body {
 .rp-pull {
   display: none;
 }
-@media (min-width: 781px) {
+@media (min-width: 780.02px) {
   .main-column {
     position: relative;
   }
@@ -6062,6 +6062,12 @@ html, body {
   from {
     opacity: 0;
     transform: translateX(14px);
+    visibility: hidden;
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+    visibility: visible;
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -6070,7 +6076,7 @@ html, body {
   .rp-pull-chevron { transition: none; }
 }
 
-@media (min-width: 781px) and (max-width: 1060px) {
+@media (min-width: 780.02px) and (max-width: 1060px) {
   /* Queue opens as an overlay drawer here: keep it inset like the panels. */
   .right-panel {
     top: 8px;
@@ -6087,7 +6093,7 @@ html, body {
    panel stays rendered until it has finished closing; browsers without
    support simply toggle instantly as before. body.rp-anim is added by app.js
    on the first real toggle, so the panel doesn't animate in on page load. */
-@media (min-width: 781px) {
+@media (min-width: 780.02px) {
   .right-panel {
     width: var(--rp-w);
     overflow: hidden;
@@ -6641,7 +6647,7 @@ body:not(.audio-playing) .qp-wave span { animation-play-state: paused; }
 
 /* Desktop home rails: one tidy row per section (no orphaned wrap rows);
    extra items scroll sideways. Mobile sizing is set in the block above. */
-@media (min-width: 781px) {
+@media (min-width: 780.02px) {
   .card-grid.rail,
   .mixed-for-you-grid.rail {
     display: grid;
@@ -6695,7 +6701,7 @@ body:not(.audio-playing) .qp-wave span { animation-play-state: paused; }
   pointer-events: auto;
   transition: transform 0.4s var(--fs-ease), visibility 0s linear 0s, background-color 0.6s ease;
 }
-@media (min-width: 781px) {
+@media (min-width: 780.02px) {
   /* Same inset as the panel shell */
   .fs-player {
     top: 8px;

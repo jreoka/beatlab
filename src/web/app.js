@@ -133,6 +133,10 @@
   }
 
   const RIGHT_PANEL_CLOSED_KEY = 'beatlab_right_panel_closed';
+  const MQ_MOBILE = window.matchMedia('(max-width: 780px)');
+  const MQ_TABLET = window.matchMedia('(max-width: 1060px)');
+  const isMobileViewport = () => MQ_MOBILE.matches;
+  const isTabletOrMobileViewport = () => MQ_TABLET.matches;
 
   function loadDesktopRightPanelClosed() {
     try {
@@ -851,9 +855,35 @@
     }
   }
 
+  let rpContentRaf = 0;
+
+  function scheduleRightPanelContentSync(scrollBehavior = 'smooth') {
+    if (rpContentRaf) cancelAnimationFrame(rpContentRaf);
+    rpContentRaf = requestAnimationFrame(() => {
+      rpContentRaf = 0;
+      const rp = $('right-panel');
+      const shell = $('app-shell');
+      if (!rp || rp.classList.contains('hidden') || !shell || shell.classList.contains('hidden')) return;
+      const queueBody = $('rp-queue-body');
+      if (queueBody && !queueBody.classList.contains('hidden')) {
+        const cur = currentTrack();
+        if (cur) {
+          setMarqueeText($('queue-now-playing')?.querySelector('.q-item.active .q-item-title'), cur.title);
+        }
+      }
+      const lyricsBody = $('rp-lyrics-body');
+      if (lyricsBody && !lyricsBody.classList.contains('hidden') && state.activeLyricIdx >= 0) {
+        const activeLine = $('lyrics-container')?.querySelector(`.lyric-line[data-lidx="${state.activeLyricIdx}"]`);
+        if (activeLine) {
+          activeLine.scrollIntoView({ behavior: scrollBehavior, block: 'center', inline: 'nearest' });
+        }
+      }
+    });
+  }
+
   function syncResponsiveLayout() {
-    const isMobile = window.innerWidth <= 780;
-    const isTabletOrMobile = window.innerWidth <= 1060;
+    const isMobile = isMobileViewport();
+    const isTabletOrMobile = isTabletOrMobileViewport();
     const searchInput = $('global-search');
     if (searchInput) {
       searchInput.placeholder = isMobile
@@ -863,6 +893,10 @@
     const rp = $('right-panel');
     const backdrop = $('panel-backdrop');
     if (!rp) return;
+    const wasHidden = rp.classList.contains('hidden');
+    // Breakpoint transitions switch between docked grid column and fixed
+    // overlay drawer; snap cleanly instead of animating across layout modes.
+    document.body.classList.remove('rp-anim');
     if (isMobile) {
       delete rp.dataset.tabletToggled;
       rp.classList.add('hidden');
@@ -873,9 +907,14 @@
       }
       if (backdrop) backdrop.classList.toggle('hidden', rp.classList.contains('hidden'));
     } else {
+      const keepTabletOpen = rp.dataset.tabletToggled === '1' && !wasHidden;
       delete rp.dataset.tabletToggled;
       if (backdrop) backdrop.classList.add('hidden');
-      rp.classList.toggle('hidden', state.desktopRightPanelClosed);
+      rp.classList.toggle('hidden', keepTabletOpen ? false : state.desktopRightPanelClosed);
+    }
+    syncRightPanelState();
+    if (wasHidden && !rp.classList.contains('hidden')) {
+      scheduleRightPanelContentSync('auto');
     }
   }
 
@@ -1062,12 +1101,13 @@
     setExpandedPlayer(false);
     closeModal();
     closeTrackMenu();
-    if ($('right-panel') && window.innerWidth <= 1060) {
+    if ($('right-panel') && isTabletOrMobileViewport()) {
       delete $('right-panel').dataset.tabletToggled;
       $('right-panel').classList.add('hidden');
     }
     if ($('panel-backdrop')) $('panel-backdrop').classList.add('hidden');
     document.body.classList.remove('rp-anim');
+    syncRightPanelState();
     authScreen.classList.remove('hidden');
     $('app-shell').classList.add('hidden');
     $('player-bar').classList.add('hidden');
@@ -1506,6 +1546,7 @@
       const shell = $('app-shell');
       if (shell && !shell.classList.contains('hidden')) document.body.classList.add('rp-anim');
       sync();
+      if (!closed) scheduleRightPanelContentSync('smooth');
     });
     observer.observe(rp, { attributes: true, attributeFilter: ['class'] });
     syncRightPanelState = () => {
@@ -1527,9 +1568,19 @@
     wirePwaLifecycle();
     watchRightPanel();
     syncResponsiveLayout();
-    syncRightPanelState();
-    window.matchMedia('(max-width: 1060px)').addEventListener('change', syncResponsiveLayout);
-    window.matchMedia('(max-width: 780px)').addEventListener('change', syncResponsiveLayout);
+    MQ_TABLET.addEventListener('change', syncResponsiveLayout);
+    MQ_MOBILE.addEventListener('change', syncResponsiveLayout);
+    window.addEventListener('storage', (e) => {
+      if (e.key !== null && e.key !== RIGHT_PANEL_CLOSED_KEY) return;
+      const nextClosed = loadDesktopRightPanelClosed();
+      if (nextClosed === state.desktopRightPanelClosed) return;
+      state.desktopRightPanelClosed = nextClosed;
+      const rp = $('right-panel');
+      const shell = $('app-shell');
+      if (!rp || isTabletOrMobileViewport() || !shell || shell.classList.contains('hidden')) return;
+      rp.classList.toggle('hidden', nextClosed);
+      if ($('panel-backdrop')) $('panel-backdrop').classList.add('hidden');
+    });
     window.addEventListener('resize', () => {
       clearTimeout(state.marqueeTimer);
       state.marqueeTimer = setTimeout(() => {
@@ -8624,6 +8675,7 @@
       $('tab-lyrics').classList.toggle('active', tab === 'lyrics');
       $('rp-queue-body').classList.toggle('hidden', tab !== 'queue');
       $('rp-lyrics-body').classList.toggle('hidden', tab !== 'lyrics');
+      scheduleRightPanelContentSync('smooth');
     },
     setFsMobileView,
     toggleFsMobileView: (view) => {
@@ -8647,13 +8699,15 @@
       const rp = $('right-panel');
       const backdrop = $('panel-backdrop');
       if (!rp) return;
-      if (window.innerWidth <= 780) {
+      if (isMobileViewport()) {
+        delete rp.dataset.tabletToggled;
         rp.classList.add('hidden');
         if (backdrop) backdrop.classList.add('hidden');
         return;
       }
       const hide = show === false;
-      if (window.innerWidth > 1060) {
+      const isDesktop = !isTabletOrMobileViewport();
+      if (isDesktop) {
         state.desktopRightPanelClosed = hide;
         saveDesktopRightPanelClosed(hide);
       } else {
@@ -8661,11 +8715,12 @@
       }
       rp.classList.toggle('hidden', hide);
       if (backdrop) {
-        backdrop.classList.toggle('hidden', hide || window.innerWidth > 1060);
+        backdrop.classList.toggle('hidden', hide || isDesktop);
       }
+      if (!hide) scheduleRightPanelContentSync('smooth');
     },
     openPanelTab: (tab) => {
-      if (window.innerWidth <= 780) {
+      if (isMobileViewport()) {
         setExpandedPlayer(true);
         setFsMobileView(tab === 'lyrics' ? 'lyrics' : 'queue');
         return;
@@ -8675,7 +8730,8 @@
         return;
       }
       const rp = $('right-panel');
-      if (window.innerWidth > 1060) {
+      const isDesktop = !isTabletOrMobileViewport();
+      if (isDesktop) {
         state.desktopRightPanelClosed = false;
         saveDesktopRightPanelClosed(false);
       } else {
@@ -8683,7 +8739,7 @@
       }
       rp.classList.remove('hidden');
       if ($('panel-backdrop')) {
-        $('panel-backdrop').classList.toggle('hidden', window.innerWidth > 1060);
+        $('panel-backdrop').classList.toggle('hidden', isDesktop);
       }
       window.App.setRightTab(tab);
     },
