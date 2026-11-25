@@ -8,8 +8,8 @@
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui"],
   "orientation": "any",
-  "background_color": "#0c0e13",
-  "theme_color": "#0c0e13",
+  "background_color": "#0b0b0d",
+  "theme_color": "#0b0b0d",
   "categories": ["music", "entertainment"],
   "launch_handler": {
     "client_mode": ["focus-existing", "auto"]

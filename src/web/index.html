@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <meta name="theme-color" content="#090a0d" />
+  <meta name="theme-color" content="#0b0b0d" />
   <meta name="application-name" content="Beatlab" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="Beatlab" />
@@ -13,7 +13,7 @@
   <title>Beatlab — Stream Everything</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&display=swap" />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" type="image/svg+xml" href="/web/favicon.svg" />
   <link rel="icon" type="image/png" sizes="192x192" href="/web/icon-192.png" />
@@ -375,12 +375,7 @@
 
   <!-- Expanded Now Playing View -->
   <div id="fullscreen-player" class="fs-player fs-view-player" aria-hidden="true">
-    <div class="fs-backdrop" aria-hidden="true">
-      <div id="fs-bg" class="fs-bg"></div>
-      <div class="fs-bg-shade"></div>
-    </div>
     <div class="fs-inner">
-      <div class="fs-drag-handle" aria-hidden="true"></div>
       <div class="fs-topbar">
         <button class="fs-round-btn fs-collapse" title="Collapse player" onclick="App.toggleFullscreen(false)">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8.5 7 7 7-7"/></svg>
@@ -419,7 +414,6 @@
               <svg class="heart-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
             </button>
           </div>
-          <canvas id="fs-visualizer" class="fs-visualizer" width="460" height="72"></canvas>
         </div>
         <div class="fs-panel-col">
           <div class="fs-tabs" role="tablist">

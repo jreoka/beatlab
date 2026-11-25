@@ -579,12 +579,6 @@ pub fn render_share_html(
       gap: 6px;
     }}
     .vol-slider {{ width: 84px; height: 4px; }}
-    .visualizer {{
-      width: 100%;
-      height: 40px;
-      display: block;
-      margin-top: 2px;
-    }}
 
     .actions-row {{
       display: flex;
@@ -858,7 +852,6 @@ pub fn render_share_html(
               <input id="vol-slider" class="vol-slider" type="range" min="0" max="1" step="0.01" value="0.9" />
             </div>
           </div>
-          <canvas id="viz-canvas" class="visualizer" width="520" height="40"></canvas>
         </div>
 
         <div class="actions-row">
@@ -964,22 +957,12 @@ pub fn render_share_html(
       authMode: 'signin',
     }};
 
-    let audioCtx = null;
-    let analyser = null;
-    let masterGainNode = null;
-    let vizStarted = false;
     let masterVolume = 0.9;
 
     function applyOutputVolume() {{
       const v = Math.max(0, Math.min(1, Number(masterVolume) || 0));
-      if (masterGainNode && audioCtx) {{
-        audio.muted = false;
-        audio.volume = 1;
-        masterGainNode.gain.setTargetAtTime(v, audioCtx.currentTime, 0.015);
-      }} else {{
-        audio.volume = v;
-        audio.muted = v === 0;
-      }}
+      audio.volume = v;
+      audio.muted = v === 0;
     }}
 
     function esc(s) {{
@@ -1022,59 +1005,6 @@ pub fn render_share_html(
     function buildUrl(t, forceCompat = false) {{
       const needCompat = forceCompat || !canBrowserPlayFormat(t.format);
       return needCompat ? `${{t.streamUrl}}?compat=1` : t.streamUrl;
-    }}
-    function ensureVisualizer() {{
-      if (!vizStarted) {{
-        vizStarted = true;
-        drawViz();
-      }}
-      if (audioCtx) {{
-        if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {{}});
-        return;
-      }}
-      try {{
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (!AC) return;
-        audioCtx = new AC();
-        const src = audioCtx.createMediaElementSource(audio);
-
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 128;
-
-        masterGainNode = audioCtx.createGain();
-        src.connect(analyser);
-        analyser.connect(masterGainNode);
-        masterGainNode.connect(audioCtx.destination);
-        applyOutputVolume();
-      }} catch {{}}
-    }}
-    function drawViz() {{
-      const canvas = $('viz-canvas');
-      if (canvas) {{
-        const ctx = canvas.getContext('2d');
-        const w = canvas.width;
-        const h = canvas.height;
-        ctx.clearRect(0, 0, w, h);
-        const bars = 44;
-        const bw = w / bars;
-        if (analyser && !audio.paused) {{
-          const data = new Uint8Array(analyser.frequencyBinCount);
-          analyser.getByteFrequencyData(data);
-          ctx.fillStyle = '#1ed760';
-          for (let i = 0; i < bars; i++) {{
-            const v = data[i] / 255;
-            const bh = Math.max(3, v * h);
-            ctx.fillRect(i * bw + 2, h - bh, Math.max(2, bw - 4), bh);
-          }}
-        }} else {{
-          ctx.fillStyle = 'rgba(152,162,179,0.22)';
-          for (let i = 0; i < bars; i++) {{
-            const bh = 3 + ((Math.sin(i * 0.55) + 1) * 3.5);
-            ctx.fillRect(i * bw + 2, h - bh, Math.max(2, bw - 4), bh);
-          }}
-        }}
-      }}
-      requestAnimationFrame(drawViz);
     }}
 
     function updateHeaderAndMeta(t) {{
@@ -1206,7 +1136,6 @@ pub fn render_share_html(
       audio.src = buildUrl(t, false);
       if (state.lyricsOpen) loadLyrics(t);
       if (autoplay) {{
-        ensureVisualizer();
         audio.play().catch((e) => {{
           if (token !== state.activeAudioToken || (e && e.name === 'AbortError')) return;
           updatePlayBtn(false);
@@ -1235,7 +1164,6 @@ pub fn render_share_html(
       $('seek-slider').value = '0';
       $('elapsed-lbl').textContent = '0:00';
       updateHeaderAndMeta(t);
-      if (autoplay) ensureVisualizer();
       if (!isBurst) {{
         commitShareTrack(token, t, autoplay);
         return;
@@ -1335,7 +1263,7 @@ pub fn render_share_html(
     }}
 
     applyOutputVolume();
-    audio.addEventListener('play', () => {{ ensureVisualizer(); updatePlayBtn(true); }});
+    audio.addEventListener('play', () => {{ updatePlayBtn(true); }});
     audio.addEventListener('pause', () => updatePlayBtn(false));
     audio.addEventListener('ended', () => {{
       if (state.loadCommitTimer) return;
@@ -1393,7 +1321,6 @@ pub fn render_share_html(
     window.ShareApp = {{
       togglePlay: () => {{
         if (!tracks.length) return;
-        ensureVisualizer();
         if (!audio.getAttribute('src')) loadTrack(state.idx, true);
         else if (audio.paused) audio.play().catch(() => {{}});
         else audio.pause();
@@ -1439,7 +1366,7 @@ pub fn render_share_html(
       seekMs: (ms) => {{
         if (Number.isFinite(ms)) {{
           audio.currentTime = ms / 1000;
-          if (audio.paused) {{ ensureVisualizer(); audio.play().catch(() => {{}}); }}
+          if (audio.paused) {{ audio.play().catch(() => {{}}); }}
         }}
       }},
       copyLink: async () => {{

@@ -2,21 +2,6 @@
   'use strict';
 
   const audio = document.getElementById('audio-el');
-  let rafVisualizer = null;
-  let vizCtx = null;
-  let vizAnalyser = null;
-  let vizSource = null;
-  let vizData = null;
-  let vizStream = null;
-  let vizBoundTrack = null;
-  let vizSink = null;
-  let vizMode = '';
-  let vizUnavailable = false;
-  let vizSignalAt = 0;
-  let vizLastCaptureAt = 0;
-  let vizSilentSince = 0;
-  let vizRecaptureAttempts = 0;
-  let vizTrackSrc = '';
 
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
@@ -262,7 +247,7 @@
     state.theme = next;
     document.documentElement.setAttribute('data-theme', next);
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', next === 'light' ? '#f8f9fb' : '#090a0d');
+    if (meta) meta.setAttribute('content', next === 'light' ? '#ffffff' : '#0b0b0d');
   }
   applyTheme(state.theme);
 
@@ -578,22 +563,8 @@
     });
 
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') {
-        // Detach captureStream() and suspend the mobile visualizer AudioContext
-        // while locked or backgrounded so Android Chrome keeps native <audio>
-        // playback uninterrupted.
-        teardownStreamVisualizer(true);
-      } else if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible') {
         checkServerHealth();
-        if (vizCtxNeedsResume() && !audio.paused) {
-          vizCtx.resume().catch(() => {});
-        }
-        const fs = $('fullscreen-player');
-        if (fs && fs.classList.contains('open') && !rafVisualizer) {
-          vizSilentSince = 0;
-          vizRecaptureAttempts = 0;
-          drawVisualizer();
-        }
         if (state.pendingNetworkResume && navigator.onLine !== false) {
           resumePendingNetworkPlayback();
         }
@@ -776,7 +747,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Playback output & visualizer
+  // Playback output
   // ---------------------------------------------------------------------------
   function applyOutputVolume() {
     const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
@@ -832,15 +803,6 @@
     if (btn) {
       btn.classList.toggle('active', next);
       btn.title = next ? 'Collapse player' : 'Expand player';
-    }
-    if (!next) {
-      teardownStreamVisualizer(true);
-    } else {
-      vizSilentSince = 0;
-      vizRecaptureAttempts = 0;
-      if (!rafVisualizer && document.visibilityState !== 'hidden') {
-        drawVisualizer();
-      }
     }
     if (next) {
       const cur = currentTrack();
@@ -904,249 +866,6 @@
     const icon = $('vol-icon');
     if (!icon) return;
     icon.innerHTML = state.muted || state.volume === 0 ? ICONS.volMuted : ICONS.volOn;
-  }
-
-  function vizCtxNeedsResume() {
-    // iOS also reports the transient 'interrupted' state (e.g. after a system
-    // sound or route change); without resuming it the analyser goes silent.
-    return vizCtx && (vizCtx.state === 'suspended' || vizCtx.state === 'interrupted');
-  }
-
-  function teardownStreamVisualizer(suspendCtx = false) {
-    // Never touch desktop 'element' mode, which routes audible output through vizCtx.
-    if (vizMode === 'stream') {
-      if (vizSource) {
-        try { vizSource.disconnect(); } catch {}
-        vizSource = null;
-      }
-      if (vizSink) {
-        try { vizAnalyser && vizAnalyser.disconnect(vizSink); } catch {}
-        try { vizSink.disconnect(); } catch {}
-        vizSink = null;
-      }
-      if (vizStream && typeof vizStream.getTracks === 'function') {
-        vizStream.getTracks().forEach((t) => {
-          try { t.stop(); } catch {}
-        });
-      }
-      vizStream = null;
-      vizBoundTrack = null;
-      vizTrackSrc = '';
-      vizMode = '';
-      vizSilentSince = 0;
-    }
-    if (suspendCtx && vizMode !== 'element' && vizCtx && vizCtx.state === 'running') {
-      vizCtx.suspend().catch(() => {});
-    }
-  }
-
-  function ensureVisualizerAnalyser(forceRecapture = false) {
-    if (vizUnavailable || !audio) return;
-    if (document.visibilityState === 'hidden') return;
-    const fs = $('fullscreen-player');
-    if (!fs || !fs.classList.contains('open')) return;
-    if (vizCtxNeedsResume() && !audio.paused) {
-      vizCtx.resume().catch(() => {});
-    }
-    if (vizAnalyser && vizMode === 'element') {
-      return;
-    }
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) {
-      vizUnavailable = true;
-      return;
-    }
-    const isMobileUa = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '');
-    try {
-      if (!vizCtx) {
-        vizCtx = new AC();
-        audio.addEventListener('play', () => {
-          if (vizCtxNeedsResume() && document.visibilityState !== 'hidden') {
-            vizCtx.resume().catch(() => {});
-          }
-        });
-      }
-      if (vizCtxNeedsResume()) {
-        vizCtx.resume().catch(() => {});
-      }
-      if (!vizAnalyser) {
-        vizAnalyser = vizCtx.createAnalyser();
-        vizAnalyser.fftSize = 256;
-        vizAnalyser.smoothingTimeConstant = 0.78;
-        vizData = new Uint8Array(vizAnalyser.frequencyBinCount);
-      }
-      if (!isMobileUa && typeof vizCtx.createMediaElementSource === 'function') {
-        vizSource = vizCtx.createMediaElementSource(audio);
-        vizSource.connect(vizAnalyser);
-        vizAnalyser.connect(vizCtx.destination);
-        vizMode = 'element';
-        return;
-      }
-      const capture =
-        typeof audio.captureStream === 'function'
-          ? () => audio.captureStream()
-          : typeof audio.mozCaptureStream === 'function'
-            ? () => audio.mozCaptureStream()
-            : null;
-      if (!capture) {
-        if (typeof vizCtx.createMediaElementSource === 'function' && !vizSource) {
-          vizSource = vizCtx.createMediaElementSource(audio);
-          vizSource.connect(vizAnalyser);
-          vizAnalyser.connect(vizCtx.destination);
-          vizMode = 'element';
-        } else {
-          vizUnavailable = true;
-        }
-        return;
-      }
-      const activeSrc = audio.currentSrc || audio.src || '';
-      if (forceRecapture || (vizMode === 'stream' && vizTrackSrc && activeSrc && vizTrackSrc !== activeSrc)) {
-        teardownStreamVisualizer(false);
-        if (forceRecapture) vizLastCaptureAt = 0;
-      }
-      // A captured media-element track can end, go muted, or silently stall when
-      // tracks change sample rate/codec or playback pauses. Re-capture when needed.
-      const usableTrack = (s) =>
-        s && typeof s.getAudioTracks === 'function'
-          ? s.getAudioTracks().find((t) => t.readyState === 'live' && !t.muted) || null
-          : null;
-      let liveTrack = usableTrack(vizStream);
-      if (!liveTrack) {
-        const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
-        if (!vizLastCaptureAt || nowMs - vizLastCaptureAt > 400) {
-          vizLastCaptureAt = nowMs;
-          const nextStream = capture();
-          const nextTrack = usableTrack(nextStream);
-          if (nextTrack) {
-            if (
-              vizStream &&
-              vizStream !== nextStream &&
-              typeof vizStream.getTracks === 'function'
-            ) {
-              vizStream.getTracks().forEach((t) => {
-                try { t.stop(); } catch {}
-              });
-            }
-            vizStream = nextStream;
-            liveTrack = nextTrack;
-          }
-        }
-      }
-      if (!liveTrack) {
-        return;
-      }
-      if (vizMode === 'stream' && vizBoundTrack === liveTrack && vizSource) {
-        return;
-      }
-      if (vizSource) {
-        try {
-          vizSource.disconnect();
-        } catch {}
-      }
-      vizSource = vizCtx.createMediaStreamSource(vizStream);
-      vizBoundTrack = liveTrack;
-      vizTrackSrc = activeSrc;
-      vizMode = 'stream';
-      if (vizSink) {
-        try { vizAnalyser.disconnect(vizSink); } catch {}
-        try { vizSink.disconnect(); } catch {}
-      }
-      const silentGain = vizCtx.createGain();
-      silentGain.gain.value = 0;
-      vizSink = silentGain;
-      vizSource.connect(vizAnalyser);
-      vizAnalyser.connect(silentGain);
-      silentGain.connect(vizCtx.destination);
-    } catch {
-      // Transient captureStream() errors (e.g. while switching sources) shouldn't
-      // permanently disable the visualizer for the rest of the session.
-    }
-  }
-
-  function drawVisualizer() {
-    const fs = $('fullscreen-player');
-    if (!fs || !fs.classList.contains('open') || document.visibilityState === 'hidden') {
-      rafVisualizer = null;
-      return;
-    }
-    const canvas = $('fs-visualizer');
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      const bars = 40;
-      const bw = canvas.width / bars;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
-      const playing = !!audio && !audio.paused && !audio.ended;
-      if (playing && audio.readyState >= 2) {
-        ensureVisualizerAnalyser();
-      }
-      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
-      let hasSignal = false;
-      if (playing && vizAnalyser && vizData) {
-        vizAnalyser.getByteFrequencyData(vizData);
-        for (let k = 0; k < vizData.length; k++) {
-          if (vizData[k] > 0) {
-            hasSignal = true;
-            break;
-          }
-        }
-        if (hasSignal) {
-          vizSignalAt = nowMs;
-          vizSilentSince = 0;
-          vizRecaptureAttempts = 0;
-        } else if (
-          vizMode === 'stream' &&
-          !audio.muted &&
-          audio.volume > 0 &&
-          audio.readyState >= 2
-        ) {
-          // On Android Chrome, a captureStream() track can stay readyState==='live'
-          // yet deliver all zeros after a codec/sample-rate switch or route change.
-          if (!vizSilentSince) vizSilentSince = nowMs;
-          if (
-            nowMs - vizSilentSince > 1200 &&
-            nowMs - vizLastCaptureAt > 1500 &&
-            vizRecaptureAttempts < 4
-          ) {
-            vizRecaptureAttempts++;
-            vizSilentSince = nowMs;
-            ensureVisualizerAnalyser(true);
-          }
-        }
-      }
-      // On some mobile browsers the analyser only receives audio briefly (the
-      // captured track ends or goes muted). Rather than collapsing into a flat
-      // line for the rest of the song, fall back to an animated waveform.
-      const useAnalyser = playing && nowMs - vizSignalAt < 300;
-      if (useAnalyser) {
-        const usableBins = Math.max(1, Math.floor(vizData.length * 0.65));
-        for (let i = 0; i < bars; i++) {
-          const bin = Math.min(
-            vizData.length - 1,
-            Math.floor(Math.pow(i / bars, 1.35) * usableBins)
-          );
-          const amp = vizData[bin] / 255;
-          const h = Math.min(canvas.height, Math.max(3, (0.06 + amp * 0.9) * canvas.height));
-          ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
-        }
-      } else if (playing) {
-        const t = nowMs / 1000;
-        for (let i = 0; i < bars; i++) {
-          const wave =
-            0.18 +
-            0.45 * Math.abs(Math.sin(t * 2.1 + i * 0.42)) +
-            0.25 * Math.abs(Math.sin(t * 3.6 - i * 0.27));
-          const h = Math.min(canvas.height, Math.max(3, wave * canvas.height * 0.9));
-          ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
-        }
-      } else {
-        for (let i = 0; i < bars; i++) {
-          const h = Math.max(3, canvas.height * 0.06);
-          ctx.fillRect(i * bw + 2, canvas.height - h, Math.max(3, bw - 4), h);
-        }
-      }
-    }
-    rafVisualizer = requestAnimationFrame(drawVisualizer);
   }
 
   // ---------------------------------------------------------------------------
@@ -1223,7 +942,6 @@
 
   function resetPlayerAndSessionUI() {
     clearPlaybackRecovery();
-    teardownStreamVisualizer(true);
     audio.pause();
     audio.removeAttribute('src');
     audio.load();
@@ -1278,7 +996,7 @@
     $('fs-cover').src = '/api/web/cover/default';
     setMarqueeText($('fs-title'), 'Ready');
     $('fs-artist').textContent = 'Beatlab';
-    $('fs-bg').style.backgroundImage = '';
+    setFsTint('');
     if ($('fs-mini-cover')) $('fs-mini-cover').src = '/api/web/cover/default';
     if ($('fs-mini-title')) $('fs-mini-title').textContent = 'Ready';
     if ($('fs-mini-artist')) $('fs-mini-artist').textContent = 'Beatlab';
@@ -4993,11 +4711,6 @@
     if (!cur || cur.id !== track.id) return;
 
     clearPlaybackRecovery();
-    // Release any previous captureStream() before swapping src so Android Chrome
-    // re-captures cleanly if the new track uses a different sample rate or codec.
-    teardownStreamVisualizer(false);
-    vizSilentSince = 0;
-    vizRecaptureAttempts = 0;
 
     applyCommittedMediaUI(track);
     state.isSwitchingTrack = true;
@@ -5331,12 +5044,93 @@
     }
   }
 
+  // Flat now-playing colour: one calm colour sampled from the cover art
+  // (no blur). Saturated pixels are weighted up so colourful covers don't
+  // average out to grey, then lightness is pinned to a readable range.
+  // --fs-tint paints the expanded player; --np-tint / --np-tint-light (on the
+  // root) paint the mobile mini player in the dark / light theme.
+  let fsTintUrl = null;
+  let fsTintToken = 0;
+  function clearNowPlayingTint() {
+    const fs = $('fullscreen-player');
+    if (fs) fs.style.removeProperty('--fs-tint');
+    const root = document.documentElement.style;
+    root.removeProperty('--np-tint');
+    root.removeProperty('--np-tint-light');
+  }
+  function setFsTint(url) {
+    const fs = $('fullscreen-player');
+    if (!fs || url === fsTintUrl) return;
+    fsTintUrl = url;
+    const token = ++fsTintToken;
+    if (!url) {
+      clearNowPlayingTint();
+      return;
+    }
+    const img = new Image();
+    img.decoding = 'async';
+    img.onload = () => {
+      if (token !== fsTintToken) return;
+      try {
+        const size = 16;
+        const c = document.createElement('canvas');
+        c.width = size;
+        c.height = size;
+        const ctx = c.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, size, size);
+        const d = ctx.getImageData(0, 0, size, size).data;
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        let w = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const hi = Math.max(d[i], d[i + 1], d[i + 2]);
+          const lo = Math.min(d[i], d[i + 1], d[i + 2]);
+          const wt = 0.08 + ((hi - lo) / 255) ** 2 * 2;
+          r += d[i] * wt;
+          g += d[i + 1] * wt;
+          b += d[i + 2] * wt;
+          w += wt;
+        }
+        r /= w * 255;
+        g /= w * 255;
+        b /= w * 255;
+        const hi = Math.max(r, g, b);
+        const lo = Math.min(r, g, b);
+        const l = (hi + lo) / 2;
+        let h = 0;
+        let sat = 0;
+        if (hi !== lo) {
+          const delta = hi - lo;
+          sat = l > 0.5 ? delta / (2 - hi - lo) : delta / (hi + lo);
+          if (hi === r) h = (g - b) / delta + (g < b ? 6 : 0);
+          else if (hi === g) h = (b - r) / delta + 2;
+          else h = (r - g) / delta + 4;
+          h *= 60;
+        }
+        const hue = Math.round(h);
+        const outS = Math.round(Math.min(sat, 0.5) * 100);
+        const dark = `hsl(${hue} ${outS}% 16%)`;
+        fs.style.setProperty('--fs-tint', dark);
+        const root = document.documentElement.style;
+        root.setProperty('--np-tint', `hsl(${hue} ${outS}% 22%)`);
+        root.setProperty('--np-tint-light', `hsl(${hue} ${Math.min(outS, 45)}% 91%)`);
+      } catch {
+        clearNowPlayingTint();
+      }
+    };
+    img.onerror = () => {
+      if (token === fsTintToken) clearNowPlayingTint();
+    };
+    img.src = url;
+  }
+
   function applyCommittedMediaUI(track) {
     if (!track) return;
     $('pb-cover').src = track.coverUrl;
     $('fs-cover').src = track.coverUrl;
     if ($('fs-mini-cover')) $('fs-mini-cover').src = track.coverUrl;
-    $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
+    setFsTint(track.coverUrl);
 
     syncMediaSession(track, true);
   }
@@ -5364,7 +5158,7 @@
       $('pb-cover').src = track.coverUrl;
       $('fs-cover').src = track.coverUrl;
       if ($('fs-mini-cover')) $('fs-mini-cover').src = track.coverUrl;
-      $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
+      setFsTint(track.coverUrl);
     }
     setMarqueeText($('pb-title'), track.title);
     $('pb-artist').textContent = track.artist;
@@ -6007,10 +5801,6 @@
       }
       setMediaPlaybackState('playing');
       updateMediaPositionState(true);
-      const activeSrc = audio.currentSrc || audio.src || '';
-      if (vizMode === 'stream' && vizTrackSrc && activeSrc && vizTrackSrc !== activeSrc) {
-        teardownStreamVisualizer(false);
-      }
     });
     audio.addEventListener('pause', () => {
       clearStallWatch();
@@ -6093,19 +5883,6 @@
       }
       nextTrack(false);
     });
-
-    const fsEl = $('fullscreen-player');
-    if (fsEl) {
-      fsEl.addEventListener(
-        'pointerdown',
-        () => {
-          if (vizCtxNeedsResume() && !audio.paused && document.visibilityState !== 'hidden') {
-            vizCtx.resume().catch(() => {});
-          }
-        },
-        { passive: true }
-      );
-    }
 
     audio.addEventListener('timeupdate', () => {
       clearStallWatch();
