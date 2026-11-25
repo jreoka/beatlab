@@ -6015,6 +6015,8 @@ html, body {
     color: var(--text-muted);
     z-index: 5;
     pointer-events: none;
+  }
+  body.rp-anim.rp-closed .rp-pull {
     /* Wait for the panel to finish sliding shut before the tab appears */
     animation: rpPullIn 0.35s cubic-bezier(0.22, 1, 0.36, 1) 0.22s both;
   }
@@ -6063,7 +6065,7 @@ html, body {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  body.rp-closed .rp-pull { animation: none; }
+  body.rp-anim.rp-closed .rp-pull { animation: none; }
   .rp-pull-shape,
   .rp-pull-chevron { transition: none; }
 }

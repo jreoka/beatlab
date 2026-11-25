@@ -132,6 +132,22 @@
       .join('');
   }
 
+  const RIGHT_PANEL_CLOSED_KEY = 'beatlab_right_panel_closed';
+
+  function loadDesktopRightPanelClosed() {
+    try {
+      return localStorage.getItem(RIGHT_PANEL_CLOSED_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  function saveDesktopRightPanelClosed(closed) {
+    try {
+      localStorage.setItem(RIGHT_PANEL_CLOSED_KEY, closed ? 'true' : 'false');
+    } catch {}
+  }
+
   const state = {
     token: localStorage.getItem('beatlab_token') || '',
     user: null,
@@ -146,6 +162,7 @@
     autoplay: localStorage.getItem('beatlab_autoplay') !== 'false',
     hapticsEnabled: localStorage.getItem('beatlab_haptics') !== 'false',
     theme: localStorage.getItem('beatlab_theme') === 'light' ? 'light' : 'dark',
+    desktopRightPanelClosed: loadDesktopRightPanelClosed(),
     radioReqToken: 0,
     radioLoading: false,
     radioInFlight: null,
@@ -847,18 +864,18 @@
     const backdrop = $('panel-backdrop');
     if (!rp) return;
     if (isMobile) {
+      delete rp.dataset.tabletToggled;
       rp.classList.add('hidden');
       if (backdrop) backdrop.classList.add('hidden');
     } else if (isTabletOrMobile) {
-      if (!rp.dataset.userToggled) {
+      if (!rp.dataset.tabletToggled) {
         rp.classList.add('hidden');
       }
       if (backdrop) backdrop.classList.toggle('hidden', rp.classList.contains('hidden'));
     } else {
+      delete rp.dataset.tabletToggled;
       if (backdrop) backdrop.classList.add('hidden');
-      if (!rp.dataset.userToggled) {
-        rp.classList.remove('hidden');
-      }
+      rp.classList.toggle('hidden', state.desktopRightPanelClosed);
     }
   }
 
@@ -1046,6 +1063,7 @@
     closeModal();
     closeTrackMenu();
     if ($('right-panel') && window.innerWidth <= 1060) {
+      delete $('right-panel').dataset.tabletToggled;
       $('right-panel').classList.add('hidden');
     }
     if ($('panel-backdrop')) $('panel-backdrop').classList.add('hidden');
@@ -1509,6 +1527,7 @@
     wirePwaLifecycle();
     watchRightPanel();
     syncResponsiveLayout();
+    syncRightPanelState();
     window.matchMedia('(max-width: 1060px)').addEventListener('change', syncResponsiveLayout);
     window.matchMedia('(max-width: 780px)').addEventListener('change', syncResponsiveLayout);
     window.addEventListener('resize', () => {
@@ -8633,8 +8652,13 @@
         if (backdrop) backdrop.classList.add('hidden');
         return;
       }
-      rp.dataset.userToggled = '1';
       const hide = show === false;
+      if (window.innerWidth > 1060) {
+        state.desktopRightPanelClosed = hide;
+        saveDesktopRightPanelClosed(hide);
+      } else {
+        rp.dataset.tabletToggled = '1';
+      }
       rp.classList.toggle('hidden', hide);
       if (backdrop) {
         backdrop.classList.toggle('hidden', hide || window.innerWidth > 1060);
@@ -8651,7 +8675,12 @@
         return;
       }
       const rp = $('right-panel');
-      rp.dataset.userToggled = '1';
+      if (window.innerWidth > 1060) {
+        state.desktopRightPanelClosed = false;
+        saveDesktopRightPanelClosed(false);
+      } else {
+        rp.dataset.tabletToggled = '1';
+      }
       rp.classList.remove('hidden');
       if ($('panel-backdrop')) {
         $('panel-backdrop').classList.toggle('hidden', window.innerWidth > 1060);
