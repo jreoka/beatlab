@@ -799,11 +799,16 @@ pub fn compute_stats_from_data(
             };
             if !disp_artist.is_empty() {
                 let aa = artist_acc.entry(aid).or_insert_with(|| ArtistAccum {
-                    name: disp_artist,
+                    name: disp_artist.clone(),
                     streams: 0,
                     listened_secs: 0,
                     song_keys: HashSet::new(),
                 });
+                if !crate::models::is_solo_artist_name(&aa.name)
+                    && crate::models::is_solo_artist_name(&disp_artist)
+                {
+                    aa.name = disp_artist;
+                }
                 aa.streams += 1;
                 aa.listened_secs += l.listened_secs;
                 aa.song_keys.insert(l.song_key.clone());

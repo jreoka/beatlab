@@ -1,7 +1,9 @@
 use crate::models::{
     primary_artist, slug, AlbumSummary, ArtistSummary, Mood, Track, UserTrackStats,
 };
-use crate::sources::{dedup_tracks_prefer_quality, merge_track_pair, SourceRegistry};
+use crate::sources::{
+    dedup_tracks_prefer_quality, merge_album_tracks, merge_track_pair, SourceRegistry,
+};
 use crate::store::{search_match_score, Store};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -3675,13 +3677,20 @@ impl TasteEngine {
                 let _ = self.store.upsert_album_meta(&meta);
                 let _ = self.store.upsert_tracks(&it_tracks);
                 let official_keys: HashSet<String> =
-                    it_tracks.iter().map(|t| t.song_key()).collect();
+                    it_tracks.iter().map(|t| t.album_track_key()).collect();
                 let local_same: Vec<Track> = existing_tracks
                     .into_iter()
-                    .filter(|t| official_keys.contains(&t.song_key()))
+                    .filter(|t| official_keys.contains(&t.album_track_key()))
                     .collect();
-                let merged = merge_tracks_dedup(it_tracks, local_same);
+                let merged = merge_album_tracks(it_tracks, local_same);
                 let final_tracks = self.upgrade_album_from_soulseek(&meta, merged).await;
+                if !final_tracks.is_empty() {
+                    meta.song_count = final_tracks.len();
+                    let dur: i32 = final_tracks.iter().map(|t| t.duration.max(0)).sum();
+                    if dur > 0 {
+                        meta.duration = dur;
+                    }
+                }
                 return Some((meta, final_tracks));
             }
         }
@@ -3750,7 +3759,7 @@ impl TasteEngine {
         }
 
         if let Some(ref dz_id) = dz_album_id {
-            if let Some((meta, dz_tracks)) = self.sources.deezer.fetch_album(dz_id).await {
+            if let Some((mut meta, dz_tracks)) = self.sources.deezer.fetch_album(dz_id).await {
                 let _ = self.store.upsert_album_meta(&meta);
                 let _ = self.store.upsert_tracks(&dz_tracks);
                 let stored = self
@@ -3761,13 +3770,21 @@ impl TasteEngine {
                     .unwrap_or(dz_tracks);
                 // Fold in local copies (e.g. the version being played) of songs on
                 // the official tracklist; don't append unrelated local strays.
-                let official_keys: HashSet<String> = stored.iter().map(|t| t.song_key()).collect();
+                let official_keys: HashSet<String> =
+                    stored.iter().map(|t| t.album_track_key()).collect();
                 let local_same: Vec<Track> = existing_tracks
                     .into_iter()
-                    .filter(|t| official_keys.contains(&t.song_key()))
+                    .filter(|t| official_keys.contains(&t.album_track_key()))
                     .collect();
-                let merged = merge_tracks_dedup(stored, local_same);
+                let merged = merge_album_tracks(stored, local_same);
                 let final_tracks = self.upgrade_album_from_soulseek(&meta, merged).await;
+                if !final_tracks.is_empty() {
+                    meta.song_count = final_tracks.len();
+                    let dur: i32 = final_tracks.iter().map(|t| t.duration.max(0)).sum();
+                    if dur > 0 {
+                        meta.duration = dur;
+                    }
+                }
                 return Some((meta, final_tracks));
             }
         }
@@ -3798,12 +3815,7 @@ impl TasteEngine {
                 .collect();
             if !found.is_empty() {
                 let _ = self.store.upsert_tracks(&found);
-                tracks = merge_tracks_dedup(tracks, found);
-                tracks.sort_by(|a, b| {
-                    a.disc_no
-                        .cmp(&b.disc_no)
-                        .then_with(|| a.track_no.cmp(&b.track_no))
-                });
+                tracks = merge_album_tracks(tracks, found);
             }
         }
 
@@ -3870,7 +3882,9 @@ impl TasteEngine {
 
         let mut base_by_key: HashMap<String, Track> = HashMap::new();
         for t in &tracks {
-            base_by_key.entry(t.song_key()).or_insert_with(|| t.clone());
+            base_by_key
+                .entry(t.album_track_key())
+                .or_insert_with(|| t.clone());
         }
 
         let mut upgraded = Vec::new();
@@ -3878,7 +3892,7 @@ impl TasteEngine {
             if !h.is_lossless() {
                 continue;
             }
-            if let Some(base) = base_by_key.get(&h.song_key()) {
+            if let Some(base) = base_by_key.get(&h.album_track_key()) {
                 enrich_slsk_hit_with_base(&mut h, base, true);
                 upgraded.push(h);
             }
@@ -3887,7 +3901,7 @@ impl TasteEngine {
             return tracks;
         }
         let _ = self.store.upsert_tracks(&upgraded);
-        self.store.album_tracks(&meta.id).unwrap_or(tracks)
+        merge_album_tracks(tracks, upgraded)
     }
 
     async fn upgrade_artist_from_soulseek(
@@ -3956,21 +3970,40 @@ impl TasteEngine {
     ) -> Option<(ArtistSummary, Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
         let local_summary = self.store.artist_summary_by_id(artist_id).ok().flatten();
         let stored_for_id = self.store.artist_tracks(artist_id).unwrap_or_default();
-        let search_name = local_summary
+        let hint_clean = name_hint
+            .map(primary_artist)
+            .filter(|n| !n.trim().is_empty());
+        let local_summary_name = local_summary
             .as_ref()
-            .map(|a| a.name.clone())
-            .filter(|n| !n.trim().is_empty())
+            .map(|a| a.name.trim().to_string())
+            .filter(|n| !n.is_empty());
+        let stored_solo_name = stored_for_id
+            .iter()
+            .map(|t| primary_artist(&t.artist))
+            .find(|n| !n.trim().is_empty() && crate::models::is_solo_artist_name(n));
+        let stored_any_name = stored_for_id
+            .first()
+            .map(|t| primary_artist(&t.artist))
+            .filter(|n| !n.trim().is_empty());
+        let search_name = local_summary_name
+            .as_ref()
+            .filter(|n| crate::models::is_solo_artist_name(n))
+            .cloned()
             .or_else(|| {
-                stored_for_id
-                    .first()
-                    .map(|t| primary_artist(&t.artist))
-                    .filter(|n| !n.trim().is_empty())
+                hint_clean
+                    .as_ref()
+                    .filter(|n| crate::models::is_solo_artist_name(n))
+                    .cloned()
             })
+            .or(stored_solo_name)
             .or_else(|| {
-                name_hint
+                local_summary_name
+                    .as_deref()
                     .map(primary_artist)
                     .filter(|n| !n.trim().is_empty())
             })
+            .or(stored_any_name)
+            .or(hint_clean)
             .unwrap_or_else(|| {
                 if artist_id.starts_with("ar:dz:") || artist_id.starts_with("ar:ytm:") {
                     String::new()
@@ -4051,7 +4084,13 @@ impl TasteEngine {
 
         let mut meta = if let Some((ref m, _, _, _)) = hydrated {
             m.clone()
-        } else if let Some(s) = local_summary.clone() {
+        } else if let Some(mut s) = local_summary.clone() {
+            if s.deezer_id.is_empty()
+                && !crate::models::is_solo_artist_name(&s.name)
+                && !search_name.trim().is_empty()
+            {
+                s.name = search_name.clone();
+            }
             s
         } else if !stored_for_id.is_empty() || !search_name.trim().is_empty() {
             let fallback_name = if !search_name.trim().is_empty() {

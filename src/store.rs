@@ -2755,21 +2755,16 @@ impl Store {
             .collect();
         tracks.sort_by(|a, b| {
             a.disc_no
-                .cmp(&b.disc_no)
+                .max(1)
+                .cmp(&b.disc_no.max(1))
+                .then_with(|| (a.track_no <= 0).cmp(&(b.track_no <= 0)))
                 .then_with(|| a.track_no.cmp(&b.track_no))
                 .then_with(|| b.quality_score().cmp(&a.quality_score()))
                 .then_with(|| a.title.cmp(&b.title))
         });
-        // Collapse exact duplicate song_keys within the same album keeping highest quality.
-        let mut seen = HashSet::new();
-        let mut out = Vec::with_capacity(tracks.len());
-        for t in tracks {
-            let key = format!("{}:{}", t.disc_no, t.song_key());
-            if seen.insert(key) {
-                out.push(t);
-            }
-        }
-        Ok(out)
+        // Collapse cross-source duplicates of the same album track keeping highest quality,
+        // while preserving distinct versions (e.g. TV Size, Instrumental, Acoustic, Remix).
+        Ok(crate::sources::merge_album_tracks(tracks, Vec::new()))
     }
 
     pub fn build_artist_summaries(&self) -> AppResult<Vec<ArtistSummary>> {
@@ -2781,21 +2776,32 @@ impl Store {
 
         for t in tracks {
             let arid = resolver.resolve_track(&t);
+            let candidate_name = {
+                let pa = crate::models::primary_artist(&t.artist);
+                if pa.is_empty() {
+                    t.artist.trim().to_string()
+                } else {
+                    pa
+                }
+            };
             albums_per_artist
                 .entry(arid.clone())
                 .or_default()
                 .insert(t.album_id());
             let entry = map.entry(arid.clone()).or_insert_with(|| ArtistSummary {
                 id: arid.clone(),
-                name: crate::models::primary_artist(&t.artist),
+                name: candidate_name.clone(),
                 cover_url: t.cover_url.clone(),
                 bio: String::new(),
                 deezer_id: t.deezer_artist_id().unwrap_or_default(),
                 album_count: 0,
                 song_count: 0,
             });
-            if entry.name.is_empty() {
-                entry.name = t.artist.clone();
+            if entry.name.is_empty()
+                || (!crate::models::is_solo_artist_name(&entry.name)
+                    && crate::models::is_solo_artist_name(&candidate_name))
+            {
+                entry.name = candidate_name;
             }
             if entry.deezer_id.is_empty() {
                 if let Some(dz_id) = t.deezer_artist_id() {
@@ -2827,7 +2833,11 @@ impl Store {
                 song_count: 0,
             });
             if is_canonical {
-                if !meta.name.is_empty() {
+                if !meta.name.is_empty()
+                    && (crate::models::is_solo_artist_name(&meta.name)
+                        || entry.name.is_empty()
+                        || !crate::models::is_solo_artist_name(&entry.name))
+                {
                     entry.name = meta.name;
                 }
                 if !meta.cover_url.is_empty() {
@@ -2840,7 +2850,11 @@ impl Store {
                     entry.deezer_id = meta.deezer_id;
                 }
             } else {
-                if entry.name.is_empty() && !meta.name.is_empty() {
+                if !meta.name.is_empty()
+                    && (entry.name.is_empty()
+                        || (!crate::models::is_solo_artist_name(&entry.name)
+                            && crate::models::is_solo_artist_name(&meta.name)))
+                {
                     entry.name = meta.name;
                 }
                 if entry.cover_url.is_empty() && !meta.cover_url.is_empty() {
@@ -7985,5 +7999,90 @@ mod tests {
             .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn album_tracks_preserves_vocal_tv_size_and_instrumental_versions_and_upgrades_matching_flac() {
+        let store = Store::open_memory().unwrap();
+        let mk = |id: &str, title: &str, track_no: i32, dur: i32| {
+            let mut t = sample_track(id, title, "ASCA", "Remedy / Double Wings");
+            t.source = "itunes".into();
+            t.format = "m4a".into();
+            t.bitrate = 256;
+            t.disc_no = 1;
+            t.track_no = track_no;
+            t.duration = dur;
+            t.meta = r#"{"itunes_album_id":6831539495,"itunes_artist_id":1300493324}"#.into();
+            t
+        };
+        let ep = vec![
+            mk("it:1", "Remedy", 1, 246),
+            mk("it:2", "Double Wings", 2, 215),
+            mk("it:3", "Remedy (TV Size)", 3, 90),
+            mk("it:4", "Double Wings (TV Size)", 4, 90),
+            mk("it:5", "Remedy (Instrumental)", 5, 246),
+            mk("it:6", "Double Wings (Instrumental)", 6, 215),
+        ];
+        store.upsert_tracks(&ep).unwrap();
+
+        let loaded = store.album_tracks("al:it-6831539495").unwrap();
+        let titles: Vec<&str> = loaded.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Remedy",
+                "Double Wings",
+                "Remedy (TV Size)",
+                "Double Wings (TV Size)",
+                "Remedy (Instrumental)",
+                "Double Wings (Instrumental)",
+            ]
+        );
+        let nums: Vec<i32> = loaded.iter().map(|t| t.track_no).collect();
+        assert_eq!(nums, vec![1, 2, 3, 4, 5, 6]);
+
+        // Adding a FLAC copy of track 1 upgrades ONLY track 1 while keeping tracks 2-6 intact.
+        let mut flac = mk("slsk:1", "Remedy [FLAC]", 0, 246);
+        flac.source = "soulseek".into();
+        flac.format = "flac".into();
+        flac.bitrate = 1000;
+        flac.bit_depth = 16;
+        flac.sample_rate = 44100;
+        store.upsert_tracks(&[flac]).unwrap();
+
+        let upgraded = store.album_tracks("al:it-6831539495").unwrap();
+        assert_eq!(upgraded.len(), 6);
+        assert_eq!(upgraded[0].id, "slsk:1");
+        assert_eq!(upgraded[0].track_no, 1);
+        assert_eq!(upgraded[2].id, "it:3");
+        assert_eq!(upgraded[4].id, "it:5");
+    }
+
+    #[test]
+    fn artist_summary_uses_solo_name_even_when_newer_collab_track_shares_artist_id() {
+        let store = Store::open_memory().unwrap();
+        let mut solo = sample_track("ytm:color", "色彩 - color", "yama", "色彩");
+        solo.source = "ytm".into();
+        solo.created = 1000;
+        solo.meta = r#"{"ytm_artist_id":"UC_YAMA_CH"}"#.into();
+
+        let mut collab = sample_track("ytm:burn", "BURN", "yama, WurtS", "BURN");
+        collab.source = "ytm".into();
+        collab.created = 2000;
+        collab.meta = r#"{"ytm_artist_id":"UC_YAMA_CH"}"#.into();
+
+        let mut amp_collab = sample_track("ytm:amp", "Collab", "yama & WurtS", "Collab");
+        amp_collab.source = "ytm".into();
+        amp_collab.created = 3000;
+        amp_collab.meta = r#"{"ytm_artist_id":"UC_YAMA_CH"}"#.into();
+
+        store.upsert_tracks(&[solo, collab, amp_collab]).unwrap();
+
+        let summary = store
+            .artist_summary_by_id("ar:ytm:UC_YAMA_CH")
+            .unwrap()
+            .expect("yama summary should exist");
+        assert_eq!(summary.name, "yama");
+        assert_eq!(summary.song_count, 3);
     }
 }

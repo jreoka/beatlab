@@ -473,6 +473,9 @@ impl StreamEngine {
             if c.id == track.id || (ckey != key && ckey != cleaned_key) {
                 continue;
             }
+            if crate::models::titles_have_version_mismatch(&track.title, &c.title) {
+                continue;
+            }
             if track.duration > 0 && c.duration > 0 && (track.duration - c.duration).abs() > 20 {
                 continue;
             }

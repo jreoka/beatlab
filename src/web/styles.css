@@ -3923,12 +3923,35 @@ a {
   margin-top: 2px;
 }
 
+/* Overflow Tooltip — reveals text cut off by an ellipsis or a line clamp.
+   Sits under the cursor on pointer/fine devices only (see app.js). */
+.overflow-tooltip {
+  position: fixed;
+  z-index: 260;
+  pointer-events: none;
+  max-width: min(380px, calc(100vw - 24px));
+  background: var(--surface);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
+}
+
 /* ---------------- Responsive / Mobile ---------------- */
 .mobile-nav {
   display: none;
 }
 
 @media (hover: none) {
+  .overflow-tooltip {
+    display: none !important;
+  }
   .qp-play {
     display: none;
   }

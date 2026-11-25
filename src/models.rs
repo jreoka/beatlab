@@ -420,6 +420,21 @@ impl Track {
         let a = if pa.is_empty() { &self.artist } else { &pa };
         format!("{}|{}", slug(a), core_song_title(&self.title))
     }
+
+    /// Version-preserving key for tracks within an album: strips release/codec/upload
+    /// tags (`[FLAC]`, `(24bit-48kHz)`, `(Official Audio)`) while keeping musical version
+    /// qualifiers (`(Instrumental)`, `(TV Size)`, `(Acoustic)`, `(Remix)`, `(Live)`).
+    pub fn album_track_key(&self) -> String {
+        let pa = primary_artist(&self.artist);
+        let a = if pa.is_empty() { &self.artist } else { &pa };
+        let stripped = strip_release_tags(&self.title);
+        let title_src = if stripped.is_empty() {
+            self.title.as_str()
+        } else {
+            stripped.as_str()
+        };
+        format!("{}|{}", slug(a), slug(title_src))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -764,6 +779,65 @@ fn is_release_tag(inner: &str) -> bool {
     RELEASE_WORDS.iter().any(|w| low.contains(w))
 }
 
+/// Returns true when `name` looks like a single artist rather than a collaboration
+/// credit (e.g. `"yama, WurtS"`, `"yama × WurtS"`, `"A feat. B"`).
+pub fn is_solo_artist_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let low = trimmed.to_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    for marker in [
+        " feat.",
+        " feat ",
+        " ft.",
+        " ft ",
+        " featuring ",
+        " & ",
+        " + ",
+        " x ",
+        " × ",
+        " cv:",
+        "(cv:",
+        "（cv:",
+    ] {
+        if low.contains(marker) {
+            return false;
+        }
+    }
+    if comma_collab_split_pos(trimmed).is_some() {
+        return false;
+    }
+    true
+}
+
+/// If `s` is a comma-separated collaboration credit (like YouTube Music's `"yama, WurtS"`),
+/// returns the byte offset of the `", "` delimiter. Preserves band names containing
+/// `" & "`/`" and "` (`"Earth, Wind & Fire"`), titles like `"Tyler, The Creator"`,
+/// and suffixes like `", Jr."` / `", Inc."`.
+fn comma_collab_split_pos(s: &str) -> Option<usize> {
+    let pos = s.find(", ")?;
+    let left = s[..pos].trim();
+    let right = s[pos + 2..].trim();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    let low = s.to_ascii_lowercase();
+    if low.contains(" & ") || low.contains(" and ") {
+        return None;
+    }
+    let right_low = right.to_ascii_lowercase();
+    if right_low.starts_with("the ")
+        || matches!(
+            right_low.as_str(),
+            "jr" | "jr." | "sr" | "sr." | "inc" | "inc." | "llc" | "ii" | "iii" | "iv"
+        )
+    {
+        return None;
+    }
+    Some(pos)
+}
+
 /// Extracts primary artist display name by stripping release tags, channel suffixes, and collab trailers.
 pub fn primary_artist(s: &str) -> String {
     let mut cleaned = strip_release_tags(s);
@@ -799,7 +873,42 @@ pub fn primary_artist(s: &str) -> String {
             }
         }
     }
+    if let Some(pos) = cleaned.find(" × ") {
+        if pos > 0 && cleaned.is_char_boundary(pos) {
+            cleaned = cleaned[..pos].trim().to_string();
+        }
+    }
+    if let Some(pos) = comma_collab_split_pos(&cleaned) {
+        if cleaned.is_char_boundary(pos) {
+            cleaned = cleaned[..pos].trim().to_string();
+        }
+    }
     cleaned.trim().to_string()
+}
+
+/// Returns true when two titles represent incompatible musical versions of the same
+/// song (e.g. `"Remedy"` vs `"Remedy (Instrumental)"` or `"Remedy (TV Size)"`), so
+/// playback caching must not substitute one version's audio for another.
+pub fn titles_have_version_mismatch(a: &str, b: &str) -> bool {
+    const VERSION_FLAGS: &[&[&str]] = &[
+        &["instrumental", "off vocal", "off-vocal", "karaoke", "backing track"],
+        &["tv size", "tv-size", "short ver", "short version"],
+        &["acoustic", "unplugged", "piano ver", "piano version"],
+        &["live"],
+        &["remix", "mix"],
+        &["sped up", "slowed", "nightcore"],
+        &["english ver", "english version", "japanese ver", "japanese version"],
+    ];
+    let al = a.to_lowercase();
+    let bl = b.to_lowercase();
+    for group in VERSION_FLAGS {
+        let a_has = group.iter().any(|kw| crate::taste::contains_term(&al, kw));
+        let b_has = group.iter().any(|kw| crate::taste::contains_term(&bl, kw));
+        if a_has != b_has {
+            return true;
+        }
+    }
+    false
 }
 
 /// Strips parenthetical suffixes, punctuation, and trailing version words ("remaster", "live", "radio edit", year).
@@ -1184,5 +1293,64 @@ mod tests {
             Some("UC6-BgjsBa5R3PZQ_kZTGGQw")
         );
         assert_eq!(ytm_money.artist_id(), "ar:dz:14559887");
+    }
+
+    #[test]
+    fn primary_artist_splits_collab_lists_while_preserving_band_and_comma_names() {
+        assert_eq!(primary_artist("yama, WurtS"), "yama");
+        assert_eq!(primary_artist("yama × WurtS"), "yama");
+        assert_eq!(primary_artist("milet × Aimer × 幾田りら"), "milet");
+        assert_eq!(primary_artist("yama feat. WurtS"), "yama");
+        assert_eq!(primary_artist("Tyler, The Creator"), "Tyler, The Creator");
+        assert_eq!(primary_artist("Earth, Wind & Fire"), "Earth, Wind & Fire");
+        assert_eq!(primary_artist("Peter, Paul and Mary"), "Peter, Paul and Mary");
+        assert_eq!(primary_artist("Harry Connick, Jr."), "Harry Connick, Jr.");
+
+        assert!(!is_solo_artist_name("yama, WurtS"));
+        assert!(!is_solo_artist_name("yama × WurtS"));
+        assert!(is_solo_artist_name("yama"));
+        assert!(is_solo_artist_name("Tyler, The Creator"));
+    }
+
+    #[test]
+    fn album_track_key_preserves_versions_and_collapses_release_tags() {
+        let vocal = Track {
+            artist: "ASCA".into(),
+            title: "Remedy".into(),
+            ..Default::default()
+        };
+        let vocal_flac = Track {
+            artist: "ASCA".into(),
+            title: "Remedy [FLAC] (24bit-48kHz)".into(),
+            ..Default::default()
+        };
+        let tv = Track {
+            artist: "ASCA".into(),
+            title: "Remedy (TV Size)".into(),
+            ..Default::default()
+        };
+        let inst = Track {
+            artist: "ASCA".into(),
+            title: "Remedy (Instrumental)".into(),
+            ..Default::default()
+        };
+        let inst_dash = Track {
+            artist: "ASCA".into(),
+            title: "Remedy - Instrumental [FLAC]".into(),
+            ..Default::default()
+        };
+        assert_eq!(vocal.album_track_key(), vocal_flac.album_track_key());
+        assert_ne!(vocal.album_track_key(), tv.album_track_key());
+        assert_ne!(vocal.album_track_key(), inst.album_track_key());
+        assert_ne!(tv.album_track_key(), inst.album_track_key());
+        assert_eq!(inst.album_track_key(), inst_dash.album_track_key());
+
+        assert!(titles_have_version_mismatch("Remedy", "Remedy (Instrumental)"));
+        assert!(titles_have_version_mismatch("Remedy", "Remedy (TV Size)"));
+        assert!(!titles_have_version_mismatch("Remedy", "Remedy [FLAC]"));
+        assert!(!titles_have_version_mismatch(
+            "Remedy (Instrumental)",
+            "Remedy - Instrumental"
+        ));
     }
 }

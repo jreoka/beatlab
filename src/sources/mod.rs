@@ -396,10 +396,11 @@ impl SourceRegistry {
     }
 }
 
-/// Picks the higher-quality track between `a` and `b` while preserving missing metadata
-/// (artwork, genre, moods, year, Deezer ID, popularity metadata, album).
+/// Picks the higher-quality track between `a` and `b` (preferring `a` on ties) while
+/// preserving missing metadata (artwork, genre, moods, year, track/disc numbers, Deezer ID,
+/// popularity metadata, album).
 pub fn merge_track_pair(a: Track, b: Track) -> Track {
-    let (mut winner, loser) = if a.quality_score() > b.quality_score() {
+    let (mut winner, loser) = if a.quality_score() >= b.quality_score() {
         (a, b)
     } else {
         (b, a)
@@ -415,6 +416,12 @@ pub fn merge_track_pair(a: Track, b: Track) -> Track {
     }
     if winner.year == 0 && loser.year > 0 {
         winner.year = loser.year;
+    }
+    if winner.track_no == 0 && loser.track_no > 0 {
+        winner.track_no = loser.track_no;
+    }
+    if winner.disc_no <= 1 && loser.disc_no > 1 {
+        winner.disc_no = loser.disc_no;
     }
     if winner.deezer_id.is_empty() && !loser.deezer_id.is_empty() {
         winner.deezer_id = loser.deezer_id;
@@ -512,6 +519,45 @@ pub fn disambiguate_batch_tracks(
     }
 }
 
+/// Deduplicates tracks within an album while preserving distinct musical versions
+/// (e.g. `"Remedy"`, `"Remedy (TV Size)"`, `"Remedy (Instrumental)"`) and distinct
+/// track positions on the same disc. True cross-source duplicates of the same album
+/// track (such as an iTunes/Deezer track and a Soulseek/local FLAC copy) are merged
+/// via `merge_track_pair`, keeping the highest quality and retaining `track_no`/`disc_no`.
+pub fn merge_album_tracks(primary: Vec<Track>, secondary: Vec<Track>) -> Vec<Track> {
+    let mut indices_by_key: HashMap<(i32, String), Vec<usize>> = HashMap::new();
+    let mut out: Vec<Track> = Vec::new();
+    for t in primary.into_iter().chain(secondary) {
+        let disc = t.disc_no.max(1);
+        let key = (disc, t.album_track_key());
+        let existing_idx = indices_by_key.get(&key).and_then(|indices| {
+            indices.iter().copied().find(|&idx| {
+                let ex = &out[idx];
+                let track_pos_compatible =
+                    ex.track_no == t.track_no || ex.track_no == 0 || t.track_no == 0;
+                track_pos_compatible && !crate::models::tracks_conflict_artist(ex, &t)
+            })
+        });
+        if let Some(idx) = existing_idx {
+            let existing = std::mem::take(&mut out[idx]);
+            out[idx] = merge_track_pair(existing, t);
+        } else {
+            let idx = out.len();
+            indices_by_key.entry(key).or_default().push(idx);
+            out.push(t);
+        }
+    }
+    out.sort_by(|a, b| {
+        a.disc_no
+            .max(1)
+            .cmp(&b.disc_no.max(1))
+            .then_with(|| (a.track_no <= 0).cmp(&(b.track_no <= 0)))
+            .then_with(|| a.track_no.cmp(&b.track_no))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    out
+}
+
 /// Deduplicate across sources by canonical `(artist, core_title)` keeping highest quality
 /// and clean metadata, while never merging tracks from conflicting external artist IDs.
 pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
@@ -525,7 +571,7 @@ pub fn dedup_tracks_prefer_quality(tracks: Vec<Track>) -> Vec<Track> {
                 .find(|&&i| !crate::models::tracks_conflict_artist(&out[i], &t))
             {
                 let existing = std::mem::take(&mut out[idx]);
-                out[idx] = merge_track_pair(t, existing);
+                out[idx] = merge_track_pair(existing, t);
                 continue;
             }
         }

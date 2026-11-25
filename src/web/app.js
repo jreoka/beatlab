@@ -1716,6 +1716,7 @@
     wireTrackGestures();
     wireIntentWarm();
     wireStatsTooltips();
+    wireOverflowTooltips();
     window.addEventListener('hashchange', () => renderCurrentHash());
 
     if (state.token) {
@@ -2912,15 +2913,34 @@
     const { reqToken, signal } = beginViewRequest();
     setMainLoading('Loading artist profile...');
     try {
+      const isSoloHint = (n) => {
+        const s = String(n || '').trim();
+        if (!s) return false;
+        const low = s.toLowerCase();
+        if (/\b(feat\.?|ft\.?|featuring|vs\.?)\b/.test(low)) return false;
+        if (s.includes(' × ') || s.includes(' & ') || s.includes(' + ')) return false;
+        const comma = s.indexOf(', ');
+        if (comma > 0) {
+          const right = s.slice(comma + 2).trim().toLowerCase();
+          if (!right.startsWith('the ') && !/^(jr\.?|sr\.?|inc\.?|llc|ii|iii|iv)$/.test(right)) {
+            return false;
+          }
+        }
+        return true;
+      };
       let hintName = '';
       const cur = currentTrack();
-      if (cur && cur.artistId === id) {
-        hintName = cur.artist || '';
-      } else {
+      if (cur && cur.artistId === id && cur.artist) {
+        hintName = cur.artist;
+      }
+      if (!hintName || !isSoloHint(hintName)) {
         for (const t of state.trackMap.values()) {
-          if (t.artistId === id) {
-            hintName = t.artist || '';
-            break;
+          if (t.artistId === id && t.artist) {
+            if (!hintName) hintName = t.artist;
+            if (isSoloHint(t.artist)) {
+              hintName = t.artist;
+              break;
+            }
           }
         }
       }
@@ -3437,6 +3457,226 @@
         showStatsTooltip(t, e.clientX, e.clientY);
       }
     });
+  }
+
+  /* ------------------------------------------------------------------
+   * Overflow tooltips (desktop): text cut off by an ellipsis or a line
+   * clamp reveals its full value in a floating box under the cursor,
+   * the way native title tooltips do — but styled for this UI.
+   * ---------------------------------------------------------------- */
+  const OVF_SVG_NS = 'http://www.w3.org/2000/svg';
+  const OVF_SHOW_DELAY = 220;
+  const OVF_MAX_TEXT = 300;
+  const OVF_MAX_DEPTH = 10;
+  const OVF_MAX_CHILDREN = 6;
+  const OVF_MAX_DESCENDANTS = 40;
+  let ovfTip = null;
+  let ovfTarget = null;
+  let ovfText = '';
+  let ovfTimer = 0;
+  let ovfX = 0;
+  let ovfY = 0;
+  let ovfW = 0;
+  let ovfH = 0;
+  let ovfStrippedTitle = null;
+
+  function ovfHideBox() {
+    if (ovfTimer) {
+      clearTimeout(ovfTimer);
+      ovfTimer = 0;
+    }
+    // Hand the native title back so app logic that relies on it (marquee
+    // titles) keeps working the way it did before this tooltip existed.
+    if (ovfStrippedTitle && ovfTarget && ovfTarget.isConnected && !ovfTarget.hasAttribute('title')) {
+      ovfTarget.setAttribute('title', ovfStrippedTitle);
+    }
+    ovfStrippedTitle = null;
+    if (ovfTip) ovfTip.classList.add('hidden');
+  }
+
+  function ovfHide() {
+    ovfHideBox();
+    ovfTarget = null;
+    ovfText = '';
+  }
+
+  function ovfPlace() {
+    if (!ovfTip || ovfTip.classList.contains('hidden')) return;
+    const pad = 10;
+    const left = Math.max(pad, Math.min(window.innerWidth - ovfW - pad, ovfX - ovfW / 2));
+    let top = ovfY + 22;
+    if (top + ovfH > window.innerHeight - pad) top = ovfY - ovfH - 12;
+    ovfTip.style.left = `${Math.round(left)}px`;
+    ovfTip.style.top = `${Math.round(Math.max(pad, top))}px`;
+  }
+
+  function ovfSchedule(el) {
+    if (ovfTimer) return;
+    ovfTimer = setTimeout(() => {
+      ovfTimer = 0;
+      if (ovfTarget === el && el.isConnected) ovfShow(el);
+    }, OVF_SHOW_DELAY);
+  }
+
+  function ovfShow(el) {
+    if (!ovfTip || !ovfText) return;
+    if (el.hasAttribute('title')) {
+      // Suppress the browser's own box so only one tooltip is ever visible.
+      ovfStrippedTitle = el.getAttribute('title');
+      el.removeAttribute('title');
+    }
+    ovfTip.textContent = ovfText;
+    ovfTip.classList.remove('hidden');
+    ovfW = ovfTip.offsetWidth;
+    ovfH = ovfTip.offsetHeight;
+    ovfPlace();
+  }
+
+  // The full, uncut value of an element's text. Marquee titles duplicate
+  // their text in the DOM, so read the first copy instead.
+  function ovfTextOf(el) {
+    let source = el;
+    if (el.classList.contains('is-marquee')) {
+      source = el.querySelector('.marquee-inner > span') || el;
+    }
+    let text = (source.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!text) text = (el.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+    if (!text || text.length > OVF_MAX_TEXT) return null;
+    return text;
+  }
+
+  // Is this element actually cutting its own content off? Scroll containers
+  // and plain overflow are excluded: those can be scrolled or never clip.
+  function ovfIsClipped(el) {
+    if (!el.clientWidth || !el.clientHeight) return false;
+    if (el.scrollWidth - el.clientWidth > 1) {
+      const ox = getComputedStyle(el).overflowX;
+      if (ox !== 'visible' && ox !== 'auto' && ox !== 'scroll') return true;
+    }
+    if (el.scrollHeight - el.clientHeight > 1) {
+      const cs = getComputedStyle(el);
+      const clamp = cs.getPropertyValue('-webkit-line-clamp');
+      if (clamp && clamp !== 'none' && cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') return true;
+    }
+    return false;
+  }
+
+  // Cards, rows and lists clip for layout reasons; only a text run should
+  // become a tooltip target, so containers with clipped children are skipped.
+  function ovfHasClippedDescendant(el) {
+    const kids = el.querySelectorAll('*');
+    const n = Math.min(kids.length, OVF_MAX_DESCENDANTS);
+    for (let i = 0; i < n; i += 1) {
+      if (ovfIsClipped(kids[i])) return true;
+    }
+    return false;
+  }
+
+  function ovfFindTarget(start) {
+    let el = start;
+    for (let depth = 0; el && el.nodeType === 1 && depth < OVF_MAX_DEPTH; depth += 1) {
+      if (el === document.body || el === document.documentElement) break;
+      if (el.id === 'text-tooltip') return null;
+      if (el.hasAttribute('data-no-overflow-tip')) return null;
+      if (typeof el.closest === 'function' && el.closest('.stats-tip-target')) return null;
+      const tag = el.tagName;
+      if (
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        el.namespaceURI === OVF_SVG_NS
+      ) {
+        el = el.parentElement;
+        continue;
+      }
+      if (ovfIsClipped(el) && el.children.length <= OVF_MAX_CHILDREN && !ovfHasClippedDescendant(el)) {
+        const text = ovfTextOf(el);
+        return text ? { el, text } : null;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  function wireOverflowTooltips() {
+    // Pointer/fine devices only — touch devices reveal text by tapping.
+    if (!window.matchMedia || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+    ovfTip = $('text-tooltip');
+    if (!ovfTip) return;
+
+    document.addEventListener(
+      'pointerover',
+      (e) => {
+        const node = e.target;
+        if (!node || node.nodeType !== 1) return;
+        ovfX = e.clientX;
+        ovfY = e.clientY;
+        const hit = ovfFindTarget(node);
+        const el = hit ? hit.el : null;
+        if (el === ovfTarget) {
+          if (!el) return;
+          if (ovfTip.classList.contains('hidden')) ovfSchedule(el);
+          else ovfPlace();
+          return;
+        }
+        ovfHide();
+        ovfTarget = el;
+        ovfText = hit ? hit.text : '';
+        if (el) ovfSchedule(el);
+      },
+      true
+    );
+
+    document.addEventListener(
+      'pointermove',
+      (e) => {
+        ovfX = e.clientX;
+        ovfY = e.clientY;
+        if (ovfTimer) return;
+        if (!ovfTarget) return;
+        if (!ovfTarget.isConnected) {
+          ovfHide();
+          return;
+        }
+        if (ovfTip.classList.contains('hidden')) {
+          // Re-arm after an explicit hide (e.g. a click) while still hovering.
+          if (!ovfTarget.matches(':hover')) {
+            ovfTarget = null;
+            ovfText = '';
+            return;
+          }
+          ovfSchedule(ovfTarget);
+          return;
+        }
+        // The text under the cursor can change while it is showing (the
+        // track advances, a list re-renders) — refresh instead of going stale.
+        if (ovfTextOf(ovfTarget) !== ovfText) {
+          const hit = ovfFindTarget(ovfTarget);
+          ovfHide();
+          if (hit) {
+            ovfTarget = hit.el;
+            ovfText = hit.text;
+            ovfSchedule(hit.el);
+          }
+          return;
+        }
+        ovfPlace();
+      },
+      true
+    );
+
+    document.addEventListener(
+      'pointerout',
+      (e) => {
+        if (!e.relatedTarget) ovfHide();
+      },
+      true
+    );
+
+    // Clicking opens menus/modals that would otherwise sit under the box.
+    document.addEventListener('pointerdown', ovfHideBox, true);
+    window.addEventListener('scroll', ovfHide, true);
+    window.addEventListener('blur', ovfHide);
   }
 
   function svgDonutSlicePath(cx, cy, rOuter, rInner, startDeg, endDeg) {

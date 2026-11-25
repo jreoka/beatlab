@@ -1,4 +1,4 @@
-use crate::models::{slug, upgrade_cover_url, AlbumSummary, Track};
+use crate::models::{primary_artist, slug, upgrade_cover_url, AlbumSummary, Track};
 use crate::sources::deezer::NEW_RELEASE_WINDOW_DAYS;
 use crate::taste::classify_moods_str;
 use chrono::Utc;
@@ -549,10 +549,16 @@ fn parse_itunes_album_response(
     }
     tracks.sort_by(|a, b| a.disc_no.cmp(&b.disc_no).then_with(|| a.track_no.cmp(&b.track_no)));
 
+    let pa = primary_artist(&album_artist);
+    let primary_alb_artist = if pa.is_empty() {
+        album_artist.as_str()
+    } else {
+        pa.as_str()
+    };
     let summary = AlbumSummary {
         id: aid.clone(),
         name: album_name,
-        artist_id: format!("ar:{}", slug(&album_artist)),
+        artist_id: format!("ar:{}", slug(primary_alb_artist)),
         artist: album_artist,
         cover_id: aid,
         cover_url: album_cover,
