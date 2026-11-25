@@ -1903,6 +1903,10 @@ pub async fn passkey_delete(
 /// user follows or listens to. Fresh releases are pulled from Deezer in
 /// parallel (only releases from the last ~month); a short timeout keeps the
 /// home tab responsive.
+///
+/// The last good result is kept per account, so artists whose lookup misses
+/// the deadline on a busy visit don't silently vanish from the shelf (a slow
+/// Deezer burst used to leave the whole section empty).
 async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<AlbumSummary> {
     let artists = state
         .store
@@ -1910,6 +1914,20 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
         .unwrap_or_default();
     if artists.is_empty() {
         return Vec::new();
+    }
+
+    // Song titles the user played, per artist, so a name shared by several
+    // Deezer artists (e.g. "Eve") resolves to the one they actually listen to.
+    let mut hint_titles: HashMap<String, Vec<String>> = HashMap::new();
+    if artists.iter().any(|a| a.deezer_id.is_empty()) {
+        for (t, _) in state.store.user_recent_tracks(uid, 500, 0).unwrap_or_default() {
+            let primary = crate::models::primary_artist(&t.artist);
+            let key = slug(if primary.is_empty() { &t.artist } else { &primary });
+            let titles = hint_titles.entry(key).or_default();
+            if titles.len() < 15 && !titles.contains(&t.title) {
+                titles.push(t.title.clone());
+            }
+        }
     }
 
     // Each artist is fetched in its own task. We keep whatever finishes before
@@ -1924,9 +1942,10 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
             let store = state.store.clone();
             let mut id = artist.deezer_id.clone();
             let name = artist.name.clone();
+            let hints = hint_titles.get(&slug(&name)).cloned().unwrap_or_default();
             tokio::spawn(async move {
                 if id.is_empty() {
-                    match resolve_deezer_artist_by_name(&dz, &store, &name).await {
+                    match resolve_deezer_artist_by_name(&dz, &store, &name, &hints).await {
                         Some(found) => id = found,
                         None => return Vec::new(),
                     }
@@ -1935,13 +1954,15 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
             })
         })
         .collect();
+    let total = handles.len();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut batches: Vec<Vec<AlbumSummary>> = Vec::with_capacity(handles.len());
+    let mut batches: Vec<Vec<AlbumSummary>> = Vec::with_capacity(total);
     for handle in handles {
         if let Ok(Ok(batch)) = tokio::time::timeout_at(deadline, handle).await {
             batches.push(batch);
         }
     }
+    let answered = batches.len();
 
     let mut albums: Vec<AlbumSummary> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1952,27 +1973,64 @@ async fn collect_new_releases(state: &AppState, uid: i64, limit: usize) -> Vec<A
             }
         }
     }
+    let live = albums.len();
 
+    // Merge in the last good shelf. Everything in it is still a real release
+    // from the last month, so it is always safe to keep showing; this covers
+    // artists that missed the deadline and Deezer failing fast (an error looks
+    // exactly like "no releases", so a live result alone can't be trusted to
+    // clear the shelf). Entries age out once they leave the release window.
+    let last_key = format!("newrel:last:{uid}");
+    let window_start = Utc::now().timestamp() - 31 * 86_400;
+    let stored: Vec<AlbumSummary> = state
+        .store
+        .kv_get(&last_key)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    for album in stored {
+        if seen.insert(album.id.clone()) {
+            albums.push(album);
+        }
+    }
+    albums.retain(|a| a.created >= window_start);
     albums.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.name.cmp(&b.name)));
+    albums.truncate(limit.max(24));
+    if let Ok(raw) = serde_json::to_string(&albums) {
+        state.store.kv_set(&last_key, &raw);
+    }
     albums.truncate(limit);
+
+    tracing::info!(
+        uid,
+        artists = total,
+        answered,
+        live,
+        shown = albums.len(),
+        "home new releases"
+    );
     albums
 }
 
 /// Finds an artist's Deezer ID from their name (for artists known only via
 /// YouTube Music or by name). Only an exact, case-insensitive name match is
-/// accepted so we never show releases from a different artist. Hits and misses
-/// are remembered so each name is searched at most once a day.
+/// accepted so we never show releases from a different artist. When several
+/// Deezer artists share the name, an exact-case match wins ("LiSA" vs
+/// "LISA"); otherwise the one whose top tracks overlap the songs the user
+/// played is chosen ("Eve" the J-pop artist vs "Eve" the rapper). Hits and
+/// misses are remembered so each name is searched at most once a day.
 async fn resolve_deezer_artist_by_name(
     dz: &crate::sources::deezer::DeezerSource,
     store: &crate::store::Store,
     name: &str,
+    played_titles: &[String],
 ) -> Option<String> {
     let name = name.trim();
     let key_name = slug(name);
     if key_name.is_empty() {
         return None;
     }
-    let cache_key = format!("dzartist:byname:{key_name}");
+    // v2: keyed by the exact name, since case now matters for disambiguation.
+    let cache_key = format!("dzartist:byname2:{name}");
     let now = Utc::now().timestamp();
     if let Some(raw) = store.kv_get(&cache_key) {
         if let Some((ts, id)) = raw.split_once('|') {
@@ -1986,11 +2044,13 @@ async fn resolve_deezer_artist_by_name(
         }
     }
     let wanted = name.to_lowercase();
-    let found = dz
-        .search_artists(name, 5)
+    let candidates: Vec<ArtistSummary> = dz
+        .search_artists(name, 8)
         .await
         .into_iter()
-        .find(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name);
+        .filter(|a| a.name.trim().to_lowercase() == wanted || slug(&a.name) == key_name)
+        .collect();
+    let found = pick_artist_candidate(dz, name, candidates, played_titles).await;
     match found {
         Some(a) => {
             let _ = store.upsert_artist_meta(&a);
@@ -2002,6 +2062,53 @@ async fn resolve_deezer_artist_by_name(
             None
         }
     }
+}
+
+/// Chooses between Deezer artists that all match a name.
+async fn pick_artist_candidate(
+    dz: &crate::sources::deezer::DeezerSource,
+    name: &str,
+    mut candidates: Vec<ArtistSummary>,
+    played_titles: &[String],
+) -> Option<ArtistSummary> {
+    if candidates.len() <= 1 {
+        return candidates.pop();
+    }
+    let exact_case: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.name.trim() == name)
+        .map(|(i, _)| i)
+        .collect();
+    if exact_case.len() == 1 {
+        return Some(candidates.swap_remove(exact_case[0]));
+    }
+    let played: Vec<String> = played_titles
+        .iter()
+        .map(|t| slug(t))
+        .filter(|t| t.len() >= 3)
+        .collect();
+    if !played.is_empty() {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, cand) in candidates.iter().enumerate().take(4) {
+            let top = dz.fetch_artist_top_tracks(&cand.deezer_id, 25).await;
+            let hits = top
+                .iter()
+                .map(|t| slug(&t.title))
+                .filter(|t| t.len() >= 3)
+                .filter(|t| played.iter().any(|p| t == p || t.starts_with(p.as_str()) || p.starts_with(t.as_str())))
+                .count();
+            if hits > 0 && best.map_or(true, |(_, b)| hits > b) {
+                best = Some((i, hits));
+            }
+        }
+        if let Some((i, _)) = best {
+            return Some(candidates.swap_remove(i));
+        }
+    }
+    // No evidence either way: keep Deezer's own ranking, preferring exact case.
+    let first = exact_case.first().copied().unwrap_or(0);
+    Some(candidates.swap_remove(first))
 }
 
 /// Builds the new-releases shelf and advances the per-account "seen" marker so

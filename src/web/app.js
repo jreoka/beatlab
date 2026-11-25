@@ -2136,6 +2136,9 @@
         html += quickPicksSectionHtml(quickPicks);
       }
 
+      // New releases from artists the user listens to sit right under Quick Picks.
+      html += newReleasesSectionHtml(newReleases, d.newReleaseUnseen || 0);
+
       if (mixedForYou.length > 0) {
         html += `<section class="section">
           <div class="section-head">
@@ -2143,8 +2146,6 @@
           <div class="mixed-for-you-grid rail">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
         </section>`;
       }
-
-      html += newReleasesSectionHtml(newReleases, d.newReleaseUnseen || 0);
 
       if (mixes.length > 0) {
         html += `<section class="section">

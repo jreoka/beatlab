@@ -548,7 +548,9 @@ impl DeezerSource {
         if dz_id == 0 {
             return Vec::new();
         }
-        let url = format!("https://api.deezer.com/artist/{}/albums?limit=50", dz_id);
+        // Deezer groups this list by type (albums, then EPs, then singles), not by
+        // date, so read a full 100 to reach recent singles of prolific artists.
+        let url = format!("https://api.deezer.com/artist/{}/albums?limit=100", dz_id);
         let Some(parsed) = self.get_json::<DzDataList<DzAlbum>>(&url).await else {
             return Vec::new();
         };
