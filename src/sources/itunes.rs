@@ -81,6 +81,17 @@ impl ItunesSource {
     }
 
     async fn throttle(&self) {
+        self.throttle_with_floor(1.0).await;
+    }
+
+    async fn throttle_interactive(&self) {
+        // Allow 1-2 user-initiated clicks to go out immediately even right after
+        // a background New Releases sweep drained the bucket; background calls
+        // still wait until tokens refill to >= 1.0 so the overall rate stays bounded.
+        self.throttle_with_floor(-1.0).await;
+    }
+
+    async fn throttle_with_floor(&self, min_tokens_before_spend: f64) {
         loop {
             let wait = {
                 let mut b = self.bucket.lock().unwrap_or_else(|e| e.into_inner());
@@ -88,12 +99,12 @@ impl ItunesSource {
                 let refill = now.duration_since(b.last).as_secs_f64() * IT_BUCKET_REFILL_PER_SEC;
                 b.tokens = (b.tokens + refill).min(IT_BUCKET_CAPACITY);
                 b.last = now;
-                if b.tokens >= 1.0 {
+                if b.tokens >= min_tokens_before_spend {
                     b.tokens -= 1.0;
                     None
                 } else {
                     Some(Duration::from_secs_f64(
-                        (1.0 - b.tokens) / IT_BUCKET_REFILL_PER_SEC,
+                        (min_tokens_before_spend - b.tokens) / IT_BUCKET_REFILL_PER_SEC,
                     ))
                 }
             };
@@ -105,6 +116,14 @@ impl ItunesSource {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
+        self.get_json_inner(url, false).await
+    }
+
+    async fn get_json_interactive<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
+        self.get_json_inner(url, true).await
+    }
+
+    async fn get_json_inner<T: DeserializeOwned>(&self, url: &str, interactive: bool) -> Option<T> {
         {
             let guard = self.json_cache.read().await;
             if let Some((ts, v)) = guard.get(url) {
@@ -115,16 +134,20 @@ impl ItunesSource {
                 }
             }
         }
-        let val = self.fetch_and_cache(url).await?;
+        let val = self.fetch_and_cache(url, interactive).await?;
         serde_json::from_value::<T>(val).ok()
     }
 
-    async fn fetch_and_cache(&self, url: &str) -> Option<serde_json::Value> {
+    async fn fetch_and_cache(&self, url: &str, interactive: bool) -> Option<serde_json::Value> {
         for attempt in 0..2 {
             if self.is_blocked() {
                 return None;
             }
-            self.throttle().await;
+            if interactive {
+                self.throttle_interactive().await;
+            } else {
+                self.throttle().await;
+            }
             let permit = self.http_sem.acquire().await.ok();
             let resp = match self.http.get(url).send().await {
                 Ok(r) => r,
@@ -297,7 +320,7 @@ impl ItunesSource {
             "https://itunes.apple.com/lookup?id={}&entity=song",
             collection_id
         );
-        let parsed = self.get_json::<ItResponse>(&url).await?;
+        let parsed = self.get_json_interactive::<ItResponse>(&url).await?;
         parse_itunes_album_response(collection_id, parsed)
     }
 }
@@ -648,5 +671,21 @@ mod tests {
         assert_eq!(tracks[0].album_id(), "al:it-6831539495");
         assert_eq!(tracks[0].stream_url, "resolve:ytm:ASCA|Remedy|246");
         assert_eq!(tracks[1].duration, 219);
+    }
+
+    #[tokio::test]
+    async fn interactive_throttle_does_not_stall_on_drained_bucket() {
+        let src = ItunesSource::new();
+        {
+            let mut b = src.bucket.lock().unwrap();
+            b.tokens = 0.0;
+            b.last = Instant::now();
+        }
+        let t0 = Instant::now();
+        src.throttle_interactive().await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "interactive lookup should not stall behind background sweep bucket drain"
+        );
     }
 }

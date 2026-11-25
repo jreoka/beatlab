@@ -7379,6 +7379,27 @@ body.audio-loading #fs-play::after {
   border-top-color: transparent;
   opacity: 0.85;
 }
+.card-play-fab.fab-loading,
+.mixfor-play.fab-loading {
+  opacity: 1;
+  transform: none;
+}
+.card-play-fab.fab-loading svg,
+.mixfor-play.fab-loading svg {
+  display: none;
+}
+.card-play-fab.fab-loading::after,
+.mixfor-play.fab-loading::after {
+  content: '';
+  display: block;
+  width: 45%;
+  height: 45%;
+  border-radius: 50%;
+  border: 2.2px solid currentColor;
+  border-top-color: transparent;
+  opacity: 0.85;
+  animation: beatlab-spin 0.78s linear infinite;
+}
 @media (max-width: 780px) {
   body.audio-loading .qp-pager .qp-tile.playing .qp-wave::after { width: 26px; height: 26px; border-width: 3px; }
 }
@@ -7386,5 +7407,7 @@ body.audio-loading #fs-play::after {
   body.audio-loading .qp-tile.playing .qp-wave::after,
   body.audio-loading .track-row.playing .tr-idx::after,
   body.audio-loading #btn-play::after,
-  body.audio-loading #fs-play::after { animation-duration: 1.6s; }
+  body.audio-loading #fs-play::after,
+  .card-play-fab.fab-loading::after,
+  .mixfor-play.fab-loading::after { animation-duration: 1.6s; }
 }

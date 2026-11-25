@@ -2279,7 +2279,7 @@
         ${artHtml}
         <div class="mixfor-overlay"></div>
         <div class="mixfor-art-title"><span>${esc(m.art_title)}</span>${m.is_super ? '' : `<span class="mixfor-num">${esc(m.number || '')}</span>`}</div>
-        <button class="mixfor-play" title="Play ${esc(m.title)}" aria-label="Play ${esc(m.title)}" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(m.id))})">${ICONS.play}</button>
+        <button class="mixfor-play" title="Play ${esc(m.title)}" aria-label="Play ${esc(m.title)}" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(m.id))}, this)">${ICONS.play}</button>
       </div>
       <div class="mixfor-info">
         <div class="mixfor-name">${esc(m.title)}</div>
@@ -4723,7 +4723,7 @@
     return `<div class="media-card" data-share-kind="album" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
-        <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
+        <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))}, this)">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(a.name)}</div>
       <div class="card-sub">${esc(sub)}</div>
@@ -4735,7 +4735,7 @@
     return `<div class="media-card new-release-card" data-share-kind="album" data-share-id="${esc(a.id)}" data-share-title="${esc(a.name)}" data-share-sub="${esc(sub)}" data-share-cover="${esc(a.coverUrl)}" onclick="App.navigate('album/${encodeURIComponent(a.id)}')">
       <div class="card-art-wrap">
         <img src="${esc(a.coverUrl)}" loading="lazy" alt="" />
-        <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))})">${ICONS.play}</button>
+        <button class="card-play-fab" onclick="event.stopPropagation();App.playAlbumNow(${esc(JSON.stringify(a.id))}, this)">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(a.name)}</div>
       <div class="card-sub">${esc(sub)}</div>
@@ -4760,7 +4760,7 @@
         <img src="${esc(p.coverUrl)}" loading="lazy" alt="" />
         <button class="card-pin-btn ${pinned ? 'pinned' : ''}" title="${pinned ? 'Unpin from sidebar' : 'Pin to sidebar'}" aria-label="${pinned ? 'Unpin' : 'Pin'} ${esc(p.name)}" onclick="event.stopPropagation();App.togglePinPlaylist(${esc(JSON.stringify(p.id))})">${ICONS.pin}</button>
         ${!p.isAuto ? `<button class="card-del-btn" title="Delete playlist" aria-label="Delete ${esc(p.name)}" onclick="event.stopPropagation();App.deletePlaylist(${esc(JSON.stringify(p.id))})">${ICONS.trash}</button>` : ''}
-        <button class="card-play-fab" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(p.id))})">${ICONS.play}</button>
+        <button class="card-play-fab" onclick="event.stopPropagation();App.playPlaylistNow(${esc(JSON.stringify(p.id))}, this)">${ICONS.play}</button>
       </div>
       <div class="card-title">${esc(p.name)}</div>
       <div class="card-sub">${esc(sub)}</div>
@@ -5594,10 +5594,48 @@
     }
   }
 
-  async function playAlbumNow(id) {
+  let activeLoadingFab = null;
+
+  function setFabLoading(btn) {
+    if (activeLoadingFab && activeLoadingFab !== btn) {
+      activeLoadingFab.classList.remove('fab-loading');
+      activeLoadingFab.removeAttribute('aria-busy');
+    }
+    activeLoadingFab = btn || null;
+    if (activeLoadingFab) {
+      activeLoadingFab.classList.add('fab-loading');
+      activeLoadingFab.setAttribute('aria-busy', 'true');
+    }
+  }
+
+  function clearFabLoading(btn) {
+    if (btn) {
+      btn.classList.remove('fab-loading');
+      btn.removeAttribute('aria-busy');
+      if (activeLoadingFab === btn) activeLoadingFab = null;
+    } else if (activeLoadingFab) {
+      activeLoadingFab.classList.remove('fab-loading');
+      activeLoadingFab.removeAttribute('aria-busy');
+      activeLoadingFab = null;
+    }
+  }
+
+  function findCardPlayBtn(kind, id) {
+    for (const el of document.querySelectorAll(`[data-share-kind="${kind}"]`)) {
+      if (el.dataset.shareId === id) {
+        return el.querySelector('.card-play-fab, .mixfor-play');
+      }
+    }
+    return null;
+  }
+
+  async function playAlbumNow(id, btn = null) {
+    const targetBtn = btn || findCardPlayBtn('album', id);
+    if (targetBtn && targetBtn.classList.contains('fab-loading')) return;
+    setFabLoading(targetBtn);
     const { token, signal } = beginQueueFetch();
     try {
-      const d = await api(`/api/web/album/${encodeURIComponent(id)}`, { signal });
+      const d = await api(`/api/web/album/${encodeURIComponent(id)}?fast=1`, { signal });
       if (token !== state.queueActionToken) return;
       const tracks = cacheTracks(d.tracks || []);
       if (tracks.length) {
@@ -5608,14 +5646,21 @@
         state.radioInFlight = null;
         const idx = setQueueWithShuffle(tracks, 0, false);
         playQueueAt(idx);
+      } else {
+        showToast('No playable tracks found for this album');
       }
     } catch (e) {
       if (e && e.name === 'AbortError') return;
       showToast(e.message);
+    } finally {
+      clearFabLoading(targetBtn);
     }
   }
 
-  async function playPlaylistNow(id) {
+  async function playPlaylistNow(id, btn = null) {
+    const targetBtn = btn || findCardPlayBtn('playlist', id);
+    if (targetBtn && targetBtn.classList.contains('fab-loading')) return;
+    setFabLoading(targetBtn);
     const { token, signal } = beginQueueFetch();
     try {
       const d = await api(`/api/web/playlist/${encodeURIComponent(id)}`, { signal });
@@ -5633,6 +5678,8 @@
     } catch (e) {
       if (e && e.name === 'AbortError') return;
       showToast(e.message);
+    } finally {
+      clearFabLoading(targetBtn);
     }
   }
 

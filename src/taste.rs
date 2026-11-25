@@ -3642,7 +3642,8 @@ impl TasteEngine {
     }
 
     pub async fn get_or_hydrate_album(&self, album_id: &str) -> Option<(AlbumSummary, Vec<Track>)> {
-        self.get_or_hydrate_album_with_hints(album_id, None, None, None).await
+        self.get_or_hydrate_album_inner(album_id, None, None, None, false)
+            .await
     }
 
     /// Resolves an album to its full, authoritative tracklist. The local library
@@ -3656,8 +3657,51 @@ impl TasteEngine {
         artist_hint: Option<&str>,
         track_hint: Option<&str>,
     ) -> Option<(AlbumSummary, Vec<Track>)> {
+        self.get_or_hydrate_album_inner(album_id, name_hint, artist_hint, track_hint, false)
+            .await
+    }
+
+    /// Fast-path album hydration for direct play actions: returns immediately
+    /// from SQLite when the official tracklist is already stored, and skips
+    /// blocking up to 3.2s on speculative Soulseek searches (callers can invoke
+    /// `upgrade_album_from_soulseek_background` asynchronously).
+    pub async fn get_or_hydrate_album_fast(
+        &self,
+        album_id: &str,
+        name_hint: Option<&str>,
+        artist_hint: Option<&str>,
+        track_hint: Option<&str>,
+    ) -> Option<(AlbumSummary, Vec<Track>)> {
+        self.get_or_hydrate_album_inner(album_id, name_hint, artist_hint, track_hint, true)
+            .await
+    }
+
+    pub async fn upgrade_album_from_soulseek_background(
+        &self,
+        meta: &AlbumSummary,
+        tracks: Vec<Track>,
+    ) {
+        let _ = self.upgrade_album_from_soulseek(meta, tracks).await;
+    }
+
+    async fn get_or_hydrate_album_inner(
+        &self,
+        album_id: &str,
+        name_hint: Option<&str>,
+        artist_hint: Option<&str>,
+        track_hint: Option<&str>,
+        fast: bool,
+    ) -> Option<(AlbumSummary, Vec<Track>)> {
         let existing_tracks = self.store.album_tracks(album_id).unwrap_or_default();
         let existing_meta = self.store.get_album_meta(album_id).ok().flatten();
+
+        if fast {
+            if let Some(ref meta) = existing_meta {
+                if meta.song_count > 0 && existing_tracks.len() >= meta.song_count {
+                    return Some((meta.clone(), existing_tracks));
+                }
+            }
+        }
 
         let local_summary = self.store.album_summary_by_id(0, album_id).ok().flatten();
 
@@ -3683,7 +3727,11 @@ impl TasteEngine {
                     .filter(|t| official_keys.contains(&t.album_track_key()))
                     .collect();
                 let merged = merge_album_tracks(it_tracks, local_same);
-                let final_tracks = self.upgrade_album_from_soulseek(&meta, merged).await;
+                let final_tracks = if fast {
+                    merged
+                } else {
+                    self.upgrade_album_from_soulseek(&meta, merged).await
+                };
                 if !final_tracks.is_empty() {
                     meta.song_count = final_tracks.len();
                     let dur: i32 = final_tracks.iter().map(|t| t.duration.max(0)).sum();
@@ -3777,7 +3825,11 @@ impl TasteEngine {
                     .filter(|t| official_keys.contains(&t.album_track_key()))
                     .collect();
                 let merged = merge_album_tracks(stored, local_same);
-                let final_tracks = self.upgrade_album_from_soulseek(&meta, merged).await;
+                let final_tracks = if fast {
+                    merged
+                } else {
+                    self.upgrade_album_from_soulseek(&meta, merged).await
+                };
                 if !final_tracks.is_empty() {
                     meta.song_count = final_tracks.len();
                     let dur: i32 = final_tracks.iter().map(|t| t.duration.max(0)).sum();
@@ -3825,7 +3877,11 @@ impl TasteEngine {
             } else {
                 tracks
             };
-            let upgraded = self.upgrade_album_from_soulseek(&summary, tracks).await;
+            let upgraded = if fast {
+                tracks
+            } else {
+                self.upgrade_album_from_soulseek(&summary, tracks).await
+            };
             return Some((summary, upgraded));
         }
 

@@ -4177,6 +4177,10 @@ pub struct EntityHintQuery {
     pub artist: Option<String>,
     /// Title of the song the album was opened from, to locate the album online.
     pub track: Option<String>,
+    /// When set (`fast=1`), skip blocking on speculative Soulseek searches so
+    /// direct Play clicks start playback immediately.
+    #[serde(default)]
+    pub fast: Option<String>,
 }
 
 pub async fn album_detail(
@@ -4189,18 +4193,44 @@ pub async fn album_detail(
         Ok(u) => u,
         Err(r) => return r,
     };
-    let Some((album, tracks)) = state
-        .taste
-        .get_or_hydrate_album_with_hints(
-            &id,
-            q.name.as_deref(),
-            q.artist.as_deref(),
-            q.track.as_deref(),
-        )
-        .await
-    else {
+    let fast = matches!(
+        q.fast.as_deref().map(str::trim),
+        Some("1" | "true" | "yes")
+    );
+    let hydrated = if fast {
+        state
+            .taste
+            .get_or_hydrate_album_fast(
+                &id,
+                q.name.as_deref(),
+                q.artist.as_deref(),
+                q.track.as_deref(),
+            )
+            .await
+    } else {
+        state
+            .taste
+            .get_or_hydrate_album_with_hints(
+                &id,
+                q.name.as_deref(),
+                q.artist.as_deref(),
+                q.track.as_deref(),
+            )
+            .await
+    };
+    let Some((album, tracks)) = hydrated else {
         return err_res(StatusCode::NOT_FOUND, "Album not found");
     };
+    if fast && !tracks.is_empty() && !tracks.iter().all(|t| t.is_lossless()) {
+        let taste = state.taste.clone();
+        let bg_album = album.clone();
+        let bg_tracks = tracks.clone();
+        tokio::spawn(async move {
+            taste
+                .upgrade_album_from_soulseek_background(&bg_album, bg_tracks)
+                .await;
+        });
+    }
     let saved = state.store.saved_album_ids(user.id).unwrap_or_default();
     json_res(json!({
         "album": album_json(&album, saved.contains(&album.id)),
