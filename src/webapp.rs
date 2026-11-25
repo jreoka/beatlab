@@ -7,8 +7,8 @@ use crate::models::{
     AlbumSummary, ArtistSummary, Mood, PlayQueueState, Playlist, PublicUser, Track, User,
     UserProfile, UserTrackStats, ERR_RESTORE_REQUIRED, slug,
 };
+use crate::state::{client_ip, rate_limit_ip, user_agent, AppState};
 use crate::store::SessionMeta;
-use crate::subsonic::{client_ip, user_agent, AppState};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -463,7 +463,6 @@ fn extract_web_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<S
     }
     if let Some(raw) = headers
         .get(header::AUTHORIZATION)
-        .or_else(|| headers.get("x-nd-authorization"))
         .and_then(|v| v.to_str().ok())
     {
         let trimmed = raw.trim();
@@ -482,10 +481,7 @@ fn extract_web_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<S
 
 fn resolve_web_user(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> Option<User> {
     let tok = extract_web_token(headers, query_token)?;
-    if let Ok(Some(u)) = state.store.get_session_user(&tok) {
-        return Some(u);
-    }
-    state.store.get_user_by_api_key(&tok).ok().flatten()
+    state.store.get_session_user(&tok).ok().flatten()
 }
 
 fn require_web_user(state: &AppState, headers: &HeaderMap) -> Result<User, Response> {
@@ -576,21 +572,9 @@ fn too_many_attempts(retry_after: i64) -> Response {
 
 /// Signed-in user together with the bearer token backing this request. Needed
 /// whenever a successful MFA check must be recorded against the session.
-///
-/// Only interactive web-player sessions qualify. The API key (and Navidrome
-/// sessions minted from it) is a credential users paste into third-party
-/// music apps, so it must never be able to manage the account itself —
-/// otherwise anyone holding it could e.g. enrol their own passkey and take
-/// over the account.
 fn require_web_user_with_token(state: &AppState, headers: &HeaderMap) -> Result<(User, String), Response> {
     let token = extract_web_token(headers, None).ok_or_else(unauthorized)?;
     let user = resolve_web_user(state, headers, None).ok_or_else(unauthorized)?;
-    if state.store.session_kind(&token).ok().flatten().as_deref() != Some("web") {
-        return Err(err_res(
-            StatusCode::FORBIDDEN,
-            "Sign in to the Beatlab web player to manage your account",
-        ));
-    }
     Ok((user, token))
 }
 
@@ -647,8 +631,8 @@ fn second_factor_ok(state: &AppState, user: &User, code: Option<&str>) -> Result
 }
 
 /// Gate for sensitive operations (password change, disabling 2FA, account
-/// deletion, API-key rotation). A fresh session-level MFA check or a code in
-/// the request satisfies the gate.
+/// deletion). A fresh session-level MFA check or a code in the request
+/// satisfies the gate.
 fn require_sensitive_auth(
     state: &AppState,
     headers: &HeaderMap,
@@ -704,7 +688,6 @@ fn issue_session(state: &AppState, user: &User, headers: &HeaderMap, kind: &str)
     let meta = SessionMeta {
         user_agent: user_agent(headers),
         ip: client_ip(headers),
-        client: if kind == "nd" { "Navidrome".to_string() } else { String::new() },
     };
     state
         .store
@@ -713,13 +696,11 @@ fn issue_session(state: &AppState, user: &User, headers: &HeaderMap, kind: &str)
 }
 
 fn user_json(state: &AppState, user: &User) -> Value {
-    let api_key = state.store.get_or_create_api_key(user.id).unwrap_or_default();
     let two_factor_enabled = state.store.is_2fa_enabled(user.id).unwrap_or(false);
     let (recovery_total, recovery_used) = state.store.recovery_code_stats(user.id).unwrap_or((0, 0));
     json!({
         "id": user.id,
         "username": user.username,
-        "apiKey": api_key,
         "created": user.created,
         "avatarUrl": self_avatar_url(state, user.id),
         "twoFactorEnabled": two_factor_enabled,
@@ -887,7 +868,7 @@ pub async fn signin(
     let rate_keys = crate::auth::rate_keys(
         "signin",
         &req.username,
-        &crate::subsonic::rate_limit_ip(&headers),
+        &rate_limit_ip(&headers),
     );
     if let Some(wait) = crate::auth::throttled_for(&rate_keys) {
         return too_many_attempts(wait);
@@ -1017,13 +998,10 @@ pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
         .map(|s| {
             json!({
                 "id": s.token,
-                "kind": s.kind,
                 "created": s.created,
                 "lastSeen": s.last_seen,
                 "userAgent": s.user_agent,
                 "ip": s.ip,
-                "client": s.client,
-                "revoked": s.revoked,
                 "current": s.token == current_token,
             })
         })
@@ -1046,27 +1024,6 @@ pub async fn revoke_session(
         .revoke_session_for_user(&req.id, user.id)
         .unwrap_or(false);
     if removed {
-        json_res(json!({ "ok": true }))
-    } else {
-        err_res(StatusCode::NOT_FOUND, "Session not found")
-    }
-}
-
-/// Allow a previously revoked Subsonic client session again.
-pub async fn allow_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<RevokeSessionReq>,
-) -> Response {
-    let user = match require_account_session(&state, &headers) {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-    let allowed = state
-        .store
-        .allow_session_for_user(&req.id, user.id)
-        .unwrap_or(false);
-    if allowed {
         json_res(json!({ "ok": true }))
     } else {
         err_res(StatusCode::NOT_FOUND, "Session not found")
@@ -1097,29 +1054,6 @@ fn optional_code(body: &Bytes) -> Option<String> {
     serde_json::from_slice::<CodeReq>(body)
         .ok()
         .and_then(|r| r.code)
-}
-
-pub async fn regenerate_api_key(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let (user, _) = match require_sensitive_auth(&state, &headers, optional_code(&body).as_deref()) {
-        Ok(value) => value,
-        Err(r) => return r,
-    };
-    match state.store.regenerate_api_key(user.id) {
-        Ok(api_key) => {
-            state.store.record_security_event(
-                user.id,
-                "api_key_rotated",
-                "API key regenerated",
-                &client_ip(&headers),
-            );
-            json_res(json!({ "apiKey": api_key }))
-        }
-        Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
 }
 
 pub async fn change_password(
@@ -6108,32 +6042,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_keys_and_client_sessions_cannot_manage_the_account() {
-        let state = account_test_state();
-        let (u, _) = state.store.authenticate_or_create_user("owner", "pw123").unwrap();
-        let api_key = state.store.get_or_create_api_key(u.id).unwrap();
-        let nd_token = state.store.create_session(u.id, "nd").unwrap();
-        let web_token = state.store.create_session(u.id, "web").unwrap();
-
-        for tok in [&api_key, &nd_token] {
-            let res = regenerate_api_key(State(state.clone()), bearer(tok), Bytes::new()).await;
-            assert_eq!(res.status(), StatusCode::FORBIDDEN);
-            let res = passkey_register_options(State(state.clone()), bearer(tok), Bytes::new()).await;
-            assert_eq!(res.status(), StatusCode::FORBIDDEN);
-            let res = list_sessions(State(state.clone()), bearer(tok)).await;
-            assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        }
-        // The API key still works for ordinary player endpoints.
-        assert_eq!(
-            sources_info(State(state.clone()), bearer(&api_key)).await.status(),
-            StatusCode::OK
-        );
-        // A real web session can manage the account.
-        let res = regenerate_api_key(State(state.clone()), bearer(&web_token), Bytes::new()).await;
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
     async fn repeated_failed_signins_are_throttled_and_passwords_are_hashed() {
         let state = account_test_state();
         let (u, _) = state.store.authenticate_or_create_user("throttled-user", "right-pass").unwrap();
@@ -6193,7 +6101,6 @@ mod tests {
         let (u, _) = state.store.authenticate_or_create_user("pwuser", "old-pass").unwrap();
         let current = state.store.create_session(u.id, "web").unwrap();
         let other = state.store.create_session(u.id, "web").unwrap();
-        let nd = state.store.create_session(u.id, "nd").unwrap();
 
         let res = change_password(
             State(state.clone()),
@@ -6208,7 +6115,6 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert!(state.store.get_session_user(&current).unwrap().is_some());
         assert!(state.store.get_session_user(&other).unwrap().is_none());
-        assert!(state.store.get_session_user(&nd).unwrap().is_none());
     }
 
     #[test]

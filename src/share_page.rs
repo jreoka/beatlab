@@ -897,7 +897,7 @@ pub fn render_share_html(
     <section id="cta-banner" class="cta-banner">
       <div>
         <h3>Listen to everything on Beatlab</h3>
-        <p>Create a free account in seconds for smart custom mixes, synced lyrics, detailed listening stats, and Subsonic/Navidrome apps.</p>
+        <p>Create a free account in seconds for smart custom mixes, synced lyrics, and detailed listening stats.</p>
       </div>
       <div class="cta-actions">
         <button class="btn-primary" onclick="ShareApp.openAuth('signup')">Sign Up Free</button>

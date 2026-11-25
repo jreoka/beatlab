@@ -348,7 +348,7 @@
       const o = state.overview; if (!o) return;
       const people = [
         statCard('users', '', 'Active users', num(o.activeUsers), 'of ' + num(o.totalUsers) + ' total accounts'),
-        statCard('monitor', 'info', 'Active sessions', num(o.sessions), num(o.clientSessions) + ' music clients'),
+        statCard('monitor', 'info', 'Active sessions', num(o.sessions), 'signed-in web sessions'),
         statCard('key', 'violet', '2FA users', num(o.totpUsers), num(o.passkeys) + ' passkeys registered'),
         statCard('trash', o.deletedUsers ? 'danger' : 'warn', 'Pending deletion', num(o.deletedUsers), '7-day restore window'),
       ];
@@ -391,7 +391,6 @@
           '<button class="mini" onclick="openResetPassword(' + u.id + ')">Reset password</button>',
           '<button class="mini" onclick="userAction(' + u.id + ',\'sessions\')">Sign out</button>',
           '<button class="mini" onclick="userAction(' + u.id + ',\'2fa\')">Reset 2FA</button>',
-          '<button class="mini" onclick="userAction(' + u.id + ',\'key\')">Rotate key</button>',
           u.deletedAt
             ? '<button class="mini" onclick="userAction(' + u.id + ',\'restore\')">Restore</button><button class="mini danger" onclick="userAction(' + u.id + ',\'purge\')">Purge</button>'
             : '<button class="mini danger" onclick="userAction(' + u.id + ',\'delete\')">Delete</button>',
@@ -418,20 +417,18 @@
       const labels = {
         sessions: 'Sign out all sessions of this user?',
         '2fa': 'Remove this user\'s authenticator, passkeys and recovery codes?',
-        key: 'Rotate this user\'s API key? Their music clients will need the new key.',
         delete: 'Schedule this account for deletion? It can be restored for 7 days.',
         restore: 'Restore this account now?',
         purge: 'PERMANENTLY delete this account and all its data? This cannot be undone.',
       };
       if (!confirm(labels[action] || 'Continue?')) return;
       const routes = {
-        sessions: '/sessions/revoke', '2fa': '/2fa/reset', key: '/api-key/regenerate',
+        sessions: '/sessions/revoke', '2fa': '/2fa/reset',
         delete: '/delete', restore: '/restore', purge: '/purge',
       };
       try {
-        const res = await api('/api/admin/users/' + id + routes[action], { method:'POST' });
-        if (res.apiKey) toast('New API key: ' + res.apiKey);
-        else toast('Done');
+        await api('/api/admin/users/' + id + routes[action], { method:'POST' });
+        toast('Done');
         if (action === 'purge') state.users = state.users.filter((u) => u.id !== id);
         await load();
       } catch (e) { toast(e.message); }
@@ -542,7 +539,7 @@
         html += tile('Display name', profile.displayName || '—') + tile('Location', profile.location || '—');
         html += '</div><h4>Sessions</h4>';
         html += d.sessions.length
-          ? d.sessions.map((s) => '<div class="list-row"><span>' + esc(s.kind) + ' · ' + esc(s.client || s.userAgent || 'unknown') + ' <span class="muted">· ' + esc(s.ip || 'no IP') + '</span></span><span class="when">' + esc(ago(s.lastSeen)) + (s.revoked ? ' · revoked' : '') + '</span></div>').join('')
+          ? d.sessions.map((s) => '<div class="list-row"><span>' + esc(s.userAgent || 'unknown') + ' <span class="muted">· ' + esc(s.ip || 'no IP') + '</span></span><span class="when">' + esc(ago(s.lastSeen)) + '</span></div>').join('')
           : '<p class="muted">No sessions.</p>';
         $('modal-body').innerHTML = html;
         $('modal').classList.remove('hidden');

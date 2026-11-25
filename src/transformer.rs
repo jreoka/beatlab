@@ -2027,8 +2027,8 @@ fn classify_event(kind: &str, value: f64) -> Option<(Outcome, usize)> {
     }
 }
 
-/// Collapses a chronological event stream into listens. The web player and Subsonic clients
-/// emit `play` when a track starts and `complete`/`skip` when it ends; treating those as two
+/// Collapses a chronological event stream into listens. The web player emits `play`
+/// when a track starts and `complete`/`skip` when it ends; treating those as two
 /// separate interactions taught the old model to "predict" the track it had just been shown,
 /// and counted every skipped track as a positive play.
 fn collapse_events<'a, I>(events: I) -> Vec<Listen>

@@ -2081,8 +2081,8 @@
   }
 
   // The shuffle toggle is stored per browser while the queue is synced through the
-  // server (and can be rewritten by other devices / Subsonic clients). Remember which
-  // exact order this browser shuffled so a restored queue can be reconciled with it.
+  // server (and can be rewritten by other devices). Remember which exact order this
+  // browser shuffled so a restored queue can be reconciled with it.
   const QUEUE_SHUFFLE_KEY = 'beatlab_queue_shuffle_state';
 
   function rememberQueueShuffleState() {
@@ -2128,8 +2128,8 @@
       if (original.length === state.queue.length) state.unshuffledQueue = original;
       return false;
     }
-    // Queue came back in natural order (another device, a Subsonic client, or saved with
-    // shuffle off) while shuffle is on here: shuffle what hasn't played yet.
+    // Queue came back in natural order (another device, or saved with shuffle off)
+    // while shuffle is on here: shuffle what hasn't played yet.
     const splitIdx = state.queueIndex >= 0 ? state.queueIndex + 1 : 0;
     const upcoming = state.queue.slice(splitIdx);
     if (upcoming.length < 2) return false;
@@ -4160,7 +4160,7 @@
           <h2>No Streams Recorded in ${esc(d.rangeLabel || 'This Period')}</h2>
           ${
             isSelf
-              ? `<p>Play songs from Home, Explore, or Search (or scrobble via Subsonic/Navidrome clients) to unlock your timeline graphs, 24-hour listening clock, mood radar, and top charts.</p>`
+              ? `<p>Play songs from Home, Explore, or Search to unlock your timeline graphs, 24-hour listening clock, mood radar, and top charts.</p>`
               : `<p>${esc(ownerName)} hasn’t played anything in this period yet.</p>`
           }
           <div class="hero-actions" style="justify-content:center;margin-top:14px">
@@ -4630,7 +4630,7 @@
         <div class="stats-card-head">
           <div>
             <h2>Recent Activity Log</h2>
-            <p class="stats-card-sub">Latest playback &amp; taste events across web &amp; Subsonic</p>
+            <p class="stats-card-sub">Latest playback &amp; taste events</p>
           </div>
         </div>
         ${
@@ -7009,23 +7009,8 @@
   }
 
   function sessionInfo(s) {
-    const client = (s.client || '').trim();
     const ua = s.userAgent || '';
     const mobile = /iPhone|iPad|Android|Mobile/i.test(ua);
-    if (s.kind === 'subsonic') {
-      return {
-        title: client || 'Subsonic client',
-        kindLabel: 'Subsonic / Navidrome client',
-        icon: SESSION_ICON_APP,
-      };
-    }
-    if (s.kind === 'nd') {
-      return {
-        title: client || parseUserAgent(ua),
-        kindLabel: 'Navidrome login',
-        icon: mobile ? SESSION_ICON_APP : SESSION_ICON_WEB,
-      };
-    }
     return {
       title: parseUserAgent(ua),
       kindLabel: 'Web browser session',
@@ -7154,7 +7139,7 @@
       body.innerHTML = `
         <div class="settings-section">
           <div class="settings-section-title">Active Sessions</div>
-          <div class="settings-row-desc" style="margin-bottom:12px">Every device and app currently connected to your account &mdash; web logins, Navidrome sign-ins, and Subsonic clients. Revoke anything you don't recognize.</div>
+          <div class="settings-row-desc" style="margin-bottom:12px">Every device currently signed in to your account. Revoke anything you don't recognize.</div>
           ${
             sessions.length > 0
               ? `<div class="session-list">
@@ -7162,27 +7147,21 @@
                     .map((s) => {
                       const info = sessionInfo(s);
                       const isCurrent = s.current || s.id === state.token;
-                      const revoked = !!s.revoked;
                       const ua = s.userAgent || '';
                       return `
-                    <div class="session-card${isCurrent ? ' current' : ''}${revoked ? ' revoked' : ''}">
+                    <div class="session-card${isCurrent ? ' current' : ''}">
                       <span class="session-icon">${info.icon}</span>
                       <div class="session-meta">
                         <div class="session-title">
                           ${esc(info.title)}
                           ${isCurrent ? '<span class="session-current-pill">This device</span>' : ''}
-                          ${revoked ? '<span class="session-revoked-pill">Revoked</span>' : ''}
                         </div>
                         <div class="session-sub">${esc(info.kindLabel)} &middot; Signed in ${esc(formatSessionDate(s.created))}</div>
                         <div class="session-sub">Last active ${esc(timeAgo(s.lastSeen || s.created))}</div>
                         ${s.ip ? `<div class="session-sub">IP ${esc(s.ip)}</div>` : ''}
                         ${ua ? `<div class="session-ua" title="${esc(ua)}">${esc(ua)}</div>` : ''}
                       </div>
-                      ${
-                        revoked
-                          ? `<button class="mini-btn session-revoke" title="Allow this client again" onclick="App.allowSession(${esc(JSON.stringify(s.id))})">Allow</button>`
-                          : `<button class="mini-btn danger-btn session-revoke" title="Revoke this session" onclick="App.revokeSession(${esc(JSON.stringify(s.id))})">Revoke</button>`
-                      }
+                      <button class="mini-btn danger-btn session-revoke" title="Revoke this session" onclick="App.revokeSession(${esc(JSON.stringify(s.id))})">Revoke</button>
                     </div>`;
                     })
                     .join('')}
@@ -7212,45 +7191,6 @@
                   <button class="btn-secondary danger-btn" onclick="App.promptRevokeAll()">Sign out of every session</button>
                 </div>`
           }
-        </div>
-      `;
-      return;
-    }
-
-    if (tab === 'apps') {
-      const clients = ['Symfonium', 'Feishin', 'Supersonic', 'Tempo', 'DSub', 'Amperfy'];
-      body.innerHTML = `
-        <div class="settings-section">
-          <div class="settings-section-title">Subsonic &amp; Navidrome Connect</div>
-          <div class="kv-card">
-            <div class="kv-label">SERVER URL</div>
-            <div class="kv-row">
-              <span class="kv-val">${esc(location.origin)}</span>
-              <button class="mini-btn" onclick="App.copyText(${esc(JSON.stringify(location.origin))}, 'Server URL copied')">Copy</button>
-            </div>
-          </div>
-          <div class="kv-card">
-            <div class="kv-label">USERNAME</div>
-            <div class="kv-val">${esc(state.user.username)}</div>
-          </div>
-          <div class="settings-row-desc" style="margin-bottom:12px">Music clients can no longer sign in with your account password. When your client asks for a password, paste the API key below instead &mdash; or use its <code>apiKey</code> field. Regenerating the key signs every connected client out until you update it.</div>
-          <div class="kv-card">
-            <div class="kv-label">OPENSUBSONIC / NAVIDROME API KEY</div>
-            <div class="kv-row">
-              <span id="modal-apikey" class="kv-val">${esc(state.user.apiKey || '')}</span>
-              <div style="display:flex;gap:6px;flex-shrink:0">
-                <button class="mini-btn" onclick="App.copyText(document.getElementById('modal-apikey').textContent, 'API key copied')">Copy</button>
-                <button class="mini-btn" onclick="App.regenApiKey()">Regenerate</button>
-              </div>
-            </div>
-            ${state.user && state.user.twoFactorEnabled ? '<input id="apikey-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code to regenerate" style="width:100%;margin-top:8px" />' : ''}
-          </div>
-          <div class="settings-clients">
-            <div class="kv-label">COMPATIBLE CLIENTS</div>
-            <div class="settings-client-chips">
-              ${clients.map((c) => `<span class="settings-client-chip">${c}</span>`).join('')}
-            </div>
-          </div>
         </div>
       `;
       return;
@@ -7393,7 +7333,7 @@
           <div class="settings-row">
             <div class="settings-row-info">
               <div class="settings-row-label">Delete my account</div>
-              <div class="settings-row-desc">Signs you out of every device and music app immediately. You have 7 days to restore it by signing back in — after that it is permanently removed.</div>
+              <div class="settings-row-desc">Signs you out of every device immediately. You have 7 days to restore it by signing back in — after that it is permanently removed.</div>
             </div>
           </div>
           ${
@@ -7428,7 +7368,7 @@
           <span class="avatar-dot large">${avatarInner(selfAvatarUser())}</span>
           <div>
             <div class="settings-profile-name">${esc(state.user.username)}</div>
-            <div class="settings-row-desc">Web, OpenSubsonic &amp; Navidrome account</div>
+            <div class="settings-row-desc">Beatlab account</div>
           </div>
         </div>
         <button class="btn-secondary" style="margin-top:12px;width:100%" onclick="App.closeModal();App.openMyProfile()">View my public profile →</button>
@@ -7460,7 +7400,6 @@
             <button class="settings-nav-btn" data-stab="hidden" onclick="App.setSettingsTab('hidden')">Hidden Songs</button>
             <button class="settings-nav-btn" data-stab="sessions" onclick="App.setSettingsTab('sessions')">Sessions</button>
             <button class="settings-nav-btn" data-stab="security" onclick="App.setSettingsTab('security')">Security &amp; 2FA</button>
-            <button class="settings-nav-btn" data-stab="apps" onclick="App.setSettingsTab('apps')">Apps &amp; API</button>
             <button class="settings-nav-btn" data-stab="account" onclick="App.setSettingsTab('account')">Account</button>
           </nav>
           <div id="settings-body" class="settings-body"></div>
@@ -8875,17 +8814,6 @@
         showToast(err.message);
       }
     },
-    allowSession: async (id) => {
-      try {
-        await api('/api/web/sessions/allow', { method: 'POST', body: JSON.stringify({ id }) });
-        const sessRes = await api('/api/web/sessions').catch(() => null);
-        if (sessRes) state.settingsData.sessions = sessRes;
-        renderSettingsModalBody();
-        showToast('Client allowed again');
-      } catch (err) {
-        showToast(err.message);
-      }
-    },
     refreshSecurityStatus: async () => {
       try {
         state.settingsData.security = await api('/api/web/2fa/status');
@@ -9478,21 +9406,6 @@
     },
     closeModal,
     installPwa,
-    regenApiKey: async () => {
-      try {
-        const codeInput = $('apikey-code');
-        const res = await api('/api/web/account/apikey', {
-          method: 'POST',
-          body: JSON.stringify({ code: codeInput ? codeInput.value : undefined }),
-        });
-        state.user.apiKey = res.apiKey;
-        const el = $('modal-apikey');
-        if (el) el.textContent = res.apiKey;
-        showToast('API Key regenerated');
-      } catch (err) {
-        showToast(err.message);
-      }
-    },
     showPasswordForm: () => {
       state.settingsData.showPasswordForm = true;
       renderSettingsModalBody();

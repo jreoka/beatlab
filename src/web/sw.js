@@ -57,12 +57,8 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
 
-  // Leave API, Subsonic/Navidrome, auth, and range-based media stream requests untouched.
-  if (
-    url.pathname.startsWith('/api/') ||
-    url.pathname.startsWith('/rest/') ||
-    url.pathname.startsWith('/auth/')
-  ) {
+  // Leave API and range-based media stream requests untouched.
+  if (url.pathname.startsWith('/api/')) {
     return;
   }
 

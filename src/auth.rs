@@ -1,4 +1,4 @@
-//! Authentication helpers shared by the web UI, Subsonic bridge and store.
+//! Authentication helpers shared by the web UI and store.
 //!
 //! Everything here is deliberately dependency-light except the WebAuthn
 //! implementation: TOTP and recovery codes are built on the same SHA/HMAC
@@ -154,10 +154,6 @@ pub const RATE_WINDOW_SECS: i64 = 15 * 60;
 pub const MAX_FAILURES_PER_ACCOUNT: u32 = 10;
 /// Failed attempts allowed per client IP in a window (covers many accounts).
 pub const MAX_FAILURES_PER_IP: u32 = 50;
-/// Failed API-key attempts allowed per IP. API keys carry 122 random bits, so
-/// this only sheds load from abusive clients; it is high so a music app still
-/// retrying an old key doesn't keep its owner locked out after they fix it.
-pub const MAX_API_KEY_FAILURES_PER_IP: u32 = 300;
 
 static FAILURES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>> =
     OnceLock::new();
@@ -184,9 +180,7 @@ pub fn rate_keys(scope: &str, account: &str, ip: &str) -> Vec<String> {
 }
 
 fn limit_for(key: &str) -> u32 {
-    if key.starts_with("apikey:") {
-        MAX_API_KEY_FAILURES_PER_IP
-    } else if key.contains(":ip:") {
+    if key.contains(":ip:") {
         MAX_FAILURES_PER_IP
     } else {
         MAX_FAILURES_PER_ACCOUNT

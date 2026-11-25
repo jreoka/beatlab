@@ -499,14 +499,6 @@ pub struct ShareRecord {
     pub created: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RadioStation {
-    pub id: String,
-    pub name: String,
-    pub stream_url: String,
-    pub home_page_url: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub path: String,

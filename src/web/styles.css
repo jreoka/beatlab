@@ -2794,10 +2794,6 @@ a {
   font-size: 13.5px;
   font-weight: 600;
 }
-.session-card.revoked {
-  opacity: 0.72;
-  border-color: rgba(253, 164, 175, 0.3);
-}
 .session-current-pill {
   font-size: 10px;
   font-weight: 700;
@@ -2807,16 +2803,6 @@ a {
   border-radius: 999px;
   background: rgba(30, 215, 96, 0.16);
   color: var(--accent);
-}
-.session-revoked-pill {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(248, 113, 113, 0.16);
-  color: #fda4af;
 }
 .session-sub {
   font-size: 11.5px;
@@ -2885,23 +2871,6 @@ a {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-}
-.settings-clients {
-  margin-top: 12px;
-}
-.settings-client-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
-}
-.settings-client-chip {
-  font-size: 12px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
 }
 .settings-profile-card {
   display: flex;

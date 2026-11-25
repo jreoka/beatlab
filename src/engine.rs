@@ -707,51 +707,6 @@ impl StreamEngine {
         });
     }
 
-    pub async fn serve_track_stream(
-        &self,
-        track: &Track,
-        req_headers: &HeaderMap,
-        max_bitrate: Option<i32>,
-        target_format: Option<&str>,
-        time_offset: f64,
-    ) -> Response {
-        let want_fmt = target_format
-            .map(|f| f.trim().to_lowercase())
-            .filter(|f| !f.is_empty() && f != "raw");
-
-        let resolved = match self.resolve_target(track).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(track_id = %track.id, error = %e, "stream resolution failed");
-                return (StatusCode::BAD_GATEWAY, format!("Stream error: {}", e)).into_response();
-            }
-        };
-
-        let safe_offset = sanitize_time_offset(time_offset);
-        // Avoid pointless up-transcoding of lossy streams when the requested
-        // maxBitRate already fits the source bitrate and no format/offset change
-        // was asked for — preserving original quality and HTTP Range seeking.
-        let needs_bitrate_cap = max_bitrate
-            .filter(|&b| b > 0)
-            .is_some_and(|cap| track.is_lossless() || track.bitrate <= 0 || track.bitrate > cap);
-        let need_transcode = self.ffmpeg_available
-            && (safe_offset > 0.5 || want_fmt.is_some() || needs_bitrate_cap);
-
-        if need_transcode {
-            let (fmt, br) = choose_transcode_params(
-                want_fmt.as_deref(),
-                max_bitrate,
-                track,
-            );
-            return self
-                .serve_ffmpeg_transcode(track, &resolved, &fmt, br, safe_offset)
-                .await;
-        }
-
-        self.serve_play_target_range(track, resolved, req_headers)
-            .await
-    }
-
     /// Streams a track for the web player at the highest browser-compatible quality:
     /// passes through the original audio untouched when natively playable, or automatically
     /// transcodes unsupported formats (lossless -> FLAC, lossy -> 320k MP3, or `compat=1` retry -> 320k MP3).
@@ -2392,41 +2347,6 @@ fn choose_web_transcode_params(resolved_ext: &str, track: &Track) -> (String, i3
         320
     };
     ("mp3".to_string(), br)
-}
-
-fn choose_transcode_params(
-    want_fmt: Option<&str>,
-    max_bitrate: Option<i32>,
-    track: &Track,
-) -> (String, i32) {
-    let has_cap = max_bitrate.map(|b| b > 0).unwrap_or(false);
-    let fmt = want_fmt.unwrap_or_else(|| {
-        if track.format.is_empty() {
-            "mp3"
-        } else if is_lossless_ext(&track.format) {
-            if has_cap {
-                "mp3"
-            } else {
-                "flac"
-            }
-        } else if track.format == "m4a" || track.format == "mp4" {
-            "aac"
-        } else {
-            track.format.as_str()
-        }
-    });
-    let norm = match fmt {
-        "mp3" => "mp3",
-        "opus" => "opus",
-        "ogg" | "vorbis" => "ogg",
-        "aac" | "m4a" => "aac",
-        "flac" => "flac",
-        _ => "mp3",
-    };
-    let br = max_bitrate
-        .filter(|&b| b > 0)
-        .unwrap_or_else(|| if track.bitrate > 0 { track.bitrate } else { 256 });
-    (norm.to_string(), br)
 }
 
 pub fn mime_for_audio_ext(ext: &str) -> &'static str {

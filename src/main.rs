@@ -2,14 +2,13 @@ mod admin;
 mod auth;
 mod engine;
 mod models;
-mod navidrome;
 mod profile_page;
 mod remote_cache;
 mod share_page;
 mod sources;
+mod state;
 mod stats;
 mod store;
-mod subsonic;
 mod taste;
 mod transformer;
 mod webapp;
@@ -18,7 +17,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, uri::Authority, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post, put};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use engine::StreamEngine;
 use sources::archive::ArchiveSource;
@@ -27,13 +26,13 @@ use sources::local::LocalSource;
 use sources::soulseek::SoulseekSource;
 use sources::ytm::YtmSource;
 use sources::SourceRegistry;
+use state::AppState;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use store::Store;
-use subsonic::AppState;
 use taste::TasteEngine;
 use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
@@ -202,7 +201,6 @@ async fn main() -> models::AppResult<()> {
             header::CONTENT_RANGE,
             header::ACCEPT_RANGES,
             header::CONTENT_TYPE,
-            "x-total-count".parse().unwrap(),
         ]);
 
     let app = Router::new()
@@ -215,9 +213,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/auth/signout", post(webapp::signout))
         .route("/api/web/sessions", get(webapp::list_sessions))
         .route("/api/web/sessions/revoke", post(webapp::revoke_session))
-        .route("/api/web/sessions/allow", post(webapp::allow_session))
         .route("/api/web/sessions/revoke-all", post(webapp::revoke_all_sessions))
-        .route("/api/web/account/apikey", post(webapp::regenerate_api_key))
         .route("/api/web/account/password", post(webapp::change_password))
         .route("/api/web/account/delete", post(webapp::account_delete))
         .route("/api/web/account/restore", post(webapp::account_restore))
@@ -333,60 +329,6 @@ async fn main() -> models::AppResult<()> {
             "/api/public/share/{id}/lyrics/{track_id}",
             get(webapp::public_share_lyrics),
         )
-        // Subsonic / OpenSubsonic REST API
-        .route("/rest/{*action}", any(subsonic::dispatch))
-        // Navidrome Auth & Native API (auto-creates new user accounts on first login!)
-        .route("/auth/login", post(navidrome::login))
-        .route("/api/auth/login", post(navidrome::login))
-        .route("/auth/signup", post(navidrome::signup))
-        .route("/api/auth/signup", post(navidrome::signup))
-        .route("/auth/logout", post(navidrome::logout))
-        .route("/api/song", get(navidrome::list_songs))
-        .route("/api/song/{id}", get(navidrome::get_song))
-        .route("/api/album", get(navidrome::list_albums))
-        .route("/api/album/{id}", get(navidrome::get_album))
-        .route("/api/artist", get(navidrome::list_artists))
-        .route("/api/artist/{id}", get(navidrome::get_artist))
-        .route("/api/genre", get(navidrome::list_genres))
-        .route("/api/tag", get(navidrome::list_genres))
-        .route(
-            "/api/playlist",
-            get(navidrome::list_playlists).post(navidrome::create_playlist),
-        )
-        .route(
-            "/api/playlist/{id}",
-            get(navidrome::get_playlist)
-                .put(navidrome::update_playlist)
-                .delete(navidrome::delete_playlist),
-        )
-        .route(
-            "/api/playlist/{id}/tracks",
-            get(navidrome::get_playlist_tracks)
-                .post(navidrome::add_playlist_tracks)
-                .delete(navidrome::remove_playlist_tracks),
-        )
-        .route(
-            "/api/playlist/{id}/tracks/{pos}",
-            put(navidrome::move_playlist_track),
-        )
-        .route(
-            "/api/queue",
-            get(navidrome::get_queue).post(navidrome::save_queue),
-        )
-        .route(
-            "/api/radio",
-            get(navidrome::list_radios).post(navidrome::create_radio),
-        )
-        .route(
-            "/api/radio/{id}",
-            put(navidrome::update_radio).delete(navidrome::delete_radio),
-        )
-        .route("/api/user", get(navidrome::list_users))
-        .route(
-            "/api/user/{id}",
-            get(navidrome::get_user).put(navidrome::update_user),
-        )
-        .route("/api/keepalive/keepalive", get(navidrome::keepalive))
         // Administrator panel (gated by ADMIN_USERNAME at the API layer).
         // Every tab has its own path so it can be bookmarked, shared and
         // navigated with the browser's back/forward buttons.
@@ -404,7 +346,6 @@ async fn main() -> models::AppResult<()> {
         .route("/api/admin/users/{id}/sessions/revoke", post(admin::revoke_sessions))
         .route("/api/admin/users/{id}/password/reset", post(admin::reset_password))
         .route("/api/admin/users/{id}/2fa/reset", post(admin::reset_2fa))
-        .route("/api/admin/users/{id}/api-key/regenerate", post(admin::regenerate_key))
         .route("/api/admin/users/{id}/delete", post(admin::delete_user))
         .route("/api/admin/users/{id}/restore", post(admin::restore_user))
         .route("/api/admin/users/{id}/purge", post(admin::purge_user))
@@ -425,14 +366,14 @@ async fn main() -> models::AppResult<()> {
     // (which hit 127.0.0.1 or private IPs without the public Host) still succeed.
     let app = app.route("/health", get(|| async { "ok" }));
     // Outermost: record the real TCP peer so rate limiting can't be dodged with spoofed
-    // forwarding headers (see subsonic::client_ip).
+    // forwarding headers (see state::client_ip).
     let app = app.layer(middleware::from_fn(stamp_peer_ip));
 
     let addr: SocketAddr = addr_str.parse()?;
     if let Some(ref raw_url) = allowed_url_raw {
-        info!(address = %addr, data_dir = %data_dir.display(), url = %raw_url, "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
+        info!(address = %addr, data_dir = %data_dir.display(), url = %raw_url, "Beatlab listening — open sign-up enabled (Web UI)");
     } else {
-        info!(address = %addr, data_dir = %data_dir.display(), "Beatlab listening — open sign-up enabled (Subsonic, Navidrome & Web UI)");
+        info!(address = %addr, data_dir = %data_dir.display(), "Beatlab listening — open sign-up enabled (Web UI)");
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
@@ -446,9 +387,9 @@ async fn stamp_peer_ip(mut req: Request, next: Next) -> Response {
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip().to_string());
     let headers = req.headers_mut();
-    headers.remove(subsonic::PEER_IP_HEADER);
+    headers.remove(state::PEER_IP_HEADER);
     if let Some(ip) = peer.and_then(|p| header::HeaderValue::from_str(&p).ok()) {
-        headers.insert(subsonic::PEER_IP_HEADER, ip);
+        headers.insert(state::PEER_IP_HEADER, ip);
     }
     next.run(req).await
 }
@@ -764,7 +705,7 @@ mod tests {
     }
 }
 
-/// gzip/brotli for text responses (app.js, CSS, HTML, JSON, XML). Audio, video and
+/// gzip/brotli for text responses (app.js, CSS, HTML, JSON). Audio, video and
 /// images are already compressed and served with byte ranges, so they are never touched.
 fn compression_layer() -> CompressionLayer<impl Predicate> {
     let text_only = |_: axum::http::StatusCode,
@@ -782,7 +723,6 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
         ct.starts_with("text/")
             || ct.starts_with("application/json")
             || ct.starts_with("application/javascript")
-            || ct.starts_with("application/xml")
             || ct.starts_with("application/manifest+json")
             || ct.starts_with("image/svg+xml")
     };

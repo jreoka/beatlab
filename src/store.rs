@@ -1,7 +1,7 @@
 use crate::auth::{hash_recovery_code, RESTORE_WINDOW_SECS};
 use crate::models::{
     err_msg, primary_artist, slug, validate_credentials, AlbumSummary, AppResult,
-    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, PublicUser, RadioStation,
+    ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist, PublicUser,
     ShareRecord, Track, User, UserEventRow, UserProfile, UserTrackStats,
 };
 use chrono::Utc;
@@ -49,13 +49,10 @@ pub struct Store {
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub token: String,
-    pub kind: String,
     pub created: i64,
     pub last_seen: i64,
     pub user_agent: String,
     pub ip: String,
-    pub client: String,
-    pub revoked: bool,
 }
 
 /// Context captured when a session is created, used to describe it later in
@@ -64,7 +61,6 @@ pub struct SessionInfo {
 pub struct SessionMeta {
     pub user_agent: String,
     pub ip: String,
-    pub client: String,
 }
 
 /// Server-side state of a user's TOTP enrolment.
@@ -109,7 +105,6 @@ pub struct AdminOverview {
     pub active_users: usize,
     pub deleted_users: usize,
     pub sessions: usize,
-    pub client_sessions: usize,
     pub tracks: usize,
     pub passkeys: usize,
     pub totp_users: usize,
@@ -178,15 +173,6 @@ impl Store {
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-
-            CREATE TABLE IF NOT EXISTS api_keys (
-                key TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                label TEXT NOT NULL DEFAULT 'default',
-                created INTEGER NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 
             -- Two-factor authentication (TOTP secret + single-use recovery codes)
             CREATE TABLE IF NOT EXISTS totp_secrets (
@@ -372,14 +358,6 @@ impl Store {
                 updated INTEGER NOT NULL DEFAULT 0
             );
 
-            CREATE TABLE IF NOT EXISTS radio_stations (
-                id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL DEFAULT 0,
-                name TEXT NOT NULL,
-                stream_url TEXT NOT NULL,
-                home_page_url TEXT NOT NULL DEFAULT ''
-            );
-
             CREATE TABLE IF NOT EXISTS cache_entries (
                 track_id TEXT PRIMARY KEY,
                 path TEXT NOT NULL,
@@ -511,7 +489,6 @@ impl Store {
             "current_index",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        ensure_column(&conn, "radio_stations", "user_id", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "albums_meta", "artist_id", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "user_profiles", "avatar", "BLOB")?;
         ensure_column(&conn, "user_profiles", "avatar_mime", "TEXT NOT NULL DEFAULT ''")?;
@@ -519,9 +496,7 @@ impl Store {
         ensure_column(&conn, "user_profiles", "public_page", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "sessions", "user_agent", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "sessions", "ip", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column(&conn, "sessions", "client", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&conn, "sessions", "last_seen", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_column(&conn, "sessions", "revoked", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "sessions", "mfa_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "deleted_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "restore_hash", "TEXT NOT NULL DEFAULT ''")?;
@@ -587,10 +562,11 @@ impl Store {
             "UPDATE sessions SET expires = ?1 WHERE expires < ?1",
             params![SESSION_NO_EXPIRY],
         )?;
-        // Older builds indexed client sessions by (client, user-agent); drop
-        // that so a client name maps to a single session even when its app
-        // version (and therefore User-Agent) changes.
+        // Clean up legacy Subsonic/Navidrome tables and sessions from upgraded databases.
+        conn.execute("DELETE FROM sessions WHERE kind <> 'web'", [])?;
         conn.execute("DROP INDEX IF EXISTS idx_sessions_client", [])?;
+        conn.execute("DROP TABLE IF EXISTS api_keys", [])?;
+        conn.execute("DROP TABLE IF EXISTS radio_stations", [])?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tracks_deezer ON tracks(deezer_id)",
             [],
@@ -606,7 +582,7 @@ impl Store {
     }
 
     // -------------------------------------------------------------------------
-    // Users, Open Auto-Signup, Sessions & API Keys (zero admin concepts)
+    // Users, Open Auto-Signup & Sessions (zero admin concepts)
     // -------------------------------------------------------------------------
 
     pub fn create_user(&self, username: &str, password: &str) -> AppResult<User> {
@@ -798,9 +774,9 @@ impl Store {
         let now = Utc::now().timestamp();
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO sessions(token, user_id, kind, created, expires, last_seen, user_agent, ip, client, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6, ?7, ?8, 0)",
-            params![token, user_id, kind, now, SESSION_NO_EXPIRY, meta.user_agent, meta.ip, meta.client],
+            "INSERT INTO sessions(token, user_id, kind, created, expires, last_seen, user_agent, ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6, ?7)",
+            params![token, user_id, kind, now, SESSION_NO_EXPIRY, meta.user_agent, meta.ip],
         )?;
         Ok(token)
     }
@@ -814,7 +790,7 @@ impl Store {
             .query_row(
                 "SELECT u.id, u.username, u.password, u.created
                  FROM sessions s JOIN users u ON u.id = s.user_id
-                 WHERE s.token = ?1 AND s.revoked = 0 AND u.deleted_at = 0",
+                 WHERE s.token = ?1 AND s.kind = 'web' AND u.deleted_at = 0",
                 params![token.trim()],
                 row_to_user,
             )
@@ -822,25 +798,11 @@ impl Store {
         Ok(user)
     }
 
-    /// The `kind` of a live session token (`web`, `nd`, `subsonic`), if any.
-    pub fn session_kind(&self, token: &str) -> AppResult<Option<String>> {
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT kind FROM sessions WHERE token = ?1 AND revoked = 0",
-                params![token.trim()],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
-
-    /// Signs out every token session of a user except `keep_token`. Subsonic
-    /// client rows are left alone: they authenticate with the API key, not
-    /// the password, so a password change does not affect them.
+    /// Signs out every session of a user except `keep_token`.
     pub fn delete_other_sessions(&self, user_id: i64, keep_token: &str) -> AppResult<usize> {
         let conn = self.lock();
         Ok(conn.execute(
-            "DELETE FROM sessions WHERE user_id = ?1 AND kind <> 'subsonic' AND token <> ?2",
+            "DELETE FROM sessions WHERE user_id = ?1 AND token <> ?2",
             params![user_id, keep_token.trim()],
         )?)
     }
@@ -851,103 +813,23 @@ impl Store {
         Ok(())
     }
 
-    /// Refresh `last_seen` (and connection metadata) for a bearer session,
-    /// throttled to once a minute unless IP or User-Agent changes.
-    pub fn touch_session(&self, token: &str, user_agent: &str, ip: &str) {
-        let tok = token.trim();
-        if tok.is_empty() {
-            return;
-        }
-        let now = Utc::now().timestamp();
-        let conn = self.lock();
-        let existing: Option<(i64, String, String)> = conn
-            .query_row(
-                "SELECT last_seen, ip, user_agent FROM sessions WHERE token = ?1 AND revoked = 0",
-                params![tok],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        if let Some((last_seen, saved_ip, saved_ua)) = existing {
-            if now - last_seen >= 60 || saved_ip != ip || saved_ua != user_agent {
-                let _ = conn.execute(
-                    "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3 WHERE token = ?4",
-                    params![now, ip, user_agent, tok],
-                );
-            }
-        }
-    }
-
-    /// Find and refresh a Subsonic client's session row, creating one on first
-    /// sight. Returns its token and whether it has been revoked by the user.
-    /// These clients re-send credentials on every request instead of using a
-    /// server-issued token, so the row is keyed by the client identity.
-    pub fn touch_subsonic_client(
-        &self,
-        user_id: i64,
-        client: &str,
-        user_agent: &str,
-        ip: &str,
-    ) -> AppResult<(String, bool)> {
-        let now = Utc::now().timestamp();
-        let conn = self.lock();
-        // Keyed on client name only: a client's User-Agent changes with every
-        // app update, and revocation must survive that.
-        let existing: Option<(String, i64, i64, String, String)> = conn
-            .query_row(
-                "SELECT token, revoked, last_seen, ip, user_agent FROM sessions
-                 WHERE user_id = ?1 AND client = ?2 AND kind = 'subsonic'
-                 ORDER BY created DESC LIMIT 1",
-                params![user_id, client],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?;
-        if let Some((token, revoked, last_seen, saved_ip, saved_ua)) = existing {
-            // Subsonic clients re-authenticate on every request; throttle the
-            // write to once a minute (or when the connection details change)
-            // to avoid a DB write per media chunk.
-            if now - last_seen >= 60 || saved_ip != ip || saved_ua != user_agent {
-                conn.execute(
-                    "UPDATE sessions SET last_seen = ?1, ip = ?2, user_agent = ?3 WHERE token = ?4",
-                    params![now, ip, user_agent, token],
-                )?;
-            }
-            return Ok((token, revoked != 0));
-        }
-        let token = format!(
-            "{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
-        conn.execute(
-            "INSERT INTO sessions(token, user_id, kind, created, expires, last_seen, user_agent, ip, client, revoked)
-             VALUES (?1, ?2, 'subsonic', ?3, ?4, ?3, ?5, ?6, ?7, 0)",
-            params![token, user_id, now, SESSION_NO_EXPIRY, user_agent, ip, client],
-        )?;
-        Ok((token, false))
-    }
-
     /// List the sessions belonging to a user, newest first. Sessions persist
     /// until revoked or signed out, so nothing is pruned here.
     pub fn list_sessions(&self, user_id: i64) -> AppResult<Vec<SessionInfo>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT token, kind, created, last_seen, user_agent, ip, client, revoked
+            "SELECT token, created, last_seen, user_agent, ip
              FROM sessions WHERE user_id = ?1
-             ORDER BY revoked ASC, created DESC",
+             ORDER BY created DESC",
         )?;
         let rows = stmt
             .query_map(params![user_id], |r| {
                 Ok(SessionInfo {
                     token: r.get(0)?,
-                    kind: r.get(1)?,
-                    created: r.get(2)?,
-                    last_seen: r.get(3)?,
-                    user_agent: r.get(4)?,
-                    ip: r.get(5)?,
-                    client: r.get(6)?,
-                    revoked: r.get::<_, i64>(7)? != 0,
+                    created: r.get(1)?,
+                    last_seen: r.get(2)?,
+                    user_agent: r.get(3)?,
+                    ip: r.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -955,36 +837,10 @@ impl Store {
     }
 
     /// Revoke a single session, but only if it belongs to the given user.
-    /// Token sessions are deleted; Subsonic client sessions are flagged so the
-    /// client cannot simply authenticate again.
     pub fn revoke_session_for_user(&self, token: &str, user_id: i64) -> AppResult<bool> {
         let conn = self.lock();
-        let kind: Option<String> = conn
-            .query_row(
-                "SELECT kind FROM sessions WHERE token = ?1 AND user_id = ?2",
-                params![token, user_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match kind.as_deref() {
-            None => Ok(false),
-            Some("subsonic") => Ok(conn.execute(
-                "UPDATE sessions SET revoked = 1 WHERE token = ?1 AND user_id = ?2",
-                params![token, user_id],
-            )? > 0),
-            Some(_) => Ok(conn.execute(
-                "DELETE FROM sessions WHERE token = ?1 AND user_id = ?2",
-                params![token, user_id],
-            )? > 0),
-        }
-    }
-
-    /// Undo a revocation for a Subsonic client session.
-    pub fn allow_session_for_user(&self, token: &str, user_id: i64) -> AppResult<bool> {
-        let conn = self.lock();
         Ok(conn.execute(
-            "UPDATE sessions SET revoked = 0
-             WHERE token = ?1 AND user_id = ?2 AND kind = 'subsonic'",
+            "DELETE FROM sessions WHERE token = ?1 AND user_id = ?2",
             params![token, user_id],
         )? > 0)
     }
@@ -992,93 +848,10 @@ impl Store {
     /// Revoke every session belonging to a user. Returns the number affected.
     pub fn delete_all_sessions_for_user(&self, user_id: i64) -> AppResult<usize> {
         let conn = self.lock();
-        let deleted = conn.execute(
-            "DELETE FROM sessions WHERE user_id = ?1 AND kind <> 'subsonic'",
+        Ok(conn.execute(
+            "DELETE FROM sessions WHERE user_id = ?1",
             params![user_id],
-        )?;
-        let flagged = conn.execute(
-            "UPDATE sessions SET revoked = 1 WHERE user_id = ?1 AND kind = 'subsonic'",
-            params![user_id],
-        )?;
-        Ok(deleted + flagged)
-    }
-
-    pub fn get_or_create_api_key(&self, user_id: i64) -> AppResult<String> {
-        let conn = self.lock();
-        if let Some(key) = conn
-            .query_row(
-                "SELECT key FROM api_keys WHERE user_id = ?1 ORDER BY created ASC LIMIT 1",
-                params![user_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            return Ok(key);
-        }
-        let key = format!("bl_{}", Uuid::new_v4().simple());
-        let now = Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO api_keys(key, user_id, label, created) VALUES (?1, ?2, 'default', ?3)",
-            params![key, user_id, now],
-        )?;
-        Ok(key)
-    }
-
-    pub fn regenerate_api_key(&self, user_id: i64) -> AppResult<String> {
-        let key = format!("bl_{}", Uuid::new_v4().simple());
-        let now = Utc::now().timestamp();
-        let conn = self.lock();
-        conn.execute("DELETE FROM api_keys WHERE user_id = ?1", params![user_id])?;
-        conn.execute(
-            "INSERT INTO api_keys(key, user_id, label, created) VALUES (?1, ?2, 'default', ?3)",
-            params![key, user_id, now],
-        )?;
-        // Navidrome sessions are minted from the API key, so rotating the key
-        // must immediately sign out every connected Navidrome client too.
-        conn.execute(
-            "DELETE FROM sessions WHERE user_id = ?1 AND kind = 'nd'",
-            params![user_id],
-        )?;
-        Ok(key)
-    }
-
-    pub fn get_user_by_api_key(&self, key: &str) -> AppResult<Option<User>> {
-        if key.trim().is_empty() {
-            return Ok(None);
-        }
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT u.id, u.username, u.password, u.created
-                 FROM api_keys k JOIN users u ON u.id = k.user_id
-                 WHERE k.key = ?1 AND u.deleted_at = 0",
-                params![key.trim()],
-                row_to_user,
-            )
-            .optional()?)
-    }
-
-    /// Look up an active (non-deleted) user together with their stored API key
-    /// by username. Used to verify Subsonic 1.13+ salted token auth (`t = md5(apiKey + s)`)
-    /// without ever touching or accepting the account password.
-    pub fn get_user_and_api_key_by_name(&self, name: &str) -> AppResult<Option<(User, String)>> {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT u.id, u.username, u.password, u.created, k.key
-                 FROM users u
-                 JOIN api_keys k ON k.user_id = u.id
-                 WHERE lower(u.username) = lower(?1) AND u.deleted_at = 0
-                 ORDER BY k.created ASC
-                 LIMIT 1",
-                params![trimmed],
-                |r| Ok((row_to_user(r)?, r.get::<_, String>(4)?)),
-            )
-            .optional()?)
+        )?)
     }
 
     // -------------------------------------------------------------------------
@@ -1395,7 +1168,7 @@ impl Store {
         let conn = self.lock();
         Ok(conn
             .query_row(
-                "SELECT user_id, mfa_at FROM sessions WHERE token = ?1 AND revoked = 0",
+                "SELECT user_id, mfa_at FROM sessions WHERE token = ?1",
                 params![token.trim()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1424,9 +1197,9 @@ impl Store {
             .optional()?)
     }
 
-    /// Soft-delete an account: all sessions and API keys are destroyed so no
-    /// client stays signed in, while library data and 2FA settings are kept for
-    /// the seven-day recovery window.
+    /// Soft-delete an account: all sessions are destroyed so no device stays
+    /// signed in, while library data and 2FA settings are kept for the
+    /// seven-day recovery window.
     pub fn soft_delete_user(&self, user_id: i64, restore_hash: &str) -> AppResult<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -1435,7 +1208,6 @@ impl Store {
             params![Utc::now().timestamp(), restore_hash, user_id],
         )?;
         tx.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
-        tx.execute("DELETE FROM api_keys WHERE user_id = ?1", params![user_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -1531,8 +1303,7 @@ impl Store {
             total_users: count("SELECT COUNT(*) FROM users")?,
             active_users: count("SELECT COUNT(*) FROM users WHERE deleted_at = 0")?,
             deleted_users: count("SELECT COUNT(*) FROM users WHERE deleted_at > 0")?,
-            sessions: count("SELECT COUNT(*) FROM sessions WHERE revoked = 0")?,
-            client_sessions: count("SELECT COUNT(*) FROM sessions WHERE kind = 'subsonic' AND revoked = 0")?,
+            sessions: count("SELECT COUNT(*) FROM sessions")?,
             tracks: count("SELECT COUNT(*) FROM tracks")?,
             passkeys: count("SELECT COUNT(*) FROM passkeys")?,
             totp_users: count("SELECT COUNT(*) FROM totp_secrets WHERE enabled = 1")?,
@@ -1548,7 +1319,7 @@ impl Store {
                     COALESCE(t.enabled, 0),
                     (SELECT COUNT(*) FROM passkeys p WHERE p.user_id = u.id),
                     (SELECT COUNT(*) FROM recovery_codes r WHERE r.user_id = u.id AND r.used = 0),
-                    (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.revoked = 0),
+                    (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id),
                     (SELECT COUNT(*) FROM playlists p WHERE p.user_id = u.id),
                     (SELECT COUNT(*) FROM stars st WHERE st.user_id = u.id),
                     (SELECT COUNT(*) FROM security_events e WHERE e.user_id = u.id),
@@ -1613,7 +1384,6 @@ impl Store {
             "followed_artists",
             "ratings",
             "play_queues",
-            "radio_stations",
             "user_taste_links",
             "hidden_tracks",
         ] {
@@ -2599,33 +2369,6 @@ impl Store {
         self.all_tracks(limit, offset)
     }
 
-    pub fn random_tracks(&self, limit: usize, genre: Option<&str>) -> AppResult<Vec<Track>> {
-        let conn = self.lock();
-        let g = genre.map(|s| s.trim()).filter(|s| !s.is_empty());
-        if let Some(gen) = g {
-            let pat = format!("%{}%", gen.to_lowercase());
-            let sql = format!(
-                "SELECT {} FROM tracks WHERE lower(genre) LIKE ?1 ORDER BY RANDOM() LIMIT ?2",
-                TRACK_COLS
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params![pat, limit as i64], row_to_track)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        } else {
-            let sql = format!(
-                "SELECT {} FROM tracks ORDER BY RANDOM() LIMIT ?1",
-                TRACK_COLS
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params![limit as i64], row_to_track)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        }
-    }
-
     pub fn upsert_album_meta(&self, meta: &AlbumSummary) -> AppResult<()> {
         let conn = self.lock();
         let now = Utc::now().timestamp();
@@ -3244,32 +2987,6 @@ impl Store {
         Ok(albums)
     }
 
-    pub fn genres(&self) -> AppResult<Vec<(String, usize, usize)>> {
-        let tracks = self.all_tracks(8000, 0)?;
-        let mut song_counts: HashMap<String, usize> = HashMap::new();
-        let mut album_sets: HashMap<String, HashSet<String>> = HashMap::new();
-        for t in tracks {
-            for raw in t.genre.split(&[',', ';', '/'][..]) {
-                let g = raw.trim();
-                if g.is_empty() {
-                    continue;
-                }
-                let norm = title_case(g);
-                *song_counts.entry(norm.clone()).or_insert(0) += 1;
-                album_sets.entry(norm).or_default().insert(t.album_id());
-            }
-        }
-        let mut out: Vec<(String, usize, usize)> = song_counts
-            .into_iter()
-            .map(|(g, sc)| {
-                let ac = album_sets.get(&g).map(|s| s.len()).unwrap_or(0);
-                (g, sc, ac)
-            })
-            .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(out)
-    }
-
     pub fn tracks_by_genre(
         &self,
         genre: &str,
@@ -3537,29 +3254,6 @@ impl Store {
             map.insert(item.0, item.1);
         }
         Ok(map)
-    }
-
-    pub fn get_user_track_stats(
-        &self,
-        user_id: i64,
-        track_id: &str,
-    ) -> AppResult<UserTrackStats> {
-        let conn = self.lock();
-        let st = conn
-            .query_row(
-                "SELECT play_count, skip_count, last_played FROM user_track_stats WHERE user_id = ?1 AND track_id = ?2",
-                params![user_id, track_id],
-                |r| {
-                    Ok(UserTrackStats {
-                        play_count: r.get(0)?,
-                        skip_count: r.get(1)?,
-                        last_played: r.get(2)?,
-                    })
-                },
-            )
-            .optional()?
-            .unwrap_or_default();
-        Ok(st)
     }
 
     pub fn user_recent_tracks(
@@ -3932,15 +3626,6 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn starred_at_map(&self, user_id: i64) -> AppResult<HashMap<String, i64>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT track_id, at FROM stars WHERE user_id = ?1")?;
-        let rows = stmt
-            .query_map(params![user_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .collect::<Result<HashMap<_, _>, _>>()?;
-        Ok(rows)
-    }
-
     pub fn starred_tracks(&self, user_id: i64) -> AppResult<Vec<(Track, i64)>> {
         let conn = self.lock();
         let sql = format!(
@@ -3982,15 +3667,6 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn saved_album_at_map(&self, user_id: i64) -> AppResult<HashMap<String, i64>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT album_id, at FROM saved_albums WHERE user_id = ?1")?;
-        let rows = stmt
-            .query_map(params![user_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .collect::<Result<HashMap<_, _>, _>>()?;
-        Ok(rows)
-    }
-
     pub fn follow_artist(&self, user_id: i64, artist_id: &str) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();
@@ -4016,15 +3692,6 @@ impl Store {
         let rows = stmt
             .query_map(params![user_id], |r| r.get::<_, String>(0))?
             .collect::<Result<HashSet<_>, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn followed_artist_at_map(&self, user_id: i64) -> AppResult<HashMap<String, i64>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT artist_id, at FROM followed_artists WHERE user_id = ?1")?;
-        let rows = stmt
-            .query_map(params![user_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .collect::<Result<HashMap<_, _>, _>>()?;
         Ok(rows)
     }
 
@@ -4885,34 +4552,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn add_tracks_to_playlist(&self, id: &str, track_ids: &[String]) -> AppResult<()> {
-        if track_ids.is_empty() {
-            return Ok(());
-        }
-        let now = Utc::now().timestamp();
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let max_pos: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(pos), -1) FROM playlist_tracks WHERE playlist_id = ?1",
-            params![id],
-            |r| r.get(0),
-        )?;
-        let mut pos = max_pos + 1;
-        for tid in track_ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            tx.execute(
-                "INSERT INTO playlist_tracks(playlist_id, pos, track_id, added) VALUES (?1, ?2, ?3, ?4)",
-                params![id, pos, tid, now],
-            )?;
-            pos += 1;
-        }
-        tx.execute(
-            "UPDATE playlists SET changed = ?1 WHERE id = ?2",
-            params![now, id],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Appends `track_ids` not already present in playlist `id` and returns the newly added IDs.
     pub fn add_unique_tracks_to_playlist(&self, id: &str, track_ids: &[String]) -> AppResult<Vec<String>> {
         if track_ids.is_empty() {
@@ -5102,98 +4741,8 @@ impl Store {
     }
 
     // -------------------------------------------------------------------------
-    // Internet Radio Stations, Cache & KV
+    // Cache & KV
     // -------------------------------------------------------------------------
-
-    pub fn list_radio_stations(&self, user_id: i64) -> AppResult<Vec<RadioStation>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, stream_url, home_page_url FROM radio_stations
-             WHERE user_id = ?1 OR user_id = 0 ORDER BY name ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![user_id], |r| {
-                Ok(RadioStation {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    stream_url: r.get(2)?,
-                    home_page_url: r.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn upsert_radio_station(
-        &self,
-        user_id: i64,
-        station: &RadioStation,
-    ) -> AppResult<RadioStation> {
-        let trimmed_id = station.id.trim();
-        let id = if trimmed_id.is_empty() {
-            format!("rad-{}", Uuid::new_v4().simple())
-        } else {
-            trimmed_id.to_string()
-        };
-        let conn = self.lock();
-        if !trimmed_id.is_empty() {
-            let existing_owner: Option<i64> = conn
-                .query_row(
-                    "SELECT user_id FROM radio_stations WHERE id = ?1",
-                    params![&id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(owner) = existing_owner {
-                if owner != user_id {
-                    return Err(err_msg("Permission denied"));
-                }
-            }
-        }
-        conn.execute(
-            "INSERT INTO radio_stations(id, user_id, name, stream_url, home_page_url)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET
-               name = excluded.name,
-               stream_url = excluded.stream_url,
-               home_page_url = excluded.home_page_url
-             WHERE radio_stations.user_id = excluded.user_id",
-            params![
-                id,
-                user_id,
-                station.name.trim(),
-                station.stream_url.trim(),
-                station.home_page_url.trim()
-            ],
-        )?;
-        Ok(RadioStation {
-            id,
-            name: station.name.trim().to_string(),
-            stream_url: station.stream_url.trim().to_string(),
-            home_page_url: station.home_page_url.trim().to_string(),
-        })
-    }
-
-    pub fn delete_radio_station(&self, user_id: i64, id: &str) -> AppResult<()> {
-        let conn = self.lock();
-        let existing_owner: Option<i64> = conn
-            .query_row(
-                "SELECT user_id FROM radio_stations WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(owner) = existing_owner {
-            if owner != user_id {
-                return Err(err_msg("Permission denied"));
-            }
-            conn.execute(
-                "DELETE FROM radio_stations WHERE id = ?1 AND user_id = ?2",
-                params![id, user_id],
-            )?;
-        }
-        Ok(())
-    }
 
     // -- Optional S3/R2 cool cache registry ----------------------------------
 
@@ -6803,19 +6352,6 @@ fn migrate_artist_disambiguation_v2(conn: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
-fn title_case(s: &str) -> String {
-    s.split_whitespace()
-        .map(|w| {
-            let mut ch = w.chars();
-            match ch.next() {
-                Some(first) => first.to_uppercase().to_string() + &ch.as_str().to_lowercase(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6857,18 +6393,11 @@ mod tests {
         assert!(store.authenticate_or_create_user("alice", "wrongpass").is_err());
 
         // Session roundtrip.
-        let tok = store.create_session(alice.id, "nd").unwrap();
+        let tok = store.create_session(alice.id, "web").unwrap();
         let loaded = store.get_session_user(&tok).unwrap().unwrap();
         assert_eq!(loaded.id, alice.id);
         store.delete_session(&tok).unwrap();
         assert!(store.get_session_user(&tok).unwrap().is_none());
-
-        // API key roundtrip.
-        let key1 = store.get_or_create_api_key(alice.id).unwrap();
-        assert_eq!(store.get_user_by_api_key(&key1).unwrap().unwrap().id, alice.id);
-        let key2 = store.regenerate_api_key(alice.id).unwrap();
-        assert_ne!(key1, key2);
-        assert!(store.get_user_by_api_key(&key1).unwrap().is_none());
     }
 
     #[test]
@@ -7013,14 +6542,12 @@ mod tests {
     fn soft_delete_signs_out_everywhere_and_allows_restore() {
         let store = Store::open_memory().unwrap();
         let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
-        let key = store.get_or_create_api_key(alice.id).unwrap();
         let token = store.create_session(alice.id, "web").unwrap();
 
         store
             .soft_delete_user(alice.id, &crate::auth::hash_token("restore-secret"))
             .unwrap();
         assert!(store.get_session_user(&token).unwrap().is_none());
-        assert!(store.get_user_by_api_key(&key).unwrap().is_none());
         assert!(store.get_user_by_id(alice.id).unwrap().is_none());
         assert_eq!(
             store.authenticate_or_create_user("alice", "secret123").unwrap_err().0,
@@ -7031,7 +6558,6 @@ mod tests {
 
         store.restore_user(alice.id).unwrap();
         assert!(store.authenticate_or_create_user("alice", "secret123").is_ok());
-        assert_ne!(store.get_or_create_api_key(alice.id).unwrap(), key);
 
         // Accounts past the seven-day window are removed permanently.
         let (bob, _) = store.authenticate_or_create_user("bob", "secret123").unwrap();
@@ -7055,13 +6581,13 @@ mod tests {
         let (bob, _) = store.authenticate_or_create_user("bob", "secret123").unwrap();
 
         let t1 = store.create_session(alice.id, "web").unwrap();
-        let t2 = store.create_session(alice.id, "nd").unwrap();
+        let t2 = store.create_session(alice.id, "web").unwrap();
         let bob_tok = store.create_session(bob.id, "web").unwrap();
 
         let sessions = store.list_sessions(alice.id).unwrap();
         assert_eq!(sessions.len(), 2);
-        assert!(sessions.iter().any(|s| s.token == t1 && s.kind == "web"));
-        assert!(sessions.iter().any(|s| s.token == t2 && s.kind == "nd"));
+        assert!(sessions.iter().any(|s| s.token == t1));
+        assert!(sessions.iter().any(|s| s.token == t2));
         assert_eq!(store.list_sessions(bob.id).unwrap().len(), 1);
 
         // A user cannot revoke somebody else's session.
@@ -7082,14 +6608,13 @@ mod tests {
     }
 
     #[test]
-    fn session_metadata_and_subsonic_client_revocation() {
+    fn session_metadata_roundtrip() {
         let store = Store::open_memory().unwrap();
         let (alice, _) = store.authenticate_or_create_user("alice", "secret123").unwrap();
 
         let meta = SessionMeta {
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0".to_string(),
             ip: "203.0.113.7".to_string(),
-            client: String::new(),
         };
         let tok = store
             .create_session_with_meta(alice.id, "web", &meta)
@@ -7101,51 +6626,8 @@ mod tests {
         assert_eq!(sessions[0].ip, meta.ip);
         assert!(sessions[0].last_seen > 0);
 
-        // Subsonic client sessions are tracked by client identity.
-        let (client_tok, revoked) = store
-            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.7")
-            .unwrap();
-        assert!(!revoked);
-        let (client_tok2, revoked2) = store
-            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.9")
-            .unwrap();
-        assert_eq!(client_tok, client_tok2);
-        assert!(!revoked2);
-
-        let sessions = store.list_sessions(alice.id).unwrap();
-        assert_eq!(sessions.len(), 2);
-        let client = sessions.iter().find(|s| s.kind == "subsonic").unwrap();
-        assert_eq!(client.client, "Symfonium");
-        assert_eq!(client.ip, "203.0.113.9");
-        assert!(!client.revoked);
-
-        // Revoking a Subsonic session flags it instead of deleting it, so the
-        // client can't simply authenticate again.
-        assert!(store.revoke_session_for_user(&client_tok, alice.id).unwrap());
-        let (_, revoked) = store
-            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.7")
-            .unwrap();
-        assert!(revoked);
-        assert!(store
-            .list_sessions(alice.id)
-            .unwrap()
-            .iter()
-            .find(|s| s.kind == "subsonic")
-            .unwrap()
-            .revoked);
-
-        // Re-allowing clears the flag.
-        assert!(store.allow_session_for_user(&client_tok, alice.id).unwrap());
-        let (_, revoked) = store
-            .touch_subsonic_client(alice.id, "Symfonium", "Symfonium/12", "203.0.113.7")
-            .unwrap();
-        assert!(!revoked);
-
-        // Revoking all deletes the web session and flags the client session.
-        assert_eq!(store.delete_all_sessions_for_user(alice.id).unwrap(), 2);
-        let sessions = store.list_sessions(alice.id).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert!(sessions[0].revoked);
+        assert_eq!(store.delete_all_sessions_for_user(alice.id).unwrap(), 1);
+        assert!(store.list_sessions(alice.id).unwrap().is_empty());
     }
 
     #[test]
@@ -7310,8 +6792,24 @@ mod tests {
         store.record_event(u1.id, &t1.id, "play", 1.0).unwrap();
         store.record_event(u2.id, &t2.id, "play", 1.0).unwrap();
 
-        assert_eq!(store.get_user_track_stats(u1.id, &t1.id).unwrap().play_count, 2);
-        assert_eq!(store.get_user_track_stats(u2.id, &t1.id).unwrap().play_count, 0);
+        assert_eq!(
+            store
+                .track_stats_map(u1.id)
+                .unwrap()
+                .get(&t1.id)
+                .map(|s| s.play_count)
+                .unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            store
+                .track_stats_map(u2.id)
+                .unwrap()
+                .get(&t1.id)
+                .map(|s| s.play_count)
+                .unwrap_or(0),
+            0
+        );
 
         let pl = store
             .create_playlist(u1.id, "Mix", "My mix", false, &[t1.id.clone(), t2.id.clone()])
@@ -7592,65 +7090,6 @@ mod tests {
 
         drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn radio_station_ownership_prevents_cross_user_overwrite_and_delete() {
-        let store = Store::open_memory().unwrap();
-        let (alice, _) = store.authenticate_or_create_user("alice", "pw1").unwrap();
-        let (bob, _) = store.authenticate_or_create_user("bob", "pw2").unwrap();
-
-        let created = store
-            .upsert_radio_station(
-                alice.id,
-                &RadioStation {
-                    id: String::new(),
-                    name: "Alice FM".into(),
-                    stream_url: "https://example.com/alice.mp3".into(),
-                    home_page_url: String::new(),
-                },
-            )
-            .unwrap();
-
-        // Bob cannot overwrite or delete Alice's station.
-        let overwrite = store.upsert_radio_station(
-            bob.id,
-            &RadioStation {
-                id: created.id.clone(),
-                name: "Hijacked FM".into(),
-                stream_url: "https://evil.example/stream.mp3".into(),
-                home_page_url: String::new(),
-            },
-        );
-        assert!(overwrite.is_err());
-        assert!(store.delete_radio_station(bob.id, &created.id).is_err());
-
-        // Global (user_id = 0) stations are also protected against non-owner deletes.
-        {
-            let conn = store.lock();
-            conn.execute(
-                "INSERT INTO radio_stations(id, user_id, name, stream_url, home_page_url)
-                 VALUES ('rad-global', 0, 'Global FM', 'https://example.com/global.mp3', '')",
-                [],
-            )
-            .unwrap();
-        }
-        assert!(store.delete_radio_station(bob.id, "rad-global").is_err());
-
-        // Owner can still update and delete her own station.
-        let updated = store
-            .upsert_radio_station(
-                alice.id,
-                &RadioStation {
-                    id: created.id.clone(),
-                    name: "Alice HD".into(),
-                    stream_url: "https://example.com/alice-hd.mp3".into(),
-                    home_page_url: String::new(),
-                },
-            )
-            .unwrap();
-        assert_eq!(updated.name, "Alice HD");
-        store.delete_radio_station(alice.id, &created.id).unwrap();
     }
 
     #[test]

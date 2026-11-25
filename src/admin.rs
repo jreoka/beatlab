@@ -5,7 +5,7 @@
 
 use crate::auth::{hash_token, random_bytes};
 use crate::models::User;
-use crate::subsonic::{client_ip, AppState};
+use crate::state::{client_ip, AppState};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -87,7 +87,6 @@ fn err_res(status: StatusCode, msg: &str) -> Response {
 fn token_from_headers(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get("authorization")
-        .or_else(|| headers.get("x-nd-authorization"))
         .and_then(|v| v.to_str().ok())?
         .trim();
     let token = raw
@@ -100,27 +99,12 @@ fn token_from_headers(headers: &HeaderMap) -> Option<String> {
 
 fn signed_in_user(state: &AppState, headers: &HeaderMap) -> Option<User> {
     let token = token_from_headers(headers)?;
-    state
-        .store
-        .get_session_user(&token)
-        .ok()
-        .flatten()
-        .or_else(|| state.store.get_user_by_api_key(&token).ok().flatten())
+    state.store.get_session_user(&token).ok().flatten()
 }
 
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<User, Response> {
     let user = signed_in_user(state, headers)
         .ok_or_else(|| err_res(StatusCode::UNAUTHORIZED, "Sign in to continue"))?;
-    // Admin actions need an interactive web-player session. The API key (and
-    // Navidrome sessions minted from it) is handed to third-party music apps
-    // and must not unlock the admin panel.
-    let token = token_from_headers(headers).unwrap_or_default();
-    if state.store.session_kind(&token).ok().flatten().as_deref() != Some("web") {
-        return Err(err_res(
-            StatusCode::FORBIDDEN,
-            "Sign in to the Beatlab web player to use the admin panel",
-        ));
-    }
     if !is_admin_username(&user.username) {
         return Err(err_res(
             StatusCode::FORBIDDEN,
@@ -189,7 +173,6 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "activeUsers": o.active_users,
             "deletedUsers": o.deleted_users,
             "sessions": o.sessions,
-            "clientSessions": o.client_sessions,
             "tracks": o.tracks,
             "passkeys": o.passkeys,
             "totpUsers": o.totp_users,
@@ -267,13 +250,10 @@ pub async fn user_detail(
         .map(|s| {
             json!({
                 "id": s.token,
-                "kind": s.kind,
-                "client": s.client,
                 "userAgent": s.user_agent,
                 "ip": s.ip,
                 "created": s.created,
                 "lastSeen": s.last_seen,
-                "revoked": s.revoked,
             })
         })
         .collect();
@@ -459,28 +439,6 @@ pub async fn reset_2fa(
     let _ = state.store.replace_recovery_codes(id, &[]);
     admin_event(&state, &admin, "admin_2fa_reset", &format!("Reset 2FA for {}", target.username), &headers);
     json_res(json!({ "ok": true }))
-}
-
-pub async fn regenerate_key(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    headers: HeaderMap,
-) -> Response {
-    let admin = match require_admin(&state, &headers) {
-        Ok(a) => a,
-        Err(r) => return r,
-    };
-    let target = match target_user(&state, id) {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-    match state.store.regenerate_api_key(id) {
-        Ok(key) => {
-            admin_event(&state, &admin, "admin_api_key_rotated", &format!("Rotated API key for {}", target.username), &headers);
-            json_res(json!({ "apiKey": key }))
-        }
-        Err(e) => err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    }
 }
 
 pub async fn delete_user(

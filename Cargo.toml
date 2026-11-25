@@ -2,7 +2,7 @@
 name = "beatlab"
 version = "0.3.0"
 edition = "2021"
-description = "Self-hosted music streaming platform in Rust with open sign-up, Subsonic/OpenSubsonic & Navidrome APIs, smart mixes, synced lyrics, and a full web music player"
+description = "Self-hosted music streaming platform in Rust with open sign-up, smart mixes, synced lyrics, and a full web music player"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
