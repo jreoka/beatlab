@@ -567,7 +567,13 @@
 
     window.addEventListener('online', () => {
       checkServerHealth().then((ok) => {
-        if (ok) resumePendingNetworkPlayback();
+        if (ok) {
+          resumePendingNetworkPlayback();
+          const cur = currentTrack();
+          if (cur && !mediaSessionState.artwork) {
+            syncMediaSession(cur, false);
+          }
+        }
       });
     });
 
@@ -791,7 +797,13 @@
     if (!force && nowMs - state.lastPositionStateAt < 4000) return;
     const cur = currentTrack();
     const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
-    const position = Number.isFinite(audio.currentTime) && audio.currentTime >= 0 ? audio.currentTime : 0;
+    const rawPos =
+      Number.isFinite(audio.currentTime) && audio.currentTime > 0
+        ? audio.currentTime
+        : state.pendingSeekSec > 0
+          ? state.pendingSeekSec
+          : 0;
+    const position = Math.max(0, rawPos);
     if (!Number.isFinite(duration) || duration <= 0) return;
     try {
       navigator.mediaSession.setPositionState({
@@ -1295,6 +1307,7 @@
       toast.classList.add('hidden');
     }
     document.title = 'Beatlab — Stream Everything';
+    resetMediaSessionState();
     setMediaPlaybackState('none');
     if ('mediaSession' in navigator) {
       try {
@@ -2023,6 +2036,7 @@
         renderQueuePanel();
         if (cur) {
           audio.src = buildStreamUrl(cur);
+          syncMediaSession(cur, true);
           if (savedSec > 0) {
             const total = cur.duration > 0 ? cur.duration : savedSec;
             const clamped = Math.min(savedSec, total);
@@ -5162,19 +5176,65 @@
 
   function setMediaMetadata(track, artwork) {
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: track.title,
-      artist: track.artist,
-      album: track.album,
+      title: track.title || '',
+      artist: track.artist || '',
+      album: track.album || '',
       artwork,
     });
+  }
+
+  let mediaArtworkToken = 0;
+  let mediaSessionState = {
+    trackId: '',
+    coverSrc: '',
+    artwork: null,
+    refiningKey: '',
+    publishedWhilePlaying: '',
+  };
+
+  function resetMediaSessionState() {
+    mediaArtworkToken++;
+    mediaSessionState.trackId = '';
+    mediaSessionState.coverSrc = '';
+    mediaSessionState.artwork = null;
+    mediaSessionState.refiningKey = '';
+    mediaSessionState.publishedWhilePlaying = '';
+  }
+
+  function bindMediaSessionHandlers() {
+    if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setActionHandler !== 'function') return;
+    const handlers = [
+      ['play', () => playCurrent()],
+      ['pause', () => pauseCurrent()],
+      ['previoustrack', () => prevTrack()],
+      ['nexttrack', () => nextTrack(true)],
+      [
+        'seekto',
+        (details) => {
+          if (details.seekTime != null && Number.isFinite(audio.duration)) {
+            audio.currentTime = details.seekTime;
+            updateMediaPositionState(true);
+          }
+        },
+      ],
+    ];
+    for (const [action, handler] of handlers) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+      } catch {
+        // unsupported action in this browser
+      }
+    }
   }
 
   // Lock-screen / notification players (Android especially) can't render SVG
   // placeholders and pick artwork by declared size/type. Load the cover once,
   // then publish either its real type + size or a rasterized PNG copy.
-  let mediaArtworkToken = 0;
   async function refineMediaArtwork(track, coverSrc) {
+    const key = `${track.id}\0${coverSrc}`;
+    if (mediaSessionState.refiningKey === key) return;
     const token = ++mediaArtworkToken;
+    mediaSessionState.refiningKey = key;
     const stillCurrent = () => token === mediaArtworkToken && currentTrack()?.id === track.id;
     try {
       const res = await fetch(coverSrc, { credentials: 'same-origin' });
@@ -5206,6 +5266,10 @@
         canvas.width = size;
         canvas.height = size;
         const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          URL.revokeObjectURL(objectUrl);
+          return;
+        }
         // Cover-fit the image into a square.
         const scale = Math.max(size / w, size / h);
         const dw = w * scale;
@@ -5215,9 +5279,55 @@
       }
       URL.revokeObjectURL(objectUrl);
       if (!stillCurrent() || !('mediaSession' in navigator)) return;
+      mediaSessionState.trackId = track.id;
+      mediaSessionState.coverSrc = coverSrc;
+      mediaSessionState.artwork = artwork;
       setMediaMetadata(track, artwork);
     } catch {
       // keep the plain URL artwork already set
+    } finally {
+      if (token === mediaArtworkToken && mediaSessionState.refiningKey === key) {
+        mediaSessionState.refiningKey = '';
+      }
+    }
+  }
+
+  function syncMediaSession(track, force = false) {
+    if (!track || !('mediaSession' in navigator)) return;
+    try {
+      const coverSrc = new URL(track.coverUrl || '/api/web/cover/default', location.origin).href;
+      const sameTrack = mediaSessionState.trackId === track.id && mediaSessionState.coverSrc === coverSrc;
+      const hasMetadata = !!navigator.mediaSession.metadata;
+
+      if (!sameTrack) {
+        mediaArtworkToken++;
+        mediaSessionState.trackId = track.id;
+        mediaSessionState.coverSrc = coverSrc;
+        mediaSessionState.artwork = null;
+        mediaSessionState.refiningKey = '';
+        mediaSessionState.publishedWhilePlaying = '';
+      }
+
+      if (force || !sameTrack || !hasMetadata) {
+        if (sameTrack && mediaSessionState.artwork) {
+          setMediaMetadata(track, mediaSessionState.artwork);
+        } else {
+          setMediaMetadata(track, [
+            { src: coverSrc, sizes: '96x96' },
+            { src: coverSrc, sizes: '256x256' },
+            { src: coverSrc, sizes: '512x512' },
+          ]);
+        }
+      }
+
+      if (!mediaSessionState.artwork) {
+        refineMediaArtwork(track, coverSrc);
+      }
+
+      bindMediaSessionHandlers();
+      updateMediaPositionState(true);
+    } catch {
+      // unsupported in some browsers
     }
   }
 
@@ -5228,30 +5338,7 @@
     if ($('fs-mini-cover')) $('fs-mini-cover').src = track.coverUrl;
     $('fs-bg').style.backgroundImage = `url('${track.coverUrl}')`;
 
-    if ('mediaSession' in navigator) {
-      try {
-        const coverSrc = new URL(track.coverUrl, location.origin).href;
-        setMediaMetadata(track, [
-          { src: coverSrc, sizes: '96x96' },
-          { src: coverSrc, sizes: '256x256' },
-          { src: coverSrc, sizes: '512x512' },
-        ]);
-        refineMediaArtwork(track, coverSrc);
-        navigator.mediaSession.setActionHandler('play', () => playCurrent());
-        navigator.mediaSession.setActionHandler('pause', () => pauseCurrent());
-        navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
-        navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(true));
-        navigator.mediaSession.setActionHandler('seekto', (details) => {
-          if (details.seekTime != null && Number.isFinite(audio.duration)) {
-            audio.currentTime = details.seekTime;
-            updateMediaPositionState(true);
-          }
-        });
-        updateMediaPositionState(true);
-      } catch {
-        // unsupported in some browsers
-      }
-    }
+    syncMediaSession(track, true);
   }
 
   // Only long, clipped titles scroll. A duplicated copy makes the loop seamless,
@@ -5775,6 +5862,7 @@
     const cur = currentTrack();
     if (!cur) return;
     clearPlaybackRecovery();
+    syncMediaSession(cur, true);
     if (!audio.getAttribute('src')) {
       audio.src = buildStreamUrl(cur);
     }
@@ -5901,6 +5989,7 @@
     audio.addEventListener('play', () => {
       clearStallWatch();
       updatePlayButton(true);
+      syncMediaSession(currentTrack(), false);
       setMediaPlaybackState('playing');
       updateMediaPositionState(true);
     });
@@ -5910,6 +5999,12 @@
       state.networkRetryCount = 0;
       state.pendingNetworkResume = null;
       updatePlayButton(true);
+      const cur = currentTrack();
+      if (cur) {
+        const needsPublish = mediaSessionState.publishedWhilePlaying !== cur.id;
+        syncMediaSession(cur, needsPublish);
+        mediaSessionState.publishedWhilePlaying = cur.id;
+      }
       setMediaPlaybackState('playing');
       updateMediaPositionState(true);
       const activeSrc = audio.currentSrc || audio.src || '';
@@ -5920,6 +6015,7 @@
     audio.addEventListener('pause', () => {
       clearStallWatch();
       if (state.isSwitchingTrack || audio.ended || state.playCommitTimer) return;
+      mediaSessionState.publishedWhilePlaying = '';
       updatePlayButton(false);
       setMediaPlaybackState('paused');
       updateMediaPositionState(true);
