@@ -5979,6 +5979,83 @@ html, body {
     border-top: 0;
   }
 }
+/* Edge pull-tab: an organic bulge on the main panel's right edge that
+   reopens the queue / lyrics panel. Only the painted shape takes clicks, so
+   the transparent tails never block the scrollbar underneath. */
+.rp-pull {
+  display: none;
+}
+@media (min-width: 781px) {
+  .main-column {
+    position: relative;
+  }
+  body.rp-closed .rp-pull {
+    display: block;
+    position: absolute;
+    top: 50%;
+    right: 0;
+    width: 28px;
+    height: 260px;
+    margin-top: -130px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-muted);
+    z-index: 5;
+    pointer-events: none;
+    /* Wait for the panel to finish sliding shut before the tab appears */
+    animation: rpPullIn 0.35s cubic-bezier(0.22, 1, 0.36, 1) 0.22s both;
+  }
+  .rp-pull-shape {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    fill: var(--surface-2);
+    transform-origin: right center;
+    transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1), fill 0.15s ease;
+  }
+  .rp-pull-shape path {
+    pointer-events: auto;
+    cursor: pointer;
+  }
+  .rp-pull-chevron {
+    position: absolute;
+    top: 50%;
+    right: 3px;
+    width: 18px;
+    height: 18px;
+    margin-top: -9px;
+    pointer-events: none;
+    transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1), color 0.15s ease;
+  }
+  .rp-pull:hover,
+  .rp-pull:focus-visible {
+    color: var(--text);
+    outline: none;
+  }
+  .rp-pull:hover .rp-pull-shape,
+  .rp-pull:focus-visible .rp-pull-shape {
+    fill: var(--surface-3);
+    transform: scaleX(1.3);
+  }
+  .rp-pull:hover .rp-pull-chevron,
+  .rp-pull:focus-visible .rp-pull-chevron {
+    transform: translateX(-3px);
+  }
+}
+@keyframes rpPullIn {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  body.rp-closed .rp-pull { animation: none; }
+  .rp-pull-shape,
+  .rp-pull-chevron { transition: none; }
+}
+
 @media (min-width: 781px) and (max-width: 1060px) {
   /* Queue opens as an overlay drawer here: keep it inset like the panels. */
   .right-panel {
@@ -5987,6 +6064,45 @@ html, body {
     bottom: var(--player-h);
     margin-left: 0;
     border-left: 0;
+  }
+}
+
+/* Queue / lyrics panel: slide open and closed by animating its width.
+   The panel's contents keep their full width and are clipped, so text
+   doesn't re-wrap mid-animation. `display` is transitioned discretely so the
+   panel stays rendered until it has finished closing; browsers without
+   support simply toggle instantly as before. body.rp-anim is added by app.js
+   on the first real toggle, so the panel doesn't animate in on page load. */
+@media (min-width: 781px) {
+  .right-panel {
+    width: var(--rp-w);
+    overflow: hidden;
+  }
+  .right-panel > * {
+    min-width: var(--rp-w);
+  }
+  body.rp-anim .right-panel {
+    transition-property: width, margin-left, opacity, display;
+    transition-duration: 0.34s, 0.34s, 0.34s, 0.34s;
+    transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+    transition-behavior: allow-discrete;
+  }
+  .right-panel.hidden {
+    width: 0;
+    margin-left: 0;
+    opacity: 0;
+  }
+  @starting-style {
+    body.rp-anim .right-panel:not(.hidden) {
+      width: 0;
+      margin-left: 0;
+      opacity: 0;
+    }
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  body.rp-anim .right-panel {
+    transition: none;
   }
 }
 

@@ -1464,6 +1464,22 @@
     }
   }
 
+  // Mirror the queue panel's visibility onto <body> so the edge pull-tab shows
+  // whenever the panel is closed, whichever code path closed it.
+  function watchRightPanel() {
+    const rp = $('right-panel');
+    if (!rp) return;
+    const sync = () => document.body.classList.toggle('rp-closed', rp.classList.contains('hidden'));
+    new MutationObserver(() => {
+      // Enable the open/close slide only once the app is on screen, so the
+      // panel doesn't animate in when the shell first appears after sign-in.
+      const shell = $('app-shell');
+      if (shell && !shell.classList.contains('hidden')) document.body.classList.add('rp-anim');
+      sync();
+    }).observe(rp, { attributes: true, attributeFilter: ['class'] });
+    sync();
+  }
+
   async function init() {
     applyOutputVolume();
     $('pb-volume').value = String(state.volume);
@@ -1474,6 +1490,7 @@
     wireFsSwipeClose();
     wireSheetAndPtrGestures();
     wirePwaLifecycle();
+    watchRightPanel();
     syncResponsiveLayout();
     window.matchMedia('(max-width: 1060px)').addEventListener('change', syncResponsiveLayout);
     window.matchMedia('(max-width: 780px)').addEventListener('change', syncResponsiveLayout);
