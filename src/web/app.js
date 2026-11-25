@@ -1049,6 +1049,7 @@
       $('right-panel').classList.add('hidden');
     }
     if ($('panel-backdrop')) $('panel-backdrop').classList.add('hidden');
+    document.body.classList.remove('rp-anim');
     authScreen.classList.remove('hidden');
     $('app-shell').classList.add('hidden');
     $('player-bar').classList.add('hidden');
@@ -1058,10 +1059,12 @@
   }
 
   function showAppShell() {
+    document.body.classList.remove('rp-anim');
+    syncResponsiveLayout();
+    syncRightPanelState();
     $('auth-screen').classList.add('hidden');
     $('app-shell').classList.remove('hidden');
     $('player-bar').classList.remove('hidden');
-    syncResponsiveLayout();
   }
 
   // WebAuthn's JavaScript API uses ArrayBuffers while the server speaks
@@ -1464,19 +1467,33 @@
     }
   }
 
+  let syncRightPanelState = () => {};
+
   // Mirror the queue panel's visibility onto <body> so the edge pull-tab shows
   // whenever the panel is closed, whichever code path closed it.
   function watchRightPanel() {
     const rp = $('right-panel');
     if (!rp) return;
-    const sync = () => document.body.classList.toggle('rp-closed', rp.classList.contains('hidden'));
-    new MutationObserver(() => {
-      // Enable the open/close slide only once the app is on screen, so the
-      // panel doesn't animate in when the shell first appears after sign-in.
+    let wasClosed = rp.classList.contains('hidden');
+    const sync = () => {
+      const closed = rp.classList.contains('hidden');
+      wasClosed = closed;
+      document.body.classList.toggle('rp-closed', closed);
+    };
+    const observer = new MutationObserver(() => {
+      const closed = rp.classList.contains('hidden');
+      if (closed === wasClosed) return;
+      // Enable the open/close slide only on an actual visibility toggle while
+      // the app is on screen, so the panel doesn't animate in on initial load.
       const shell = $('app-shell');
       if (shell && !shell.classList.contains('hidden')) document.body.classList.add('rp-anim');
       sync();
-    }).observe(rp, { attributes: true, attributeFilter: ['class'] });
+    });
+    observer.observe(rp, { attributes: true, attributeFilter: ['class'] });
+    syncRightPanelState = () => {
+      observer.takeRecords();
+      sync();
+    };
     sync();
   }
 
