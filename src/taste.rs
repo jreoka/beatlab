@@ -3228,6 +3228,56 @@ impl TasteEngine {
         tracks
     }
 
+    /// Materialize an on-demand LLM-interpreted Instant Mix specification into a
+    /// real playable `InstantMix` using the same verified search & taste ranking
+    /// pipeline used for overnight Explore/Mood mixes.
+    pub async fn materialize_llm_instant_mix(
+        &self,
+        user_id: i64,
+        raw_query: &str,
+        spec: &crate::llm::LlmInstantMixSpec,
+        limit: usize,
+    ) -> Option<InstantMix> {
+        let context_text = format!(
+            "{} {} {} {} {}",
+            raw_query,
+            spec.title,
+            spec.subtitle,
+            spec.seed_queries.join(" "),
+            spec.genres.join(" ")
+        );
+        let empty_excl = HashSet::new();
+        let tracks = self
+            .curate_llm_mix_tracks(
+                user_id,
+                LlmMixKind::Thematic,
+                &context_text,
+                &spec.seed_queries,
+                &spec.seed_artists,
+                &spec.genres,
+                spec.mood.as_deref(),
+                spec.year_range,
+                &spec.familiarity,
+                &empty_excl,
+                limit,
+            )
+            .await;
+        let visible = self.filter_hidden_tracks_for_user(user_id, tracks);
+        if visible.is_empty() {
+            return None;
+        }
+        let total_duration: i32 = visible.iter().map(|t| t.duration.max(0)).sum();
+        Some(InstantMix {
+            title: spec.title.clone(),
+            subtitle: spec.subtitle.clone(),
+            query: raw_query.to_string(),
+            is_theme_mix: true,
+            prominent: true,
+            tracks: visible,
+            total_duration,
+        })
+    }
+
     /// Materialize a freshly generated `DailyLlmExperience` into real playlists and
     /// cached Explore category pools in SQLite so every screen loads instantaneously.
     pub async fn materialize_llm_experience(

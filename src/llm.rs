@@ -34,8 +34,13 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
-const EXPERIENCE_SCHEMA_VERSION: u32 = 2;
+const EXPERIENCE_SCHEMA_VERSION: u32 = 3;
 const RETRY_BACKOFF_SECS: i64 = 30 * 60;
+pub const TASTE_NOTE_MAX_CHARS: usize = 280;
+const USER_MANUAL_REFRESH_COOLDOWN_SECS: i64 = 30 * 60;
+const INSTANT_MIX_CACHE_TTL_SECS: i64 = 24 * 3600;
+const INSTANT_MIX_RATE_WINDOW_SECS: i64 = 3600;
+const INSTANT_MIX_MAX_PER_HOUR: usize = 15;
 
 const CURATED_PALETTES: &[(&str, &str)] = &[
     ("#38bdf8", "#0c2d48"),
@@ -229,6 +234,18 @@ fn pools_v2_ready_kv_key(user_id: i64) -> String {
     format!("llm:pools_v2_ready:{user_id}")
 }
 
+pub fn taste_note_kv_key(user_id: i64) -> String {
+    format!("llm:taste_note:v1:{user_id}")
+}
+
+fn user_refresh_kv_key(user_id: i64) -> String {
+    format!("llm:user_refresh_at:v1:{user_id}")
+}
+
+fn instant_mix_spec_kv_key(user_id: i64, norm_query: &str) -> String {
+    format!("llm:instant_spec:v1:{user_id}:{}", slug(norm_query))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmSectionTitles {
@@ -399,6 +416,48 @@ pub struct LlmHomeGreetings {
     pub late_night: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmTastePortrait {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub traits: Vec<String>,
+}
+
+impl LlmTastePortrait {
+    pub fn is_empty(&self) -> bool {
+        self.title.trim().is_empty() && self.summary.trim().is_empty() && self.traits.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInstantMixSpec {
+    pub title: String,
+    pub subtitle: String,
+    #[serde(default)]
+    pub seed_queries: Vec<String>,
+    #[serde(default)]
+    pub seed_artists: Vec<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub mood: Option<String>,
+    #[serde(default)]
+    pub year_range: Option<(i32, i32)>,
+    #[serde(default)]
+    pub familiarity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedInstantMixSpec {
+    created_at: i64,
+    spec: LlmInstantMixSpec,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyLlmExperience {
@@ -416,6 +475,8 @@ pub struct DailyLlmExperience {
     pub explore_title: String,
     pub home_tagline: String,
     pub explore_tagline: String,
+    #[serde(default)]
+    pub taste_portrait: LlmTastePortrait,
     #[serde(default)]
     pub sections: LlmSectionTitles,
     #[serde(default)]
@@ -461,6 +522,7 @@ pub struct LlmCurator {
     http: reqwest::Client,
     in_flight: Arc<Mutex<HashSet<i64>>>,
     last_error: Arc<Mutex<Option<(i64, String)>>>,
+    instant_mix_hits: Arc<Mutex<HashMap<i64, Vec<i64>>>>,
 }
 
 impl LlmCurator {
@@ -483,7 +545,171 @@ impl LlmCurator {
             http,
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             last_error: Arc::new(Mutex::new(None)),
+            instant_mix_hits: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn load_taste_note(store: &Store, user_id: i64) -> String {
+        if user_id <= 0 {
+            return String::new();
+        }
+        store
+            .kv_get(&taste_note_kv_key(user_id))
+            .map(|s| sanitize_taste_note(&s))
+            .unwrap_or_default()
+    }
+
+    pub fn save_taste_note(store: &Store, user_id: i64, raw: &str) -> String {
+        if user_id <= 0 {
+            return String::new();
+        }
+        let cleaned = sanitize_taste_note(raw);
+        let key = taste_note_kv_key(user_id);
+        if cleaned.is_empty() {
+            store.kv_delete(&key);
+        } else {
+            store.kv_set(&key, &cleaned);
+        }
+        cleaned
+    }
+
+    pub fn is_in_flight(&self, user_id: i64) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&user_id)
+    }
+
+    pub fn user_refresh_cooldown_remaining(&self, store: &Store, user_id: i64) -> i64 {
+        if user_id <= 0 {
+            return 0;
+        }
+        let now = Utc::now().timestamp();
+        let last = store
+            .kv_get(&user_refresh_kv_key(user_id))
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let elapsed = now.saturating_sub(last);
+        if elapsed < USER_MANUAL_REFRESH_COOLDOWN_SECS {
+            USER_MANUAL_REFRESH_COOLDOWN_SECS - elapsed
+        } else {
+            0
+        }
+    }
+
+    /// Trigger a user-requested refresh of their own daily edition, subject to a
+    /// per-user cooldown so listeners can apply a new taste note without spamming the LLM.
+    /// Returns `Ok(true)` if started, `Ok(false)` if already running, or `Err(cooldown_secs)`.
+    pub fn try_spawn_user_refresh(&self, taste: &TasteEngine, user_id: i64) -> Result<bool, i64> {
+        if user_id <= 0 {
+            return Ok(false);
+        }
+        if self.is_in_flight(user_id) {
+            return Ok(false);
+        }
+        let remaining = self.user_refresh_cooldown_remaining(&taste.store, user_id);
+        if remaining > 0 {
+            return Err(remaining);
+        }
+        let now = Utc::now().timestamp();
+        taste
+            .store
+            .kv_set(&user_refresh_kv_key(user_id), &now.to_string());
+        let curator = self.clone();
+        let taste_cloned = taste.clone();
+        tokio::spawn(async move {
+            if let Err(e) = curator.refresh_user_experience(&taste_cloned, user_id, true).await {
+                warn!(user_id, error = %e, "user-triggered LLM daily customization failed");
+            }
+        });
+        Ok(true)
+    }
+
+    fn check_and_record_instant_mix_budget(&self, user_id: i64, now: i64) -> bool {
+        let mut map = self
+            .instant_mix_hits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entries = map.entry(user_id).or_default();
+        entries.retain(|&ts| now - ts < INSTANT_MIX_RATE_WINDOW_SECS);
+        if entries.len() >= INSTANT_MIX_MAX_PER_HOUR {
+            return false;
+        }
+        entries.push(now);
+        true
+    }
+
+    /// Translate a natural-language Instant Mix prompt (e.g. "rainy 2am Tokyo drive
+    /// with warm analog synths") into a structured mix specification for `TasteEngine`.
+    /// Results are cached per user + query for 24 hours.
+    pub async fn interpret_instant_mix_prompt(
+        &self,
+        store: &Store,
+        user_id: i64,
+        raw_query: &str,
+    ) -> AppResult<LlmInstantMixSpec> {
+        let trimmed = clean_text(raw_query, 180);
+        if trimmed.is_empty() {
+            return Err(err_msg("Instant mix prompt must not be empty"));
+        }
+        let norm_key = trimmed.to_lowercase();
+        let cache_key = instant_mix_spec_kv_key(user_id, &norm_key);
+        let now = Utc::now().timestamp();
+        if let Some(raw_cached) = store.kv_get(&cache_key) {
+            if let Ok(cached) = serde_json::from_str::<CachedInstantMixSpec>(&raw_cached) {
+                if now - cached.created_at < INSTANT_MIX_CACHE_TTL_SECS
+                    && (!cached.spec.seed_queries.is_empty() || !cached.spec.seed_artists.is_empty())
+                {
+                    return Ok(cached.spec);
+                }
+            }
+        }
+
+        if !self.check_and_record_instant_mix_budget(user_id, now) {
+            return Err(err_msg("AI Instant Mix hourly limit reached; falling back to standard mix"));
+        }
+
+        let store_bg = store.clone();
+        let (top_artists, top_genres, taste_note) = tokio::task::spawn_blocking(move || {
+            let note = Self::load_taste_note(&store_bg, user_id);
+            let Some(user) = store_bg.get_user_by_id(user_id).ok().flatten() else {
+                return (Vec::new(), Vec::new(), note);
+            };
+            let stats = build_user_stats(&store_bg, &user, StatsRange::Days30, 0, now);
+            let artists: Vec<String> = stats
+                .top_artists
+                .iter()
+                .take(6)
+                .map(|a| a.name.clone())
+                .collect();
+            let genres: Vec<String> = stats
+                .genres
+                .iter()
+                .take(4)
+                .map(|g| g.name.clone())
+                .collect();
+            (artists, genres, note)
+        })
+        .await
+        .unwrap_or_default();
+
+        let sys_prompt = build_instant_mix_system_prompt(self.config.extra_system_prompt.as_deref());
+        let usr_prompt = build_instant_mix_user_prompt(&trimmed, &top_artists, &top_genres, &taste_note);
+
+        let raw_content = self.call_chat_completions(&sys_prompt, &usr_prompt).await?;
+        let json_str = extract_json_object(&raw_content)
+            .ok_or_else(|| err_msg("LLM instant mix response did not contain a valid JSON object"))?;
+        let parsed: RawInstantMixSpec = serde_json::from_str(json_str)
+            .map_err(|e| err_msg(format!("Failed to parse LLM instant mix JSON: {e}")))?;
+        let spec = sanitize_instant_mix_spec(parsed, &trimmed);
+
+        if let Ok(serialized) = serde_json::to_string(&CachedInstantMixSpec {
+            created_at: now,
+            spec: spec.clone(),
+        }) {
+            store.kv_set(&cache_key, &serialized);
+        }
+        Ok(spec)
     }
 
     pub fn load_experience(store: &Store, user_id: i64) -> Option<DailyLlmExperience> {
@@ -1300,6 +1526,10 @@ fn extract_valid_experience_json(raw: &str) -> Option<&str> {
                 {
                     best = Some(candidate);
                 }
+            } else if let Ok(parsed_mix) = serde_json::from_str::<RawInstantMixSpec>(candidate) {
+                if !parsed_mix.seed_queries.is_empty() || !parsed_mix.seed_artists.is_empty() {
+                    best = Some(candidate);
+                }
             }
             i = end + 1;
         } else {
@@ -1398,6 +1628,7 @@ struct UserTasteDigest {
     skipped_artists: Vec<String>,
     chart_artists: Vec<String>,
     previous_titles: Vec<String>,
+    taste_note: String,
 }
 
 fn build_user_taste_digest(
@@ -1559,6 +1790,8 @@ fn build_user_taste_digest(
         .unwrap_or("Evening")
         .to_string();
 
+    let taste_note = LlmCurator::load_taste_note(store, user_id);
+
     Ok(UserTasteDigest {
         username: user.username,
         display_name,
@@ -1581,6 +1814,7 @@ fn build_user_taste_digest(
         skipped_artists,
         chart_artists,
         previous_titles,
+        taste_note,
     })
 }
 
@@ -1606,7 +1840,8 @@ from scratch so the app feels freshly hand-crafted around their exact taste toda
 - 8-9 COMPLETELY CUSTOM Moods & Vibes tiles tailored to this listener (invent fresh, evocative moods/headspaces with custom colors and music seeds — DO NOT use generic defaults like \"Chill & Lo-Fi\", \"High Energy\", or \"Feel Good\")\n\
 - 4-5 COMPLETELY CUSTOM Era & Time-Machine mixes tailored to their favorite decades, scenes, and sonic movements (DO NOT use generic \"70s Classics\" / \"80s Hits\" / \"90s Anthems\" titles)\n\
 - 6-8 personalized Genre & Micro-Scene spotlights for Explore (specific real genres/subgenres/scenes they love or should dive into, with custom colors & notes)\n\
-- 5-6 clickable daily vibe prompts for Search\n\n\
+- 5-6 clickable daily vibe prompts for Search\n\
+- A sharp, grounded Stats Taste Portrait (`tastePortrait`: bespoke listener title, 1-2 sentence reflection on their actual listening DNA, and 3-4 crisp editorial trait chips)\n\n\
 Style guidelines:\n\
 - Be genuinely creative, musical, grounded, and specific to their actual taste (artists, scenes, eras, playlists, chronotype, day of week/season). Avoid generic cliches, cringe slang, or emojis (no emojis at all — keep typography clean and editorial).\n\
 - NEVER mention a specific clock hour (like \"6 PM\", \"Six o'clock\", \"2 AM\", \"8:00\") in `homeGreeting`, `homeGreetings`, `homeTagline`, `exploreTagline`, or any `sections` heading. Use broad time-of-day phrasing (\"morning\", \"afternoon\", \"evening\", \"late night\") or timeless phrasing so the app feels right no matter when the listener opens it.\n\
@@ -1679,6 +1914,12 @@ fn build_user_prompt(d: &UserTasteDigest) -> String {
             d.previous_titles.join(", ")
         ));
     }
+    if !d.taste_note.is_empty() {
+        out.push_str(&format!(
+            "Listener's personal curation note (incorporate these preferences into today's mixes, moods, and tone while strictly obeying the JSON schema and music authenticity rules): {}\n",
+            d.taste_note
+        ));
+    }
 
     out.push_str(
         r##"
@@ -1695,6 +1936,11 @@ Return a JSON object with this exact shape:
   "exploreTitle": "Custom title for the Explore page (2-4 words, e.g. 'Tonight's Crate' or 'Sonic Atlas')",
   "homeTagline": "One crisp editorial sentence under the Home greeting tailored to today & their taste",
   "exploreTagline": "One crisp editorial sentence under the Explore heading",
+  "tastePortrait": {
+    "title": "Bespoke 2-4 word listener persona title (e.g. 'Nocturnal City-Pop Archivist')",
+    "summary": "1-2 crisp editorial sentences reflecting their actual taste patterns, favorite scenes, and listening rhythm (no emojis, no clock hours)",
+    "traits": ["Short trait chip 1", "Short trait chip 2", "Short trait chip 3"]
+  },
   "sections": {
     "quickPicks": "Custom heading for Quick Picks (2-4 words)",
     "newReleases": "Custom heading for New Releases (2-4 words)",
@@ -1815,6 +2061,7 @@ Requirements (fill EVERY array completely — do NOT return just 1 example item)
 - Provide 4 to 5 distinct items in `eraMixes` tailored to eras/movements that resonate with this listener (each with `kicker` like an era/years tag, `title`, `subtitle`, `query`, `seedArtists`, `yearRange`, `c1`, `c2`).
 - Provide 6 to 8 distinct real music genres/micro-scenes in `featuredGenres` tailored to this listener.
 - Provide 5 to 6 items in `searchPrompts`.
+- Provide a specific, grounded `tastePortrait` (`title`, `summary`, and 3-4 `traits`) for their Stats page.
 "##,
     );
     out
@@ -1835,6 +2082,8 @@ struct RawLlmResponse {
     home_tagline: String,
     #[serde(default)]
     explore_tagline: String,
+    #[serde(default)]
+    taste_portrait: LlmTastePortrait,
     #[serde(default)]
     sections: LlmSectionTitles,
     #[serde(default)]
@@ -1966,6 +2215,187 @@ struct RawExploreMix {
     c2: String,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawInstantMixSpec {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    subtitle: String,
+    #[serde(default)]
+    seed_queries: Vec<String>,
+    #[serde(default)]
+    seed_artists: Vec<String>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    mood: Option<String>,
+    #[serde(default)]
+    year_range: Option<Vec<i32>>,
+    #[serde(default)]
+    familiarity: String,
+}
+
+fn sanitize_taste_note(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    clean_text(&cleaned, TASTE_NOTE_MAX_CHARS)
+}
+
+/// Returns true when an Instant Mix query reads like a descriptive natural-language
+/// prompt/scenario rather than a short artist, track, album, or simple genre lookup.
+pub fn looks_like_natural_language_mix_prompt(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let words: Vec<String> = trimmed
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                .to_ascii_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.len() < 3 {
+        return false;
+    }
+    // 6+ word prompts are almost always descriptive scenes/vibes rather than simple searches.
+    if words.len() >= 6 {
+        return true;
+    }
+    let has_punctuation_clause = trimmed.contains(',') || trimmed.contains(';');
+    if has_punctuation_clause && words.len() >= 3 {
+        return true;
+    }
+    const DESCRIPTIVE_CUES: &[&str] = &[
+        "for", "while", "without", "with", "like", "feels", "feeling", "vibe", "vibes",
+        "driving", "rainy", "rain", "coding", "studying", "working", "cleaning", "walking",
+        "running", "cooking", "reading", "sleeping", "morning", "midnight", "sunset", "sunrise",
+        "coffee", "coffeehouse", "cozy", "nostalgic", "dreamy", "moody", "melancholic",
+        "upbeat", "energetic", "chill", "relaxing", "ambient", "no", "songs", "tracks",
+        "music", "playlist", "soundtrack", "something", "that", "through", "into", "after",
+        "late", "night", "sunday", "friday", "summer", "winter", "autumn", "tokyo", "paris",
+        "neon", "analog", "warm", "dark", "soft", "heavy", "vocals", "instrumental",
+    ];
+    let cue_hits = words
+        .iter()
+        .filter(|w| DESCRIPTIVE_CUES.contains(&w.as_str()))
+        .count();
+    (words.len() >= 4 && cue_hits >= 1) || (words.len() == 3 && cue_hits >= 2)
+}
+
+fn build_instant_mix_system_prompt(extra: Option<&str>) -> String {
+    let mut prompt = String::from(
+        "You are Beatlab's Instant Mix DJ. Given a listener's natural-language prompt describing \
+a mood, scene, activity, era, or musical vibe, translate it into a crisp JSON specification \
+that Beatlab's music search & taste engine will populate with real playable songs.\n\
+Rules:\n\
+- `title`: Evocative 2-5 word mix title (no emojis, clean editorial typography).\n\
+- `subtitle`: One concise sentence (under 95 chars) describing the sonic direction.\n\
+- `seedQueries`: 2-3 crisp 2-4 word music search/playlist queries that match real playlists on Deezer/YouTube Music (e.g. \"japanese city pop\", \"warm analog synthwave\", \"rainy lofi jazz\", \"early 2000s garage rock\"). If the prompt specifies a region or language, include it in every query and in `genres`.\n\
+- `seedArtists`: 3-5 REAL musical artists who authentically fit the exact prompt (scene, era, language, energy, instrumentation). NEVER force unrelated artists from the listener's profile if the prompt asks for a specific genre or vibe.\n\
+- `genres`: 1-3 real genre/subgenre names.\n\
+- `mood`: null or one of \"chill\", \"energy\", \"late_night\", \"upbeat\", \"melancholy\", \"party\", \"acoustic\", \"groove\", \"rock_indie\".\n\
+- `yearRange`: null or [startYear, endYear] if the prompt implies a specific era/decade.\n\
+- `familiarity`: \"familiar\", \"balanced\", or \"discovery\".\n\
+- Respond ONLY with a single valid JSON object matching the schema. No markdown fences, no commentary.",
+    );
+    if let Some(extra_text) = extra {
+        let trimmed = extra_text.trim();
+        if !trimmed.is_empty() {
+            prompt.push_str("\n\nAdditional server-owner guidance:\n");
+            prompt.push_str(trimmed);
+        }
+    }
+    prompt
+}
+
+fn build_instant_mix_user_prompt(
+    prompt_text: &str,
+    top_artists: &[String],
+    top_genres: &[String],
+    taste_note: &str,
+) -> String {
+    let mut out = format!("Listener prompt: \"{prompt_text}\"\n");
+    if !top_artists.is_empty() {
+        out.push_str(&format!(
+            "Listener's recent artists (use ONLY if they genuinely fit the prompt): {}\n",
+            top_artists.join(", ")
+        ));
+    }
+    if !top_genres.is_empty() {
+        out.push_str(&format!(
+            "Listener's top genres (optional context): {}\n",
+            top_genres.join(", ")
+        ));
+    }
+    if !taste_note.is_empty() {
+        out.push_str(&format!("Listener's general taste note: {taste_note}\n"));
+    }
+    out.push_str(
+        r##"
+Return JSON with this exact shape:
+{
+  "title": "Short evocative mix title",
+  "subtitle": "Concise description of the mix vibe",
+  "seedQueries": ["query 1", "query 2"],
+  "seedArtists": ["Real Artist 1", "Real Artist 2", "Real Artist 3", "Real Artist 4"],
+  "genres": ["Genre 1", "Genre 2"],
+  "mood": "late_night",
+  "yearRange": null,
+  "familiarity": "balanced"
+}"##,
+    );
+    out
+}
+
+fn sanitize_instant_mix_spec(raw: RawInstantMixSpec, fallback_query: &str) -> LlmInstantMixSpec {
+    let title = {
+        let t = clean_text(&raw.title, 54);
+        if t.is_empty() {
+            clean_text(fallback_query, 48)
+        } else {
+            t
+        }
+    };
+    let subtitle = {
+        let s = clean_text(&raw.subtitle, 110);
+        if s.is_empty() {
+            format!("Custom mix tuned to \"{}\"", clean_text(fallback_query, 64))
+        } else {
+            s
+        }
+    };
+    let mut seed_queries = clean_list(raw.seed_queries, 3, 64);
+    let seed_artists = clean_list(raw.seed_artists, 5, 60);
+    let genres = clean_list(raw.genres, 3, 36);
+    if seed_queries.is_empty() {
+        if !genres.is_empty() {
+            seed_queries.push(genres.join(" "));
+        } else {
+            seed_queries.push(clean_text(fallback_query, 64));
+        }
+    }
+    let familiarity = match raw.familiarity.trim().to_ascii_lowercase().as_str() {
+        "familiar" => "familiar".to_string(),
+        "discovery" => "discovery".to_string(),
+        _ => "balanced".to_string(),
+    };
+    LlmInstantMixSpec {
+        title,
+        subtitle,
+        seed_queries,
+        seed_artists,
+        genres,
+        mood: sanitize_mood(raw.mood),
+        year_range: sanitize_year_range(raw.year_range),
+        familiarity,
+    }
+}
+
 fn clean_text(raw: &str, max_chars: usize) -> String {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_str(&collapsed, max_chars)
@@ -2058,6 +2488,11 @@ fn sanitize_experience(
     let explore_title = clean_text(&raw.explore_title, 48);
     let home_tagline = clean_text(&raw.home_tagline, 160);
     let explore_tagline = clean_text(&raw.explore_tagline, 160);
+    let taste_portrait = LlmTastePortrait {
+        title: clean_text(&raw.taste_portrait.title, 48),
+        summary: clean_text(&raw.taste_portrait.summary, 240),
+        traits: clean_list(raw.taste_portrait.traits, 4, 28),
+    };
 
     let sections = LlmSectionTitles {
         quick_picks: clean_text(&raw.sections.quick_picks, 42),
@@ -2435,6 +2870,7 @@ fn sanitize_experience(
         explore_title,
         home_tagline,
         explore_tagline,
+        taste_portrait,
         sections,
         daily_mixes,
         auto_mix_overrides,
@@ -3147,5 +3583,207 @@ mod tests {
         assert_eq!(exp.home_greetings.afternoon, "Afternoon drift, cross");
         assert_eq!(exp.home_greetings.evening, "Evening glow, cross");
         assert_eq!(exp.home_greetings.late_night, "After-hours signal, cross");
+    }
+
+    #[test]
+    fn natural_language_mix_prompt_detector_distinguishes_vibes_from_short_queries() {
+        assert!(!looks_like_natural_language_mix_prompt(""));
+        assert!(!looks_like_natural_language_mix_prompt("Daft Punk"));
+        assert!(!looks_like_natural_language_mix_prompt("80s hits"));
+        assert!(!looks_like_natural_language_mix_prompt("90s rock"));
+        assert!(!looks_like_natural_language_mix_prompt("city pop"));
+        assert!(!looks_like_natural_language_mix_prompt("Bohemian Rhapsody"));
+
+        assert!(looks_like_natural_language_mix_prompt(
+            "rainy 2am Tokyo drive with warm analog synths"
+        ));
+        assert!(looks_like_natural_language_mix_prompt(
+            "upbeat indie rock like early strokes for cleaning"
+        ));
+        assert!(looks_like_natural_language_mix_prompt(
+            "cozy sunday morning acoustic coffee"
+        ));
+        assert!(looks_like_natural_language_mix_prompt(
+            "warm synths, no vocals, late night"
+        ));
+    }
+
+    #[test]
+    fn taste_note_sanitizes_persists_and_enters_user_prompt() {
+        let store = Store::open_memory().unwrap();
+        let (user, _) = store.authenticate_or_create_user("bob", "password123").unwrap();
+
+        let saved = LlmCurator::save_taste_note(
+            &store,
+            user.id,
+            "  More 90s jazz-rap\n\tand acoustic mornings;   less anime OSTs  ",
+        );
+        assert_eq!(
+            saved,
+            "More 90s jazz-rap and acoustic mornings; less anime OSTs"
+        );
+        assert_eq!(LlmCurator::load_taste_note(&store, user.id), saved);
+
+        let digest =
+            build_user_taste_digest(&store, user.id, 0, 1700000000, None).unwrap();
+        assert_eq!(digest.taste_note, saved);
+        let prompt = build_user_prompt(&digest);
+        assert!(prompt.contains("More 90s jazz-rap and acoustic mornings; less anime OSTs"));
+        assert!(prompt.contains("\"tastePortrait\""));
+
+        // Clearing removes the note cleanly.
+        assert_eq!(LlmCurator::save_taste_note(&store, user.id, "   "), "");
+        assert_eq!(LlmCurator::load_taste_note(&store, user.id), "");
+    }
+
+    #[test]
+    fn sanitize_experience_populates_taste_portrait() {
+        let raw: RawLlmResponse = serde_json::from_value(json!({
+            "editionTitle": "Velvet Drift",
+            "tastePortrait": {
+                "title": "Nocturnal City-Pop Archivist",
+                "summary": "Your rotation bridges glossy 80s Tokyo grooves with hazy modern dream pop.",
+                "traits": ["City-Pop Devotee", "Late-Night Listener", "city-pop devotee", "Deep Cut Hunter", "Album Player", "Overflow"]
+            }
+        }))
+        .unwrap();
+        let exp = sanitize_experience(raw, "Wed, Nov 25", 100, 1700000000, "test");
+        assert!(!exp.taste_portrait.is_empty());
+        assert_eq!(exp.taste_portrait.title, "Nocturnal City-Pop Archivist");
+        assert!(exp.taste_portrait.summary.contains("80s Tokyo grooves"));
+        // Deduplicated case-insensitively and capped to 4 traits.
+        assert_eq!(
+            exp.taste_portrait.traits,
+            vec![
+                "City-Pop Devotee",
+                "Late-Night Listener",
+                "Deep Cut Hunter",
+                "Album Player"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn interpret_instant_mix_prompt_caches_and_materializes_tracks() {
+        use crate::models::Track;
+        use crate::sources::archive::ArchiveSource;
+        use crate::sources::deezer::DeezerSource;
+        use crate::sources::local::LocalSource;
+        use crate::sources::soulseek::SoulseekSource;
+        use crate::sources::ytm::YtmSource;
+        use crate::sources::SourceRegistry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Json(json!({
+                        "choices": [{
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": json!({
+                                    "title": "Rainy Neon Expressway",
+                                    "subtitle": "Warm analog synthwave and hazy midnight grooves for a 2am drive.",
+                                    "seedQueries": ["synthwave night"],
+                                    "seedArtists": ["The Midnight", "Kavinsky"],
+                                    "genres": ["Synthwave"],
+                                    "mood": "late_night",
+                                    "yearRange": [2010, 2025],
+                                    "familiarity": "balanced"
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let store = Store::open_memory().unwrap();
+        let tmp = std::env::temp_dir().join(format!("beatlab-imix-test-{}", uuid::Uuid::new_v4()));
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.join("slsk")),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+        let (user, _) = store.authenticate_or_create_user("carol", "password123").unwrap();
+        let tracks: Vec<Track> = (1..=8)
+            .map(|i| Track {
+                id: format!("loc:neon-{i}"),
+                source: "local".into(),
+                title: format!("Neon Highway {i}"),
+                artist: if i % 2 == 0 {
+                    "The Midnight".into()
+                } else {
+                    "Kavinsky".into()
+                },
+                album: format!("Midnight Drive {i}"),
+                genre: "Synthwave".into(),
+                moods: "late_night".into(),
+                year: 2018,
+                duration: 220,
+                bitrate: 900,
+                format: "flac".into(),
+                ..Default::default()
+            })
+            .collect();
+        store.upsert_tracks(&tracks).unwrap();
+
+        let cfg = LlmConfig {
+            endpoint_base: format!("http://{addr}/v1"),
+            completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: String::new(),
+            model: "test-model".to_string(),
+            refresh_hour: 4,
+            temperature: 0.7,
+            max_tokens: None,
+            timeout_secs: 15,
+            extra_system_prompt: None,
+            extra_headers: vec![],
+            reasoning_effort: None,
+        };
+        let curator = LlmCurator::new_with_config(cfg);
+
+        let prompt = "rainy 2am Tokyo drive with warm analog synths";
+        let spec1 = curator
+            .interpret_instant_mix_prompt(&store, user.id, prompt)
+            .await
+            .unwrap();
+        assert_eq!(spec1.title, "Rainy Neon Expressway");
+        assert_eq!(spec1.mood.as_deref(), Some("late_night"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second request with the same prompt (different casing/whitespace) hits SQLite cache.
+        let spec2 = curator
+            .interpret_instant_mix_prompt(&store, user.id, "  RAINY 2AM Tokyo drive with warm analog synths ")
+            .await
+            .unwrap();
+        assert_eq!(spec2.title, spec1.title);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Materialize into real playable InstantMix tracks.
+        let mix = taste
+            .materialize_llm_instant_mix(user.id, prompt, &spec1, 20)
+            .await
+            .expect("expected materialized instant mix");
+        assert_eq!(mix.title, "Rainy Neon Expressway");
+        assert!(mix.is_theme_mix);
+        assert!(!mix.tracks.is_empty());
+        assert_eq!(mix.total_duration, mix.tracks.iter().map(|t| t.duration).sum::<i32>());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

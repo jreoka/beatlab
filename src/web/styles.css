@@ -7521,3 +7521,61 @@ body.audio-loading #fs-play::after {
   .card-play-fab.fab-loading::after,
   .mixfor-play.fab-loading::after { animation-duration: 1.6s; }
 }
+
+/* ---------------- Daily Curator Settings & Stats Taste Portrait ---------------- */
+.stats-portrait-badge {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(30, 215, 96, 0.35);
+  color: var(--accent);
+}
+html[data-theme="light"] .stats-portrait-badge {
+  border-color: rgba(22, 163, 74, 0.35);
+}
+.curator-note-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.curator-note-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 76px;
+  max-height: 160px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-bright);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 1.45;
+  outline: none;
+}
+.curator-note-input:focus {
+  border-color: var(--accent);
+}
+.curator-note-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.curator-note-count {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.curator-note-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}

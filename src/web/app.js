@@ -232,6 +232,8 @@
       hidden: null,
       sessions: null,
       security: null,
+      curator: null,
+      curatorSaving: false,
       totpSetup: null,
       recoveryCodes: null,
       confirmResetHidden: false,
@@ -1061,6 +1063,8 @@
       hidden: null,
       sessions: null,
       security: null,
+      curator: null,
+      curatorSaving: false,
       totpSetup: null,
       recoveryCodes: null,
       confirmResetHidden: false,
@@ -2752,7 +2756,11 @@
         ? `<div class="mix-mosaic">${covers.map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`
         : `<img class="mix-single-art" src="${esc(covers[0] || '')}" alt="" />`;
     const previewCount = expanded ? mix.tracks.length : Math.min(6, mix.tracks.length);
-    const intentTag = refinements?.detectedIntent ? ` · ${esc(refinements.detectedIntent)}` : '';
+    const intentTag = mix.aiInterpreted
+      ? ' · AI VIBE MIX'
+      : refinements?.detectedIntent
+        ? ` · ${esc(refinements.detectedIntent)}`
+        : '';
 
     const isProminent = !!(mix.prominent || mix.isThemeMix);
     return `<section class="instant-mix-card ${isProminent ? 'prominent' : ''}" data-share-kind="mix" data-share-id="${esc(`mix:${mix.title || query}`)}" data-share-title="${esc(mix.title)}" data-share-sub="${esc(mix.subtitle || '')}" data-share-cover="${esc(covers[0] || '')}">
@@ -2832,7 +2840,9 @@
 
   async function renderInstantMixPage(query, mode = 'auto') {
     const cleanQ = String(query || '').trim();
-    const cleanMode = ['topic', 'entity'].includes(mode) ? mode : 'auto';
+    const llmOn = Boolean(state.user?.llmEnabled);
+    const allowedModes = llmOn ? ['topic', 'entity', 'ai'] : ['topic', 'entity'];
+    const cleanMode = allowedModes.includes(mode) ? mode : 'auto';
     state.instantMixMode = cleanMode;
     state.searchState = null;
     const modeOptions = [
@@ -2840,30 +2850,60 @@
       ['topic', 'Genre & Vibe'],
       ['entity', 'Artist or Song'],
     ];
+    if (llmOn) {
+      modeOptions.push(['ai', 'AI Vibe']);
+    }
+    const placeholder = llmOn
+      ? 'Describe a vibe, scene, artist, or era (e.g. rainy 2am Tokyo drive with warm synths, Daft Punk)...'
+      : 'Enter an artist, song, genre, era, or mood (e.g. 80s hits, Daft Punk, chill)...';
     const builderHeader = (val) => `
       <div class="section-head" style="margin-bottom:14px">
         <h1 class="page-greeting" style="margin-bottom:0">Instant Mix</h1>
       </div>
       <form class="instant-mix-builder-form" onsubmit="App.submitInstantMixForm(event)">
-        <input id="instant-mix-term-input" type="text" value="${esc(val)}" placeholder="Enter an artist, song, genre, era, or mood (e.g. 80s hits, Daft Punk, chill)..." autocomplete="off" />
+        <input id="instant-mix-term-input" type="text" value="${esc(val)}" placeholder="${esc(placeholder)}" autocomplete="off" />
         <button type="submit" class="btn-primary">Create Instant Mix</button>
       </form>
       <div class="instant-mix-mode-row" role="group" aria-label="Mix mode">
         ${modeOptions
           .map(
             ([key, label]) =>
-              `<button type="button" class="refine-query-pill${cleanMode === key ? ' active' : ''}" onclick="App.setInstantMixMode('${key}')">${esc(label)}</button>`
+              `<button type="button" class="refine-query-pill${cleanMode === key ? ' active' : ''}" data-mode="${esc(key)}" onclick="App.setInstantMixMode('${key}')">${esc(label)}</button>`
           )
           .join('')}
       </div>
     `;
     if (!cleanQ) {
       state.activeInstantMix = null;
+      const dailyPrompts = Array.isArray(state.llmSearchPrompts) && state.llmSearchPrompts.length
+        ? state.llmSearchPrompts.map((p) => ({
+            label: p.label || p.query,
+            query: p.query || p.label,
+            mode: llmOn ? 'ai' : 'auto',
+          }))
+        : [];
+      const fallbackPrompts = llmOn
+        ? [
+            { label: 'Rainy 2am Tokyo drive, warm synths', query: 'rainy 2am Tokyo drive with warm analog synths', mode: 'ai' },
+            { label: 'Cozy Sunday morning acoustic coffee', query: 'cozy sunday morning acoustic songs for coffee', mode: 'ai' },
+            { label: 'Upbeat indie rock for cleaning', query: 'upbeat indie rock like early strokes for cleaning', mode: 'ai' },
+            { label: '80s hits', query: '80s hits', mode: 'auto' },
+            { label: 'Late night chill', query: 'Late night chill', mode: 'auto' },
+          ]
+        : ['80s hits', '90s rock', 'Late night chill', 'Workout energy', 'Indie synthpop'].map((sg) => ({
+            label: sg,
+            query: sg,
+            mode: 'auto',
+          }));
+      const chips = dailyPrompts.length ? dailyPrompts : fallbackPrompts;
       $('main-view').innerHTML = `
         ${builderHeader('')}
         <div class="instant-mix-suggestions">
-          ${['80s hits', '90s rock', 'Late night chill', 'Workout energy', 'Indie synthpop']
-            .map((sg) => `<button class="refine-query-pill" onclick="App.navigate('mix?q=${encodeURIComponent(sg)}')">${esc(sg)}</button>`)
+          ${chips
+            .map((sg) => {
+              const m = sg.mode && sg.mode !== 'auto' ? `&mode=${encodeURIComponent(sg.mode)}` : '';
+              return `<button class="refine-query-pill" onclick="App.navigate('mix?q=${encodeURIComponent(sg.query)}${m}')">${esc(sg.label)}</button>`;
+            })
             .join('')}
         </div>
       `;
@@ -2871,7 +2911,11 @@
     }
 
     const { reqToken, signal } = beginViewRequest();
-    setMainLoading(`Creating instant mix for "${cleanQ}"...`);
+    setMainLoading(
+      cleanMode === 'ai'
+        ? `Curating AI mix for "${cleanQ}"...`
+        : `Creating instant mix for "${cleanQ}"...`
+    );
     try {
       const modeParam = cleanMode !== 'auto' ? `&mode=${encodeURIComponent(cleanMode)}` : '';
       const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}${modeParam}`, { signal });
@@ -2906,11 +2950,18 @@
 
   function promptInstantMix(initialQuery = '') {
     const defaultVal = String(initialQuery || (state.searchState ? state.searchState.query : '') || '').trim();
+    const llmOn = Boolean(state.user?.llmEnabled);
+    const hint = llmOn
+      ? 'Describe any mood, scene, activity, artist, song, genre, or era.'
+      : 'Generate an on-demand mix from any artist, song, genre, era, or mood.';
+    const placeholder = llmOn
+      ? 'e.g. rainy 2am Tokyo drive with warm synths, Daft Punk, 80s hits...'
+      : 'e.g. 80s hits, Daft Punk, late night chill...';
     openModal(`
       <div class="modal-head"><h3>Create Instant Mix</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
       <form onsubmit="App.submitInstantMixModal(event)" style="display:flex;flex-direction:column;gap:12px">
-        <p style="font-size:13px;color:var(--text-muted)">Generate an on-demand mix from any artist, song, genre, era, or mood.</p>
-        <input id="instant-mix-modal-input" type="text" value="${esc(defaultVal)}" placeholder="e.g. 80s hits, Daft Punk, late night chill..." required autofocus />
+        <p style="font-size:13px;color:var(--text-muted)">${esc(hint)}</p>
+        <input id="instant-mix-modal-input" type="text" value="${esc(defaultVal)}" placeholder="${esc(placeholder)}" required autofocus />
         <button type="submit" class="btn-primary">Create Instant Mix</button>
       </form>
     `);
@@ -4264,6 +4315,16 @@
     const streaks = d.streaks || {};
     const lib = d.library || {};
     const persona = d.persona || {};
+    const portrait = d.tastePortrait || null;
+    const hasPortrait = Boolean(
+      portrait && (portrait.title || portrait.summary || (Array.isArray(portrait.traits) && portrait.traits.length))
+    );
+    const personaTitle = (hasPortrait && portrait.title) || persona.title || 'Music Listener';
+    const personaBadges =
+      hasPortrait && Array.isArray(portrait.traits) && portrait.traits.length
+        ? portrait.traits
+        : persona.badges || [];
+    const personaHeadline = (hasPortrait && portrait.summary) || persona.headline || '';
     const metric = state.statsMetric === 'mins' ? 'mins' : 'streams';
     const ranges = [
       ['7d', '7 Days'],
@@ -4291,10 +4352,11 @@
           </div>
           <div class="stats-persona-box">
             <div class="stats-persona-row">
-              <span class="stats-persona-pill">${esc(persona.title || 'Music Listener')}</span>
-              ${(persona.badges || []).map((b) => `<span class="stats-vibe-chip">${esc(b)}</span>`).join('')}
+              <span class="stats-persona-pill">${esc(personaTitle)}</span>
+              ${hasPortrait ? `<span class="stats-portrait-badge" title="${esc(portrait.editionTitle || 'Daily Taste Portrait')}">Taste Portrait</span>` : ''}
+              ${personaBadges.map((b) => `<span class="stats-vibe-chip">${esc(b)}</span>`).join('')}
             </div>
-            <p class="stats-persona-headline">${esc(persona.headline || '')}</p>
+            <p class="stats-persona-headline">${esc(personaHeadline)}</p>
           </div>
         </div>
         <div class="stats-hero-controls">
@@ -7474,6 +7536,7 @@
             </label>
           </div>
         </div>
+        ${renderCuratorSettingsSection()}
       `;
       return;
     }
@@ -7778,6 +7841,52 @@
     `;
   }
 
+  function renderCuratorSettingsSection() {
+    const cur = state.settingsData.curator;
+    const enabled = Boolean(cur ? cur.enabled : state.user?.llmEnabled);
+    if (!enabled) return '';
+    const note = cur ? String(cur.tasteNote || '') : '';
+    const maxChars = (cur && cur.maxChars) || 280;
+    const saving = Boolean(state.settingsData.curatorSaving);
+    const inFlight = Boolean(cur && cur.inFlight);
+    const cooldownSecs = (cur && cur.cooldownSecs) || 0;
+    const cooldownMins = cooldownSecs > 0 ? Math.ceil(cooldownSecs / 60) : 0;
+    const editionMeta = cur && cur.editionTitle
+      ? `Current edition: ${cur.editionTitle}${cur.dateLabel ? ` · ${cur.dateLabel}` : ''}`
+      : 'Applied on your next overnight edition or when you refresh.';
+    const statusText = inFlight
+      ? 'Refreshing your daily edition in the background…'
+      : cooldownMins > 0
+        ? `${editionMeta} · Manual refresh available in ~${cooldownMins} min`
+        : editionMeta;
+    const refreshDisabled = saving || inFlight || cooldownSecs > 0;
+    return `
+      <div class="settings-section">
+        <div class="settings-section-title">Daily Curator</div>
+        <div class="curator-note-wrap">
+          <div class="settings-row-label">Personal Curation Note</div>
+          <div class="settings-row-desc">Steer your overnight Daily Mixes, Explore categories, custom moods, Taste Portrait, and AI Instant Mixes.</div>
+          <textarea
+            id="curator-taste-note"
+            class="curator-note-input"
+            rows="3"
+            maxlength="${maxChars}"
+            placeholder="e.g. More 90s jazz-rap and warm acoustic mornings; less anime OSTs on weekdays; road trip energy this week"
+            oninput="App.onCuratorNoteInput(this)"
+          >${esc(note)}</textarea>
+          <div class="curator-note-meta">
+            <span class="settings-row-desc">${esc(statusText)}</span>
+            <span id="curator-note-count" class="curator-note-count">${note.length}/${maxChars}</span>
+          </div>
+          <div class="curator-note-actions">
+            <button type="button" class="btn-primary" ${saving ? 'disabled' : ''} onclick="App.saveCuratorPrefs(false)">${saving ? 'Saving…' : 'Save Note'}</button>
+            <button type="button" class="btn-secondary" ${refreshDisabled ? 'disabled' : ''} onclick="App.saveCuratorPrefs(true)">${inFlight ? 'Refreshing…' : 'Save & Refresh Edition'}</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   async function openSettingsModal(initialTab = 'general') {
     state.settingsTab = initialTab || 'general';
     state.settingsData.confirmResetHidden = false;
@@ -7804,14 +7913,16 @@
     renderSettingsModalBody();
 
     try {
-      const [hidRes, sessRes, secRes] = await Promise.all([
+      const [hidRes, sessRes, secRes, curRes] = await Promise.all([
         api('/api/web/hidden').catch(() => null),
         api('/api/web/sessions').catch(() => null),
         api('/api/web/2fa/status').catch(() => null),
+        api('/api/web/curator/prefs').catch(() => null),
       ]);
       if (hidRes) state.settingsData.hidden = hidRes;
       if (sessRes) state.settingsData.sessions = sessRes;
       if (secRes) state.settingsData.security = secRes;
+      if (curRes) state.settingsData.curator = curRes;
       if ($('settings-body')) {
         renderSettingsModalBody();
       }
@@ -9637,16 +9748,16 @@
       navigate(`mix?q=${encodeURIComponent(val)}${mode}`);
     },
     setInstantMixMode: (mode) => {
-      const cleanMode = ['topic', 'entity'].includes(mode) ? mode : 'auto';
+      const allowed = state.user?.llmEnabled ? ['topic', 'entity', 'ai'] : ['topic', 'entity'];
+      const cleanMode = allowed.includes(mode) ? mode : 'auto';
       state.instantMixMode = cleanMode;
       const val = ($('instant-mix-term-input')?.value || '').trim();
       if (val) {
         const modeParam = cleanMode !== 'auto' ? `&mode=${encodeURIComponent(cleanMode)}` : '';
         navigate(`mix?q=${encodeURIComponent(val)}${modeParam}`);
       } else {
-        document.querySelectorAll('.instant-mix-mode-row .refine-query-pill').forEach((btn, idx) => {
-          const keys = ['auto', 'topic', 'entity'];
-          btn.classList.toggle('active', keys[idx] === cleanMode);
+        document.querySelectorAll('.instant-mix-mode-row .refine-query-pill').forEach((btn) => {
+          btn.classList.toggle('active', btn.dataset.mode === cleanMode);
         });
       }
     },
@@ -9836,6 +9947,46 @@
     },
     closeModal,
     installPwa,
+    onCuratorNoteInput: (el) => {
+      const cnt = $('curator-note-count');
+      const max = (state.settingsData.curator && state.settingsData.curator.maxChars) || 280;
+      if (cnt && el) cnt.textContent = `${el.value.length}/${max}`;
+    },
+    saveCuratorPrefs: async (refreshNow = false) => {
+      const input = $('curator-taste-note');
+      const note = input ? input.value : '';
+      state.settingsData.curatorSaving = true;
+      renderSettingsModalBody();
+      try {
+        const res = await api('/api/web/curator/prefs', {
+          method: 'POST',
+          body: JSON.stringify({ tasteNote: note, refreshNow: Boolean(refreshNow) }),
+        });
+        state.settingsData.curator = {
+          ...(state.settingsData.curator || {}),
+          enabled: res.enabled,
+          tasteNote: res.tasteNote || '',
+          inFlight: Boolean(res.inFlight),
+          cooldownSecs: res.cooldownSecs || 0,
+        };
+        if (refreshNow) {
+          if (res.refreshStarted) {
+            showToast('Curation note saved · Refreshing your daily edition in the background');
+          } else if (res.cooldownSecs > 0) {
+            showToast(`Curation note saved · Refresh available in ~${Math.ceil(res.cooldownSecs / 60)} min`);
+          } else {
+            showToast('Curation note saved · Edition refresh already running');
+          }
+        } else {
+          showToast(res.tasteNote ? 'Personal curation note saved' : 'Personal curation note cleared');
+        }
+      } catch (err) {
+        showToast(err.message || 'Could not save curation note');
+      } finally {
+        state.settingsData.curatorSaving = false;
+        if ($('settings-body')) renderSettingsModalBody();
+      }
+    },
     showPasswordForm: () => {
       state.settingsData.showPasswordForm = true;
       renderSettingsModalBody();

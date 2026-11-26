@@ -299,6 +299,10 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/artist/{id}", get(webapp::artist_detail))
         .route("/api/web/library", get(webapp::library))
         .route("/api/web/stats", get(webapp::stats))
+        .route(
+            "/api/web/curator/prefs",
+            get(webapp::curator_prefs).post(webapp::update_curator_prefs),
+        )
         .route("/api/web/playlists", post(webapp::create_playlist))
         .route(
             "/api/web/playlist/{id}",

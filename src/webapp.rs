@@ -705,6 +705,7 @@ fn user_json(state: &AppState, user: &User) -> Value {
         "avatarUrl": self_avatar_url(state, user.id),
         "twoFactorEnabled": two_factor_enabled,
         "isAdmin": crate::admin::is_admin_username(&user.username),
+        "llmEnabled": state.llm.is_some(),
         "totpEnabled": state.store.get_totp(user.id).ok().flatten().map(|t| t.enabled).unwrap_or(false),
         "passkeys": state.store.passkey_count(user.id).unwrap_or(0),
         "recoveryCodesLeft": recovery_total.saturating_sub(recovery_used),
@@ -3643,6 +3644,10 @@ pub async fn instant_mix(
         Err(r) => return r,
     };
     let query = q.q.unwrap_or_default().trim().to_string();
+    let explicit_ai = matches!(
+        q.mode.as_deref().map(str::trim).map(str::to_lowercase).as_deref(),
+        Some("ai") | Some("prompt")
+    );
     let mode_override = match q.mode.as_deref().map(str::trim).map(str::to_lowercase).as_deref() {
         Some("topic") | Some("genre") | Some("vibe") => Some("topic".to_string()),
         Some("entity") | Some("artist") | Some("song") => Some("entity".to_string()),
@@ -3654,6 +3659,19 @@ pub async fn instant_mix(
             "instantMix": Value::Null,
             "refinements": Value::Null,
         }));
+    }
+
+    let mut tried_llm = false;
+    let should_try_llm_first = state.llm.is_some()
+        && mode_override.as_deref() != Some("entity")
+        && (explicit_ai || crate::llm::looks_like_natural_language_mix_prompt(&query));
+    if should_try_llm_first {
+        tried_llm = true;
+        if let Some(ref curator) = state.llm {
+            if let Some(resp) = try_build_llm_instant_mix(&state, curator, user.id, &query).await {
+                return resp;
+            }
+        }
     }
 
     let intent = crate::taste::parse_search_intent(&query);
@@ -3895,6 +3913,13 @@ pub async fn instant_mix(
                 &ytm_hints,
             )
             .await;
+            if refined.instant_mix.is_none() && !tried_llm && mode_override.as_deref() != Some("entity") {
+                if let Some(ref curator) = state.llm {
+                    if let Some(resp) = try_build_llm_instant_mix(&state, curator, user.id, &query).await {
+                        return resp;
+                    }
+                }
+            }
             return format_instant_mix_response(
                 &state,
                 user.id,
@@ -3918,6 +3943,14 @@ pub async fn instant_mix(
     )
     .await;
 
+    if refined.instant_mix.is_none() && !tried_llm && mode_override.as_deref() != Some("entity") {
+        if let Some(ref curator) = state.llm {
+            if let Some(resp) = try_build_llm_instant_mix(&state, curator, user.id, &query).await {
+                return resp;
+            }
+        }
+    }
+
     format_instant_mix_response(
         &state,
         user.id,
@@ -3927,6 +3960,61 @@ pub async fn instant_mix(
         radio_len,
         refined,
     )
+}
+
+async fn try_build_llm_instant_mix(
+    state: &AppState,
+    curator: &crate::llm::LlmCurator,
+    uid: i64,
+    query: &str,
+) -> Option<Response> {
+    let spec = match curator
+        .interpret_instant_mix_prompt(&state.store, uid, query)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(user_id = uid, query = %query, error = %e, "LLM instant mix interpretation fell back to standard pipeline");
+            return None;
+        }
+    };
+    let mix = state
+        .taste
+        .materialize_llm_instant_mix(uid, query, &spec, 30)
+        .await?;
+    let taste_match_ids = personal_match_ids(state, uid);
+    let mut suggestions: Vec<String> = Vec::new();
+    for s in spec.seed_queries.iter().chain(spec.genres.iter()) {
+        let clean = s.trim();
+        if !clean.is_empty()
+            && !clean.eq_ignore_ascii_case(query)
+            && !suggestions.iter().any(|x| x.eq_ignore_ascii_case(clean))
+        {
+            suggestions.push(clean.to_string());
+            if suggestions.len() >= 4 {
+                break;
+            }
+        }
+    }
+    let refinements = crate::taste::SearchRefinements {
+        detected_intent: "AI Vibe Mix".to_string(),
+        filter_chips: Vec::new(),
+        query_suggestions: suggestions,
+    };
+    Some(json_res(json!({
+        "query": query,
+        "instantMix": {
+            "title": mix.title,
+            "subtitle": mix.subtitle,
+            "query": mix.query,
+            "isThemeMix": mix.is_theme_mix,
+            "prominent": mix.prominent,
+            "aiInterpreted": true,
+            "totalDuration": mix.total_duration,
+            "tracks": to_web_tracks_with_taste(state, uid, &mix.tracks, &taste_match_ids),
+        },
+        "refinements": refinements,
+    })))
 }
 
 /// Minimum size a theme mix should reach before we try to grow it.
@@ -4750,7 +4838,90 @@ pub async fn stats(
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute stats");
     };
 
-    json_res(stats_payload(computed, &starred, &track_stats, &ratings, true))
+    let llm_exp = crate::llm::LlmCurator::load_experience(&state.store, uid);
+    json_res(stats_payload(
+        computed,
+        &starred,
+        &track_stats,
+        &ratings,
+        true,
+        llm_exp.as_ref(),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct CuratorPrefsReq {
+    #[serde(default, rename = "tasteNote")]
+    pub taste_note: String,
+    #[serde(default, rename = "refreshNow")]
+    pub refresh_now: bool,
+}
+
+pub async fn curator_prefs(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let enabled = state.llm.is_some();
+    let taste_note = crate::llm::LlmCurator::load_taste_note(&state.store, user.id);
+    let exp = crate::llm::LlmCurator::load_experience(&state.store, user.id);
+    let (in_flight, cooldown_secs) = match state.llm.as_ref() {
+        Some(c) => (
+            c.is_in_flight(user.id),
+            c.user_refresh_cooldown_remaining(&state.store, user.id),
+        ),
+        None => (false, 0),
+    };
+    json_res(json!({
+        "enabled": enabled,
+        "tasteNote": taste_note,
+        "maxChars": crate::llm::TASTE_NOTE_MAX_CHARS,
+        "hasExperience": exp.is_some(),
+        "editionTitle": exp.as_ref().map(|e| e.edition_title.as_str()).unwrap_or(""),
+        "dateLabel": exp.as_ref().map(|e| e.date_label.as_str()).unwrap_or(""),
+        "generatedAt": exp.as_ref().map(|e| e.generated_at).unwrap_or(0),
+        "inFlight": in_flight,
+        "cooldownSecs": cooldown_secs,
+    }))
+}
+
+pub async fn update_curator_prefs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CuratorPrefsReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let saved_note = crate::llm::LlmCurator::save_taste_note(&state.store, user.id, &req.taste_note);
+    let mut refresh_started = false;
+    let mut cooldown_secs = 0i64;
+    let mut in_flight = false;
+    if let Some(ref curator) = state.llm {
+        if req.refresh_now {
+            match curator.try_spawn_user_refresh(&state.taste, user.id) {
+                Ok(started) => {
+                    refresh_started = started;
+                    in_flight = true;
+                }
+                Err(wait) => {
+                    cooldown_secs = wait;
+                }
+            }
+        } else {
+            in_flight = curator.is_in_flight(user.id);
+            cooldown_secs = curator.user_refresh_cooldown_remaining(&state.store, user.id);
+        }
+    }
+    json_res(json!({
+        "ok": true,
+        "enabled": state.llm.is_some(),
+        "tasteNote": saved_note,
+        "refreshStarted": refresh_started,
+        "inFlight": in_flight,
+        "cooldownSecs": cooldown_secs,
+    }))
 }
 
 /// Full listening stats for another user's profile — the same payload as the
@@ -4800,7 +4971,15 @@ pub async fn social_stats(
         return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute stats");
     };
 
-    json_res(stats_payload(computed, &starred, &track_stats, &ratings, is_self))
+    let llm_exp = crate::llm::LlmCurator::load_experience(&state.store, target.id);
+    json_res(stats_payload(
+        computed,
+        &starred,
+        &track_stats,
+        &ratings,
+        is_self,
+        llm_exp.as_ref(),
+    ))
 }
 
 fn stats_payload(
@@ -4809,6 +4988,7 @@ fn stats_payload(
     track_stats: &HashMap<String, UserTrackStats>,
     ratings: &HashMap<String, i32>,
     is_self: bool,
+    llm_exp: Option<&crate::llm::DailyLlmExperience>,
 ) -> Value {
     if !is_self {
         computed.recent_events.clear();
@@ -4912,6 +5092,22 @@ fn stats_payload(
         })
         .collect();
 
+    let taste_portrait = if computed.summary.total_streams > 0 {
+        llm_exp
+            .filter(|e| !e.taste_portrait.is_empty())
+            .map(|e| {
+                json!({
+                    "title": e.taste_portrait.title,
+                    "summary": e.taste_portrait.summary,
+                    "traits": e.taste_portrait.traits,
+                    "dateLabel": e.date_label,
+                    "editionTitle": e.edition_title,
+                })
+            })
+    } else {
+        None
+    };
+
     json!({
         "isSelf": is_self,
         "range": computed.range.key(),
@@ -4925,6 +5121,7 @@ fn stats_payload(
         "streaks": computed.streaks,
         "library": computed.library,
         "persona": computed.persona,
+        "tastePortrait": taste_portrait,
         "timeline": computed.timeline,
         "heatmap": computed.heatmap,
         "hourly": computed.hourly,
@@ -6755,6 +6952,21 @@ async fn render_public_profile(
             // per-track activity log and hidden-track count.
             stats.recent_events.clear();
             stats.library.hidden_tracks = 0;
+            if stats.summary.total_streams > 0 {
+                if let Some(exp) = crate::llm::LlmCurator::load_experience(&state.store, target.id) {
+                    if !exp.taste_portrait.is_empty() {
+                        if !exp.taste_portrait.title.trim().is_empty() {
+                            stats.persona.title = exp.taste_portrait.title;
+                        }
+                        if !exp.taste_portrait.summary.trim().is_empty() {
+                            stats.persona.headline = exp.taste_portrait.summary;
+                        }
+                        if !exp.taste_portrait.traits.is_empty() {
+                            stats.persona.badges = exp.taste_portrait.traits;
+                        }
+                    }
+                }
+            }
             crate::profile_page::render_profile_page(
                 &origin,
                 &target,
