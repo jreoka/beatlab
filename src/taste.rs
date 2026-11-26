@@ -5367,11 +5367,14 @@ impl TasteEngine {
         &self,
         seen_keys: &mut HashSet<String>,
         out: &mut Vec<Track>,
-        radio: Vec<Track>,
+        mut radio: Vec<Track>,
     ) {
         if radio.is_empty() {
             return;
         }
+        // Preserve previously enriched years/genres from SQLite (and twins/albums)
+        // before upserting and pushing into the in-memory radio pool.
+        let _ = self.store.hydrate_track_metadata(&mut radio);
         let _ = self.store.upsert_tracks(&radio);
         for t in radio {
             if seen_keys.insert(t.song_key()) {

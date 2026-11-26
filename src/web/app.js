@@ -748,7 +748,14 @@
   function cacheTracks(list) {
     if (!Array.isArray(list)) return [];
     for (const t of list) {
-      if (t && t.id) state.trackMap.set(t.id, t);
+      if (t && t.id) {
+        const prev = state.trackMap.get(t.id);
+        if (prev) {
+          if (!t.year && prev.year > 0) t.year = prev.year;
+          if (!t.genre && prev.genre) t.genre = prev.genre;
+        }
+        state.trackMap.set(t.id, t);
+      }
     }
     return list;
   }
@@ -5726,11 +5733,60 @@
     if ($('fs-play-icon-svg')) $('fs-play-icon-svg').innerHTML = svgHtml;
   }
 
+  function applyTrackYearUpdate(trackId, patch) {
+    const year = parseInt(patch?.year, 10);
+    if (!trackId || !Number.isFinite(year) || year < 1900 || year > 2100) return;
+    const genre = typeof patch?.genre === 'string' && patch.genre.trim() ? patch.genre : '';
+    let changed = false;
+
+    const patchObj = (t) => {
+      if (!t || t.id !== trackId) return;
+      if (!t.year || t.year <= 0) {
+        t.year = year;
+        changed = true;
+      }
+      if (!t.genre && genre) {
+        t.genre = genre;
+      }
+    };
+
+    patchObj(state.trackMap.get(trackId));
+    let inQueue = false;
+    for (const t of state.queue) {
+      if (t && t.id === trackId) {
+        patchObj(t);
+        inQueue = true;
+      }
+    }
+    if (Array.isArray(state.unshuffledQueue)) {
+      for (const t of state.unshuffledQueue) {
+        patchObj(t);
+      }
+    }
+    if (!changed) return;
+
+    const cur = currentTrack();
+    if (cur && cur.id === trackId) {
+      $('pb-artist').innerHTML = `${esc(cur.artist)}${yearTag(cur.year)}`;
+      $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(cur.artist)}</span>${cur.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(cur.album)}</span>` : ''}${yearTag(cur.year)}`;
+      if ($('fs-mini-artist')) $('fs-mini-artist').innerHTML = `${esc(cur.artist)}${yearTag(cur.year)}`;
+    }
+    if (inQueue) {
+      renderQueuePanel();
+    }
+  }
+
   function sendTrackEvent(trackId, kind, value = 1) {
     api('/api/web/event', {
       method: 'POST',
       body: JSON.stringify({ trackId, kind, value }),
-    }).catch(() => {});
+    })
+      .then((res) => {
+        if (kind === 'play' && res && res.track && res.track.id === trackId) {
+          applyTrackYearUpdate(trackId, res.track);
+        }
+      })
+      .catch(() => {});
   }
 
   function playListByIds(ids, startIndex = 0) {

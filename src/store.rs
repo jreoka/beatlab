@@ -3720,6 +3720,137 @@ impl Store {
         Ok(updates.len())
     }
 
+    /// Fills missing release years (and empty genres/moods) on an in-memory batch
+    /// from data already stored in SQLite — matching by track ID first, then
+    /// `albums_meta`, then twin tracks with the same artist & title or same
+    /// artist & album. All lookups hit indexed columns and never scan the table.
+    pub fn hydrate_track_metadata(&self, tracks: &mut [Track]) -> AppResult<usize> {
+        if !tracks
+            .iter()
+            .any(|t| t.year <= 0 || t.genre.trim().is_empty())
+        {
+            return Ok(0);
+        }
+        let conn = self.lock();
+        let mut by_id =
+            conn.prepare("SELECT genre, moods, year FROM tracks WHERE id = ?1")?;
+        let mut by_album_id =
+            conn.prepare("SELECT year, genre FROM albums_meta WHERE id = ?1")?;
+        let mut by_dz_album = conn.prepare(
+            "SELECT year, genre FROM albums_meta WHERE deezer_id = ?1 AND deezer_id != '' LIMIT 1",
+        )?;
+        let mut by_twin = conn.prepare(
+            "SELECT year, genre FROM tracks WHERE artist = ?1 AND title = ?2 AND year > 0 LIMIT 1",
+        )?;
+        let mut by_same_album = conn.prepare(
+            "SELECT year, genre FROM tracks WHERE album = ?1 AND artist = ?2 AND year > 0 LIMIT 1",
+        )?;
+
+        let mut updated = 0usize;
+        for t in tracks.iter_mut() {
+            if t.year > 0 && !t.genre.trim().is_empty() {
+                continue;
+            }
+            let before_year = t.year;
+            let before_genre_empty = t.genre.trim().is_empty();
+
+            if !t.id.is_empty() {
+                if let Some((genre, moods, year)) = by_id
+                    .query_row(params![&t.id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i32>(2)?,
+                        ))
+                    })
+                    .optional()?
+                {
+                    if t.year <= 0 && (1900..=2100).contains(&year) {
+                        t.year = year;
+                    }
+                    if t.genre.trim().is_empty() && !genre.trim().is_empty() {
+                        t.genre = genre;
+                    }
+                    if t.moods.trim().is_empty() && !moods.trim().is_empty() {
+                        t.moods = moods;
+                    }
+                }
+            }
+
+            if t.year <= 0 || t.genre.trim().is_empty() {
+                let alb_id = t.album_id();
+                if let Some((year, genre)) = by_album_id
+                    .query_row(params![&alb_id], |r| {
+                        Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .optional()?
+                {
+                    if t.year <= 0 && (1900..=2100).contains(&year) {
+                        t.year = year;
+                    }
+                    if t.genre.trim().is_empty() && !genre.trim().is_empty() {
+                        t.genre = genre;
+                    }
+                }
+            }
+
+            if t.year <= 0 || t.genre.trim().is_empty() {
+                if let Some(dz_aid) = t.deezer_album_id() {
+                    if let Some((year, genre)) = by_dz_album
+                        .query_row(params![&dz_aid], |r| {
+                            Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .optional()?
+                    {
+                        if t.year <= 0 && (1900..=2100).contains(&year) {
+                            t.year = year;
+                        }
+                        if t.genre.trim().is_empty() && !genre.trim().is_empty() {
+                            t.genre = genre;
+                        }
+                    }
+                }
+            }
+
+            if t.year <= 0 && !t.artist.trim().is_empty() && !t.title.trim().is_empty() {
+                if let Some((year, genre)) = by_twin
+                    .query_row(params![&t.artist, &t.title], |r| {
+                        Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .optional()?
+                {
+                    if (1900..=2100).contains(&year) {
+                        t.year = year;
+                    }
+                    if t.genre.trim().is_empty() && !genre.trim().is_empty() {
+                        t.genre = genre;
+                    }
+                }
+            }
+
+            if t.year <= 0 && !t.album.trim().is_empty() && !t.artist.trim().is_empty() {
+                if let Some((year, genre)) = by_same_album
+                    .query_row(params![&t.album, &t.artist], |r| {
+                        Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .optional()?
+                {
+                    if (1900..=2100).contains(&year) {
+                        t.year = year;
+                    }
+                    if t.genre.trim().is_empty() && !genre.trim().is_empty() {
+                        t.genre = genre;
+                    }
+                }
+            }
+
+            if t.year != before_year || (before_genre_empty && !t.genre.trim().is_empty()) {
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     pub fn star_track(&self, user_id: i64, track_id: &str) -> AppResult<()> {
         let now = Utc::now().timestamp();
         let conn = self.lock();
@@ -6713,6 +6844,64 @@ mod tests {
 
         assert_eq!(store.backfill_track_years().unwrap(), 1);
         assert_eq!(store.get_track("local:1").unwrap().unwrap().year, 1997);
+    }
+
+    #[test]
+    fn hydrate_track_metadata_restores_existing_id_album_and_twin_years() {
+        let store = Store::open_memory().unwrap();
+
+        // 1. Existing track already enriched in SQLite.
+        let mut stored = sample_track("dz:100", "Perfect Day", "Supercell", "Today Is A Beautiful Day");
+        stored.year = 2011;
+        stored.genre = "J-Pop".into();
+        store.upsert_tracks(&[stored]).unwrap();
+
+        // 2. Album metadata row with Deezer ID.
+        let mut alb = AlbumSummary::default();
+        alb.id = "al:dz-77-ziga".into();
+        alb.name = "ZIGAEXPERIENTIA".into();
+        alb.artist = "Supercell".into();
+        alb.deezer_id = "99999".into();
+        alb.year = 2015;
+        alb.genre = "Pop".into();
+        store.upsert_album_meta(&alb).unwrap();
+
+        // 3. Twin copy from another source with year populated.
+        let mut twin = sample_track("ytm:abc", "Empathy", "Asian Kung-Fu Generation", "Planet Folks");
+        twin.source = "ytm".into();
+        twin.year = 2021;
+        twin.genre = "J-Rock".into();
+        store.upsert_tracks(&[twin]).unwrap();
+
+        // Fresh radio batch arriving with year = 0 & genre = "".
+        let mut t_existing = sample_track("dz:100", "Perfect Day", "Supercell", "Today Is A Beautiful Day");
+        t_existing.year = 0;
+        t_existing.genre.clear();
+
+        let mut t_album = sample_track("dz:200", "My Dearest", "Supercell", "ZIGAEXPERIENTIA");
+        t_album.year = 0;
+        t_album.genre.clear();
+        t_album.meta = r#"{"deezer_album_id":99999}"#.into();
+
+        let mut t_twin = sample_track("dz:300", "Empathy", "Asian Kung-Fu Generation", "Empathy");
+        t_twin.year = 0;
+        t_twin.genre.clear();
+
+        let mut t_same_album = sample_track("dz:400", "Sayonara Memories", "Supercell", "Today Is A Beautiful Day");
+        t_same_album.year = 0;
+        t_same_album.genre.clear();
+
+        let mut batch = vec![t_existing, t_album, t_twin, t_same_album];
+        let count = store.hydrate_track_metadata(&mut batch).unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(batch[0].year, 2011);
+        assert_eq!(batch[0].genre, "J-Pop");
+        assert_eq!(batch[1].year, 2015);
+        assert_eq!(batch[1].genre, "Pop");
+        assert_eq!(batch[2].year, 2021);
+        assert_eq!(batch[2].genre, "J-Rock");
+        assert_eq!(batch[3].year, 2011);
+        assert_eq!(batch[3].genre, "J-Pop");
     }
 
     #[test]

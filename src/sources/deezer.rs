@@ -738,9 +738,18 @@ impl DeezerSource {
     /// year from each distinct album's Deezer metadata (and artist album search fallback for
     /// non-Deezer tracks), then recompute moods. Results are cached by `get_json`.
     pub async fn enrich_track_genres(&self, tracks: &mut [Track]) {
-        if self.is_blocked() {
+        self.enrich_track_genres_with_timeout(tracks, Duration::from_secs(5))
+            .await;
+    }
+
+    /// Bounded variant of `enrich_track_genres` used on interactive paths (radio / play)
+    /// where partial results must still be preserved and applied even if one upstream
+    /// album lookup is slow.
+    pub async fn enrich_track_genres_with_timeout(&self, tracks: &mut [Track], budget: Duration) {
+        if self.is_blocked() || tracks.is_empty() {
             return;
         }
+        let started = Instant::now();
         let mut album_ids: Vec<u64> = tracks
             .iter()
             .filter(|t| t.genre.trim().is_empty() || t.year <= 0)
@@ -766,35 +775,37 @@ impl DeezerSource {
         album_ids.truncate(24);
 
         if !album_ids.is_empty() {
-            let lookup = async {
-                let futs = album_ids.into_iter().map(|id| async move {
-                    let url = format!("https://api.deezer.com/album/{}", id);
-                    let info = self.get_json::<DzAlbumFull>(&url).await.map(|a| {
-                        let g = a.resolved_genre();
-                        let y = parse_year(&a.release_date);
-                        (g, y)
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining >= Duration::from_millis(100) {
+                let fetched = Arc::new(std::sync::Mutex::new(HashMap::<u64, (String, i32)>::new()));
+                let lookup = async {
+                    let futs = album_ids.into_iter().map(|id| {
+                        let fetched = fetched.clone();
+                        async move {
+                            let url = format!("https://api.deezer.com/album/{}", id);
+                            if let Some(a) = self.get_json::<DzAlbumFull>(&url).await {
+                                let info = (a.resolved_genre(), parse_year(&a.release_date));
+                                fetched
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(id, info.clone());
+                                let mut cache =
+                                    self.album_info_cache.lock().unwrap_or_else(|e| e.into_inner());
+                                if cache.len() >= DZ_ALBUM_INFO_CACHE_MAX {
+                                    cache.clear();
+                                }
+                                cache.insert(id, info);
+                            }
+                        }
                     });
-                    (id, info)
-                });
-                futures::future::join_all(futs).await
-            };
-            let fetched: Vec<(u64, (String, i32))> =
-                tokio::time::timeout(Duration::from_secs(5), lookup)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(id, info)| info.map(|v| (id, v)))
-                    .collect();
-            {
-                let mut cache = self.album_info_cache.lock().unwrap_or_else(|e| e.into_inner());
-                if cache.len() >= DZ_ALBUM_INFO_CACHE_MAX {
-                    cache.clear();
-                }
-                for (id, info) in &fetched {
-                    cache.insert(*id, info.clone());
-                }
+                    futures::future::join_all(futs).await;
+                };
+                let _ = tokio::time::timeout(remaining, lookup).await;
+                let completed = std::mem::take(
+                    &mut *fetched.lock().unwrap_or_else(|e| e.into_inner()),
+                );
+                by_album.extend(completed);
             }
-            by_album.extend(fetched);
         }
 
         if !by_album.is_empty() {
@@ -814,8 +825,9 @@ impl DeezerSource {
             }
         }
 
-        // Fallback for tracks (e.g. YTM / Soulseek or untagged singles) that still lack a genre:
-        // query Deezer's album search by primary artist name so `genre_id` on their albums fills it.
+        // Fallback for tracks (e.g. YTM / Soulseek or untagged singles) that still lack a genre
+        // or release year: query Deezer's album search by primary artist name so `genre_id` and
+        // exact album lookups fill them in.
         let mut missing_artists: Vec<String> = Vec::new();
         let mut seen_artists: HashSet<String> = HashSet::new();
         for t in tracks.iter() {
@@ -834,7 +846,10 @@ impl DeezerSource {
             }
         }
 
-        if !missing_artists.is_empty() {
+        if !missing_artists.is_empty() && budget.saturating_sub(started.elapsed()) >= Duration::from_millis(200) {
+            let remaining = budget
+                .saturating_sub(started.elapsed())
+                .min(Duration::from_secs(4));
             let artist_lookup = async {
                 let futs = missing_artists.into_iter().map(|art| async move {
                     let albs = self.search_albums(&art, 10).await;
@@ -843,14 +858,19 @@ impl DeezerSource {
                 futures::future::join_all(futs).await
             };
             let by_artist: HashMap<String, Vec<AlbumSummary>> =
-                tokio::time::timeout(Duration::from_secs(4), artist_lookup)
+                tokio::time::timeout(remaining, artist_lookup)
                     .await
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|(_, albs)| !albs.is_empty())
                     .collect();
 
-            for t in tracks.iter_mut() {
+            // Deezer's `/search/album` omits `release_date`, so collect exact album matches
+            // that still need a release year and resolve them via `/album/{id}` (cached).
+            let mut extra_album_ids: Vec<u64> = Vec::new();
+            let mut track_exact_dz_album: Vec<Option<u64>> = vec![None; tracks.len()];
+
+            for (idx, t) in tracks.iter_mut().enumerate() {
                 let needs_genre = t.genre.trim().is_empty();
                 let needs_year = t.year <= 0;
                 if !needs_genre && !needs_year {
@@ -880,6 +900,14 @@ impl DeezerSource {
                     if t.year <= 0 && alb.year > 0 {
                         t.year = alb.year;
                     }
+                    if t.year <= 0 {
+                        if let Ok(dz_id) = alb.deezer_id.parse::<u64>() {
+                            if dz_id > 0 {
+                                track_exact_dz_album[idx] = Some(dz_id);
+                                extra_album_ids.push(dz_id);
+                            }
+                        }
+                    }
                 }
                 if t.genre.trim().is_empty() {
                     let mut freq: HashMap<&str, usize> = HashMap::new();
@@ -900,6 +928,141 @@ impl DeezerSource {
                         .find_map(|a| a.artist_id.strip_prefix("ar:dz:"))
                     {
                         t.set_deezer_artist_id(dz_aid);
+                    }
+                }
+            }
+
+            if !extra_album_ids.is_empty() {
+                extra_album_ids.sort_unstable();
+                extra_album_ids.dedup();
+                let mut resolved_extra: HashMap<u64, (String, i32)> = HashMap::new();
+                {
+                    let cache = self.album_info_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    extra_album_ids.retain(|id| match cache.get(id) {
+                        Some(info) => {
+                            resolved_extra.insert(*id, info.clone());
+                            false
+                        }
+                        None => true,
+                    });
+                }
+                extra_album_ids.truncate(8);
+                let rem = budget.saturating_sub(started.elapsed());
+                if !extra_album_ids.is_empty() && rem >= Duration::from_millis(150) {
+                    let fetched = Arc::new(std::sync::Mutex::new(HashMap::<u64, (String, i32)>::new()));
+                    let lookup = async {
+                        let futs = extra_album_ids.into_iter().map(|id| {
+                            let fetched = fetched.clone();
+                            async move {
+                                let url = format!("https://api.deezer.com/album/{}", id);
+                                if let Some(a) = self.get_json::<DzAlbumFull>(&url).await {
+                                    let info = (a.resolved_genre(), parse_year(&a.release_date));
+                                    fetched
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(id, info.clone());
+                                    let mut cache = self
+                                        .album_info_cache
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if cache.len() >= DZ_ALBUM_INFO_CACHE_MAX {
+                                        cache.clear();
+                                    }
+                                    cache.insert(id, info);
+                                }
+                            }
+                        });
+                        futures::future::join_all(futs).await;
+                    };
+                    let _ = tokio::time::timeout(rem, lookup).await;
+                    let completed = std::mem::take(
+                        &mut *fetched.lock().unwrap_or_else(|e| e.into_inner()),
+                    );
+                    resolved_extra.extend(completed);
+                }
+                for (idx, t) in tracks.iter_mut().enumerate() {
+                    if let Some(dz_id) = track_exact_dz_album[idx] {
+                        if let Some((genre, year)) = resolved_extra.get(&dz_id) {
+                            if t.genre.trim().is_empty() && !genre.is_empty() {
+                                t.genre = genre.clone();
+                            }
+                            if t.year <= 0 && *year > 0 {
+                                t.year = *year;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Single-track / tiny-batch fallback for non-Deezer tracks (e.g. YTM radio items
+        // that omitted both album and year): locate the matching Deezer track by song_key
+        // and fetch its album's release date.
+        if tracks.len() <= 3 && budget.saturating_sub(started.elapsed()) >= Duration::from_millis(250) {
+            for t in tracks.iter_mut() {
+                if t.year > 0 || t.deezer_album_id().is_some() {
+                    continue;
+                }
+                let rem = budget.saturating_sub(started.elapsed());
+                if rem < Duration::from_millis(250) {
+                    break;
+                }
+                let pa = crate::models::primary_artist(&t.artist);
+                let clean_title = crate::models::strip_release_tags(&t.title);
+                let q = format!("{} {}", pa, clean_title).trim().to_string();
+                if q.is_empty() {
+                    continue;
+                }
+                let want_key = t.song_key();
+                let candidates = tokio::time::timeout(rem, self.search_tracks(&q, 5))
+                    .await
+                    .unwrap_or_default();
+                let matched_album_id = candidates
+                    .into_iter()
+                    .find(|c| c.song_key() == want_key)
+                    .and_then(|c| c.deezer_album_id())
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|&id| id > 0);
+                if let Some(dz_id) = matched_album_id {
+                    let cached = self
+                        .album_info_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&dz_id)
+                        .cloned();
+                    let info = if let Some(hit) = cached {
+                        Some(hit)
+                    } else {
+                        let rem2 = budget.saturating_sub(started.elapsed());
+                        if rem2 >= Duration::from_millis(150) {
+                            let url = format!("https://api.deezer.com/album/{}", dz_id);
+                            tokio::time::timeout(rem2, self.get_json::<DzAlbumFull>(&url))
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|a| {
+                                    let info = (a.resolved_genre(), parse_year(&a.release_date));
+                                    let mut cache = self
+                                        .album_info_cache
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if cache.len() >= DZ_ALBUM_INFO_CACHE_MAX {
+                                        cache.clear();
+                                    }
+                                    cache.insert(dz_id, info.clone());
+                                    info
+                                })
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((genre, year)) = info {
+                        if t.genre.trim().is_empty() && !genre.is_empty() {
+                            t.genre = genre;
+                        }
+                        if t.year <= 0 && year > 0 {
+                            t.year = year;
+                        }
                     }
                 }
             }
@@ -1715,5 +1878,32 @@ mod tests {
         assert_eq!(parsed.data[0].id, 1140167251);
         assert_eq!(parsed.data[0].release_date, "2026-11-18");
         assert!(parsed.next.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enrich_track_genres_with_timeout_fills_year_from_cached_album_info() {
+        let dz = DeezerSource::new();
+        {
+            let mut cache = dz.album_info_cache.lock().unwrap();
+            cache.insert(424242, ("J-Pop".to_string(), 2011));
+        }
+        let mut tracks = vec![Track {
+            id: "dz:9001".into(),
+            source: "deezer".into(),
+            title: "Perfect Day".into(),
+            artist: "Supercell".into(),
+            album: "Today Is A Beautiful Day".into(),
+            year: 0,
+            meta: r#"{"deezer_track_id":9001,"deezer_album_id":424242,"deezer_artist_id":55}"#
+                .into(),
+            ..Default::default()
+        }];
+
+        dz.enrich_track_genres_with_timeout(&mut tracks, Duration::from_secs(2))
+            .await;
+
+        assert_eq!(tracks[0].year, 2011);
+        assert_eq!(tracks[0].genre, "J-Pop");
+        assert!(!tracks[0].moods.is_empty());
     }
 }

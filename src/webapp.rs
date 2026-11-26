@@ -3562,6 +3562,7 @@ pub async fn search(
 
     let mut combined = [all_tracks, raw_tracks_extra].concat();
     crate::sources::disambiguate_batch_tracks(&mut combined, &dz_artists);
+    let _ = state.store.hydrate_track_metadata(&mut combined);
     if !dz_albums.is_empty() {
         for t in &mut combined {
             if !t.genre.trim().is_empty() && t.year > 0 {
@@ -5236,8 +5237,54 @@ pub async fn record_event(
     state
         .taste
         .record_event(user.id, &req.track_id, &req.kind, req.value);
-    if let Ok(Some(t)) = state.store.get_track(&req.track_id) {
-        if t.genre.trim().is_empty() || t.year <= 0 {
+    let mut play_patch: Option<Value> = None;
+    if let Ok(Some(mut t)) = state.store.get_track(&req.track_id) {
+        let missing_meta = t.genre.trim().is_empty() || t.year <= 0;
+        if missing_meta {
+            let _ = state
+                .store
+                .hydrate_track_metadata(std::slice::from_mut(&mut t));
+        }
+        if req.kind == "play" {
+            if t.year <= 0 {
+                state
+                    .sources
+                    .deezer
+                    .enrich_track_genres_with_timeout(
+                        std::slice::from_mut(&mut t),
+                        std::time::Duration::from_millis(1800),
+                    )
+                    .await;
+            }
+            if missing_meta && (t.year > 0 || !t.genre.trim().is_empty()) {
+                let store = state.store.clone();
+                let to_save = vec![t.clone()];
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = store.upsert_tracks(&to_save);
+                })
+                .await;
+            } else if t.genre.trim().is_empty() || t.year <= 0 {
+                let dz = state.sources.deezer.clone();
+                let store = state.store.clone();
+                let mut batch = vec![t.clone()];
+                tokio::spawn(async move {
+                    dz.enrich_track_genres(&mut batch).await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = store.upsert_tracks(&batch);
+                    })
+                    .await;
+                });
+            }
+            if t.year > 0 {
+                play_patch = Some(json!({
+                    "id": t.id,
+                    "year": t.year,
+                    "genre": t.genre,
+                }));
+            }
+            let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+            np.insert(user.id, (t, Utc::now().timestamp(), user.username));
+        } else if t.genre.trim().is_empty() || t.year <= 0 {
             let dz = state.sources.deezer.clone();
             let store = state.store.clone();
             let mut batch = vec![t.clone()];
@@ -5249,12 +5296,12 @@ pub async fn record_event(
                 .await;
             });
         }
-        if req.kind == "play" {
-            let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
-            np.insert(user.id, (t, Utc::now().timestamp(), user.username));
-        }
     }
-    json_res(json!({ "ok": true }))
+    if let Some(track) = play_patch {
+        json_res(json!({ "ok": true, "track": track }))
+    } else {
+        json_res(json!({ "ok": true }))
+    }
 }
 
 pub async fn mark_not_interested(
@@ -5403,7 +5450,7 @@ pub async fn radio(
     let recent = parse_recent_param(q.recent.as_deref());
     let mode = crate::taste::RadioMode::parse(q.mode.as_deref());
 
-    let next = if let Some(pid) = q.playlist.as_deref().filter(|s| !s.trim().is_empty()) {
+    let mut next = if let Some(pid) = q.playlist.as_deref().filter(|s| !s.trim().is_empty()) {
         let Some(pl) = state.store.get_playlist(pid).ok().flatten() else {
             return err_res(StatusCode::NOT_FOUND, "Playlist not found");
         };
@@ -5431,6 +5478,40 @@ pub async fn radio(
             )
             .await
     };
+    // Hydrate from SQLite first, then enrich any fresh radio tracks (e.g. Deezer
+    // artist radio returns tracks without `release_date`) within a tight time
+    // budget so Next Up and skipped tracks display their release year immediately.
+    let _ = state.store.hydrate_track_metadata(&mut next);
+    if next.iter().any(|t| t.year <= 0 || t.genre.trim().is_empty()) {
+        state
+            .sources
+            .deezer
+            .enrich_track_genres_with_timeout(&mut next, std::time::Duration::from_millis(2500))
+            .await;
+        let to_save = next.clone();
+        let store = state.store.clone();
+        let remaining_missing: Vec<Track> = next
+            .iter()
+            .filter(|t| t.year <= 0 || t.genre.trim().is_empty())
+            .cloned()
+            .collect();
+        let dz = state.sources.deezer.clone();
+        tokio::spawn(async move {
+            let store_first = store.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = store_first.upsert_tracks(&to_save);
+            })
+            .await;
+            if !remaining_missing.is_empty() {
+                let mut rest = remaining_missing;
+                dz.enrich_track_genres(&mut rest).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = store.upsert_tracks(&rest);
+                })
+                .await;
+            }
+        });
+    }
     json_res(json!({
         "tracks": to_web_tracks(&state, user.id, &next)
     }))
@@ -7993,6 +8074,95 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn record_event_play_hydrates_and_returns_track_year() {
+        use crate::engine::StreamEngine;
+        use crate::sources::{
+            archive::ArchiveSource, deezer::DeezerSource, local::LocalSource,
+            soulseek::SoulseekSource, ytm::YtmSource, SourceRegistry,
+        };
+        use crate::store::Store;
+        use axum::body::to_bytes;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "beatlab_play_year_patch_test_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open_memory().unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.clone()),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(crate::taste::TasteEngine::new(store.clone(), sources.clone()));
+
+        let mut alb = AlbumSummary::default();
+        alb.id = "al:dz-55-today-is-a-beautiful-day".into();
+        alb.name = "Today Is A Beautiful Day".into();
+        alb.artist = "Supercell".into();
+        alb.deezer_id = "424242".into();
+        alb.year = 2011;
+        alb.genre = "J-Pop".into();
+        store.upsert_album_meta(&alb).unwrap();
+
+        let track = Track {
+            id: "dz:9001".into(),
+            source: "deezer".into(),
+            title: "Perfect Day".into(),
+            artist: "Supercell".into(),
+            album: "Today Is A Beautiful Day".into(),
+            genre: String::new(),
+            moods: String::new(),
+            year: 0,
+            duration: 286,
+            bitrate: 256,
+            format: "m4a".into(),
+            meta: r#"{"deezer_track_id":9001,"deezer_album_id":424242,"deezer_artist_id":55}"#
+                .into(),
+            ..Default::default()
+        };
+        store.upsert_tracks(&[track]).unwrap();
+
+        let (u, _) = store.authenticate_or_create_user("yearuser", "pw123").unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            llm: None,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+        };
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
+
+        let resp = record_event(
+            State(state),
+            hdrs,
+            Json(EventReq {
+                track_id: "dz:9001".into(),
+                kind: "play".into(),
+                value: 1.0,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 64).await.unwrap()).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["track"]["id"], "dz:9001");
+        assert_eq!(body["track"]["year"], 2011);
+        assert_eq!(store.get_track("dz:9001").unwrap().unwrap().year, 2011);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
