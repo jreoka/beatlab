@@ -7439,9 +7439,6 @@ body:not(.audio-playing) .qp-wave span { animation-play-state: paused; }
   color: var(--fs-muted);
   white-space: nowrap;
 }
-.fs-top-share {
-  visibility: hidden;
-}
 .fs-mini-head,
 .fs-mobile-controls,
 .fs-mobile-tabs {
@@ -7846,10 +7843,6 @@ body:not(.audio-playing) .fs-player .fs-cover {
     width: 26px;
     height: 26px;
   }
-  .fs-top-share {
-    visibility: visible;
-  }
-  .fs-share-btn,
   .fs-topbar .quality-badge {
     display: none !important;
   }
@@ -8243,7 +8236,6 @@ html[data-theme="light"] .stats-portrait-badge {
   display: inline-grid;
   place-items: center;
 }
-.fs-top-lobby.active { color: var(--accent); }
 .fs-top-side { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .fs-top-spacer { visibility: hidden; pointer-events: none; }
 .community-intro-actions { display: flex; gap: 10px; flex-wrap: wrap; }

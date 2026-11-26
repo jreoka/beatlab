@@ -1,5 +1,5 @@
 use crate::models::{
-    primary_artist, slug, AlbumSummary, ArtistSummary, Mood, Track, UserTrackStats,
+    primary_artist, slug, AlbumSummary, ArtistSummary, Mood, Playlist, Track, UserTrackStats,
 };
 use crate::sources::{
     dedup_tracks_prefer_quality, merge_album_tracks, merge_track_pair, SourceRegistry,
@@ -876,12 +876,30 @@ impl ExpandedSeedBatch {
     }
 }
 
+/// Bundled recommendations and user lookup maps computed in a single pass for `/api/web/home`,
+/// avoiding repeated `user_profile`, `candidate_tracks_for_user`, and per-track status queries.
+pub struct HomeRecommendations {
+    pub quick_picks: Vec<Track>,
+    pub related_tracks: Vec<Track>,
+    pub recommended_artists: Vec<ArtistSummary>,
+    pub starred: HashSet<String>,
+    pub stats: HashMap<String, UserTrackStats>,
+    pub ratings: HashMap<String, i32>,
+    pub saved_albums: HashSet<String>,
+    pub followed_artists: HashSet<String>,
+    pub hidden_ids: HashSet<String>,
+    pub hidden_keys: HashSet<String>,
+}
+
 #[derive(Clone)]
 pub struct TasteEngine {
     pub store: Store,
     pub sources: SourceRegistry,
     pub neural: std::sync::Arc<crate::transformer::TransformerEngine>,
     expanding_users: std::sync::Arc<std::sync::Mutex<HashSet<i64>>>,
+    rebuilding_auto_users: std::sync::Arc<std::sync::Mutex<HashSet<i64>>>,
+    rec_artists_cache:
+        std::sync::Arc<std::sync::Mutex<HashMap<i64, (std::time::Instant, Vec<ArtistSummary>)>>>,
     slsk_checked: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>,
 }
 
@@ -893,6 +911,8 @@ impl TasteEngine {
             sources,
             neural,
             expanding_users: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+            rebuilding_auto_users: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+            rec_artists_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             slsk_checked: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -959,6 +979,16 @@ impl TasteEngine {
         }
     }
 
+    fn has_generic_auto_playlists(&self, user_id: i64) -> bool {
+        self.store
+            .list_playlists(user_id, false)
+            .map(|pls| {
+                pls.iter()
+                    .any(|p| p.is_auto && !p.kind.starts_with("mixed_for_you:"))
+            })
+            .unwrap_or(false)
+    }
+
     fn auto_playlists_need_refresh(&self, user_id: i64, max_age_secs: i64) -> bool {
         if user_id <= 0 {
             return false;
@@ -974,24 +1004,59 @@ impl TasteEngine {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
         let now = Utc::now().timestamp();
-        let has_auto = self
-            .store
-            .list_playlists(user_id, false)
-            .map(|pls| pls.iter().any(|p| p.is_auto))
-            .unwrap_or(false);
+        let has_auto = self.has_generic_auto_playlists(user_id);
 
         !has_auto || dirty || (now - last_rebuilt) >= max_age_secs
     }
 
     /// Async refresh that expands taste-related artists & radio candidates from external sources
     /// (with a bounded latency budget) before rebuilding auto-playlists.
+    /// Listeners who already have auto-playlists keep seeing them immediately while the refresh
+    /// runs in the background; only a first build blocks the request path.
     pub async fn refresh_auto_playlists_if_stale_async(&self, user_id: i64, max_age_secs: i64) {
-        if self.auto_playlists_need_refresh(user_id, max_age_secs) {
-            self.rebuild_auto_playlists_with_budget(
-                user_id,
-                std::time::Duration::from_millis(3200),
-            )
+        self.refresh_auto_playlists_impl(user_id, max_age_secs, false)
             .await;
+    }
+
+    /// Same as `refresh_auto_playlists_if_stale_async`, but always waits for the rebuild.
+    /// Used by the background curator so users are refreshed one at a time.
+    async fn refresh_auto_playlists_blocking(&self, user_id: i64, max_age_secs: i64) {
+        self.refresh_auto_playlists_impl(user_id, max_age_secs, true)
+            .await;
+    }
+
+    async fn refresh_auto_playlists_impl(&self, user_id: i64, max_age_secs: i64, wait: bool) {
+        if !self.auto_playlists_need_refresh(user_id, max_age_secs) {
+            return;
+        }
+        {
+            let mut active = self
+                .rebuilding_auto_users
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !active.insert(user_id) {
+                return;
+            }
+        }
+        let guard = ExpandSlotGuard {
+            set: self.rebuilding_auto_users.clone(),
+            user_id,
+        };
+        let has_auto = self.has_generic_auto_playlists(user_id);
+        let engine = self.clone();
+        let build = async move {
+            let _guard = guard;
+            engine
+                .rebuild_auto_playlists_with_budget(
+                    user_id,
+                    std::time::Duration::from_millis(3200),
+                )
+                .await;
+        };
+        if has_auto && !wait {
+            tokio::spawn(build);
+        } else {
+            build.await;
         }
     }
 
@@ -1252,9 +1317,23 @@ impl TasteEngine {
             return vec![];
         }
         let sctx = self.build_scoring_context(user_id);
+        self.for_you_tracks_with_ctx(user_id, limit, &candidates, &sctx)
+    }
+
+    fn for_you_tracks_with_ctx(
+        &self,
+        user_id: i64,
+        limit: usize,
+        candidates: &[Track],
+        sctx: &ScoringContext,
+    ) -> Vec<Track> {
+        if candidates.is_empty() {
+            return vec![];
+        }
         let filtered: Vec<Track> = candidates
-            .into_iter()
+            .iter()
             .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
+            .cloned()
             .collect();
         let session_ctx: Vec<Track> = if user_id > 0 {
             self.store
@@ -1272,7 +1351,7 @@ impl TasteEngine {
         let (n_scores, n_w) = if has_user_taste {
             (
                 self.neural_scores(user_id, &session_ctx, None, &[], &[], &filtered),
-                self.neural_blend_weight(0.85, &sctx),
+                self.neural_blend_weight(0.85, sctx),
             )
         } else {
             (Vec::new(), 0.0)
@@ -1459,6 +1538,19 @@ impl TasteEngine {
             return vec![];
         }
         let sctx = self.build_scoring_context(user_id);
+        self.related_tracks_with_ctx(user_id, limit, &candidates, &sctx)
+    }
+
+    fn related_tracks_with_ctx(
+        &self,
+        user_id: i64,
+        limit: usize,
+        candidates: &[Track],
+        sctx: &ScoringContext,
+    ) -> Vec<Track> {
+        if limit == 0 || candidates.is_empty() {
+            return vec![];
+        }
         let heard_keys: HashSet<String> = candidates
             .iter()
             .filter(|t| {
@@ -1472,7 +1564,7 @@ impl TasteEngine {
             || !sctx.prof.related_artist_affinity.is_empty();
 
         let mut scored: Vec<(f64, Track)> = candidates
-            .into_iter()
+            .iter()
             .filter(|t| !is_strongly_disliked(t, &sctx.prof, &sctx.stats))
             .filter_map(|t| {
                 let key = t.song_key();
@@ -1484,14 +1576,14 @@ impl TasteEngine {
                 if heard || known_fav {
                     return None;
                 }
-                let fctx = build_track_affinities(&t, &sctx.prof);
-                let align = compute_taste_alignment(&t, &sctx.prof, &fctx);
+                let fctx = build_track_affinities(t, &sctx.prof);
+                let align = compute_taste_alignment(t, &sctx.prof, &fctx);
                 let rel_bonus = align.rel_t * 3.0 + align.rel_a * 2.2;
                 if has_rel_graph && rel_bonus <= 0.0 && fctx.genre_affinity <= 0.0 {
                     return None;
                 }
-                let core = score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Discover);
-                Some((core + rel_bonus, t))
+                let core = score_track_core(t, &sctx.prof, &sctx.stats, ScoreMode::Discover);
+                Some((core + rel_bonus, t.clone()))
             })
             .collect();
 
@@ -1509,7 +1601,117 @@ impl TasteEngine {
             return vec![];
         }
         let sctx = self.build_scoring_context(user_id);
-        let followed = self.store.followed_artist_ids(user_id).unwrap_or_default();
+        self.recommended_artists_with_ctx(user_id, limit, &sctx)
+    }
+
+    /// Cached variant of `recommended_artists_for_user` for hot pages (Home, Explore) so
+    /// switching tabs doesn't re-scan 8,000 tracks and score every catalog artist with the Transformer.
+    pub fn recommended_artists_for_user_cached(
+        &self,
+        user_id: i64,
+        limit: usize,
+    ) -> Vec<ArtistSummary> {
+        self.recommended_artists_cached_inner(user_id, limit, None)
+    }
+
+    fn recommended_artists_cached_inner(
+        &self,
+        user_id: i64,
+        limit: usize,
+        sctx_opt: Option<&ScoringContext>,
+    ) -> Vec<ArtistSummary> {
+        if limit == 0 {
+            return vec![];
+        }
+        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        if user_id > 0 {
+            let cached = {
+                let guard = self
+                    .rec_artists_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard
+                    .get(&user_id)
+                    .filter(|(ts, _)| ts.elapsed() < TTL)
+                    .map(|(_, list)| list.clone())
+            };
+            if let Some(list) = cached {
+                let followed_owned;
+                let followed = match sctx_opt {
+                    Some(s) => &s.prof.followed_artists,
+                    None => {
+                        followed_owned = self.store.followed_artist_ids(user_id).unwrap_or_default();
+                        &followed_owned
+                    }
+                };
+                return list
+                    .into_iter()
+                    .filter(|a| !followed.contains(&a.id))
+                    .take(limit)
+                    .collect();
+            }
+        }
+        let owned_sctx;
+        let sctx = match sctx_opt {
+            Some(s) => s,
+            None => {
+                owned_sctx = self.build_scoring_context(user_id);
+                &owned_sctx
+            }
+        };
+        let compute_limit = limit.max(24);
+        let full = self.recommended_artists_with_ctx(user_id, compute_limit, sctx);
+        if user_id > 0 && !full.is_empty() {
+            let mut guard = self
+                .rec_artists_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.len() > 256 {
+                guard.retain(|_, (ts, _)| ts.elapsed() < TTL);
+            }
+            guard.insert(user_id, (std::time::Instant::now(), full.clone()));
+        }
+        full.into_iter().take(limit).collect()
+    }
+
+    /// Computes Home's personalized sections in a single pass with one `ScoringContext`
+    /// and one candidate-track query.
+    pub fn build_home_recommendations(&self, user_id: i64) -> HomeRecommendations {
+        let sctx = self.build_scoring_context(user_id);
+        let candidates = self
+            .store
+            .candidate_tracks_for_user(user_id, 1800)
+            .unwrap_or_default();
+        let quick_pool = self.for_you_tracks_with_ctx(user_id, 36 * 3, &candidates, &sctx);
+        let quick_picks = dedup_and_interleave(quick_pool, 36, 1);
+        let rel_cands = &candidates[..candidates.len().min(900)];
+        let related_tracks = self.related_tracks_with_ctx(user_id, 12, rel_cands, &sctx);
+        let recommended_artists =
+            self.recommended_artists_cached_inner(user_id, 12, Some(&sctx));
+        HomeRecommendations {
+            quick_picks,
+            related_tracks,
+            recommended_artists,
+            starred: sctx.prof.starred,
+            stats: sctx.stats,
+            ratings: sctx.prof.ratings,
+            saved_albums: sctx.prof.saved_albums,
+            followed_artists: sctx.prof.followed_artists,
+            hidden_ids: sctx.prof.hidden_ids,
+            hidden_keys: sctx.prof.hidden_keys,
+        }
+    }
+
+    fn recommended_artists_with_ctx(
+        &self,
+        user_id: i64,
+        limit: usize,
+        sctx: &ScoringContext,
+    ) -> Vec<ArtistSummary> {
+        if limit == 0 {
+            return vec![];
+        }
+        let followed = &sctx.prof.followed_artists;
         let summaries = self.store.build_artist_summaries().unwrap_or_default();
         if summaries.is_empty() {
             return vec![];
@@ -1581,7 +1783,7 @@ impl TasteEngine {
         } else {
             Vec::new()
         };
-        let n_w = self.neural_blend_weight(0.75, &sctx);
+        let n_w = self.neural_blend_weight(0.75, sctx);
 
         let mut scored: Vec<(f64, ArtistSummary)> = prefiltered
             .into_iter()
@@ -2276,8 +2478,30 @@ impl TasteEngine {
         let Ok(playlists) = self.store.list_playlists(user_id, false) else {
             return Vec::new();
         };
-        let mut mixes: Vec<_> = playlists
-            .into_iter()
+        let llm_exp = crate::llm::LlmCurator::load_experience(&self.store, user_id);
+        let (hidden_ids, hidden_keys) = self.store.hidden_track_sets(user_id).unwrap_or_default();
+        self.mixed_for_you_cards_with_data(
+            user_id,
+            &playlists,
+            llm_exp.as_ref(),
+            &hidden_ids,
+            &hidden_keys,
+        )
+    }
+
+    pub fn mixed_for_you_cards_with_data(
+        &self,
+        user_id: i64,
+        playlists: &[Playlist],
+        llm_exp: Option<&crate::llm::DailyLlmExperience>,
+        hidden_ids: &HashSet<String>,
+        hidden_keys: &HashSet<String>,
+    ) -> Vec<MixedForYouCard> {
+        if user_id <= 0 {
+            return Vec::new();
+        }
+        let mut mixes: Vec<&Playlist> = playlists
+            .iter()
             .filter(|p| p.kind.starts_with("mixed_for_you:"))
             .collect();
         mixes.sort_by_key(|p| {
@@ -2289,7 +2513,6 @@ impl TasteEngine {
             }
         });
 
-        let llm_exp = crate::llm::LlmCurator::load_experience(&self.store, user_id);
         let mut cards = Vec::with_capacity(mixes.len());
         for p in mixes {
             let mut parts = p.kind.split(':');
@@ -2300,7 +2523,7 @@ impl TasteEngine {
             let part = parts.next().unwrap_or("");
             let is_super = part == "supermix";
             let llm_spec = if is_llm {
-                llm_exp.as_ref().and_then(|e| e.find_daily_mix(part))
+                llm_exp.and_then(|e| e.find_daily_mix(part))
             } else {
                 None
             };
@@ -2310,10 +2533,18 @@ impl TasteEngine {
             } else {
                 (default_c1.to_string(), default_c2.to_string())
             };
-            let tracks = self.filter_hidden_tracks_for_user(
-                user_id,
-                self.store.playlist_tracks(&p.id).unwrap_or_default(),
-            );
+            let raw_tracks = self.store.playlist_tracks(&p.id).unwrap_or_default();
+            let tracks = if hidden_ids.is_empty() && hidden_keys.is_empty() {
+                raw_tracks
+            } else {
+                raw_tracks
+                    .into_iter()
+                    .filter(|t| {
+                        !hidden_ids.contains(&t.id)
+                            && (hidden_keys.is_empty() || !hidden_keys.contains(&t.song_key()))
+                    })
+                    .collect()
+            };
 
             let mut covers: Vec<String> = Vec::new();
             for t in &tracks {
@@ -2375,7 +2606,7 @@ impl TasteEngine {
             };
 
             cards.push(MixedForYouCard {
-                id: p.id,
+                id: p.id.clone(),
                 title,
                 art_title,
                 number: if is_super {
@@ -2685,7 +2916,7 @@ impl TasteEngine {
                 // Refresh personalized mixes first: rebuilding the generic auto
                 // mixes clears the shared "taste dirty" flag.
                 self.refresh_mixed_for_you_blocking(uid).await;
-                self.refresh_auto_playlists_if_stale_async(uid, 900).await;
+                self.refresh_auto_playlists_blocking(uid, 900).await;
             }
         }
 

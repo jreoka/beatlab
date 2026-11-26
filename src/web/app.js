@@ -214,6 +214,7 @@
     searchLoadingUi: false,
     viewReqToken: 0,
     viewAbortController: null,
+    homeCache: null,
     libTab: 'playlists',
     statsRange: 'all',
     statsMetric: 'streams',
@@ -1611,6 +1612,7 @@
     audio.load();
 
     state.playlists = [];
+    state.homeCache = null;
     state.trackMap.clear();
     state.queue = [];
     state.unshuffledQueue = null;
@@ -2110,6 +2112,7 @@
           ptr.style.opacity = '1';
           if (ptrText) ptrText.textContent = 'Refreshing...';
           try {
+            state.homeCache = null;
             await renderCurrentHash();
           } finally {
             setTimeout(() => {
@@ -2855,152 +2858,188 @@
     </section>`;
   }
 
+  const HOME_CACHE_FRESH_MS = 15_000;
+  const HOME_CACHE_MAX_MS = 5 * 60 * 1000;
+
+  function renderHomePayload(d, reqToken, signal, { preserveScroll = false } = {}) {
+    const quickPicks = cacheTracks(d.quickPicks || []).slice(0, QP_PER_PAGE * QP_MAX_PAGES);
+    const newReleases = d.newReleases || [];
+    const trending = cacheTracks(d.trending || []);
+    const recent = cacheTracks(d.recent || []);
+    const relatedTracks = cacheTracks(d.relatedTracks || []);
+    const mixes = d.madeForYou || [];
+    const mixedForYou = d.mixedForYou || [];
+    const homeCategories = d.homeCategories || [];
+    const albums = d.albums || [];
+    const artists = d.artists || [];
+    const recommendedArtists = d.recommendedArtists || [];
+    const moods = d.moods || [];
+    const llm = d.llm || null;
+    const sec = (llm && llm.sections) || {};
+    const secTitle = (key, fallback) => (sec[key] && String(sec[key]).trim()) || fallback;
+    if (llm && Array.isArray(llm.searchPrompts) && llm.searchPrompts.length) {
+      state.llmSearchPrompts = llm.searchPrompts;
+    }
+
+    const greetingHeading = resolveHomeGreeting(llm);
+    const hasHomeTagline = Boolean(llm && llm.homeTagline && String(llm.homeTagline).trim());
+    let html = `<h1 class="page-greeting${hasHomeTagline ? ' has-edition' : ''}">${esc(greetingHeading)}</h1>`;
+    if (hasHomeTagline) {
+      html += `<div class="daily-edition-note">
+        <span class="daily-edition-tagline">${esc(llm.homeTagline)}</span>
+      </div>`;
+    }
+
+    if (quickPicks.length > 0) {
+      html += quickPicksSectionHtml(quickPicks, secTitle('quickPicks', 'Quick Picks'));
+    }
+
+    // New releases from artists the user listens to sit right under Quick Picks.
+    const newReleasesTitle = secTitle('newReleases', 'New Releases');
+    html += `<div id="new-releases-slot">${newReleasesSectionHtml(newReleases, newReleasesTitle)}</div>`;
+
+    if (mixedForYou.length > 0) {
+      html += `<section class="section">
+        <div class="section-head">
+          <h2>${esc(secTitle('mixedForYou', 'Mixed for you'))}</h2>
+        </div>
+        <div class="mixed-for-you-grid rail">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
+      </section>`;
+    }
+
+    if (mixes.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('madeForYou', 'Made For You'))}</h2></div>
+        <div class="card-grid rail">${mixes.map(renderPlaylistCard).join('')}</div>
+      </section>`;
+    }
+
+    for (const cat of homeCategories) {
+      const catMixes = Array.isArray(cat.mixes) ? cat.mixes : [];
+      if (!catMixes.length) continue;
+      html += `<section class="section llm-explore-section">
+        <div class="section-head">
+          <div class="llm-section-title-group">
+            ${cat.kicker ? `<div class="llm-cat-kicker">${esc(cat.kicker)}</div>` : ''}
+            <h2>${esc(cat.title)}</h2>
+            ${cat.subtitle ? `<p class="llm-cat-sub">${esc(cat.subtitle)}</p>` : ''}
+          </div>
+          <button class="text-btn" onclick="App.navigate('explore')">See all</button>
+        </div>
+        <div class="explore-mix-grid">${catMixes.map(renderExploreMixCard).join('')}</div>
+      </section>`;
+    }
+
+    if (recent.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('recent', 'Recently Played'))}</h2></div>
+        <div class="card-grid rail">${recent.slice(0, 8).map(renderTrackCard).join('')}</div>
+      </section>`;
+    }
+
+    if (relatedTracks.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('relatedTracks', 'Related Tracks For You'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
+        <div class="track-table">${renderTrackRows(relatedTracks.slice(0, 10), relatedTracks)}</div>
+      </section>`;
+    }
+
+    if (recommendedArtists.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('recommendedArtists', 'Artists You Might Like'))}</h2></div>
+        <div class="card-grid rail">${recommendedArtists.map(renderArtistCard).join('')}</div>
+      </section>`;
+    }
+
+    if (moods.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('moods', 'Moods & Vibes'))}</h2><button class="text-btn" onclick="App.navigate('explore')">See all</button></div>
+        <div class="mood-grid">${moods.slice(0, 5).map(renderMoodTile).join('')}</div>
+      </section>`;
+    }
+
+    if (trending.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('trending', 'Trending Now'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(trending.map((t) => t.id)))}, 0)">Play All</button></div>
+        <div class="track-table">${renderTrackRows(trending.slice(0, 12))}</div>
+      </section>`;
+    }
+
+    if (albums.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('albums', 'Popular Albums'))}</h2></div>
+        <div class="card-grid rail">${albums.map(renderAlbumCard).join('')}</div>
+      </section>`;
+    }
+
+    if (artists.length > 0) {
+      html += `<section class="section">
+        <div class="section-head"><h2>${esc(secTitle('artists', 'Top Artists'))}</h2></div>
+        <div class="card-grid rail">${artists.map(renderArtistCard).join('')}</div>
+      </section>`;
+    }
+
+    const mainEl = $('main-view');
+    const prevScroll = preserveScroll ? mainEl.scrollTop : 0;
+    mainEl.innerHTML = html;
+    mainEl.scrollTop = prevScroll;
+    bindQuickPicksPager();
+
+    if (d.newReleasesPending && !newReleases.length) {
+      (async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const nr = await api('/api/web/home/new-releases', { signal });
+            if (!isViewRequestCurrent(reqToken, signal)) return;
+            const items = nr.newReleases || [];
+            if (items.length > 0) {
+              const slot = $('new-releases-slot');
+              if (slot) slot.innerHTML = newReleasesSectionHtml(items, newReleasesTitle);
+              if (state.homeCache && state.homeCache.userId === state.user?.id) {
+                const updated = { ...state.homeCache.data, newReleases: items, newReleasesPending: false };
+                state.homeCache = { ...state.homeCache, data: updated, json: JSON.stringify(updated) };
+              }
+              return;
+            }
+            if (!nr.pending) return;
+          } catch {
+            return;
+          }
+        }
+      })();
+    }
+  }
+
   async function renderHome() {
     const { reqToken, signal } = beginViewRequest();
+    const uid = state.user?.id || 0;
+    const cached = state.homeCache && state.homeCache.userId === uid ? state.homeCache : null;
+    const age = cached ? Date.now() - cached.ts : Infinity;
+
+    if (cached && age < HOME_CACHE_MAX_MS) {
+      renderHomePayload(cached.data, reqToken, signal, { preserveScroll: false });
+      if (age < HOME_CACHE_FRESH_MS) return;
+      try {
+        const fresh = await api(`/api/web/home?tz=${encodeURIComponent(-new Date().getTimezoneOffset())}`, { signal });
+        if (!isViewRequestCurrent(reqToken, signal)) return;
+        const freshJson = JSON.stringify(fresh);
+        const changed = freshJson !== cached.json;
+        state.homeCache = { userId: uid, ts: Date.now(), data: fresh, json: freshJson };
+        if (changed) {
+          renderHomePayload(fresh, reqToken, signal, { preserveScroll: true });
+        }
+      } catch {
+        // Keep the cached Home visible if background revalidation fails.
+      }
+      return;
+    }
+
     setMainLoading('Loading...');
     try {
       const d = await api(`/api/web/home?tz=${encodeURIComponent(-new Date().getTimezoneOffset())}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
-      const quickPicks = cacheTracks(d.quickPicks || []).slice(0, QP_PER_PAGE * QP_MAX_PAGES);
-      const newReleases = d.newReleases || [];
-      const trending = cacheTracks(d.trending || []);
-      const recent = cacheTracks(d.recent || []);
-      const relatedTracks = cacheTracks(d.relatedTracks || []);
-      const mixes = d.madeForYou || [];
-      const mixedForYou = d.mixedForYou || [];
-      const homeCategories = d.homeCategories || [];
-      const albums = d.albums || [];
-      const artists = d.artists || [];
-      const recommendedArtists = d.recommendedArtists || [];
-      const moods = d.moods || [];
-      const llm = d.llm || null;
-      const sec = (llm && llm.sections) || {};
-      const secTitle = (key, fallback) => (sec[key] && String(sec[key]).trim()) || fallback;
-      if (llm && Array.isArray(llm.searchPrompts) && llm.searchPrompts.length) {
-        state.llmSearchPrompts = llm.searchPrompts;
-      }
-
-      const greetingHeading = resolveHomeGreeting(llm);
-      const hasHomeTagline = Boolean(llm && llm.homeTagline && String(llm.homeTagline).trim());
-      let html = `<h1 class="page-greeting${hasHomeTagline ? ' has-edition' : ''}">${esc(greetingHeading)}</h1>`;
-      if (hasHomeTagline) {
-        html += `<div class="daily-edition-note">
-          <span class="daily-edition-tagline">${esc(llm.homeTagline)}</span>
-        </div>`;
-      }
-
-      if (quickPicks.length > 0) {
-        html += quickPicksSectionHtml(quickPicks, secTitle('quickPicks', 'Quick Picks'));
-      }
-
-      // New releases from artists the user listens to sit right under Quick Picks.
-      const newReleasesTitle = secTitle('newReleases', 'New Releases');
-      html += `<div id="new-releases-slot">${newReleasesSectionHtml(newReleases, newReleasesTitle)}</div>`;
-
-      if (mixedForYou.length > 0) {
-        html += `<section class="section">
-          <div class="section-head">
-            <h2>${esc(secTitle('mixedForYou', 'Mixed for you'))}</h2>
-          </div>
-          <div class="mixed-for-you-grid rail">${mixedForYou.map(renderMixedForYouCard).join('')}</div>
-        </section>`;
-      }
-
-      if (mixes.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('madeForYou', 'Made For You'))}</h2></div>
-          <div class="card-grid rail">${mixes.map(renderPlaylistCard).join('')}</div>
-        </section>`;
-      }
-
-      for (const cat of homeCategories) {
-        const catMixes = Array.isArray(cat.mixes) ? cat.mixes : [];
-        if (!catMixes.length) continue;
-        html += `<section class="section llm-explore-section">
-          <div class="section-head">
-            <div class="llm-section-title-group">
-              ${cat.kicker ? `<div class="llm-cat-kicker">${esc(cat.kicker)}</div>` : ''}
-              <h2>${esc(cat.title)}</h2>
-              ${cat.subtitle ? `<p class="llm-cat-sub">${esc(cat.subtitle)}</p>` : ''}
-            </div>
-            <button class="text-btn" onclick="App.navigate('explore')">See all</button>
-          </div>
-          <div class="explore-mix-grid">${catMixes.map(renderExploreMixCard).join('')}</div>
-        </section>`;
-      }
-
-      if (recent.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('recent', 'Recently Played'))}</h2></div>
-          <div class="card-grid rail">${recent.slice(0, 8).map(renderTrackCard).join('')}</div>
-        </section>`;
-      }
-
-      if (relatedTracks.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('relatedTracks', 'Related Tracks For You'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(relatedTracks.map((t) => t.id)))}, 0)">Play All</button></div>
-          <div class="track-table">${renderTrackRows(relatedTracks.slice(0, 10), relatedTracks)}</div>
-        </section>`;
-      }
-
-      if (recommendedArtists.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('recommendedArtists', 'Artists You Might Like'))}</h2></div>
-          <div class="card-grid rail">${recommendedArtists.map(renderArtistCard).join('')}</div>
-        </section>`;
-      }
-
-      if (moods.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('moods', 'Moods & Vibes'))}</h2><button class="text-btn" onclick="App.navigate('explore')">See all</button></div>
-          <div class="mood-grid">${moods.slice(0, 5).map(renderMoodTile).join('')}</div>
-        </section>`;
-      }
-
-      if (trending.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('trending', 'Trending Now'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(trending.map((t) => t.id)))}, 0)">Play All</button></div>
-          <div class="track-table">${renderTrackRows(trending.slice(0, 12))}</div>
-        </section>`;
-      }
-
-      if (albums.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('albums', 'Popular Albums'))}</h2></div>
-          <div class="card-grid rail">${albums.map(renderAlbumCard).join('')}</div>
-        </section>`;
-      }
-
-      if (artists.length > 0) {
-        html += `<section class="section">
-          <div class="section-head"><h2>${esc(secTitle('artists', 'Top Artists'))}</h2></div>
-          <div class="card-grid rail">${artists.map(renderArtistCard).join('')}</div>
-        </section>`;
-      }
-
-      $('main-view').innerHTML = html;
-      $('main-view').scrollTop = 0;
-      bindQuickPicksPager();
-
-      if (d.newReleasesPending && !newReleases.length) {
-        (async () => {
-          for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-              const nr = await api('/api/web/home/new-releases', { signal });
-              if (!isViewRequestCurrent(reqToken, signal)) return;
-              const items = nr.newReleases || [];
-              if (items.length > 0) {
-                const slot = $('new-releases-slot');
-                if (slot) slot.innerHTML = newReleasesSectionHtml(items, newReleasesTitle);
-                return;
-              }
-              if (!nr.pending) return;
-            } catch {
-              return;
-            }
-          }
-        })();
-      }
+      state.homeCache = { userId: uid, ts: Date.now(), data: d, json: JSON.stringify(d) };
+      renderHomePayload(d, reqToken, signal, { preserveScroll: false });
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
     }
@@ -8369,6 +8408,7 @@
         method: 'POST',
         body: JSON.stringify({ trackId }),
       });
+      state.homeCache = null;
       if (state.searchState) {
         state.searchState.tracks = (state.searchState.tracks || []).filter((t) => t.id !== trackId);
         if (state.searchState.instantMix && Array.isArray(state.searchState.instantMix.tracks)) {
@@ -10327,7 +10367,6 @@
         ? `${lobby.data.name} · ${count} ${count === 1 ? 'listener' : 'listeners'}`
         : 'Listen Together';
     }
-    if ($('fs-lobby')) $('fs-lobby').classList.toggle('active', live);
     document.body.classList.toggle('lobby-live', live);
   }
 

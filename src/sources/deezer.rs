@@ -20,7 +20,7 @@ const DZ_BUCKET_REFILL_PER_SEC: f64 = 5.0;
 /// After Deezer refuses us outright (HTTP 403), stop calling it for a while instead of
 /// hammering a blocked endpoint; callers fall back to other sources immediately.
 const DZ_BLOCK_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-const DZ_JSON_CACHE_MAX: usize = 250;
+const DZ_JSON_CACHE_MAX: usize = 400;
 const DZ_ALBUM_INFO_CACHE_MAX: usize = 8_000;
 
 struct TokenBucket {
@@ -128,7 +128,7 @@ impl DeezerSource {
         }
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
+    async fn get_cached_json<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
         let cached = {
             let guard = self.json_cache.read().await;
             guard
@@ -143,6 +143,13 @@ impl DeezerSource {
                 }
                 return Some(parsed);
             }
+        }
+        None
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Option<T> {
+        if let Some(parsed) = self.get_cached_json::<T>(url).await {
+            return Some(parsed);
         }
 
         let val = self.fetch_and_cache(url).await?;
@@ -238,11 +245,13 @@ impl DeezerSource {
                 if guard.len() >= DZ_JSON_CACHE_MAX {
                     guard.retain(|_, (ts, _)| ts.elapsed() < DZ_JSON_STALE_MAX);
                     if guard.len() >= DZ_JSON_CACHE_MAX {
-                        // Evict the oldest quarter rather than dropping everything at once.
-                        let mut ages: Vec<(Instant, String)> =
-                            guard.iter().map(|(k, (ts, _))| (*ts, k.clone())).collect();
-                        ages.sort_by_key(|(ts, _)| *ts);
-                        for (_, k) in ages.into_iter().take(DZ_JSON_CACHE_MAX / 4) {
+                        // Evict the oldest quarter, preferring non-chart entries so home/explore charts stay hot.
+                        let mut ages: Vec<(bool, Instant, String)> = guard
+                            .iter()
+                            .map(|(k, (ts, _))| (k.contains("/chart/"), *ts, k.clone()))
+                            .collect();
+                        ages.sort_by_key(|(is_chart, ts, _)| (*is_chart, *ts));
+                        for (_, _, k) in ages.into_iter().take(DZ_JSON_CACHE_MAX / 4) {
                             guard.remove(&k);
                         }
                     }
@@ -268,6 +277,19 @@ impl DeezerSource {
     pub async fn fetch_chart_tracks(&self, limit: usize) -> Vec<Track> {
         let url = format!("https://api.deezer.com/chart/0/tracks?limit={}", limit.clamp(5, 100));
         self.fetch_track_list(&url, "").await
+    }
+
+    /// Returns cached chart tracks without blocking on HTTP (spawns a background refresh if stale).
+    pub async fn cached_chart_tracks(&self, limit: usize) -> Option<Vec<Track>> {
+        let url = format!("https://api.deezer.com/chart/0/tracks?limit={}", limit.clamp(5, 100));
+        let parsed = self.get_cached_json::<DzDataList<DzTrack>>(&url).await?;
+        Some(
+            parsed
+                .data
+                .into_iter()
+                .filter_map(|d| d.into_track(None, "", 0, 0, ""))
+                .collect(),
+        )
     }
 
     pub async fn fetch_genre_chart_tracks(
@@ -296,6 +318,13 @@ impl DeezerSource {
             .collect()
     }
 
+    /// Returns cached chart albums without blocking on HTTP (spawns a background refresh if stale).
+    pub async fn cached_chart_albums(&self, limit: usize) -> Option<Vec<AlbumSummary>> {
+        let url = format!("https://api.deezer.com/chart/0/albums?limit={}", limit.clamp(5, 60));
+        let parsed = self.get_cached_json::<DzDataList<DzAlbum>>(&url).await?;
+        Some(parsed.data.into_iter().filter_map(|a| a.into_summary()).collect())
+    }
+
     pub async fn fetch_chart_artists(&self, limit: usize) -> Vec<ArtistSummary> {
         let url = format!("https://api.deezer.com/chart/0/artists?limit={}", limit.clamp(5, 60));
         let Some(parsed) = self.get_json::<DzDataList<DzArtist>>(&url).await else {
@@ -306,6 +335,13 @@ impl DeezerSource {
             .into_iter()
             .filter_map(|a| a.into_summary())
             .collect()
+    }
+
+    /// Returns cached chart artists without blocking on HTTP (spawns a background refresh if stale).
+    pub async fn cached_chart_artists(&self, limit: usize) -> Option<Vec<ArtistSummary>> {
+        let url = format!("https://api.deezer.com/chart/0/artists?limit={}", limit.clamp(5, 60));
+        let parsed = self.get_cached_json::<DzDataList<DzArtist>>(&url).await?;
+        Some(parsed.data.into_iter().filter_map(|a| a.into_summary()).collect())
     }
 
     pub async fn search_tracks(&self, query: &str, limit: usize) -> Vec<Track> {

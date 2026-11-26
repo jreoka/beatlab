@@ -351,12 +351,12 @@ fn personal_match_ids(state: &AppState, user_id: i64) -> HashSet<String> {
     ids
 }
 
-fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> Vec<Track> {
-    if user_id <= 0 || tracks.is_empty() {
-        return tracks;
-    }
-    let (hidden_ids, hidden_keys) = state.store.hidden_track_sets(user_id).unwrap_or_default();
-    if hidden_ids.is_empty() && hidden_keys.is_empty() {
+fn filter_tracks_with_hidden(
+    tracks: Vec<Track>,
+    hidden_ids: &HashSet<String>,
+    hidden_keys: &HashSet<String>,
+) -> Vec<Track> {
+    if tracks.is_empty() || (hidden_ids.is_empty() && hidden_keys.is_empty()) {
         return tracks;
     }
     tracks
@@ -366,6 +366,14 @@ fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> 
                 && (hidden_keys.is_empty() || !hidden_keys.contains(&t.song_key()))
         })
         .collect()
+}
+
+fn filter_visible_tracks(state: &AppState, user_id: i64, tracks: Vec<Track>) -> Vec<Track> {
+    if user_id <= 0 || tracks.is_empty() {
+        return tracks;
+    }
+    let (hidden_ids, hidden_keys) = state.store.hidden_track_sets(user_id).unwrap_or_default();
+    filter_tracks_with_hidden(tracks, &hidden_ids, &hidden_keys)
 }
 
 fn to_web_track_with_maps(
@@ -400,6 +408,18 @@ fn to_web_track_with_maps(
         play_count: stats.get(&t.id).map(|s| s.play_count).unwrap_or(0),
         rating: ratings.get(&t.id).copied().unwrap_or(0),
     }
+}
+
+fn to_web_tracks_from_maps(
+    tracks: &[Track],
+    starred: &HashSet<String>,
+    stats: &HashMap<String, UserTrackStats>,
+    ratings: &HashMap<String, i32>,
+) -> Vec<WebTrack> {
+    tracks
+        .iter()
+        .map(|t| to_web_track_with_maps(t, starred, stats, ratings, false))
+        .collect()
 }
 
 fn to_web_tracks(state: &AppState, user_id: i64, tracks: &[Track]) -> Vec<WebTrack> {
@@ -2838,10 +2858,10 @@ async fn build_new_releases(
         return (items, false);
     }
 
-    // Cold shelf: wait briefly so fast lookups appear on the initial response,
-    // without stalling Home if Deezer is busy (e.g. startup catalog warming).
+    // Cold shelf: wait very briefly so already-cached lookups land inline,
+    // then hand off immediately to `/api/web/home/new-releases` so Home never stalls.
     let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(2800),
+        std::time::Duration::from_millis(250),
         rx.wait_for(|&done| done),
     )
     .await;
@@ -2925,6 +2945,46 @@ async fn fetch_home_charts(
     )
 }
 
+async fn try_cached_home_charts(
+    state: &AppState,
+) -> Option<(Vec<Track>, Vec<AlbumSummary>, Vec<ArtistSummary>)> {
+    let (t, al, ar) = tokio::join!(
+        state.sources.deezer.cached_chart_tracks(20),
+        state.sources.deezer.cached_chart_albums(12),
+        state.sources.deezer.cached_chart_artists(12),
+    );
+    match (t, al, ar) {
+        (Some(t), Some(al), Some(ar)) => Some((t, al, ar)),
+        _ => None,
+    }
+}
+
+fn spawn_home_charts_refresh(state: AppState) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INFLIGHT: AtomicBool = AtomicBool::new(false);
+    if INFLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                INFLIGHT.store(false, Ordering::Release);
+            }
+        }
+        let _reset = Reset;
+        let (t, al, ar) = fetch_home_charts(&state).await;
+        let st = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            record_charts(&st, &t, &al, &ar);
+        })
+        .await;
+    });
+}
+
 async fn fetch_explore_charts(
     state: &AppState,
 ) -> (
@@ -2987,107 +3047,152 @@ pub async fn home(
     if let Some(ref curator) = state.llm {
         curator.maybe_spawn_refresh(&state.taste, uid);
     }
-    let llm_exp = crate::llm::LlmCurator::load_experience(&state.store, uid);
-    let is_fresh = !state.store.has_listening_history(uid).unwrap_or(false);
 
-    // Fetch external charts first so fresh accounts immediately have popular
-    // tracks, albums, and artists available before auto-mixes & picks are built.
-    // If Deezer is slow (cold cache), fall back to the charts stored from earlier fetches.
-    let st = state.clone();
-    let (chart_tracks, chart_albums, chart_artists) = bounded_upstream(async move {
-        let (t, al, ar) = fetch_home_charts(&st).await;
-        record_charts(&st, &t, &al, &ar);
-        (t, al, ar)
-    })
-    .await
-    .unwrap_or_default();
+    // Fast path: serve external charts directly from Deezer's in-memory stale-while-revalidate
+    // cache without writing to SQLite. If the in-memory cache is cold, prefer persisted SQLite
+    // charts immediately and refresh in the background; only block on upstream for a brand-new DB.
+    let (chart_tracks, chart_albums, chart_artists) = if let Some(cached) =
+        try_cached_home_charts(&state).await
+    {
+        cached
+    } else {
+        let has_stored_charts = !state
+            .store
+            .popular_chart_tracks(1)
+            .unwrap_or_default()
+            .is_empty();
+        if has_stored_charts {
+            spawn_home_charts_refresh(state.clone());
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let st = state.clone();
+            bounded_upstream(async move {
+                let (t, al, ar) = fetch_home_charts(&st).await;
+                record_charts(&st, &t, &al, &ar);
+                (t, al, ar)
+            })
+            .await
+            .unwrap_or_default()
+        }
+    };
 
-    // Ensure auto-mixes exist and refresh cleanly whenever user feedback/playlists changed them.
+    // Ensure auto-mixes exist; returning listeners get instant background refreshes.
     if state.store.count_tracks().unwrap_or(0) > 0 {
         // Mixed-for-you first: rebuilding generic auto mixes clears the dirty flag.
         state.taste.refresh_mixed_for_you_if_stale_async(uid).await;
         state.taste.refresh_auto_playlists_if_stale_async(uid, 900).await;
     }
-    let playlists = state.store.list_playlists(uid, false).unwrap_or_default();
 
-    let auto_mixes: Vec<Value> = playlists
-        .into_iter()
-        .filter(|p| p.is_auto && !p.kind.starts_with("mixed_for_you:"))
-        .map(|p| playlist_summary_for_user_json(&state, uid, &p))
-        .collect();
+    // Run all synchronous SQLite & Transformer scoring on a blocking thread with a single
+    // shared ScoringContext, candidate pool, and user status lookup maps.
+    let st_block = state.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        let llm_exp = crate::llm::LlmCurator::load_experience(&st_block.store, uid);
+        let is_fresh = !st_block.store.has_listening_history(uid).unwrap_or(false);
+        let recs = st_block.taste.build_home_recommendations(uid);
+        let playlists = st_block.store.list_playlists(uid, false).unwrap_or_default();
 
-    let quick_picks = state.taste.quick_picks(uid, 36);
-    let recent: Vec<Track> = filter_visible_tracks(
-        &state,
-        uid,
-        state
-            .store
-            .user_recent_tracks(uid, 12, 0)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect(),
-    );
+        let mixed_for_you = st_block.taste.mixed_for_you_cards_with_data(
+            uid,
+            &playlists,
+            llm_exp.as_ref(),
+            &recs.hidden_ids,
+            &recs.hidden_keys,
+        );
+        let auto_mixes: Vec<Value> = playlists
+            .iter()
+            .filter(|p| p.is_auto && !p.kind.starts_with("mixed_for_you:"))
+            .map(|p| {
+                playlist_summary_with_hidden_json(
+                    &st_block,
+                    uid,
+                    p,
+                    &recs.hidden_ids,
+                    &recs.hidden_keys,
+                )
+            })
+            .collect();
 
-    let trending_tracks = filter_visible_tracks(
-        &state,
-        uid,
-        if !chart_tracks.is_empty() {
-            chart_tracks
-        } else {
-            let pop = state.store.popular_chart_tracks(16).unwrap_or_default();
-            if !pop.is_empty() || is_fresh {
-                pop
-            } else {
-                state.store.newest_tracks(16, 0).unwrap_or_default()
-            }
-        },
-    );
-    let albums = if !chart_albums.is_empty() {
-        chart_albums
-    } else {
-        let pop_albums = state.store.popular_chart_albums(12);
-        if !pop_albums.is_empty() || is_fresh {
-            pop_albums
-        } else {
-            state
+        let recent: Vec<Track> = filter_tracks_with_hidden(
+            st_block
                 .store
-                .build_album_summaries(uid)
+                .user_recent_tracks(uid, 12, 0)
                 .unwrap_or_default()
                 .into_iter()
-                .take(12)
-                .collect()
-        }
-    };
-    let artists = resolve_featured_artists(&state, chart_artists, 12, is_fresh);
+                .map(|(t, _)| t)
+                .collect(),
+            &recs.hidden_ids,
+            &recs.hidden_keys,
+        );
 
-    let saved = state.store.saved_album_ids(uid).unwrap_or_default();
-    let followed = state.store.followed_artist_ids(uid).unwrap_or_default();
+        let trending_tracks = filter_tracks_with_hidden(
+            if !chart_tracks.is_empty() {
+                chart_tracks
+            } else {
+                let pop = st_block.store.popular_chart_tracks(16).unwrap_or_default();
+                if !pop.is_empty() || is_fresh {
+                    pop
+                } else {
+                    st_block.store.newest_tracks(16, 0).unwrap_or_default()
+                }
+            },
+            &recs.hidden_ids,
+            &recs.hidden_keys,
+        );
+        let albums = if !chart_albums.is_empty() {
+            chart_albums
+        } else {
+            let pop_albums = st_block.store.popular_chart_albums(12);
+            if !pop_albums.is_empty() || is_fresh {
+                pop_albums
+            } else {
+                st_block
+                    .store
+                    .build_album_summaries(uid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(12)
+                    .collect()
+            }
+        };
+        let artists = resolve_featured_artists(&st_block, chart_artists, 12, is_fresh);
+        let related_tracks =
+            filter_tracks_with_hidden(recs.related_tracks, &recs.hidden_ids, &recs.hidden_keys);
+        let moods = build_moods_json(&st_block, uid, llm_exp.as_ref(), Some(5));
+        let home_categories = build_llm_categories_json(&st_block, uid, llm_exp.as_ref(), 1);
+
+        let payload = json!({
+            "quickPicks": to_web_tracks_from_maps(&recs.quick_picks, &recs.starred, &recs.stats, &recs.ratings),
+            "recent": to_web_tracks_from_maps(&recent, &recs.starred, &recs.stats, &recs.ratings),
+            "mixedForYou": json!(mixed_for_you),
+            "madeForYou": auto_mixes,
+            "homeCategories": home_categories,
+            "relatedTracks": to_web_tracks_from_maps(&related_tracks, &recs.starred, &recs.stats, &recs.ratings),
+            "recommendedArtists": recs.recommended_artists.iter().map(|a| artist_json(a, recs.followed_artists.contains(&a.id))).collect::<Vec<_>>(),
+            "trending": to_web_tracks_from_maps(&trending_tracks, &recs.starred, &recs.stats, &recs.ratings),
+            "albums": albums.iter().map(|a| album_json(a, recs.saved_albums.contains(&a.id))).collect::<Vec<_>>(),
+            "artists": artists.iter().map(|a| artist_json(a, recs.followed_artists.contains(&a.id))).collect::<Vec<_>>(),
+            "moods": moods,
+            "llm": llm_meta_json(llm_exp.as_ref()),
+        });
+        (payload, recs.saved_albums)
+    })
+    .await;
+
+    let (mut payload, saved) = match built {
+        Ok(res) => res,
+        Err(_) => return err_res(StatusCode::INTERNAL_SERVER_ERROR, "Failed to build home feed"),
+    };
 
     let (new_releases_json, new_releases_pending) = build_new_releases(&state, uid, &saved).await;
-
-    let moods = build_moods_json(&state, uid, llm_exp.as_ref());
-
-    let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
-    let recommended_artists = state.taste.recommended_artists_for_user(uid, 12);
-    let home_categories = build_llm_categories_json(&state, uid, llm_exp.as_ref(), 1);
-
-    json_res(json!({
-        "quickPicks": to_web_tracks(&state, uid, &quick_picks),
-        "newReleases": new_releases_json,
-        "newReleasesPending": new_releases_pending,
-        "recent": to_web_tracks(&state, uid, &recent),
-        "mixedForYou": json!(state.taste.mixed_for_you_cards(uid)),
-        "madeForYou": auto_mixes,
-        "homeCategories": home_categories,
-        "relatedTracks": to_web_tracks(&state, uid, &related_tracks),
-        "recommendedArtists": recommended_artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
-        "trending": to_web_tracks(&state, uid, &trending_tracks),
-        "albums": albums.iter().map(|a| album_json(a, saved.contains(&a.id))).collect::<Vec<_>>(),
-        "artists": artists.iter().map(|a| artist_json(a, followed.contains(&a.id))).collect::<Vec<_>>(),
-        "moods": moods,
-        "llm": llm_meta_json(llm_exp.as_ref()),
-    }))
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("newReleases".to_string(), json!(new_releases_json));
+        obj.insert(
+            "newReleasesPending".to_string(),
+            json!(new_releases_pending),
+        );
+    }
+    json_res(payload)
 }
 
 fn llm_meta_json(exp: Option<&crate::llm::DailyLlmExperience>) -> Value {
@@ -3158,14 +3263,17 @@ fn build_moods_json(
     state: &AppState,
     uid: i64,
     llm_exp: Option<&crate::llm::DailyLlmExperience>,
+    limit: Option<usize>,
 ) -> Vec<Value> {
     // When the LLM designed a bespoke set of custom moods for this listener, use them
     // directly so Home & Explore show fresh personalized vibes instead of static defaults.
     if let Some(exp) = llm_exp {
         if !exp.custom_moods.is_empty() {
+            let max_items = limit.unwrap_or(exp.custom_moods.len());
             return exp
                 .custom_moods
                 .iter()
+                .take(max_items)
                 .map(|cm| {
                     let (track_count, covers) = state.taste.curated_llm_mood_preview(uid, cm);
                     json!({
@@ -3198,6 +3306,9 @@ fn build_moods_json(
         if seen.insert(m) {
             ordered_moods.push((m, None));
         }
+    }
+    if let Some(max_items) = limit {
+        ordered_moods.truncate(max_items);
     }
     ordered_moods
         .into_iter()
@@ -3253,7 +3364,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     .await
     .unwrap_or_default();
 
-    let moods = build_moods_json(&state, uid, llm_exp.as_ref());
+    let moods = build_moods_json(&state, uid, llm_exp.as_ref(), None);
 
     let custom_categories = build_llm_categories_json(&state, uid, llm_exp.as_ref(), 4);
 
@@ -3357,7 +3468,7 @@ pub async fn explore(State(state): State<AppState>, headers: HeaderMap) -> Respo
     );
 
     let related_tracks = filter_visible_tracks(&state, uid, state.taste.related_tracks_for_user(uid, 12));
-    let recommended_artists = state.taste.recommended_artists_for_user(uid, 14);
+    let recommended_artists = state.taste.recommended_artists_for_user_cached(uid, 14);
 
     let ready_mood_cards = moods
         .iter()
@@ -6492,12 +6603,14 @@ fn artist_json(a: &ArtistSummary, is_followed: bool) -> Value {
     })
 }
 
-fn playlist_summary_for_user_json(state: &AppState, user_id: i64, p: &Playlist) -> Value {
-    if !p.is_auto || user_id <= 0 {
-        return playlist_summary_json(p);
-    }
-    let (hidden_ids, hidden_keys) = state.store.hidden_track_sets(user_id).unwrap_or_default();
-    if hidden_ids.is_empty() && hidden_keys.is_empty() {
+fn playlist_summary_with_hidden_json(
+    state: &AppState,
+    user_id: i64,
+    p: &Playlist,
+    hidden_ids: &HashSet<String>,
+    hidden_keys: &HashSet<String>,
+) -> Value {
+    if !p.is_auto || user_id <= 0 || (hidden_ids.is_empty() && hidden_keys.is_empty()) {
         return playlist_summary_json(p);
     }
     let raw = state.store.playlist_tracks(&p.id).unwrap_or_default();
@@ -6511,6 +6624,14 @@ fn playlist_summary_for_user_json(state: &AppState, user_id: i64, p: &Playlist) 
     let mut adjusted = p.clone();
     adjusted.track_count = visible_count;
     playlist_summary_json(&adjusted)
+}
+
+fn playlist_summary_for_user_json(state: &AppState, user_id: i64, p: &Playlist) -> Value {
+    if !p.is_auto || user_id <= 0 {
+        return playlist_summary_json(p);
+    }
+    let (hidden_ids, hidden_keys) = state.store.hidden_track_sets(user_id).unwrap_or_default();
+    playlist_summary_with_hidden_json(state, user_id, p, &hidden_ids, &hidden_keys)
 }
 
 fn playlist_summary_json(p: &Playlist) -> Value {
