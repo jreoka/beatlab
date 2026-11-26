@@ -264,6 +264,15 @@
     marqueeTimer: null,
     healthHeartbeatTimer: null,
     healthCheckInFlight: null,
+    nowPlayingClientId:
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    nowPlayingSeq: 0,
+    nowPlayingReported: false,
+    nowPlayingTrackId: '',
+    lastNowPlayingPingAt: 0,
+    nowPlayingHeartbeatTimer: null,
     recentHeard: loadRecentHeard(),
     upcomingMode: (() => {
       const m = localStorage.getItem('beatlab_upcoming_mode');
@@ -1587,6 +1596,10 @@
 
   function resetPlayerAndSessionUI() {
     clearPlaybackRecovery();
+    stopNowPlayingHeartbeat();
+    state.nowPlayingReported = false;
+    state.nowPlayingTrackId = '';
+    state.lastNowPlayingPingAt = 0;
     state.intentionalPause = true;
     state.hiddenWhilePlayingAt = 0;
     state.hiddenResumeAttempted = false;
@@ -2191,6 +2204,7 @@
     });
     const flushOnExit = () => {
       if (state.queueSaveDirty) flushServerQueue(true);
+      if (state.nowPlayingReported) clearNowPlaying(true);
     };
     window.addEventListener('pagehide', flushOnExit);
     window.addEventListener('beforeunload', flushOnExit);
@@ -5871,6 +5885,7 @@
           if (scheduleNetworkRetry(loadToken, track, 0, false)) return;
         }
         updatePlayButton(false);
+        clearNowPlaying(false);
         console.warn('Playback prevented or error:', e);
       });
     } finally {
@@ -6422,10 +6437,110 @@
     }
   }
 
+  const NOW_PLAYING_HEARTBEAT_MS = 20000;
+
+  function sendNowPlayingPayload(payload, { keepalive = false, token = state.token } = {}) {
+    if (!token) return;
+    try {
+      fetch('/api/web/now-playing', {
+        method: 'POST',
+        keepalive: !!keepalive,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      }).catch(() => {});
+    } catch {
+      // Ignore unload/network errors; server heartbeat TTL acts as fallback.
+    }
+  }
+
+  function stopNowPlayingHeartbeat() {
+    if (state.nowPlayingHeartbeatTimer) {
+      clearInterval(state.nowPlayingHeartbeatTimer);
+      state.nowPlayingHeartbeatTimer = null;
+    }
+  }
+
+  function startNowPlayingHeartbeat() {
+    if (state.nowPlayingHeartbeatTimer) return;
+    state.nowPlayingHeartbeatTimer = setInterval(() => {
+      maybeSendNowPlayingHeartbeat();
+    }, NOW_PLAYING_HEARTBEAT_MS);
+  }
+
+  function reportNowPlaying(track, { force = false } = {}) {
+    if (!state.token || !track || !track.id) return;
+    const now = Date.now();
+    if (
+      !force &&
+      state.nowPlayingReported &&
+      state.nowPlayingTrackId === track.id &&
+      now - state.lastNowPlayingPingAt < NOW_PLAYING_HEARTBEAT_MS
+    ) {
+      startNowPlayingHeartbeat();
+      return;
+    }
+    const seq = ++state.nowPlayingSeq;
+    state.nowPlayingReported = true;
+    state.nowPlayingTrackId = track.id;
+    state.lastNowPlayingPingAt = now;
+    startNowPlayingHeartbeat();
+    sendNowPlayingPayload({
+      playing: true,
+      trackId: track.id,
+      clientId: state.nowPlayingClientId,
+      seq,
+    });
+  }
+
+  function maybeSendNowPlayingHeartbeat() {
+    if (!state.token || audio.paused || audio.ended) return;
+    const cur = currentTrack();
+    if (!cur || !cur.id) return;
+    if (
+      !state.nowPlayingReported ||
+      state.nowPlayingTrackId !== cur.id ||
+      Date.now() - state.lastNowPlayingPingAt >= NOW_PLAYING_HEARTBEAT_MS
+    ) {
+      reportNowPlaying(cur, { force: true });
+    }
+  }
+
+  function clearNowPlaying(keepalive = false, tokenOverride = null) {
+    stopNowPlayingHeartbeat();
+    const wasReported = state.nowPlayingReported;
+    state.nowPlayingReported = false;
+    state.nowPlayingTrackId = '';
+    state.lastNowPlayingPingAt = 0;
+    const tok = tokenOverride !== null ? tokenOverride : state.token;
+    if (!tok || !wasReported) return;
+    const seq = ++state.nowPlayingSeq;
+    sendNowPlayingPayload(
+      {
+        playing: false,
+        clientId: state.nowPlayingClientId,
+        seq,
+      },
+      { keepalive: !!keepalive, token: tok }
+    );
+  }
+
   function sendTrackEvent(trackId, kind, value = 1) {
+    const payload = { trackId, kind, value };
+    if (kind === 'play') {
+      const seq = ++state.nowPlayingSeq;
+      state.nowPlayingReported = true;
+      state.nowPlayingTrackId = trackId;
+      state.lastNowPlayingPingAt = Date.now();
+      startNowPlayingHeartbeat();
+      payload.clientId = state.nowPlayingClientId;
+      payload.seq = seq;
+    }
     api('/api/web/event', {
       method: 'POST',
-      body: JSON.stringify({ trackId, kind, value }),
+      body: JSON.stringify(payload),
     })
       .then((res) => {
         if (kind === 'play' && res && res.track && res.track.id === trackId) {
@@ -7014,6 +7129,7 @@
           if (scheduleNetworkRetry(playToken, cur, resumePos, false)) return;
         }
         updatePlayButton(false);
+        clearNowPlaying(false);
       });
     }
   }
@@ -7067,6 +7183,7 @@
     if (!state.queue.length) {
       updatePlayButton(false);
       setMediaPlaybackState('none');
+      clearNowPlaying(false);
       return;
     }
 
@@ -7101,10 +7218,12 @@
       }
       updatePlayButton(false);
       setMediaPlaybackState('none');
+      clearNowPlaying(false);
       return;
     }
     updatePlayButton(false);
     setMediaPlaybackState('none');
+    clearNowPlaying(false);
   }
 
   function wireAudioEvents() {
@@ -7155,6 +7274,7 @@
         const needsPublish = mediaSessionState.publishedWhilePlaying !== cur.id;
         syncMediaSession(cur, needsPublish);
         mediaSessionState.publishedWhilePlaying = cur.id;
+        reportNowPlaying(cur);
       }
       setMediaPlaybackState('playing');
       updateMediaPositionState(true);
@@ -7184,6 +7304,7 @@
           updatePlayButton(false);
           setMediaPlaybackState('paused');
           updateMediaPositionState(true);
+          clearNowPlaying(false);
           if (state.queue.length) saveServerQueue();
         });
         return;
@@ -7193,6 +7314,7 @@
       updatePlayButton(false);
       setMediaPlaybackState('paused');
       updateMediaPositionState(true);
+      clearNowPlaying(false);
       if (state.queue.length) saveServerQueue();
     });
     audio.addEventListener('loadedmetadata', () => {
@@ -7238,6 +7360,7 @@
           audio.play().catch(() => {
             if (errToken !== state.activeAudioToken) return;
             updatePlayButton(false);
+            clearNowPlaying(false);
           });
         } finally {
           state.isSwitchingTrack = false;
@@ -7251,6 +7374,7 @@
         }
       }
       updatePlayButton(false);
+      clearNowPlaying(false);
       checkServerHealth();
       showToast(`Unable to play "${cur.title}" right now`);
     });
@@ -7280,6 +7404,7 @@
       const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
       const pos = audio.currentTime || 0;
       updateMediaPositionState(false);
+      maybeSendNowPlayingHeartbeat();
       if (cur && total > 20 && pos / total >= 0.75 && state.lastScrobbleCompleteId !== cur.id) {
         state.lastScrobbleCompleteId = cur.id;
         sendTrackEvent(cur.id, 'complete', 1);
@@ -8291,6 +8416,7 @@
           state.hiddenWhilePlayingAt = 0;
           audio.pause();
           audio.removeAttribute('src');
+          clearNowPlaying(false);
           syncPlayingTrackRows('');
           renderQueuePanel();
           saveServerQueue();
@@ -9852,6 +9978,7 @@
     },
     signOut: async () => {
       const oldToken = state.token;
+      clearNowPlaying(true, oldToken);
       localStorage.removeItem('beatlab_token');
       state.token = '';
       state.user = null;

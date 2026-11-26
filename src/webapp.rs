@@ -767,6 +767,21 @@ pub struct EventReq {
     pub kind: String,
     #[serde(default = "default_one")]
     pub value: f64,
+    #[serde(default, rename = "clientId")]
+    pub client_id: String,
+    #[serde(default)]
+    pub seq: u64,
+}
+
+#[derive(Deserialize)]
+pub struct NowPlayingReq {
+    pub playing: bool,
+    #[serde(default, rename = "trackId")]
+    pub track_id: String,
+    #[serde(default, rename = "clientId")]
+    pub client_id: String,
+    #[serde(default)]
+    pub seq: u64,
 }
 
 #[derive(Deserialize)]
@@ -5521,6 +5536,18 @@ pub async fn record_event(
                 .hydrate_track_metadata(std::slice::from_mut(&mut t));
         }
         if req.kind == "play" {
+            let now = Utc::now().timestamp();
+            let client_id = normalize_now_playing_client_id(&req.client_id);
+            // Record now-playing immediately before awaiting any metadata enrichment so a
+            // quick pause or window close cannot race ahead of a slow network call.
+            upsert_now_playing(
+                &state,
+                user.id,
+                t.clone(),
+                now,
+                client_id.clone(),
+                req.seq,
+            );
             if t.year <= 0 {
                 state
                     .sources
@@ -5538,6 +5565,13 @@ pub async fn record_event(
                     let _ = store.upsert_tracks(&to_save);
                 })
                 .await;
+                // Refresh metadata on the live entry only if this same track is still playing.
+                let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = np.get_mut(&user.id) {
+                    if entry.track.as_ref().map(|cur| cur.id.as_str()) == Some(t.id.as_str()) {
+                        entry.track = Some(t.clone());
+                    }
+                }
             } else if t.genre.trim().is_empty() || t.year <= 0 {
                 let dz = state.sources.deezer.clone();
                 let store = state.store.clone();
@@ -5557,8 +5591,6 @@ pub async fn record_event(
                     "genre": t.genre,
                 }));
             }
-            let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
-            np.insert(user.id, (t, Utc::now().timestamp(), user.username));
         } else if t.genre.trim().is_empty() || t.year <= 0 {
             let dz = state.sources.deezer.clone();
             let store = state.store.clone();
@@ -6774,22 +6806,170 @@ pub async fn social_avatar_image(
     }
 }
 
-/// Returns the user's currently playing track if it was started recently
-/// enough to still be playing (track duration + 45s grace, clamped to 3m..1h,
-/// or 10m when duration is unknown).
-fn active_now_playing(state: &AppState, user_id: i64, now: i64) -> Option<(Track, i64)> {
-    let np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
-    let (track, started_at, _) = np.get(&user_id)?;
-    let window = if track.duration > 0 {
-        (track.duration as i64).clamp(180, 3600) + 45
-    } else {
-        600
-    };
-    if now.saturating_sub(*started_at) <= window {
-        Some((track.clone(), *started_at))
-    } else {
+/// Maximum time a playing session stays live without a heartbeat before it is
+/// treated as gone (e.g. crashed browser, killed process, or dropped network).
+/// Active web clients ping every ~20s while audio is playing, and also send an
+/// explicit `playing: false` keepalive request on pause, queue end, sign-out,
+/// and `pagehide`/`beforeunload`.
+const NOW_PLAYING_HEARTBEAT_TTL_SECS: i64 = 55;
+
+fn normalize_now_playing_client_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         None
+    } else {
+        Some(trimmed.chars().take(64).collect())
     }
+}
+
+fn upsert_now_playing(
+    state: &AppState,
+    user_id: i64,
+    track: Track,
+    now: i64,
+    client_id: Option<String>,
+    seq: u64,
+) {
+    let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = np.get_mut(&user_id) {
+        if let (Some(ref cur_cid), Some(ref new_cid)) = (&existing.client_id, &client_id) {
+            if cur_cid == new_cid && seq > 0 && seq <= existing.seq {
+                return;
+            }
+        }
+        if existing.track.as_ref().map(|t| t.id.as_str()) == Some(track.id.as_str())
+            && existing.client_id == client_id
+        {
+            existing.last_seen_at = now;
+            if seq > 0 {
+                existing.seq = seq;
+            }
+            return;
+        }
+    }
+    np.insert(
+        user_id,
+        crate::state::NowPlayingEntry {
+            track: Some(track),
+            started_at: now,
+            last_seen_at: now,
+            client_id,
+            seq,
+        },
+    );
+}
+
+fn clear_now_playing(
+    state: &AppState,
+    user_id: i64,
+    now: i64,
+    client_id: Option<String>,
+    seq: u64,
+) {
+    let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+    match (np.get(&user_id), client_id) {
+        (Some(existing), Some(cid)) => {
+            if let Some(ref cur_cid) = existing.client_id {
+                if cur_cid != &cid {
+                    // Another active tab/device owns now-playing; leave it untouched.
+                    return;
+                }
+                if seq > 0 && seq <= existing.seq {
+                    return;
+                }
+            }
+            np.insert(
+                user_id,
+                crate::state::NowPlayingEntry {
+                    track: None,
+                    started_at: now,
+                    last_seen_at: now,
+                    client_id: Some(cid),
+                    seq,
+                },
+            );
+        }
+        (None, Some(cid)) => {
+            // Keep a brief tombstone so an in-flight earlier `play` from this same
+            // client cannot resurrect now-playing after a quick close or pause.
+            if seq > 0 {
+                np.insert(
+                    user_id,
+                    crate::state::NowPlayingEntry {
+                        track: None,
+                        started_at: now,
+                        last_seen_at: now,
+                        client_id: Some(cid),
+                        seq,
+                    },
+                );
+            }
+        }
+        (_, None) => {
+            np.remove(&user_id);
+        }
+    }
+}
+
+pub async fn update_now_playing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<NowPlayingReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let now = Utc::now().timestamp();
+    let client_id = normalize_now_playing_client_id(&req.client_id);
+
+    if !req.playing {
+        clear_now_playing(&state, user.id, now, client_id, req.seq);
+        return json_res(json!({ "ok": true }));
+    }
+
+    let tid = req.track_id.trim();
+    if tid.is_empty() {
+        return err_res(StatusCode::BAD_REQUEST, "Missing trackId");
+    }
+
+    // Fast path for heartbeats: refresh `last_seen_at` in-memory without touching SQLite.
+    {
+        let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = np.get_mut(&user.id) {
+            if let (Some(ref cur_cid), Some(ref new_cid)) = (&existing.client_id, &client_id) {
+                if cur_cid == new_cid && req.seq > 0 && req.seq <= existing.seq {
+                    return json_res(json!({ "ok": true }));
+                }
+            }
+            if existing.track.as_ref().map(|t| t.id.as_str()) == Some(tid)
+                && existing.client_id == client_id
+            {
+                existing.last_seen_at = now;
+                if req.seq > 0 {
+                    existing.seq = req.seq;
+                }
+                return json_res(json!({ "ok": true }));
+            }
+        }
+    }
+
+    if let Ok(Some(track)) = state.store.get_track(tid) {
+        upsert_now_playing(&state, user.id, track, now, client_id, req.seq);
+    }
+    json_res(json!({ "ok": true }))
+}
+
+/// Returns the user's currently playing track if it has received a recent
+/// playback start or heartbeat within `NOW_PLAYING_HEARTBEAT_TTL_SECS`.
+fn active_now_playing(state: &AppState, user_id: i64, now: i64) -> Option<(Track, i64)> {
+    let mut np = state.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = np.get(&user_id)?;
+    if now.saturating_sub(entry.last_seen_at) > NOW_PLAYING_HEARTBEAT_TTL_SECS {
+        np.remove(&user_id);
+        return None;
+    }
+    entry.track.as_ref().map(|t| (t.clone(), entry.started_at))
 }
 
 pub async fn social_profile(
@@ -7782,6 +7962,8 @@ mod tests {
                 track_id: "loc:80s-1".into(),
                 kind: "search_pick".into(),
                 value: 1.0,
+                client_id: String::new(),
+                seq: 0,
             }),
         )
         .await;
@@ -8469,6 +8651,8 @@ mod tests {
                         track_id: tid.clone(),
                         kind: "skip".into(),
                         value: 1.0,
+                        client_id: String::new(),
+                        seq: 0,
                     }),
                 )
                 .await;
@@ -8569,6 +8753,8 @@ mod tests {
                 track_id: "dz:9001".into(),
                 kind: "play".into(),
                 value: 1.0,
+                client_id: String::new(),
+                seq: 0,
             }),
         )
         .await;
@@ -9001,5 +9187,186 @@ mod tests {
             true,
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn now_playing_clears_on_close_expires_without_heartbeat_and_isolates_tabs() {
+        use crate::engine::StreamEngine;
+        use crate::sources::{
+            archive::ArchiveSource, deezer::DeezerSource, local::LocalSource,
+            soulseek::SoulseekSource, ytm::YtmSource, SourceRegistry,
+        };
+        use crate::store::Store;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "beatlab_now_playing_test_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open_memory().unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.clone()),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(crate::taste::TasteEngine::new(store.clone(), sources.clone()));
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            llm: None,
+            now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+        };
+
+        let t1 = Track {
+            id: "loc:np-1".into(),
+            source: "local".into(),
+            title: "Midnight City".into(),
+            artist: "M83".into(),
+            year: 2011,
+            genre: "Synthpop".into(),
+            duration: 243,
+            ..Default::default()
+        };
+        let t2 = Track {
+            id: "loc:np-2".into(),
+            source: "local".into(),
+            title: "Resonance".into(),
+            artist: "HOME".into(),
+            year: 2014,
+            genre: "Synthwave".into(),
+            duration: 212,
+            ..Default::default()
+        };
+        store.upsert_tracks(&[t1.clone(), t2.clone()]).unwrap();
+
+        let (u, _) = store.authenticate_or_create_user("npuser", "pw123").unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
+
+        // 1. Starting playback sets now_playing immediately.
+        let r = record_event(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(EventReq {
+                track_id: t1.id.clone(),
+                kind: "play".into(),
+                value: 1.0,
+                client_id: "tab-a".into(),
+                seq: 1,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let now = Utc::now().timestamp();
+        let active = active_now_playing(&state, u.id, now).expect("should be active");
+        assert_eq!(active.0.id, t1.id);
+
+        // 2. Without heartbeats (e.g. abrupt browser crash), now_playing expires after TTL.
+        assert!(
+            active_now_playing(&state, u.id, now + NOW_PLAYING_HEARTBEAT_TTL_SECS + 1).is_none(),
+            "stale session must expire without heartbeats"
+        );
+
+        // 3. Re-report via heartbeat endpoint and keep alive past initial started_at + TTL.
+        let r = update_now_playing(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(NowPlayingReq {
+                playing: true,
+                track_id: t1.id.clone(),
+                client_id: "tab-a".into(),
+                seq: 2,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let started_at = active_now_playing(&state, u.id, Utc::now().timestamp())
+            .expect("should be active")
+            .1;
+        // Heartbeat preserves started_at while advancing last_seen_at.
+        upsert_now_playing(
+            &state,
+            u.id,
+            t1.clone(),
+            started_at + 40,
+            Some("tab-a".into()),
+            3,
+        );
+        let refreshed = active_now_playing(&state, u.id, started_at + 80)
+            .expect("heartbeat should keep session alive");
+        assert_eq!(refreshed.1, started_at);
+
+        // 4. Abrupt window close (playing: false) clears immediately.
+        let r = update_now_playing(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(NowPlayingReq {
+                playing: false,
+                track_id: String::new(),
+                client_id: "tab-a".into(),
+                seq: 4,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(active_now_playing(&state, u.id, Utc::now().timestamp()).is_none());
+
+        // 5. Stale out-of-order play from the closed tab (seq 3 <= 4) cannot resurrect now_playing.
+        let r = record_event(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(EventReq {
+                track_id: t1.id.clone(),
+                kind: "play".into(),
+                value: 1.0,
+                client_id: "tab-a".into(),
+                seq: 3,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(
+            active_now_playing(&state, u.id, Utc::now().timestamp()).is_none(),
+            "stale play event from closed tab must not resurrect now_playing"
+        );
+
+        // 6. Another tab (tab-b) takes over playback; closing tab-a does NOT clear tab-b.
+        let r = update_now_playing(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(NowPlayingReq {
+                playing: true,
+                track_id: t2.id.clone(),
+                client_id: "tab-b".into(),
+                seq: 1,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = update_now_playing(
+            State(state.clone()),
+            hdrs.clone(),
+            Json(NowPlayingReq {
+                playing: false,
+                track_id: String::new(),
+                client_id: "tab-a".into(),
+                seq: 5,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let still_b = active_now_playing(&state, u.id, Utc::now().timestamp())
+            .expect("closing tab-a must not clear tab-b");
+        assert_eq!(still_b.0.id, t2.id);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -335,6 +335,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/star", post(webapp::toggle_star))
         .route("/api/web/rate", post(webapp::set_rating))
         .route("/api/web/event", post(webapp::record_event))
+        .route("/api/web/now-playing", post(webapp::update_now_playing))
         .route("/api/web/not-interested", post(webapp::mark_not_interested))
         .route("/api/web/hidden", get(webapp::list_hidden))
         .route("/api/web/hidden/reset", post(webapp::reset_hidden))

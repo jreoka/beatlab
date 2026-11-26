@@ -8,8 +8,19 @@ use axum::http::{header, HeaderMap};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// (user_id -> (track, started_at_unix, username))
-pub type NowPlayingMap = Arc<Mutex<HashMap<i64, (Track, i64, String)>>>;
+#[derive(Debug, Clone)]
+pub struct NowPlayingEntry {
+    /// `None` acts as a short-lived tombstone for a client that just paused or closed,
+    /// so an in-flight older `play` request from the same client cannot resurrect it.
+    pub track: Option<Track>,
+    pub started_at: i64,
+    pub last_seen_at: i64,
+    pub client_id: Option<String>,
+    pub seq: u64,
+}
+
+/// (user_id -> active playback presence)
+pub type NowPlayingMap = Arc<Mutex<HashMap<i64, NowPlayingEntry>>>;
 
 /// In-flight background "New Releases" refresh handles keyed by user ID.
 pub type NewReleasesInflight = Arc<Mutex<HashMap<i64, tokio::sync::watch::Receiver<bool>>>>;
