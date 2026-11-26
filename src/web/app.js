@@ -10327,12 +10327,6 @@
         ? `${lobby.data.name} · ${count} ${count === 1 ? 'listener' : 'listeners'}`
         : 'Listen Together';
     }
-    const badge = $('sidebar-lobby-badge');
-    if (badge) {
-      badge.classList.toggle('hidden', !live);
-      badge.textContent = count ? `LIVE · ${count}` : 'LIVE';
-    }
-    if ($('pb-lobby')) $('pb-lobby').classList.toggle('active', live);
     if ($('fs-lobby')) $('fs-lobby').classList.toggle('active', live);
     document.body.classList.toggle('lobby-live', live);
   }

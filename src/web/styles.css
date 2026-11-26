@@ -8243,20 +8243,6 @@ html[data-theme="light"] .stats-portrait-badge {
   display: inline-grid;
   place-items: center;
 }
-.lobby-bg { color: var(--accent-blue); }
-.lobby-lib-row { position: relative; }
-.lib-live-badge {
-  margin-left: auto;
-  font-size: 9.5px;
-  font-weight: 800;
-  letter-spacing: 0.05em;
-  color: var(--accent);
-  background: var(--accent-soft);
-  padding: 2px 7px;
-  border-radius: 999px;
-  white-space: nowrap;
-}
-.pb-lobby-btn.active,
 .fs-top-lobby.active { color: var(--accent); }
 .fs-top-side { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .fs-top-spacer { visibility: hidden; pointer-events: none; }
