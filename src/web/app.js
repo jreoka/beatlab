@@ -20,6 +20,7 @@
     lock: '<svg class="vis-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="11" width="15" height="10" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/></svg>',
     globe: '<svg class="vis-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg>',
     pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>',
+    playlistAdd: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M11 12H3"/><path d="M16 6H3"/><path d="M16 18H3"/><path d="M18 9v6"/><path d="M21 12h-6"/></svg>',
   };
 
   function pinnedPlaylistsStorageKey() {
@@ -7391,7 +7392,10 @@
     const upNextHtml =
       modeTabsHtml +
       (upcoming.length
-        ? `<div class="queue-section-label">Next Up (${upcoming.length})${state.radioLoading ? ' · Updating...' : ''}</div>` +
+        ? `<div class="queue-section-head">
+            <div class="queue-section-label">Next Up (${upcoming.length})${state.radioLoading ? ' · Updating...' : ''}</div>
+            <button type="button" class="queue-save-btn" onclick="App.promptSaveUpcoming()" title="Save upcoming as playlist" aria-label="Save upcoming as playlist">${ICONS.playlistAdd}<span>Save</span></button>
+          </div>` +
           upcoming.map((t, i) => renderQItem(t, state.queueIndex + 1 + i, false)).join('')
         : state.radioLoading
           ? `<div class="queue-section-label">Next Up</div><p class="muted-center">Loading upcoming tracks...</p>`
@@ -7423,6 +7427,274 @@
       </div>
       ${!active ? `<button class="icon-btn" title="Remove from queue" onclick="event.stopPropagation();App.removeFromQueue(${idx})">${ICONS.close}</button>` : ''}
     </div>`;
+  }
+
+  let saveQueueDraft = null;
+
+  function defaultUpcomingPlaylistName(cur) {
+    const mode = state.upcomingMode;
+    const modeLabel = mode === 'discover' ? 'Discover' : mode === 'familiar' ? 'Familiar' : '';
+    if (cur && cur.title) {
+      return modeLabel ? `${cur.title} · ${modeLabel}` : `${cur.title} · Up Next`;
+    }
+    return modeLabel ? `Up Next · ${modeLabel}` : 'Up Next Queue';
+  }
+
+  function dedupeQueueTracks(list) {
+    const seen = new Set();
+    const out = [];
+    for (const t of list) {
+      if (!t || !t.id || seen.has(t.id)) continue;
+      seen.add(t.id);
+      out.push(t);
+    }
+    return out;
+  }
+
+  function saveQueueSelectedTracks(includeCurrentOverride = null) {
+    if (!saveQueueDraft) return [];
+    const inc = includeCurrentOverride === null ? saveQueueDraft.includeCurrent : includeCurrentOverride;
+    const raw = inc && saveQueueDraft.cur
+      ? [saveQueueDraft.cur, ...saveQueueDraft.upcoming]
+      : [...saveQueueDraft.upcoming];
+    return dedupeQueueTracks(raw);
+  }
+
+  function syncSaveQueueDraftFromDom() {
+    if (!saveQueueDraft) return;
+    const nameEl = $('save-queue-name');
+    if (nameEl) saveQueueDraft.name = nameEl.value;
+    const descEl = $('save-queue-desc');
+    if (descEl) saveQueueDraft.comment = descEl.value;
+    if (document.querySelector('.pl-visibility-opt.selected')) {
+      saveQueueDraft.isPublic = selectedPlaylistVisibility();
+    }
+  }
+
+  function renderSaveQueueModal(focusName = false) {
+    if (!saveQueueDraft) return;
+    const draft = saveQueueDraft;
+    const tracks = saveQueueSelectedTracks();
+    const withCurCount = saveQueueSelectedTracks(true).length;
+    const upOnlyCount = saveQueueSelectedTracks(false).length;
+    const totalSecs = tracks.reduce((sum, t) => sum + (Number(t.duration) || 0), 0);
+    const durLabel = totalSecs > 0 ? ` · ${fmtTotalDur(totalSecs)}` : '';
+
+    const coverUrls = [];
+    for (const t of tracks) {
+      if (t.coverUrl && !coverUrls.includes(t.coverUrl)) {
+        coverUrls.push(t.coverUrl);
+        if (coverUrls.length >= 4) break;
+      }
+    }
+    if (!coverUrls.length) coverUrls.push('/api/web/cover/default');
+
+    const artistNames = [];
+    for (const t of tracks) {
+      const a = (t.artist || '').trim();
+      if (a && !artistNames.includes(a)) artistNames.push(a);
+    }
+    const artistPreview = artistNames.length > 3
+      ? `${artistNames.slice(0, 3).join(', ')} & ${artistNames.length - 3} more`
+      : artistNames.join(', ');
+
+    const editablePlaylists = (state.playlists || []).filter((p) => !p.isAuto);
+    if (draft.mode === 'existing' && !editablePlaylists.length) {
+      draft.mode = 'new';
+    }
+
+    const scopeHtml =
+      draft.cur && draft.upcoming.length && withCurCount !== upOnlyCount
+        ? `<div class="save-queue-scope" role="group" aria-label="Tracks to include">
+            <button type="button" class="save-queue-chip ${draft.includeCurrent ? 'active' : ''}" onclick="App.setSaveQueueIncludeCurrent(true)">Now Playing + Up Next (${withCurCount})</button>
+            <button type="button" class="save-queue-chip ${!draft.includeCurrent ? 'active' : ''}" onclick="App.setSaveQueueIncludeCurrent(false)">Up Next only (${upOnlyCount})</button>
+          </div>`
+        : '';
+
+    const modeTabsHtml = editablePlaylists.length
+      ? `<div class="save-queue-tabs" role="tablist" aria-label="Save destination">
+          <button type="button" role="tab" aria-selected="${draft.mode === 'new' ? 'true' : 'false'}" class="save-queue-tab ${draft.mode === 'new' ? 'active' : ''}" onclick="App.setSaveQueueMode('new')">New Playlist</button>
+          <button type="button" role="tab" aria-selected="${draft.mode === 'existing' ? 'true' : 'false'}" class="save-queue-tab ${draft.mode === 'existing' ? 'active' : ''}" onclick="App.setSaveQueueMode('existing')">Add to Existing (${editablePlaylists.length})</button>
+        </div>`
+      : '';
+
+    const bodyHtml =
+      draft.mode === 'existing'
+        ? `<div class="save-queue-pl-list">
+            ${editablePlaylists
+              .map(
+                (p) => `
+              <button type="button" class="save-queue-pl-row" onclick="App.submitSaveQueueToExisting(${esc(JSON.stringify(p.id))}, this)">
+                <img src="${esc(p.coverUrl)}" alt="" />
+                <span class="save-queue-pl-meta">
+                  <span class="save-queue-pl-name">${esc(p.name)}</span>
+                  <span class="save-queue-pl-count">${p.trackCount} track${p.trackCount === 1 ? '' : 's'}</span>
+                </span>
+                <span class="save-queue-pl-add">+ Add</span>
+              </button>`
+              )
+              .join('')}
+          </div>`
+        : `<form onsubmit="App.submitSaveQueueNew(event)" style="display:flex;flex-direction:column;gap:12px">
+            <input id="save-queue-name" type="text" value="${esc(draft.name)}" placeholder="Playlist name" required />
+            <input id="save-queue-desc" type="text" value="${esc(draft.comment)}" placeholder="Description (optional)" />
+            ${playlistVisibilityHtml(!!draft.isPublic)}
+            <button id="save-queue-submit" type="submit" class="btn-primary">Create Playlist (${tracks.length} track${tracks.length === 1 ? '' : 's'})</button>
+          </form>`;
+
+    openModal(`
+      <div class="modal-head"><h3>Save Queue to Playlist</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
+      <div class="save-queue-preview">
+        <div class="save-queue-covers">
+          ${coverUrls.map((u) => `<img src="${esc(u)}" alt="" />`).join('')}
+        </div>
+        <div class="save-queue-summary">
+          <div class="save-queue-count">${tracks.length} track${tracks.length === 1 ? '' : 's'}${durLabel}</div>
+          ${artistPreview ? `<div class="save-queue-artists">${esc(artistPreview)}</div>` : ''}
+        </div>
+      </div>
+      ${scopeHtml}
+      ${modeTabsHtml}
+      ${bodyHtml}
+    `, 'save-queue-modal');
+
+    if (focusName && draft.mode === 'new' && window.matchMedia && window.matchMedia('(hover: hover)').matches) {
+      const inp = $('save-queue-name');
+      if (inp) {
+        inp.focus();
+        inp.select();
+      }
+    }
+  }
+
+  function promptSaveUpcoming() {
+    const cur = currentTrack();
+    const upcoming = state.queue.slice(state.queueIndex + 1);
+    if (!upcoming.length && !cur) {
+      showToast('No upcoming tracks to save');
+      return;
+    }
+    saveQueueDraft = {
+      cur: cur ? { ...cur } : null,
+      upcoming: upcoming.map((t) => ({ ...t })),
+      includeCurrent: !!cur,
+      mode: 'new',
+      name: defaultUpcomingPlaylistName(cur),
+      comment: '',
+      isPublic: false,
+    };
+    renderSaveQueueModal(true);
+  }
+
+  function setSaveQueueIncludeCurrent(include) {
+    if (!saveQueueDraft) return;
+    syncSaveQueueDraftFromDom();
+    saveQueueDraft.includeCurrent = !!include;
+    renderSaveQueueModal(false);
+  }
+
+  function setSaveQueueMode(mode) {
+    if (!saveQueueDraft) return;
+    syncSaveQueueDraftFromDom();
+    saveQueueDraft.mode = mode === 'existing' ? 'existing' : 'new';
+    renderSaveQueueModal(false);
+  }
+
+  async function refreshCurrentPlaylistSurface(targetPid = null) {
+    const curHash = location.hash.replace(/^#/, '');
+    if (targetPid && (curHash === `playlist/${encodeURIComponent(targetPid)}` || curHash === `playlist/${targetPid}`)) {
+      renderPlaylist(targetPid);
+    } else if (curHash === 'playlists') {
+      renderPlaylistsView();
+    } else if (isLibraryHash(curHash)) {
+      renderLibrary(state.libTab || 'playlists');
+    }
+  }
+
+  async function submitSaveQueueNew(e) {
+    e.preventDefault();
+    if (!saveQueueDraft) {
+      closeModal();
+      return;
+    }
+    syncSaveQueueDraftFromDom();
+    const name = (saveQueueDraft.name || '').trim();
+    if (!name) {
+      showToast('Please enter a playlist name');
+      return;
+    }
+    const tracks = saveQueueSelectedTracks();
+    const trackIds = tracks.map((t) => t.id);
+    if (!trackIds.length) {
+      showToast('No tracks to save');
+      return;
+    }
+    const btn = $('save-queue-submit');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Saving...';
+    }
+    try {
+      const res = await api('/api/web/playlists', {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          comment: (saveQueueDraft.comment || '').trim(),
+          public: !!saveQueueDraft.isPublic,
+          trackIds,
+        }),
+      });
+      haptic('success');
+      saveQueueDraft = null;
+      closeModal();
+      await refreshSidebarPlaylists();
+      refreshCurrentPlaylistSurface(res.playlist?.id);
+      showToast(`Saved "${name}" (${trackIds.length} track${trackIds.length === 1 ? '' : 's'})`);
+    } catch (err) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = `Create Playlist (${trackIds.length} track${trackIds.length === 1 ? '' : 's'})`;
+      }
+      showToast(err.message);
+    }
+  }
+
+  async function submitSaveQueueToExisting(pid, rowBtn) {
+    if (!saveQueueDraft) {
+      closeModal();
+      return;
+    }
+    const tracks = saveQueueSelectedTracks();
+    const trackIds = tracks.map((t) => t.id);
+    if (!trackIds.length) {
+      showToast('No tracks to add');
+      return;
+    }
+    const targetPl = (state.playlists || []).find((p) => p.id === pid);
+    const plName = targetPl ? targetPl.name : 'playlist';
+    if (rowBtn) rowBtn.disabled = true;
+    try {
+      const res = await api(`/api/web/playlists/${encodeURIComponent(pid)}/tracks`, {
+        method: 'POST',
+        body: JSON.stringify({ trackIds }),
+      });
+      haptic('success');
+      saveQueueDraft = null;
+      closeModal();
+      await refreshSidebarPlaylists();
+      refreshCurrentPlaylistSurface(pid);
+      const added = Number(res.added) || 0;
+      if (added === 0) {
+        showToast(`Already in "${plName}"`);
+      } else if (added < trackIds.length) {
+        showToast(`Added ${added} new track${added === 1 ? '' : 's'} to "${plName}"`);
+      } else {
+        showToast(`Added ${added} track${added === 1 ? '' : 's'} to "${plName}"`);
+      }
+    } catch (err) {
+      if (rowBtn) rowBtn.disabled = false;
+      showToast(err.message);
+    }
   }
 
   async function loadLyricsForTrack(id) {
@@ -10469,6 +10741,11 @@
     playInstantMix,
     playInstantMixAt,
     queueInstantMix,
+    promptSaveUpcoming,
+    setSaveQueueIncludeCurrent,
+    setSaveQueueMode,
+    submitSaveQueueNew,
+    submitSaveQueueToExisting,
     promptSaveInstantMix: () => {
       const active = getActiveInstantMix();
       if (!active || !active.mix || !Array.isArray(active.mix.tracks) || !active.mix.tracks.length) {
