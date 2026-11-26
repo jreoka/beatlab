@@ -712,10 +712,22 @@ fn user_json(state: &AppState, user: &User) -> Value {
     })
 }
 
+#[derive(Deserialize, Default)]
+pub struct CaptchaReq {
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub signals: crate::captcha::BrowserSignals,
+}
+
 #[derive(Deserialize)]
 pub struct AuthReq {
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub captcha: Option<crate::captcha::CaptchaSolution>,
+    #[serde(default, rename = "hpToken")]
+    pub hp_token: String,
 }
 
 #[derive(Deserialize)]
@@ -724,6 +736,10 @@ pub struct SignupReq {
     pub password: String,
     #[serde(rename = "confirmPassword")]
     pub confirm_password: String,
+    #[serde(default)]
+    pub captcha: Option<crate::captcha::CaptchaSolution>,
+    #[serde(default, rename = "hpToken")]
+    pub hp_token: String,
 }
 
 #[derive(Deserialize)]
@@ -861,18 +877,63 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 
+fn captcha_err_res(err: crate::captcha::CaptchaError) -> Response {
+    match err {
+        crate::captcha::CaptchaError::RateLimited(wait) => {
+            let mut res = (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                json!({ "error": err.message(), "captchaRequired": true }).to_string(),
+            )
+                .into_response();
+            if let Ok(v) = wait.max(1).to_string().parse() {
+                res.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            res
+        }
+        other => (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            json!({ "error": other.message(), "captchaRequired": true }).to_string(),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn auth_captcha(headers: HeaderMap, body: Bytes) -> Response {
+    if !crate::captcha::is_enabled() {
+        return json_res(json!({ "enabled": false }));
+    }
+    let req: CaptchaReq = if body.is_empty() {
+        CaptchaReq::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+    let ip = rate_limit_ip(&headers);
+    match crate::captcha::issue_challenge(&headers, &ip, &req.action, &req.signals) {
+        Ok(challenge) => json_res(serde_json::to_value(challenge).unwrap_or_else(|_| json!({}))),
+        Err(err) => captcha_err_res(err),
+    }
+}
+
 pub async fn signin(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<AuthReq>,
 ) -> Response {
-    let rate_keys = crate::auth::rate_keys(
-        "signin",
-        &req.username,
-        &rate_limit_ip(&headers),
-    );
+    let ip = rate_limit_ip(&headers);
+    let rate_keys = crate::auth::rate_keys("signin", &req.username, &ip);
     if let Some(wait) = crate::auth::throttled_for(&rate_keys) {
         return too_many_attempts(wait);
+    }
+    if let Err(err) = crate::captcha::verify_solution(
+        &headers,
+        &ip,
+        "signin",
+        req.captcha.as_ref(),
+        &req.hp_token,
+    ) {
+        return captcha_err_res(err);
     }
     let store = state.store.clone();
     let (username, password) = (req.username.clone(), req.password.clone());
@@ -883,7 +944,10 @@ pub async fn signin(
     match &outcome {
         Ok(_) => crate::auth::record_success(&rate_keys),
         Err(e) if e.0 == ERR_RESTORE_REQUIRED => crate::auth::record_success(&rate_keys),
-        Err(_) => crate::auth::record_failure(&rate_keys),
+        Err(_) => {
+            crate::auth::record_failure(&rate_keys);
+            crate::captcha::record_ip_failure(&ip);
+        }
     }
     match outcome {
         Ok(user) => {
@@ -941,6 +1005,19 @@ pub async fn signup(
     headers: HeaderMap,
     Json(req): Json<SignupReq>,
 ) -> Response {
+    let ip = rate_limit_ip(&headers);
+    if let Some(wait) = crate::captcha::signup_throttled_for(&ip) {
+        return too_many_attempts(wait);
+    }
+    if let Err(err) = crate::captcha::verify_solution(
+        &headers,
+        &ip,
+        "signup",
+        req.captcha.as_ref(),
+        &req.hp_token,
+    ) {
+        return captcha_err_res(err);
+    }
     if req.password != req.confirm_password {
         return err_res(StatusCode::BAD_REQUEST, "Passwords do not match");
     }
@@ -954,6 +1031,7 @@ pub async fn signup(
         .unwrap_or_else(|| Err(crate::models::err_msg("Could not create account")));
     match created {
         Ok(user) => {
+            crate::captcha::record_ip_signup(&ip);
             let taste = state.taste.clone();
             let uid = user.id;
             tokio::spawn(async move {
@@ -7329,21 +7407,148 @@ mod tests {
         h
     }
 
+    fn solved_test_captcha(headers: &HeaderMap, action: &str) -> crate::captcha::CaptchaSolution {
+        let ip = rate_limit_ip(headers);
+        let ch = crate::captcha::issue_challenge(
+            headers,
+            &ip,
+            action,
+            &crate::captcha::BrowserSignals {
+                languages: 1,
+                screen_w: 1920,
+                screen_h: 1080,
+                inner_w: 1280,
+                inner_h: 720,
+                cores: 4,
+                canvas_ok: true,
+                layout_ok: true,
+                worker_ok: true,
+                signals_present: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::captcha::solve_for_test(&ch)
+    }
+
     #[tokio::test]
     async fn repeated_failed_signins_are_throttled_and_passwords_are_hashed() {
         let state = account_test_state();
         let (u, _) = state.store.authenticate_or_create_user("throttled-user", "right-pass").unwrap();
         assert!(crate::auth::is_password_hash(&state.store.get_user_by_id(u.id).unwrap().unwrap().password));
 
-        let attempt = |pw: &str| AuthReq { username: "throttled-user".into(), password: pw.into() };
+        let headers = HeaderMap::new();
+        let attempt = |pw: &str| AuthReq {
+            username: "throttled-user".into(),
+            password: pw.into(),
+            captcha: Some(solved_test_captcha(&headers, "signin")),
+            hp_token: String::new(),
+        };
         for _ in 0..crate::auth::MAX_FAILURES_PER_ACCOUNT {
-            let res = signin(State(state.clone()), HeaderMap::new(), Json(attempt("wrong"))).await;
+            let res = signin(State(state.clone()), headers.clone(), Json(attempt("wrong"))).await;
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         }
         // Even the right password is refused while the account is throttled.
-        let res = signin(State(state.clone()), HeaderMap::new(), Json(attempt("right-pass"))).await;
+        let res = signin(State(state.clone()), headers.clone(), Json(attempt("right-pass"))).await;
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(res.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn signin_and_signup_require_valid_pow_captcha() {
+        let state = account_test_state();
+        let headers = HeaderMap::new();
+
+        // Missing captcha on signup -> rejected before account creation.
+        let res = signup(
+            State(state.clone()),
+            headers.clone(),
+            Json(SignupReq {
+                username: "botuser".into(),
+                password: "password123".into(),
+                confirm_password: "password123".into(),
+                captcha: None,
+                hp_token: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(state.store.get_user_by_name("botuser").unwrap().is_none());
+
+        // Honeypot filled even with valid captcha -> rejected.
+        let sol = solved_test_captcha(&headers, "signup");
+        let res = signup(
+            State(state.clone()),
+            headers.clone(),
+            Json(SignupReq {
+                username: "botuser".into(),
+                password: "password123".into(),
+                confirm_password: "password123".into(),
+                captcha: Some(sol),
+                hp_token: "spam-bot".into(),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(state.store.get_user_by_name("botuser").unwrap().is_none());
+
+        // Valid captcha -> signup succeeds.
+        let sol = solved_test_captcha(&headers, "signup");
+        let res = signup(
+            State(state.clone()),
+            headers.clone(),
+            Json(SignupReq {
+                username: "humanuser".into(),
+                password: "password123".into(),
+                confirm_password: "password123".into(),
+                captcha: Some(sol.clone()),
+                hp_token: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Missing captcha on signin -> rejected.
+        let res = signin(
+            State(state.clone()),
+            headers.clone(),
+            Json(AuthReq {
+                username: "humanuser".into(),
+                password: "password123".into(),
+                captcha: None,
+                hp_token: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Replaying the consumed signup captcha on signin -> rejected.
+        let res = signin(
+            State(state.clone()),
+            headers.clone(),
+            Json(AuthReq {
+                username: "humanuser".into(),
+                password: "password123".into(),
+                captcha: Some(sol),
+                hp_token: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Fresh signin captcha -> succeeds.
+        let res = signin(
+            State(state.clone()),
+            headers.clone(),
+            Json(AuthReq {
+                username: "humanuser".into(),
+                password: "password123".into(),
+                captcha: Some(solved_test_captcha(&headers, "signin")),
+                hp_token: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 mod admin;
 mod auth;
+mod captcha;
 mod engine;
 mod llm;
 mod models;
@@ -264,6 +265,7 @@ async fn main() -> models::AppResult<()> {
         .merge(web_ui_routes())
         // Web Player API (/api/web/*) — open account creation & full player features
         .route("/api/web/me", get(webapp::me))
+        .route("/api/web/auth/captcha", post(webapp::auth_captcha))
         .route("/api/web/auth/signin", post(webapp::signin))
         .route("/api/web/auth/signup", post(webapp::signup))
         .route("/api/web/auth/signout", post(webapp::signout))

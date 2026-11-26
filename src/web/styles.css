@@ -3017,19 +3017,7 @@ a {
   gap: 10px;
   align-items: center;
   flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-.instant-mix-mode-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
   margin-bottom: 18px;
-}
-.instant-mix-mode-row .refine-query-pill.active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #0b0d12;
-  font-weight: 600;
 }
 .instant-mix-builder-form input[type="text"] {
   flex: 1;
@@ -5300,6 +5288,216 @@ html, body {
   padding: 11px 16px;
 }
 
+/* ---------------- Smart PoW Captcha Widget ---------------- */
+.auth-form input.auth-hp {
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.auth-captcha {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+
+.auth-captcha:hover {
+  border-color: var(--border-bright);
+}
+
+.auth-captcha[data-state="interactive"] {
+  border-color: rgba(30, 215, 96, 0.5);
+  background: var(--surface-2);
+}
+
+.auth-captcha[data-state="verified"] {
+  border-color: rgba(30, 215, 96, 0.42);
+}
+
+.auth-captcha[data-state="error"] {
+  border-color: rgba(244, 63, 94, 0.45);
+}
+
+.auth-captcha-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 12px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.auth-captcha-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--radius);
+}
+
+.auth-captcha-indicator {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+}
+
+.auth-captcha-box {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  border: 1.5px solid var(--border-bright);
+  background: var(--bg);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.auth-captcha-btn:hover .auth-captcha-box,
+.auth-captcha[data-state="interactive"] .auth-captcha-box {
+  border-color: var(--accent);
+}
+
+.auth-captcha-spinner,
+.auth-captcha-check,
+.auth-captcha-alert {
+  display: none;
+}
+
+.auth-captcha[data-state="checking"] .auth-captcha-box,
+.auth-captcha[data-state="solving"] .auth-captcha-box,
+.auth-captcha[data-state="verified"] .auth-captcha-box,
+.auth-captcha[data-state="error"] .auth-captcha-box {
+  display: none;
+}
+
+.auth-captcha[data-state="checking"] .auth-captcha-spinner,
+.auth-captcha[data-state="solving"] .auth-captcha-spinner {
+  display: block;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid var(--border-bright);
+  border-top-color: var(--accent);
+  animation: ptrSpin 0.72s linear infinite;
+}
+
+.auth-captcha[data-state="verified"] .auth-captcha-indicator {
+  border-radius: 50%;
+  background: var(--accent);
+  color: #04120a;
+}
+
+.auth-captcha[data-state="verified"] .auth-captcha-check {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+.auth-captcha[data-state="error"] .auth-captcha-alert {
+  display: block;
+  width: 20px;
+  height: 20px;
+  color: var(--danger);
+}
+
+.auth-captcha-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.auth-captcha-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.25;
+}
+
+.auth-captcha-sub {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.auth-captcha[data-state="error"] .auth-captcha-sub {
+  color: #fda4af;
+}
+
+.auth-captcha-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
+.auth-captcha-brand svg {
+  width: 15px;
+  height: 15px;
+  color: var(--text-muted);
+}
+
+.auth-captcha[data-state="verified"] .auth-captcha-brand svg {
+  color: var(--accent);
+}
+
+.auth-captcha-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: transparent;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.auth-captcha-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.14s linear, opacity 0.2s ease;
+  opacity: 0;
+}
+
+.auth-captcha[data-state="checking"] .auth-captcha-progress-fill,
+.auth-captcha[data-state="solving"] .auth-captcha-progress-fill {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-captcha[data-state="checking"] .auth-captcha-spinner,
+  .auth-captcha[data-state="solving"] .auth-captcha-spinner {
+    animation: none;
+    border-color: var(--accent);
+  }
+}
+
 /* ---------------- Buttons & Controls ---------------- */
 .btn-primary {
   background: var(--accent);
@@ -6348,6 +6546,12 @@ html[data-theme="light"] .auth-error {
   color: #be123c;
   background: rgba(225, 29, 72, 0.08);
   border-color: rgba(225, 29, 72, 0.3);
+}
+html[data-theme="light"] .auth-captcha[data-state="error"] .auth-captcha-sub {
+  color: #be123c;
+}
+html[data-theme="light"] .auth-captcha[data-state="verified"] .auth-captcha-indicator {
+  color: #ffffff;
 }
 
 /* ---------------- Quick Picks pager (9 per page, swipe / arrows) ---------------- */

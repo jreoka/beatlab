@@ -57,6 +57,26 @@
           <span>Confirm password</span>
           <input id="auth-confirm" type="password" autocomplete="new-password" placeholder="Enter your password again" required maxlength="256" />
         </label>
+        <input id="auth-hp" class="auth-hp" type="text" name="hp_contact_token" tabindex="-1" autocomplete="off" aria-hidden="true" />
+        <div id="auth-captcha" class="auth-captcha" data-state="idle">
+          <button id="auth-captcha-btn" type="button" class="auth-captcha-btn" role="checkbox" aria-checked="false" aria-describedby="auth-captcha-sub">
+            <span class="auth-captcha-indicator" aria-hidden="true">
+              <span class="auth-captcha-box"></span>
+              <span class="auth-captcha-spinner"></span>
+              <svg class="auth-captcha-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+              <svg class="auth-captcha-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12.5"/><circle cx="12" cy="16.2" r="0.8" fill="currentColor" stroke="none"/></svg>
+            </span>
+            <span class="auth-captcha-copy">
+              <span id="auth-captcha-label" class="auth-captcha-label">Verify you&apos;re human</span>
+              <span id="auth-captcha-sub" class="auth-captcha-sub">Browser &amp; proof-of-work check</span>
+            </span>
+            <span class="auth-captcha-brand" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v6c0 4.5 3 7.8 7 9 4-1.2 7-4.5 7-9V6l-7-3z"/><path d="m9.5 12 1.8 1.8 3.5-3.8"/></svg>
+              <span>Shield</span>
+            </span>
+          </button>
+          <div class="auth-captcha-progress" aria-hidden="true"><div id="auth-captcha-progress-fill" class="auth-captcha-progress-fill"></div></div>
+        </div>
         <div id="auth-error" class="auth-error hidden"></div>
         <button id="auth-submit" type="submit" class="btn-primary btn-full">Sign in</button>
       </form>

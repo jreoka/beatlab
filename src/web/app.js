@@ -697,6 +697,7 @@
       handleConnectivityRestored();
     }
     const inlineAuthPaths = [
+      '/api/web/auth/captcha',
       '/api/web/auth/signin',
       '/api/web/auth/signup',
       '/api/web/auth/mfa/verify',
@@ -964,11 +965,513 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Smart Proof-of-Work Captcha & Browser Integrity Check
+  // ---------------------------------------------------------------------------
+  const POW_SHA256_CORE = `
+    const K = new Int32Array([
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ]);
+    const W = new Int32Array(64);
+    const BUF = new Uint8Array(192);
+    function sha256FirstWordAscii(prefixBytes, prefixLen, nonceStr) {
+      const nLen = nonceStr.length;
+      const len = prefixLen + nLen;
+      const total = ((len + 9 + 63) >> 6) << 6;
+      for (let i = 0; i < prefixLen; i++) BUF[i] = prefixBytes[i];
+      for (let i = 0; i < nLen; i++) BUF[prefixLen + i] = nonceStr.charCodeAt(i) & 0xff;
+      BUF[len] = 0x80;
+      for (let i = len + 1; i < total - 4; i++) BUF[i] = 0;
+      const bitLen = len * 8;
+      BUF[total - 4] = (bitLen >>> 24) & 0xff;
+      BUF[total - 3] = (bitLen >>> 16) & 0xff;
+      BUF[total - 2] = (bitLen >>> 8) & 0xff;
+      BUF[total - 1] = bitLen & 0xff;
+
+      let h0 = 0x6a09e667 | 0, h1 = 0xbb67ae85 | 0, h2 = 0x3c6ef372 | 0, h3 = 0xa54ff53a | 0;
+      let h4 = 0x510e527f | 0, h5 = 0x9b05688c | 0, h6 = 0x1f83d9ab | 0, h7 = 0x5be0cd19 | 0;
+
+      for (let off = 0; off < total; off += 64) {
+        for (let i = 0; i < 16; i++) {
+          const j = off + (i << 2);
+          W[i] = (BUF[j] << 24) | (BUF[j + 1] << 16) | (BUF[j + 2] << 8) | BUF[j + 3];
+        }
+        for (let i = 16; i < 64; i++) {
+          const w15 = W[i - 15], w2 = W[i - 2];
+          const s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3);
+          const s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10);
+          W[i] = (W[i - 16] + s0 + W[i - 7] + s1) | 0;
+        }
+        let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+        for (let i = 0; i < 64; i++) {
+          const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+          const ch = (e & f) ^ (~e & g);
+          const t1 = (h + S1 + ch + K[i] + W[i]) | 0;
+          const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+          const maj = (a & b) ^ (a & c) ^ (b & c);
+          const t2 = (S0 + maj) | 0;
+          h = g; g = f; f = e; e = (d + t1) | 0;
+          d = c; c = b; b = a; a = (t1 + t2) | 0;
+        }
+        h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
+        h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+      }
+      return h0 >>> 0;
+    }
+    function matchesDifficulty(h0, bits) {
+      if (bits <= 0) return true;
+      if (bits >= 32) return h0 === 0;
+      return (h0 >>> (32 - bits)) === 0;
+    }
+  `;
+
+  const captchaState = {
+    enabled: true,
+    status: 'idle', // idle | checking | interactive | solving | verified | error
+    action: 'signin',
+    challenge: null,
+    solution: null,
+    interacted: false,
+    runId: 0,
+    worker: null,
+    workerUrl: '',
+    fallbackTimer: null,
+    expiryTimer: null,
+    autoStartTimer: null,
+    inFlightPromise: null,
+    workerSupported: typeof Worker === 'function' && typeof Blob === 'function',
+  };
+
+  function computeBrowserProbe(probe) {
+    if (!probe) return 0;
+    return ((Math.imul(probe.a | 0, probe.b | 0) ^ (probe.c | 0)) >>> 0);
+  }
+
+  function detectAutomationGlobals() {
+    try {
+      const winKeys = [
+        '__playwright',
+        '__pw_manual',
+        '__PW_inspect',
+        '__nightmare',
+        '_phantom',
+        'callPhantom',
+        'domAutomation',
+        'domAutomationController',
+        '__selenium_unwrapped',
+        '__webdriver_evaluate',
+        '__driver_evaluate',
+      ];
+      for (const k of winKeys) {
+        if (k in window && window[k]) return true;
+      }
+      if (document) {
+        for (const k of Object.keys(document)) {
+          if (k.startsWith('$cdc_') || k.startsWith('$wdc_')) return true;
+        }
+      }
+    } catch {}
+    return false;
+  }
+
+  function checkCanvasRender() {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 16;
+      c.height = 16;
+      const ctx = c.getContext && c.getContext('2d');
+      if (!ctx) return false;
+      ctx.fillStyle = '#1ed760';
+      ctx.fillRect(2, 2, 12, 12);
+      const data = ctx.getImageData(4, 4, 1, 1).data;
+      return data && data.length === 4 && data[3] > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  function collectBrowserSignals() {
+    const ua = String(navigator.userAgent || '');
+    const headlessUa = /HeadlessChrome|PhantomJS|Playwright|Puppeteer|Selenium/i.test(ua);
+    const card = document.querySelector('.auth-card');
+    const rect = card && card.getBoundingClientRect ? card.getBoundingClientRect() : null;
+    const layoutOk = !!(rect && rect.width > 100 && rect.height > 100);
+    return {
+      webdriver: navigator.webdriver === true,
+      automation: detectAutomationGlobals(),
+      headlessUa,
+      languages: Array.isArray(navigator.languages) ? navigator.languages.length : (navigator.language ? 1 : 0),
+      screenW: (window.screen && window.screen.width) | 0,
+      screenH: (window.screen && window.screen.height) | 0,
+      innerW: window.innerWidth | 0,
+      innerH: window.innerHeight | 0,
+      cores: (navigator.hardwareConcurrency || 0) | 0,
+      canvasOk: checkCanvasRender(),
+      layoutOk,
+      workerOk: captchaState.workerSupported,
+      signalsPresent: true,
+    };
+  }
+
+  function setCaptchaProgress(pct) {
+    const fill = $('auth-captcha-progress-fill');
+    if (!fill) return;
+    const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+    fill.style.width = `${clamped}%`;
+  }
+
+  function setCaptchaUi(status, label, sub, progressPct) {
+    captchaState.status = status;
+    const root = $('auth-captcha');
+    const btn = $('auth-captcha-btn');
+    const lblEl = $('auth-captcha-label');
+    const subEl = $('auth-captcha-sub');
+    if (root) {
+      root.classList.toggle('hidden', !captchaState.enabled);
+      root.dataset.state = status;
+    }
+    if (btn) {
+      btn.setAttribute('aria-checked', status === 'verified' ? 'true' : 'false');
+    }
+    if (lblEl && label !== undefined) lblEl.textContent = label;
+    if (subEl && sub !== undefined) subEl.textContent = sub;
+    if (progressPct !== undefined) setCaptchaProgress(progressPct);
+  }
+
+  function cancelCaptchaWork() {
+    captchaState.runId += 1;
+    captchaState.inFlightPromise = null;
+    if (captchaState.autoStartTimer) {
+      clearTimeout(captchaState.autoStartTimer);
+      captchaState.autoStartTimer = null;
+    }
+    if (captchaState.expiryTimer) {
+      clearTimeout(captchaState.expiryTimer);
+      captchaState.expiryTimer = null;
+    }
+    if (captchaState.fallbackTimer) {
+      clearTimeout(captchaState.fallbackTimer);
+      captchaState.fallbackTimer = null;
+    }
+    if (captchaState.worker) {
+      try { captchaState.worker.terminate(); } catch {}
+      captchaState.worker = null;
+    }
+    if (captchaState.workerUrl) {
+      try { URL.revokeObjectURL(captchaState.workerUrl); } catch {}
+      captchaState.workerUrl = '';
+    }
+  }
+
+  function solvePowChallenge(challenge, probeAnswer, runId, onProgress) {
+    const prefix = `${challenge.id}:${challenge.salt}:${probeAnswer}:`;
+    const difficulty = challenge.difficulty | 0;
+    const expectedTries = Math.max(1, Math.pow(2, difficulty));
+    const startedAt = performance.now ? performance.now() : Date.now();
+
+    const runMainThreadFallback = () =>
+      new Promise((resolve, reject) => {
+        const solverFn = new Function(
+          'prefix',
+          'difficulty',
+          'startNonce',
+          'batchSize',
+          `${POW_SHA256_CORE}
+          const prefixLen = prefix.length;
+          const prefixBytes = new Uint8Array(prefixLen);
+          for (let i = 0; i < prefixLen; i++) prefixBytes[i] = prefix.charCodeAt(i) & 0xff;
+          for (let i = 0; i < batchSize; i++) {
+            const nonce = startNonce + i;
+            if (matchesDifficulty(sha256FirstWordAscii(prefixBytes, prefixLen, String(nonce)), difficulty)) {
+              return nonce;
+            }
+          }
+          return -1;`
+        );
+        let nonce = 0;
+        const batchSize = 4096;
+        const step = () => {
+          if (runId !== captchaState.runId) {
+            reject(new Error('cancelled'));
+            return;
+          }
+          const found = solverFn(prefix, difficulty, nonce, batchSize);
+          if (found >= 0) {
+            const elapsed = Math.round((performance.now ? performance.now() : Date.now()) - startedAt);
+            resolve({ nonce: found, elapsedMs: Math.max(1, elapsed) });
+            return;
+          }
+          nonce += batchSize;
+          if (onProgress) onProgress(Math.min(92, Math.round((1 - Math.exp(-nonce / expectedTries)) * 100)));
+          captchaState.fallbackTimer = setTimeout(step, 0);
+        };
+        step();
+      });
+
+    if (!captchaState.workerSupported) {
+      return runMainThreadFallback();
+    }
+
+    return new Promise((resolve, reject) => {
+      try {
+        const workerSrc = `
+          ${POW_SHA256_CORE}
+          self.onmessage = function(e) {
+            const { prefix, difficulty } = e.data;
+            const prefixLen = prefix.length;
+            const prefixBytes = new Uint8Array(prefixLen);
+            for (let i = 0; i < prefixLen; i++) prefixBytes[i] = prefix.charCodeAt(i) & 0xff;
+            const t0 = performance.now();
+            let nonce = 0;
+            while (true) {
+              for (let i = 0; i < 8192; i++) {
+                const h0 = sha256FirstWordAscii(prefixBytes, prefixLen, String(nonce));
+                if (matchesDifficulty(h0, difficulty)) {
+                  self.postMessage({ type: 'done', nonce, elapsedMs: Math.max(1, Math.round(performance.now() - t0)) });
+                  return;
+                }
+                nonce++;
+              }
+              self.postMessage({ type: 'progress', tried: nonce });
+            }
+          };
+        `;
+        const blob = new Blob([workerSrc], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        const worker = new Worker(url);
+        captchaState.worker = worker;
+        captchaState.workerUrl = url;
+
+        const cleanup = () => {
+          if (captchaState.worker === worker) {
+            captchaState.worker = null;
+          }
+          try { worker.terminate(); } catch {}
+          if (captchaState.workerUrl === url) {
+            captchaState.workerUrl = '';
+          }
+          try { URL.revokeObjectURL(url); } catch {}
+        };
+
+        worker.onmessage = (ev) => {
+          if (runId !== captchaState.runId) {
+            cleanup();
+            reject(new Error('cancelled'));
+            return;
+          }
+          const msg = ev.data || {};
+          if (msg.type === 'progress') {
+            if (onProgress) {
+              onProgress(Math.min(94, Math.round((1 - Math.exp(-msg.tried / expectedTries)) * 100)));
+            }
+          } else if (msg.type === 'done') {
+            cleanup();
+            resolve({ nonce: msg.nonce, elapsedMs: msg.elapsedMs });
+          }
+        };
+
+        worker.onerror = () => {
+          cleanup();
+          captchaState.workerSupported = false;
+          if (runId !== captchaState.runId) {
+            reject(new Error('cancelled'));
+            return;
+          }
+          runMainThreadFallback().then(resolve, reject);
+        };
+
+        worker.postMessage({ prefix, difficulty });
+      } catch {
+        captchaState.workerSupported = false;
+        runMainThreadFallback().then(resolve, reject);
+      }
+    });
+  }
+
+  function captchaSolutionFresh(action) {
+    if (!captchaState.enabled) return true;
+    if (captchaState.status !== 'verified' || !captchaState.solution || !captchaState.challenge) {
+      return false;
+    }
+    if (captchaState.action !== action) return false;
+    const nowSec = Math.floor(Date.now() / 1000);
+    return nowSec < (captchaState.challenge.expiresAt || 0) - 10;
+  }
+
+  async function solveCurrentChallenge(runId, userTriggered) {
+    const ch = captchaState.challenge;
+    if (!ch) return null;
+    if (userTriggered) captchaState.interacted = true;
+    setCaptchaUi('solving', 'Verifying browser…', 'Solving proof-of-work…', 18);
+    const probeAnswer = computeBrowserProbe(ch.probe);
+    const solved = await solvePowChallenge(ch, probeAnswer, runId, (pct) => {
+      if (runId === captchaState.runId) {
+        setCaptchaProgress(18 + Math.round(pct * 0.78));
+      }
+    });
+    if (runId !== captchaState.runId) return null;
+
+    captchaState.solution = {
+      id: ch.id,
+      nonce: solved.nonce,
+      mac: ch.mac,
+      probe: probeAnswer,
+      interacted: captchaState.interacted,
+      elapsedMs: solved.elapsedMs,
+    };
+    setCaptchaUi('verified', 'Verified', `Browser check passed · ${solved.elapsedMs} ms`, 100);
+
+    const ttlMs = Math.max(15_000, ((ch.expiresAt || 0) - Math.floor(Date.now() / 1000) - 15) * 1000);
+    captchaState.expiryTimer = setTimeout(() => {
+      if (runId !== captchaState.runId) return;
+      captchaState.solution = null;
+      captchaState.challenge = null;
+      setCaptchaUi('idle', "Verify you're human", 'Verification expired — click to refresh', 0);
+    }, ttlMs);
+
+    return captchaState.solution;
+  }
+
+  function startCaptchaFlow(action, { userTriggered = false } = {}) {
+    cancelCaptchaWork();
+    const runId = captchaState.runId;
+    captchaState.action = action === 'signup' ? 'signup' : 'signin';
+    captchaState.challenge = null;
+    captchaState.solution = null;
+    captchaState.interacted = Boolean(userTriggered);
+
+    const promise = (async () => {
+      setCaptchaUi('checking', 'Checking browser…', 'Inspecting browser environment', 10);
+      try {
+        const signals = collectBrowserSignals();
+        const ch = await api('/api/web/auth/captcha', {
+          method: 'POST',
+          body: JSON.stringify({ action: captchaState.action, signals }),
+        });
+        if (runId !== captchaState.runId) return null;
+        if (ch && ch.enabled === false) {
+          captchaState.enabled = false;
+          setCaptchaUi('verified', 'Verified', '', 100);
+          return null;
+        }
+        captchaState.enabled = true;
+        captchaState.challenge = ch;
+
+        if (ch.interactive && !captchaState.interacted) {
+          setCaptchaUi(
+            'interactive',
+            "Click to verify you're human",
+            'Additional browser verification required',
+            0
+          );
+          return null;
+        }
+
+        return await solveCurrentChallenge(runId, captchaState.interacted);
+      } catch (err) {
+        if (runId !== captchaState.runId) return null;
+        const msg = err && err.message ? err.message : 'Could not reach verification service';
+        setCaptchaUi('error', 'Verification failed', `${msg} — tap to retry`, 0);
+        return null;
+      } finally {
+        if (captchaState.inFlightPromise === promise) {
+          captchaState.inFlightPromise = null;
+        }
+      }
+    })();
+
+    captchaState.inFlightPromise = promise;
+    return promise;
+  }
+
+  function resetCaptchaAndStart(action, delayMs = 120) {
+    cancelCaptchaWork();
+    captchaState.action = action === 'signup' ? 'signup' : 'signin';
+    captchaState.challenge = null;
+    captchaState.solution = null;
+    captchaState.interacted = false;
+    setCaptchaUi('idle', "Verify you're human", 'Browser & proof-of-work check', 0);
+    const authScreen = $('auth-screen');
+    if (!authScreen || authScreen.classList.contains('hidden')) return;
+    const targetAction = captchaState.action;
+    captchaState.autoStartTimer = setTimeout(() => {
+      captchaState.autoStartTimer = null;
+      if ($('auth-screen') && !$('auth-screen').classList.contains('hidden') && state.authMode === targetAction) {
+        startCaptchaFlow(targetAction, { userTriggered: false });
+      }
+    }, delayMs);
+  }
+
+  async function onCaptchaButtonClick(e) {
+    const trusted = Boolean(e && e.isTrusted);
+    const action = state.authMode === 'signup' ? 'signup' : 'signin';
+    if (captchaSolutionFresh(action)) return;
+    if (captchaState.status === 'checking' || captchaState.status === 'solving') {
+      if (trusted) captchaState.interacted = true;
+      return;
+    }
+    if (captchaState.status === 'interactive' && captchaState.challenge) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (nowSec < (captchaState.challenge.expiresAt || 0) - 15) {
+        const runId = captchaState.runId;
+        const promise = (async () => {
+          try {
+            return await solveCurrentChallenge(runId, trusted);
+          } catch (err) {
+            if (runId !== captchaState.runId) return null;
+            setCaptchaUi('error', 'Verification failed', 'Tap to try again', 0);
+            return null;
+          } finally {
+            if (captchaState.inFlightPromise === promise) {
+              captchaState.inFlightPromise = null;
+            }
+          }
+        })();
+        captchaState.inFlightPromise = promise;
+        await promise;
+        return;
+      }
+    }
+    await startCaptchaFlow(action, { userTriggered: trusted });
+  }
+
+  async function ensureCaptchaReady(action, userTriggered) {
+    if (!captchaState.enabled) return null;
+    if (captchaSolutionFresh(action)) return captchaState.solution;
+    if (captchaState.status === 'interactive') {
+      throw new Error('Please click the verification checkbox above to continue.');
+    }
+    if (captchaState.inFlightPromise) {
+      await captchaState.inFlightPromise;
+      if (!captchaState.enabled) return null;
+      if (captchaSolutionFresh(action)) return captchaState.solution;
+      if (captchaState.status === 'interactive') {
+        throw new Error('Please click the verification checkbox above to continue.');
+      }
+    }
+    await startCaptchaFlow(action, { userTriggered });
+    if (!captchaState.enabled) return null;
+    if (captchaSolutionFresh(action)) return captchaState.solution;
+    if (captchaState.status === 'interactive') {
+      throw new Error('Please click the verification checkbox above to continue.');
+    }
+    throw new Error('Human verification failed. Please click the verification box to try again.');
+  }
+
+  // ---------------------------------------------------------------------------
   // Authentication & Session Bootstrap
   // ---------------------------------------------------------------------------
   function setAuthMode(mode) {
     const signup = mode === 'signup';
-    state.authMode = signup ? 'signup' : 'signin';
+    const nextAction = signup ? 'signup' : 'signin';
+    const modeChanged = state.authMode !== nextAction;
+    state.authMode = nextAction;
     const signinTab = $('auth-tab-signin');
     const signupTab = $('auth-tab-signup');
     if (signinTab) {
@@ -992,6 +1495,9 @@
     if (submit) submit.textContent = signup ? 'Create account' : 'Sign in';
     const passkeyBtn = $('auth-passkey-btn');
     if (passkeyBtn) passkeyBtn.classList.toggle('hidden', signup);
+    if (modeChanged || captchaState.action !== nextAction || captchaState.status === 'idle') {
+      resetCaptchaAndStart(nextAction);
+    }
   }
 
   function resetAuthForm() {
@@ -1033,6 +1539,9 @@
         el.parentNode.replaceChild(fresh, el);
       }
     }
+    const hp = $('auth-hp');
+    if (hp) hp.value = '';
+    resetCaptchaAndStart('signin');
   }
 
   function resetPlayerAndSessionUI() {
@@ -1153,6 +1662,7 @@
   }
 
   function showAppShell() {
+    cancelCaptchaWork();
     document.body.classList.remove('rp-anim');
     syncResponsiveLayout();
     syncRightPanelState();
@@ -1638,6 +2148,15 @@
     window.addEventListener('pagehide', flushOnExit);
     window.addEventListener('beforeunload', flushOnExit);
 
+    const captchaBtn = $('auth-captcha-btn');
+    if (captchaBtn) {
+      captchaBtn.addEventListener('click', (e) => {
+        const errBox = $('auth-error');
+        if (errBox) errBox.classList.add('hidden');
+        onCaptchaButtonClick(e);
+      });
+    }
+
     $('auth-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const errBox = $('auth-error');
@@ -1645,21 +2164,47 @@
       const username = $('auth-username').value.trim();
       const password = $('auth-password').value;
       const signup = state.authMode === 'signup';
+      const action = signup ? 'signup' : 'signin';
       const confirmPassword = signup ? $('auth-confirm').value : '';
       if (signup && password !== confirmPassword) {
         errBox.textContent = 'Passwords do not match';
         errBox.classList.remove('hidden');
         return;
       }
+      const submitBtn = $('auth-submit');
+      const prevSubmitText = submitBtn ? submitBtn.textContent : '';
+      const setSubmitting = (busy, label) => {
+        if (!submitBtn) return;
+        submitBtn.disabled = busy;
+        submitBtn.textContent = busy ? label : (signup ? 'Create account' : 'Sign in');
+      };
+      let captchaSolution = null;
       try {
+        if (captchaState.enabled && !captchaSolutionFresh(action)) {
+          setSubmitting(true, 'Verifying…');
+        }
+        captchaSolution = await ensureCaptchaReady(action, Boolean(e && e.isTrusted));
+      } catch (err) {
+        setSubmitting(false, prevSubmitText);
+        errBox.textContent = err.message;
+        errBox.classList.remove('hidden');
+        if (captchaState.status === 'interactive' && $('auth-captcha-btn')) {
+          $('auth-captcha-btn').focus();
+        }
+        return;
+      }
+
+      const hpToken = ($('auth-hp') && $('auth-hp').value) || '';
+      setSubmitting(true, signup ? 'Creating account…' : 'Signing in…');
+      try {
+        const payload = signup
+          ? { username, password, confirmPassword, captcha: captchaSolution, hpToken }
+          : { username, password, captcha: captchaSolution, hpToken };
         const res = await api(signup ? '/api/web/auth/signup' : '/api/web/auth/signin', {
           method: 'POST',
-          body: JSON.stringify(
-            signup
-              ? { username, password, confirmPassword }
-              : { username, password }
-          ),
+          body: JSON.stringify(payload),
         });
+        cancelCaptchaWork();
         if (res.mfaRequired) {
           state.authChallenge = res.challenge;
           state.authFactor = res.totp ? 'totp' : 'passkey';
@@ -1691,6 +2236,10 @@
       } catch (err) {
         errBox.textContent = err.message;
         errBox.classList.remove('hidden');
+        // Server consumes each PoW token once; immediately prepare a fresh one for retry.
+        resetCaptchaAndStart(action, 160);
+      } finally {
+        setSubmitting(false, prevSubmitText);
       }
     });
 
@@ -2127,8 +2676,7 @@
       const qIdx = hash.indexOf('?');
       const params = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)) : null;
       const mixQ = params ? params.get('q') || '' : '';
-      const mixMode = params ? params.get('mode') || 'auto' : 'auto';
-      return renderInstantMixPage(mixQ, mixMode);
+      return renderInstantMixPage(mixQ);
     }
     if (isSearchHash(hash)) {
       const q = extractSearchQueryFromHash(hash);
@@ -2838,21 +3386,10 @@
     }
   }
 
-  async function renderInstantMixPage(query, mode = 'auto') {
+  async function renderInstantMixPage(query) {
     const cleanQ = String(query || '').trim();
     const llmOn = Boolean(state.user?.llmEnabled);
-    const allowedModes = llmOn ? ['topic', 'entity', 'ai'] : ['topic', 'entity'];
-    const cleanMode = allowedModes.includes(mode) ? mode : 'auto';
-    state.instantMixMode = cleanMode;
     state.searchState = null;
-    const modeOptions = [
-      ['auto', 'Auto'],
-      ['topic', 'Genre & Vibe'],
-      ['entity', 'Artist or Song'],
-    ];
-    if (llmOn) {
-      modeOptions.push(['ai', 'AI Vibe']);
-    }
     const placeholder = llmOn
       ? 'Describe a vibe, scene, artist, or era (e.g. rainy 2am Tokyo drive with warm synths, Daft Punk)...'
       : 'Enter an artist, song, genre, era, or mood (e.g. 80s hits, Daft Punk, chill)...';
@@ -2864,14 +3401,6 @@
         <input id="instant-mix-term-input" type="text" value="${esc(val)}" placeholder="${esc(placeholder)}" autocomplete="off" />
         <button type="submit" class="btn-primary">Create Instant Mix</button>
       </form>
-      <div class="instant-mix-mode-row" role="group" aria-label="Mix mode">
-        ${modeOptions
-          .map(
-            ([key, label]) =>
-              `<button type="button" class="refine-query-pill${cleanMode === key ? ' active' : ''}" data-mode="${esc(key)}" onclick="App.setInstantMixMode('${key}')">${esc(label)}</button>`
-          )
-          .join('')}
-      </div>
     `;
     if (!cleanQ) {
       state.activeInstantMix = null;
@@ -2879,31 +3408,29 @@
         ? state.llmSearchPrompts.map((p) => ({
             label: p.label || p.query,
             query: p.query || p.label,
-            mode: llmOn ? 'ai' : 'auto',
           }))
         : [];
       const fallbackPrompts = llmOn
         ? [
-            { label: 'Rainy 2am Tokyo drive, warm synths', query: 'rainy 2am Tokyo drive with warm analog synths', mode: 'ai' },
-            { label: 'Cozy Sunday morning acoustic coffee', query: 'cozy sunday morning acoustic songs for coffee', mode: 'ai' },
-            { label: 'Upbeat indie rock for cleaning', query: 'upbeat indie rock like early strokes for cleaning', mode: 'ai' },
-            { label: '80s hits', query: '80s hits', mode: 'auto' },
-            { label: 'Late night chill', query: 'Late night chill', mode: 'auto' },
+            { label: 'Rainy 2am Tokyo drive, warm synths', query: 'rainy 2am Tokyo drive with warm analog synths' },
+            { label: 'Cozy Sunday morning acoustic coffee', query: 'cozy sunday morning acoustic songs for coffee' },
+            { label: 'Upbeat indie rock for cleaning', query: 'upbeat indie rock like early strokes for cleaning' },
+            { label: '80s hits', query: '80s hits' },
+            { label: 'Late night chill', query: 'Late night chill' },
           ]
         : ['80s hits', '90s rock', 'Late night chill', 'Workout energy', 'Indie synthpop'].map((sg) => ({
             label: sg,
             query: sg,
-            mode: 'auto',
           }));
       const chips = dailyPrompts.length ? dailyPrompts : fallbackPrompts;
       $('main-view').innerHTML = `
         ${builderHeader('')}
         <div class="instant-mix-suggestions">
           ${chips
-            .map((sg) => {
-              const m = sg.mode && sg.mode !== 'auto' ? `&mode=${encodeURIComponent(sg.mode)}` : '';
-              return `<button class="refine-query-pill" onclick="App.navigate('mix?q=${encodeURIComponent(sg.query)}${m}')">${esc(sg.label)}</button>`;
-            })
+            .map(
+              (sg) =>
+                `<button class="refine-query-pill" onclick="App.navigate('mix?q=${encodeURIComponent(sg.query)}')">${esc(sg.label)}</button>`
+            )
             .join('')}
         </div>
       `;
@@ -2911,14 +3438,9 @@
     }
 
     const { reqToken, signal } = beginViewRequest();
-    setMainLoading(
-      cleanMode === 'ai'
-        ? `Curating AI mix for "${cleanQ}"...`
-        : `Creating instant mix for "${cleanQ}"...`
-    );
+    setMainLoading(`Creating instant mix for "${cleanQ}"...`);
     try {
-      const modeParam = cleanMode !== 'auto' ? `&mode=${encodeURIComponent(cleanMode)}` : '';
-      const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}${modeParam}`, { signal });
+      const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
       if (!d.instantMix || !Array.isArray(d.instantMix.tracks) || !d.instantMix.tracks.length) {
         state.activeInstantMix = null;
@@ -9744,22 +10266,7 @@
       e.preventDefault();
       const val = ($('instant-mix-term-input')?.value || '').trim();
       if (!val) return;
-      const mode = state.instantMixMode && state.instantMixMode !== 'auto' ? `&mode=${encodeURIComponent(state.instantMixMode)}` : '';
-      navigate(`mix?q=${encodeURIComponent(val)}${mode}`);
-    },
-    setInstantMixMode: (mode) => {
-      const allowed = state.user?.llmEnabled ? ['topic', 'entity', 'ai'] : ['topic', 'entity'];
-      const cleanMode = allowed.includes(mode) ? mode : 'auto';
-      state.instantMixMode = cleanMode;
-      const val = ($('instant-mix-term-input')?.value || '').trim();
-      if (val) {
-        const modeParam = cleanMode !== 'auto' ? `&mode=${encodeURIComponent(cleanMode)}` : '';
-        navigate(`mix?q=${encodeURIComponent(val)}${modeParam}`);
-      } else {
-        document.querySelectorAll('.instant-mix-mode-row .refine-query-pill').forEach((btn) => {
-          btn.classList.toggle('active', btn.dataset.mode === cleanMode);
-        });
-      }
+      navigate(`mix?q=${encodeURIComponent(val)}`);
     },
     playInstantMix,
     playInstantMixAt,
