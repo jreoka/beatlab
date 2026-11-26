@@ -15,12 +15,16 @@ use std::time::Duration;
 use tokio::process::Command;
 
 /// Streaming loudness target (LUFS), aligned with Spotify / YouTube Music / Tidal.
+#[cfg(test)]
 pub const TARGET_LUFS: f64 = -14.0;
 /// True-peak output ceiling (dBTP) to leave headroom for browser/OS resampling.
+#[cfg(test)]
 pub const TRUE_PEAK_CEILING_DB: f64 = -0.5;
 /// Minimum/maximum allowed gain adjustment (dB) so corrupt/near-silent files
 /// can never produce extreme attenuation or noise-floor amplification.
+#[cfg(test)]
 pub const MIN_GAIN_DB: f64 = -18.0;
+#[cfg(test)]
 pub const MAX_GAIN_DB: f64 = 12.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -49,6 +53,7 @@ impl TrackLoudness {
 /// Computes the peak-safe linear output gain for a track at a given user volume
 /// (`0.0..=1.0`). Because this is a single constant multiplier for the whole
 /// track, dynamic range is 100% preserved and the output never clips.
+#[cfg(test)]
 pub fn compute_output_gain(lufs: f64, true_peak_db: f64, user_volume: f64) -> f64 {
     let vol = user_volume.clamp(0.0, 1.0);
     if vol <= 0.0 || !lufs.is_finite() {
