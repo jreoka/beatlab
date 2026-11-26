@@ -1895,12 +1895,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Every track in the library, newest first. Use for lookups that must not
-    /// miss older tracks (album/artist membership), unlike the capped `all_tracks`.
-    pub fn all_tracks_unbounded(&self) -> AppResult<Vec<Track>> {
-        self.all_tracks(i64::MAX as usize, 0)
-    }
-
     /// Returns user-affinity tracks (starred, manual playlists, played, rated, expanded radio links,
     /// same-artist/local/same-genre catalog matches) unioned with recent catalog tracks so personalized
     /// mixes never lose taste candidates past recent-insert offset limits.
@@ -2705,55 +2699,142 @@ impl Store {
             .flatten()
             .map(|m| m.deezer_id)
             .filter(|s| !s.is_empty());
-        // Must scan the whole library: a capped "newest N" window silently drops
-        // older tracks, leaving albums with only a stray recent song or two.
-        let all = self.all_tracks_unbounded()?;
         let artist_metas = self.all_artist_metas_map()?;
-        let resolver = ArtistResolver::build(&all, &artist_metas);
+        let is_dz_album_key = album_id.starts_with("al:dz-");
 
-        let mut matched_artist_album: Option<(String, String)> = None;
-        for t in &all {
-            if t.matches_album_id(album_id)
-                || (dz_album_id.is_some() && t.deezer_album_id() == dz_album_id)
+        // Stream lightweight columns instead of loading the entire catalog into a
+        // Vec<Track>, so concurrent album / cover lookups don't blow up VM memory.
+        let matched_ids: Vec<String> = {
+            let conn = self.lock();
+            let resolver = ArtistResolver::build_from_conn(&conn, &artist_metas);
+
+            let mut matched_artist_album: Option<(String, String)> = None;
+            let mut first_direct_idx: Option<usize> = None;
+            let mut ids: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+
             {
-                let alb_name = if t.album.trim().is_empty() {
-                    &t.title
-                } else {
-                    &t.album
-                };
-                matched_artist_album = Some((resolver.resolve_track(t), slug(alb_name)));
-                break;
-            }
-        }
+                let mut stmt = conn.prepare(
+                    "SELECT id, title, artist, album, meta FROM tracks ORDER BY created DESC",
+                )?;
+                let mut rows = stmt.query([])?;
+                let mut row_idx = 0usize;
+                while let Some(r) = rows.next()? {
+                    let tmp = Track {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        artist: r.get(2)?,
+                        album: r.get(3)?,
+                        meta: r.get(4)?,
+                        ..Default::default()
+                    };
+                    let direct = tmp.matches_album_id(album_id)
+                        || (dz_album_id.is_some() && tmp.deezer_album_id() == dz_album_id);
+                    if direct {
+                        if matched_artist_album.is_none() {
+                            let alb_name = if tmp.album.trim().is_empty() {
+                                &tmp.title
+                            } else {
+                                &tmp.album
+                            };
+                            matched_artist_album =
+                                Some((resolver.resolve_track(&tmp), slug(alb_name)));
+                            first_direct_idx = Some(row_idx);
+                        }
+                        if seen.insert(tmp.id.clone()) {
+                            ids.push(tmp.id);
+                        }
+                        row_idx += 1;
+                        continue;
+                    }
 
-        let mut tracks: Vec<Track> = all
-            .into_iter()
-            .filter(|t| {
-                if t.matches_album_id(album_id)
-                    || (dz_album_id.is_some() && t.deezer_album_id() == dz_album_id)
-                {
-                    return true;
+                    let alb_name = if tmp.album.trim().is_empty() {
+                        &tmp.title
+                    } else {
+                        &tmp.album
+                    };
+                    let mut cached_res_art: Option<String> = None;
+                    let mut matched = false;
+                    if is_dz_album_key {
+                        let alb_slug = slug(alb_name);
+                        let res_art = resolver.resolve_track(&tmp);
+                        if let Some(dz_aid) = res_art.strip_prefix("ar:dz:") {
+                            if format!("al:dz-{}-{}", dz_aid, alb_slug) == album_id {
+                                matched = true;
+                            }
+                        }
+                        if !matched {
+                            if let Some((ref want_art, ref want_alb)) = matched_artist_album {
+                                if !want_alb.is_empty()
+                                    && &alb_slug == want_alb
+                                    && &res_art == want_art
+                                {
+                                    matched = true;
+                                }
+                            }
+                        }
+                        cached_res_art = Some(res_art);
+                    }
+                    if !matched && cached_res_art.is_none() {
+                        if let Some((ref want_art, ref want_alb)) = matched_artist_album {
+                            if !want_alb.is_empty() && slug(alb_name) == *want_alb {
+                                if &resolver.resolve_track(&tmp) == want_art {
+                                    matched = true;
+                                }
+                            }
+                        }
+                    }
+                    if matched && seen.insert(tmp.id.clone()) {
+                        ids.push(tmp.id);
+                    }
+                    row_idx += 1;
                 }
-                let alb_name = if t.album.trim().is_empty() {
-                    &t.title
-                } else {
-                    &t.album
-                };
-                let alb_slug = slug(alb_name);
-                let res_art = resolver.resolve_track(t);
-                if let Some(dz_aid) = res_art.strip_prefix("ar:dz:") {
-                    if format!("al:dz-{}-{}", dz_aid, alb_slug) == album_id {
-                        return true;
+            }
+
+            // If the first direct match occurred after row 0, scan the prefix
+            // rows to catch any sibling tracks sharing (resolved_artist, album_slug).
+            if let (Some((ref want_art, ref want_alb)), Some(prefix_len)) =
+                (&matched_artist_album, first_direct_idx)
+            {
+                if prefix_len > 0 && !want_alb.is_empty() {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, title, artist, album, meta FROM tracks ORDER BY created DESC LIMIT ?1",
+                    )?;
+                    let mut rows = stmt.query(params![prefix_len as i64])?;
+                    while let Some(r) = rows.next()? {
+                        let id: String = r.get(0)?;
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        let tmp = Track {
+                            id,
+                            title: r.get(1)?,
+                            artist: r.get(2)?,
+                            album: r.get(3)?,
+                            meta: r.get(4)?,
+                            ..Default::default()
+                        };
+                        let alb_name = if tmp.album.trim().is_empty() {
+                            &tmp.title
+                        } else {
+                            &tmp.album
+                        };
+                        if slug(alb_name) == *want_alb && &resolver.resolve_track(&tmp) == want_art {
+                            if seen.insert(tmp.id.clone()) {
+                                ids.push(tmp.id);
+                            }
+                        }
                     }
                 }
-                if let Some((ref want_art, ref want_alb)) = matched_artist_album {
-                    if !want_alb.is_empty() && &alb_slug == want_alb && &res_art == want_art {
-                        return true;
-                    }
-                }
-                false
-            })
-            .collect();
+            }
+
+            ids
+        };
+
+        if matched_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tracks = self.get_tracks_by_ids(&matched_ids)?;
         tracks.sort_by(|a, b| {
             a.disc_no
                 .max(1)
@@ -3399,45 +3480,98 @@ impl Store {
         }
 
         // Cross-reference catalog metadata (sibling tracks, albums_meta, artists_meta, artist genres)
-        // so streamed tracks from YTM / Deezer / Soulseek inherit known genres, release years,
-        // moods, and canonical artist IDs.
-        let artist_genres = artist_genre_index_locked(&conn, None).unwrap_or_default();
+        // scoped strictly to the artists/albums/songs present in this user's events so we never
+        // materialize 50k+ HashMap entries for the whole catalog.
+        let mut needed_artists: HashSet<String> = HashSet::new();
+        let mut needed_artist_slugs: HashSet<String> = HashSet::new();
+        let mut needed_song_keys: HashSet<String> = HashSet::new();
+        let mut needed_album_ids: HashSet<String> = HashSet::new();
+        let mut needed_dz_album_ids: HashSet<String> = HashSet::new();
+        let mut needed_album_slugs: HashSet<String> = HashSet::new();
+        for row in &rows {
+            let Some(ref t) = row.track else {
+                continue;
+            };
+            let pa = primary_artist(&t.artist);
+            let pa_low = pa.to_lowercase();
+            if !pa_low.is_empty() {
+                needed_artists.insert(pa_low);
+            }
+            let art_key = if pa.is_empty() { t.artist.trim() } else { pa.as_str() };
+            let missing_genre = t.genre.trim().is_empty();
+            let missing_year = t.year <= 0;
+            let missing_moods = t.moods.trim().is_empty();
+            let missing_dz_artist = t.deezer_artist_id().is_none();
+            if missing_genre || missing_year || missing_moods || missing_dz_artist {
+                needed_song_keys.insert(t.song_key());
+            }
+            if missing_dz_artist {
+                let sl = slug(art_key);
+                if !sl.is_empty() {
+                    needed_artist_slugs.insert(sl);
+                }
+            }
+            if missing_genre || missing_year {
+                needed_album_ids.insert(t.album_id());
+                if let Some(dz) = t.deezer_album_id() {
+                    needed_dz_album_ids.insert(dz);
+                }
+                let alb_sl = slug(&format!("{}|{}", art_key, t.album));
+                if !alb_sl.is_empty() {
+                    needed_album_slugs.insert(alb_sl);
+                }
+            }
+        }
+
+        let artist_genres = if needed_artists.is_empty() {
+            HashMap::new()
+        } else {
+            artist_genre_index_locked(&conn, Some(&needed_artists)).unwrap_or_default()
+        };
 
         let mut album_by_id: HashMap<String, (String, i32)> = HashMap::new();
         let mut album_by_dz_id: HashMap<String, (String, i32)> = HashMap::new();
         let mut album_by_slug: HashMap<String, (String, i32)> = HashMap::new();
-        if let Ok(mut astmt) = conn.prepare(
-            "SELECT id, name, artist, genre, year, deezer_id FROM albums_meta WHERE trim(genre) != '' OR year > 0",
-        ) {
-            if let Ok(mut arows) = astmt.query([]) {
-                while let Ok(Some(r)) = arows.next() {
-                    let id: String = r.get(0).unwrap_or_default();
-                    let name: String = r.get(1).unwrap_or_default();
-                    let artist: String = r.get(2).unwrap_or_default();
-                    let genre: String = r.get(3).unwrap_or_default();
-                    let year: i32 = r.get(4).unwrap_or(0);
-                    let dz_id: String = r.get(5).unwrap_or_default();
-                    if !id.is_empty() {
-                        album_by_id.insert(id, (genre.clone(), year));
-                    }
-                    if !dz_id.trim().is_empty() {
-                        album_by_dz_id.insert(dz_id.trim().to_string(), (genre.clone(), year));
-                    }
-                    let pa = primary_artist(&artist);
-                    let art_key = if pa.is_empty() { artist.trim() } else { pa.as_str() };
-                    let alb_slug = slug(&format!("{}|{}", art_key, name));
-                    if !alb_slug.is_empty() {
-                        album_by_slug
-                            .entry(alb_slug)
-                            .and_modify(|(g, y)| {
-                                if g.is_empty() && !genre.is_empty() {
-                                    *g = genre.clone();
-                                }
-                                if *y <= 0 && year > 0 {
-                                    *y = year;
-                                }
-                            })
-                            .or_insert((genre, year));
+        if !needed_album_ids.is_empty()
+            || !needed_dz_album_ids.is_empty()
+            || !needed_album_slugs.is_empty()
+        {
+            if let Ok(mut astmt) = conn.prepare(
+                "SELECT id, name, artist, genre, year, deezer_id FROM albums_meta WHERE trim(genre) != '' OR year > 0",
+            ) {
+                if let Ok(mut arows) = astmt.query([]) {
+                    while let Ok(Some(r)) = arows.next() {
+                        let id: String = r.get(0).unwrap_or_default();
+                        let name: String = r.get(1).unwrap_or_default();
+                        let artist: String = r.get(2).unwrap_or_default();
+                        let genre: String = r.get(3).unwrap_or_default();
+                        let year: i32 = r.get(4).unwrap_or(0);
+                        let dz_id: String = r.get(5).unwrap_or_default();
+                        let dz_trimmed = dz_id.trim();
+                        if !id.is_empty() && needed_album_ids.contains(&id) {
+                            album_by_id.insert(id, (genre.clone(), year));
+                        }
+                        if !dz_trimmed.is_empty() && needed_dz_album_ids.contains(dz_trimmed) {
+                            album_by_dz_id.insert(dz_trimmed.to_string(), (genre.clone(), year));
+                        }
+                        if !needed_album_slugs.is_empty() {
+                            let pa = primary_artist(&artist);
+                            let art_key = if pa.is_empty() { artist.trim() } else { pa.as_str() };
+                            let alb_slug = slug(&format!("{}|{}", art_key, name));
+                            if !alb_slug.is_empty() && needed_album_slugs.contains(&alb_slug) {
+                                album_by_slug
+                                    .entry(alb_slug)
+                                    .and_modify(|(g, y)| {
+                                        if g.is_empty() && !genre.is_empty() {
+                                            *g = genre.clone();
+                                        }
+                                        if *y <= 0 && year > 0 {
+                                            *y = year;
+                                        }
+                                    })
+                                    .or_insert((genre, year));
+                            }
+                        }
                     }
                 }
             }
@@ -3445,34 +3579,76 @@ impl Store {
 
         let mut song_meta: HashMap<String, (String, i32, String, Option<String>)> = HashMap::new();
         let mut artist_dz_by_slug: HashMap<String, Option<String>> = HashMap::new();
-        if let Ok(mut tstmt) = conn.prepare(
-            "SELECT title, artist, album, genre, year, moods, meta FROM tracks WHERE trim(genre) != '' OR year > 0 OR trim(moods) != '' OR meta LIKE '%deezer_artist_id%'",
-        ) {
-            if let Ok(mut trows) = tstmt.query([]) {
-                while let Ok(Some(r)) = trows.next() {
-                    let title: String = r.get(0).unwrap_or_default();
-                    let artist: String = r.get(1).unwrap_or_default();
-                    let album: String = r.get(2).unwrap_or_default();
-                    let genre: String = r.get(3).unwrap_or_default();
-                    let year: i32 = r.get(4).unwrap_or(0);
-                    let moods: String = r.get(5).unwrap_or_default();
-                    let meta: String = r.get(6).unwrap_or_default();
-                    let tmp = Track {
-                        title,
-                        artist: artist.clone(),
-                        album: album.clone(),
-                        genre: genre.clone(),
-                        year,
-                        moods: moods.clone(),
-                        meta,
-                        ..Default::default()
-                    };
-                    let dz_aid = tmp.deezer_artist_id();
-                    let pa = primary_artist(&artist);
-                    let art_key = if pa.is_empty() { artist.trim() } else { pa.as_str() };
-                    if let Some(ref dz) = dz_aid {
-                        let sl = slug(art_key);
-                        if !sl.is_empty() {
+        if !needed_song_keys.is_empty()
+            || !needed_artist_slugs.is_empty()
+            || !needed_album_slugs.is_empty()
+        {
+            if let Ok(mut tstmt) = conn.prepare(
+                "SELECT title, artist, album, genre, year, moods, meta FROM tracks WHERE trim(genre) != '' OR year > 0 OR trim(moods) != '' OR meta LIKE '%deezer_artist_id%'",
+            ) {
+                if let Ok(mut trows) = tstmt.query([]) {
+                    while let Ok(Some(r)) = trows.next() {
+                        let title: String = r.get(0).unwrap_or_default();
+                        let artist: String = r.get(1).unwrap_or_default();
+                        let album: String = r.get(2).unwrap_or_default();
+                        let genre: String = r.get(3).unwrap_or_default();
+                        let year: i32 = r.get(4).unwrap_or(0);
+                        let moods: String = r.get(5).unwrap_or_default();
+                        let meta: String = r.get(6).unwrap_or_default();
+
+                        let pa = primary_artist(&artist);
+                        let art_key = if pa.is_empty() { artist.trim() } else { pa.as_str() };
+                        let art_slug = if !needed_artist_slugs.is_empty() {
+                            let sl = slug(art_key);
+                            if needed_artist_slugs.contains(&sl) {
+                                Some(sl)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let alb_slug = if (!genre.trim().is_empty() || year > 0)
+                            && !needed_album_slugs.is_empty()
+                        {
+                            let sl = slug(&format!("{}|{}", art_key, album));
+                            if needed_album_slugs.contains(&sl) {
+                                Some(sl)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let tmp = Track {
+                            title,
+                            artist,
+                            album,
+                            meta,
+                            ..Default::default()
+                        };
+                        let sk = if !needed_song_keys.is_empty() {
+                            let k = tmp.song_key();
+                            if needed_song_keys.contains(&k) {
+                                Some(k)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if art_slug.is_none() && alb_slug.is_none() && sk.is_none() {
+                            continue;
+                        }
+
+                        let dz_aid = if art_slug.is_some() || sk.is_some() {
+                            tmp.deezer_artist_id()
+                        } else {
+                            None
+                        };
+                        if let (Some(sl), Some(ref dz)) = (art_slug, &dz_aid) {
                             artist_dz_by_slug
                                 .entry(sl)
                                 .and_modify(|cur| {
@@ -3482,12 +3658,9 @@ impl Store {
                                 })
                                 .or_insert_with(|| Some(dz.clone()));
                         }
-                    }
-                    if !genre.trim().is_empty() || year > 0 {
-                        let alb_slug = slug(&format!("{}|{}", art_key, album));
-                        if !alb_slug.is_empty() {
+                        if let Some(alb_sl) = alb_slug {
                             album_by_slug
-                                .entry(alb_slug)
+                                .entry(alb_sl)
                                 .and_modify(|(g, y)| {
                                     if g.is_empty() && !genre.trim().is_empty() {
                                         *g = genre.clone();
@@ -3498,25 +3671,26 @@ impl Store {
                                 })
                                 .or_insert_with(|| (genre.clone(), year));
                         }
+                        if let Some(sk) = sk {
+                            song_meta
+                                .entry(sk)
+                                .and_modify(|(g, y, m, d)| {
+                                    if g.is_empty() && !genre.trim().is_empty() {
+                                        *g = genre.clone();
+                                    }
+                                    if *y <= 0 && year > 0 {
+                                        *y = year;
+                                    }
+                                    if m.is_empty() && !moods.trim().is_empty() {
+                                        *m = moods.clone();
+                                    }
+                                    if d.is_none() && dz_aid.is_some() {
+                                        *d = dz_aid.clone();
+                                    }
+                                })
+                                .or_insert((genre, year, moods, dz_aid));
+                        }
                     }
-                    let sk = tmp.song_key();
-                    song_meta
-                        .entry(sk)
-                        .and_modify(|(g, y, m, d)| {
-                            if g.is_empty() && !genre.trim().is_empty() {
-                                *g = genre.clone();
-                            }
-                            if *y <= 0 && year > 0 {
-                                *y = year;
-                            }
-                            if m.is_empty() && !moods.trim().is_empty() {
-                                *m = moods.clone();
-                            }
-                            if d.is_none() && dz_aid.is_some() {
-                                *d = dz_aid.clone();
-                            }
-                        })
-                        .or_insert((genre, year, moods, dz_aid));
                 }
             }
         }
@@ -6379,7 +6553,7 @@ impl ArtistResolver {
         }
     }
 
-    fn build(tracks: &[Track], metas: &HashMap<String, ArtistSummary>) -> Self {
+    fn from_metas(metas: &HashMap<String, ArtistSummary>) -> Self {
         let mut res = Self {
             ytm_to_dz: HashMap::new(),
             dz_exact: HashMap::new(),
@@ -6399,38 +6573,71 @@ impl ArtistResolver {
                 }
             }
         }
+        res
+    }
 
-        for t in tracks {
-            let pa = primary_artist(&t.artist);
-            let name = if pa.is_empty() { t.artist.as_str() } else { pa.as_str() };
-            if let Some(dz_id) = t.deezer_artist_id() {
-                let dz_ar_id = format!("ar:dz:{}", dz_id);
-                res.record_artist(&dz_ar_id, name);
-                if let Some(ytm_id) = t.ytm_artist_id() {
-                    let ytm_ar_id = format!("ar:ytm:{}", ytm_id);
-                    Self::record_unique(&mut res.ytm_to_dz, ytm_ar_id, &dz_ar_id);
-                }
-            } else if let Some(ytm_id) = t.ytm_artist_id() {
+    fn record_track(&mut self, t: &Track) {
+        let pa = primary_artist(&t.artist);
+        let name = if pa.is_empty() { t.artist.as_str() } else { pa.as_str() };
+        if let Some(dz_id) = t.deezer_artist_id() {
+            let dz_ar_id = format!("ar:dz:{}", dz_id);
+            self.record_artist(&dz_ar_id, name);
+            if let Some(ytm_id) = t.ytm_artist_id() {
                 let ytm_ar_id = format!("ar:ytm:{}", ytm_id);
-                res.record_artist(&ytm_ar_id, name);
+                Self::record_unique(&mut self.ytm_to_dz, ytm_ar_id, &dz_ar_id);
             }
+        } else if let Some(ytm_id) = t.ytm_artist_id() {
+            let ytm_ar_id = format!("ar:ytm:{}", ytm_id);
+            self.record_artist(&ytm_ar_id, name);
         }
+    }
 
-        for (name_key, ytm_opt) in &res.ytm_exact {
+    fn finish(&mut self) {
+        for (name_key, ytm_opt) in &self.ytm_exact {
             if let (Some(ytm_ar_id), Some(Some(dz_ar_id))) =
-                (ytm_opt.as_deref(), res.dz_exact.get(name_key))
+                (ytm_opt.as_deref(), self.dz_exact.get(name_key))
             {
-                Self::record_unique(&mut res.ytm_to_dz, ytm_ar_id.to_string(), dz_ar_id);
+                Self::record_unique(&mut self.ytm_to_dz, ytm_ar_id.to_string(), dz_ar_id);
             }
         }
-        for (sl_key, ytm_opt) in &res.ytm_slug {
+        for (sl_key, ytm_opt) in &self.ytm_slug {
             if let (Some(ytm_ar_id), Some(Some(dz_ar_id))) =
-                (ytm_opt.as_deref(), res.dz_slug.get(sl_key))
+                (ytm_opt.as_deref(), self.dz_slug.get(sl_key))
             {
-                Self::record_unique(&mut res.ytm_to_dz, ytm_ar_id.to_string(), dz_ar_id);
+                Self::record_unique(&mut self.ytm_to_dz, ytm_ar_id.to_string(), dz_ar_id);
             }
         }
+    }
 
+    fn build(tracks: &[Track], metas: &HashMap<String, ArtistSummary>) -> Self {
+        let mut res = Self::from_metas(metas);
+        for t in tracks {
+            res.record_track(t);
+        }
+        res.finish();
+        res
+    }
+
+    /// Streams only `(artist, meta)` rows that carry a Deezer or YTM artist ID,
+    /// avoiding loading tens of thousands of full `Track` structs into RAM.
+    fn build_from_conn(conn: &Connection, metas: &HashMap<String, ArtistSummary>) -> Self {
+        let mut res = Self::from_metas(metas);
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT artist, meta FROM tracks \
+             WHERE instr(meta, 'deezer_artist_id') > 0 OR instr(meta, 'ytm_artist_id') > 0",
+        ) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(r)) = rows.next() {
+                    let tmp = Track {
+                        artist: r.get(0).unwrap_or_default(),
+                        meta: r.get(1).unwrap_or_default(),
+                        ..Default::default()
+                    };
+                    res.record_track(&tmp);
+                }
+            }
+        }
+        res.finish();
         res
     }
 

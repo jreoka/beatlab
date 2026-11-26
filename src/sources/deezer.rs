@@ -20,8 +20,8 @@ const DZ_BUCKET_REFILL_PER_SEC: f64 = 5.0;
 /// After Deezer refuses us outright (HTTP 403), stop calling it for a while instead of
 /// hammering a blocked endpoint; callers fall back to other sources immediately.
 const DZ_BLOCK_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-const DZ_JSON_CACHE_MAX: usize = 800;
-const DZ_ALBUM_INFO_CACHE_MAX: usize = 20_000;
+const DZ_JSON_CACHE_MAX: usize = 250;
+const DZ_ALBUM_INFO_CACHE_MAX: usize = 8_000;
 
 struct TokenBucket {
     tokens: f64,

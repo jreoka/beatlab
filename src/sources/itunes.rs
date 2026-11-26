@@ -17,7 +17,7 @@ const IT_BUCKET_CAPACITY: f64 = 10.0;
 const IT_BUCKET_REFILL_PER_SEC: f64 = 0.5;
 const IT_BLOCK_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const IT_JSON_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-const IT_JSON_CACHE_MAX: usize = 600;
+const IT_JSON_CACHE_MAX: usize = 200;
 const IT_BATCH_SIZE: usize = 12;
 
 struct TokenBucket {

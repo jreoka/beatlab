@@ -146,6 +146,7 @@ async fn main() -> models::AppResult<()> {
     let cleanup_remote = remote_cache.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         loop {
             interval.tick().await;
@@ -223,6 +224,7 @@ async fn main() -> models::AppResult<()> {
             }
         }
         let mut interval = tokio::time::interval(Duration::from_secs(90));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         let mut tick: usize = 0;
         loop {

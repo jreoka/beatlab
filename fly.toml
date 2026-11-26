@@ -1,5 +1,6 @@
 app = "dill-beatlab"
 primary_region = "ord"
+swap_size_mb = 512
 
 [build]
   dockerfile = "Dockerfile"
@@ -27,6 +28,9 @@ primary_region = "ord"
   # BEATLAB_LLM_REASONING_EFFORT = "low"
   # BEATLAB_LLM_SYSTEM_PROMPT = ""
   RUST_LOG = "info"
+  # Limit glibc malloc arenas so worker/blocking threads don't retain fragmented
+  # RSS across 8+ 64MB arenas on a constrained VM.
+  MALLOC_ARENA_MAX = "2"
   # Keep yt-dlp's player/signature cache on the volume so restarts and
   # deploys don't make the first plays re-fetch it.
   XDG_CACHE_HOME = "/data/.cache"
@@ -53,4 +57,4 @@ primary_region = "ord"
 [[vm]]
   cpu_kind = "shared"
   cpus = 2
-  memory = "512mb"
+  memory = "1gb"

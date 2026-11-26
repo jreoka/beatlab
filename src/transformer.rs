@@ -3044,7 +3044,7 @@ impl TransformerEngine {
         let computed: Vec<(usize, [f32; D_MODEL])> =
             missing.iter().map(|&i| (i, net.encode_track_unit(&tracks[i]).0)).collect();
         if let Ok(mut cache) = self.unit_cache.write() {
-            if cache.len() + computed.len() > 60_000 {
+            if cache.len() + computed.len() > 16_000 {
                 cache.clear();
             }
             for &(i, u) in &computed {
@@ -3304,7 +3304,9 @@ impl TransformerEngine {
         }
         net.refresh_crowd(&table, &users);
 
+        let examples_used = data.examples.len();
         let after = evaluate(&net, &table, &users, &data.holdouts, &data.server_pop, eval_seed);
+        drop(data);
         // Paired comparison on the same held-out listens and candidate pools: discard the update
         // only when it is clearly worse (even the optimistic end of a 90% bootstrap interval of
         // the per-listen change is a loss), not whenever noise dips the average.
@@ -3330,22 +3332,29 @@ impl TransformerEngine {
             );
             net = restored;
         } else {
+            drop(prev_net);
             let prev_eval = net.eval.clone();
             net.eval = after.with_quality_from(&prev_eval);
         }
 
-        let checkpoint = net.to_checkpoint_str();
         let distilled_users = if distill_users && steps_run > 0 && !rejected {
             distill_corpus_users(&net, store, &corpus, &table, &users)
         } else {
             0
         };
+        // Release corpus & feature tables before serializing the checkpoint so
+        // peak memory doesn't stack both at once on small VMs.
+        drop(users);
+        drop(table);
+        drop(corpus);
+
+        let checkpoint = net.to_checkpoint_str();
 
         let stats = TrainEpochStats {
             steps_run,
             total_steps: net.step_count,
             avg_loss: net.avg_loss,
-            examples_used: data.examples.len(),
+            examples_used,
             distilled_users,
             skipped: false,
             rejected,
