@@ -3110,6 +3110,66 @@ impl TasteEngine {
         Self::preview_from_tracks(&tracks)
     }
 
+    /// Preview (track count + up to 4 cover URLs) for a user's LLM-curated custom Mood.
+    pub fn curated_llm_mood_preview(
+        &self,
+        user_id: i64,
+        spec: &crate::llm::LlmCustomMood,
+    ) -> (usize, Vec<String>) {
+        if user_id <= 0 {
+            return (0, Vec::new());
+        }
+        let ids = self.load_curated_pool_ids(
+            &crate::llm::llm_mood_pool_key(user_id, &spec.slug),
+            48 * 3600,
+        );
+        if ids.is_empty() {
+            return (0, Vec::new());
+        }
+        let tracks = self.store.get_tracks_by_ids(&ids).unwrap_or_default();
+        let tracks = self.filter_hidden_tracks_for_user(user_id, tracks);
+        Self::preview_from_tracks(&tracks)
+    }
+
+    /// Return tracks for an LLM-curated custom Mood, using its overnight cached pool
+    /// when ready or curating on demand if not yet cached.
+    pub async fn get_llm_mood_mix_tracks(
+        &self,
+        user_id: i64,
+        spec: &crate::llm::LlmCustomMood,
+        limit: usize,
+    ) -> Vec<Track> {
+        let pool_key = crate::llm::llm_mood_pool_key(user_id, &spec.slug);
+        let cached_ids = self.load_curated_pool_ids(&pool_key, 36 * 3600);
+        if cached_ids.len() >= 8 {
+            let tracks = self.store.get_tracks_by_ids(&cached_ids).unwrap_or_default();
+            let visible = self.filter_hidden_tracks_for_user(user_id, tracks);
+            if visible.len() >= 8 {
+                return visible.into_iter().take(limit).collect();
+            }
+        }
+        let queries = vec![spec.query.clone()];
+        let empty_excl = HashSet::new();
+        let tracks = self
+            .curate_llm_mix_tracks(
+                user_id,
+                &queries,
+                &spec.seed_artists,
+                &spec.genres,
+                spec.mood.as_deref(),
+                spec.year_range,
+                "balanced",
+                &empty_excl,
+                limit,
+            )
+            .await;
+        if !tracks.is_empty() {
+            let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+            self.save_curated_pool(&pool_key, &ids);
+        }
+        tracks
+    }
+
     /// Return tracks for an LLM-curated Explore mix, using its overnight cached pool
     /// when ready or curating on demand if not yet cached.
     pub async fn get_llm_explore_mix_tracks(
@@ -3237,20 +3297,68 @@ impl TasteEngine {
         })
         .await;
 
-        // 3. Pre-populate each custom Explore category mix overnight so cards have real
-        //    cover collages, track counts, and instant playback in the morning.
+        // 3. Pre-populate custom Moods, Explore category mixes, and custom Era mixes
+        //    with bounded concurrency so every card has real cover collages and instant playback.
+        struct PoolJob {
+            pool_key: String,
+            query: String,
+            seed_artists: Vec<String>,
+            genres: Vec<String>,
+            mood: Option<String>,
+            year_range: Option<(i32, i32)>,
+        }
+        let mut jobs: Vec<PoolJob> = Vec::new();
+        for cm in &exp.custom_moods {
+            jobs.push(PoolJob {
+                pool_key: crate::llm::llm_mood_pool_key(user_id, &cm.slug),
+                query: cm.query.clone(),
+                seed_artists: cm.seed_artists.clone(),
+                genres: cm.genres.clone(),
+                mood: cm.mood.clone(),
+                year_range: cm.year_range,
+            });
+        }
         for cat in &exp.explore_categories {
             for mix in &cat.mixes {
-                let queries = vec![mix.query.clone()];
+                jobs.push(PoolJob {
+                    pool_key: crate::llm::llm_explore_pool_key(user_id, &mix.key),
+                    query: mix.query.clone(),
+                    seed_artists: mix.seed_artists.clone(),
+                    genres: mix.genres.clone(),
+                    mood: mix.mood.clone(),
+                    year_range: mix.year_range,
+                });
+            }
+        }
+        for era in &exp.era_mixes {
+            jobs.push(PoolJob {
+                pool_key: crate::llm::llm_explore_pool_key(user_id, &era.key),
+                query: era.query.clone(),
+                seed_artists: era.seed_artists.clone(),
+                genres: era.genres.clone(),
+                mood: era.mood.clone(),
+                year_range: era.year_range,
+            });
+        }
+
+        const MAX_CONCURRENT_JOBS: usize = 4;
+        let mut join_set = tokio::task::JoinSet::new();
+        for job in jobs {
+            if join_set.len() >= MAX_CONCURRENT_JOBS {
+                let _ = join_set.join_next().await;
+            }
+            let engine = self.clone();
+            join_set.spawn(async move {
+                let queries = vec![job.query];
                 let empty_excl = HashSet::new();
-                let tracks = self
+                let tracks = engine
                     .curate_llm_mix_tracks(
                         user_id,
                         &queries,
-                        &mix.seed_artists,
-                        &mix.genres,
-                        mix.mood.as_deref(),
-                        mix.year_range,
+                        &job.seed_artists,
+                        &job.genres,
+                        job.mood.as_deref(),
+                        job.year_range,
                         "balanced",
                         &empty_excl,
                         30,
@@ -3258,14 +3366,11 @@ impl TasteEngine {
                     .await;
                 if !tracks.is_empty() {
                     let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
-                    self.save_curated_pool(
-                        &crate::llm::llm_explore_pool_key(user_id, &mix.key),
-                        &ids,
-                    );
+                    engine.save_curated_pool(&job.pool_key, &ids);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            }
+            });
         }
+        while join_set.join_next().await.is_some() {}
     }
 
     #[allow(clippy::too_many_arguments)]

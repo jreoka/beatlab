@@ -6,7 +6,7 @@
 //! - `BEATLAB_LLM_API_KEY` (required for default OpenAI endpoint, optional for local custom endpoints)
 //! - `BEATLAB_LLM_REFRESH_HOUR` (optional local hour 0..23, default `4`)
 //! - `BEATLAB_LLM_TEMPERATURE` (optional float 0.0..2.0, default `0.85`)
-//! - `BEATLAB_LLM_MAX_TOKENS` (optional integer 512..32768, default `8192`)
+//! - `BEATLAB_LLM_MAX_TOKENS` (optional integer >= 512, or `0`/`none` for uncapped; default uncapped)
 //! - `BEATLAB_LLM_TIMEOUT_SECS` (optional integer 10..300, default `120`)
 //! - `BEATLAB_LLM_SYSTEM_PROMPT` (optional extra editorial instructions from server owner)
 //! - `BEATLAB_LLM_EXTRA_HEADERS` (optional JSON object of extra HTTP headers)
@@ -14,10 +14,11 @@
 //!
 //! Once per listener-day (turning over at `refresh_hour` in each user's local timezone),
 //! Beatlab summarizes the user's listening stats, top artists/tracks, genres, moods, and
-//! playlists, asks the LLM to craft a fresh daily edition (custom Home & Explore copy,
-//! custom-named Daily Mixes, custom Explore categories & mixes, personalized Mood
-//! ordering/subtitles, and Search vibe prompts), and then uses `TasteEngine` + music
-//! sources to materialize every mix into real playable tracks stored in SQLite.
+//! playlists, asks the LLM to craft a fresh daily edition (custom Home & Explore headlines,
+//! greetings, every section heading, 4 custom Daily Mixes, custom auto-playlist copy,
+//! custom Explore categories & mixes, custom Moods & Vibes, custom Era/Time-Machine mixes,
+//! personalized Genre/Scene spotlights, and Search vibe prompts), and then uses `TasteEngine`
+//! + music sources to materialize every mix and mood into real playable tracks stored in SQLite.
 
 use crate::models::{err_msg, primary_artist, slug, AppResult, Mood};
 use crate::stats::{build_user_stats, StatsRange};
@@ -33,7 +34,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const DEFAULT_OPENAI_ENDPOINT: &str = "https://api.openai.com/v1";
-const EXPERIENCE_SCHEMA_VERSION: u32 = 1;
+const EXPERIENCE_SCHEMA_VERSION: u32 = 2;
 const RETRY_BACKOFF_SECS: i64 = 30 * 60;
 
 const CURATED_PALETTES: &[(&str, &str)] = &[
@@ -83,7 +84,7 @@ pub struct LlmConfig {
     pub model: String,
     pub refresh_hour: i64,
     pub temperature: f64,
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     pub timeout_secs: u64,
     pub extra_system_prompt: Option<String>,
     pub extra_headers: Vec<(String, String)>,
@@ -123,10 +124,14 @@ impl LlmConfig {
             .map(|v| v.clamp(0.0, 2.0))
             .unwrap_or(0.85);
 
-        let max_tokens = env_nonempty("BEATLAB_LLM_MAX_TOKENS")
-            .and_then(|s| s.parse::<u32>().ok())
-            .map(|v| v.clamp(512, 32768))
-            .unwrap_or(8192);
+        let max_tokens = env_nonempty("BEATLAB_LLM_MAX_TOKENS").and_then(|s| {
+            let low = s.to_ascii_lowercase();
+            if matches!(low.as_str(), "0" | "none" | "off" | "unlimited" | "auto") {
+                None
+            } else {
+                s.parse::<u32>().ok().map(|v| v.max(512))
+            }
+        });
 
         let timeout_secs = env_nonempty("BEATLAB_LLM_TIMEOUT_SECS")
             .and_then(|s| s.parse::<u64>().ok())
@@ -216,11 +221,17 @@ pub fn llm_explore_pool_key(user_id: i64, mix_key: &str) -> String {
     format!("curated:llm_explore:v1:{user_id}:{mix_key}")
 }
 
+pub fn llm_mood_pool_key(user_id: i64, mood_slug: &str) -> String {
+    format!("curated:llm_mood:v1:{user_id}:{mood_slug}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmSectionTitles {
     #[serde(default)]
     pub quick_picks: String,
+    #[serde(default)]
+    pub new_releases: String,
     #[serde(default)]
     pub mixed_for_you: String,
     #[serde(default)]
@@ -237,6 +248,20 @@ pub struct LlmSectionTitles {
     pub decades: String,
     #[serde(default)]
     pub discovery: String,
+    #[serde(default)]
+    pub trending: String,
+    #[serde(default)]
+    pub albums: String,
+    #[serde(default)]
+    pub artists: String,
+    #[serde(default)]
+    pub genres: String,
+    #[serde(default)]
+    pub charts: String,
+    #[serde(default)]
+    pub featured_artists: String,
+    #[serde(default)]
+    pub chart_albums: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +337,42 @@ pub struct LlmMoodOverride {
     pub label: String,
     #[serde(default)]
     pub subtitle: String,
+    #[serde(default)]
+    pub c1: String,
+    #[serde(default)]
+    pub c2: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmCustomMood {
+    /// Always prefixed with `llm-mood-` so it never collides with static `Mood` slugs.
+    pub slug: String,
+    pub label: String,
+    pub subtitle: String,
+    pub query: String,
+    #[serde(default)]
+    pub seed_artists: Vec<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub mood: Option<String>,
+    #[serde(default)]
+    pub year_range: Option<(i32, i32)>,
+    pub c1: String,
+    pub c2: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmGenreSpotlight {
+    pub name: String,
+    #[serde(default)]
+    pub subtitle: String,
+    #[serde(default)]
+    pub query: String,
+    pub c1: String,
+    pub c2: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +391,10 @@ pub struct DailyLlmExperience {
     pub date_label: String,
     pub edition_title: String,
     pub model: String,
+    #[serde(default)]
+    pub home_greeting: String,
+    #[serde(default)]
+    pub explore_title: String,
     pub home_tagline: String,
     pub explore_tagline: String,
     #[serde(default)]
@@ -340,6 +405,12 @@ pub struct DailyLlmExperience {
     pub auto_mix_overrides: HashMap<String, LlmAutoMixCopy>,
     #[serde(default)]
     pub explore_categories: Vec<LlmExploreCategory>,
+    #[serde(default)]
+    pub custom_moods: Vec<LlmCustomMood>,
+    #[serde(default)]
+    pub era_mixes: Vec<LlmExploreMixSpec>,
+    #[serde(default)]
+    pub featured_genres: Vec<LlmGenreSpotlight>,
     #[serde(default)]
     pub mood_overrides: Vec<LlmMoodOverride>,
     #[serde(default)]
@@ -353,7 +424,11 @@ impl DailyLlmExperience {
                 return Some(m);
             }
         }
-        None
+        self.era_mixes.iter().find(|m| m.key == key)
+    }
+
+    pub fn find_custom_mood(&self, slug: &str) -> Option<&LlmCustomMood> {
+        self.custom_moods.iter().find(|m| m.slug == slug)
     }
 
     pub fn find_daily_mix(&self, part: &str) -> Option<&LlmDailyMixSpec> {
@@ -604,9 +679,13 @@ impl LlmCurator {
                 { "role": "user", "content": user_prompt },
             ],
             "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
             "response_format": { "type": "json_object" },
         });
+        if let Some(mt) = self.config.max_tokens {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("max_tokens".to_string(), json!(mt));
+            }
+        }
         if let Some(ref effort) = self.config.reasoning_effort {
             if let Some(obj) = body.as_object_mut() {
                 if is_openrouter {
@@ -658,20 +737,17 @@ impl LlmCurator {
         // Retry once with settings tuned for reasoning models and providers that misbehave
         // under `response_format: json_object` or starve `content` on internal reasoning tokens:
         // 1. Drop `response_format` (the prompt already strictly requests raw JSON).
-        // 2. Expand `max_tokens` to leave room for both thinking and the full JSON edition.
+        // 2. If `max_tokens` was configured, expand it (or drop it when truncated) so both
+        //    thinking and the full JSON edition fit.
         // 3. On OpenRouter, if reasoning tokens were consumed and no effort was configured,
         //    hint `reasoning: { effort: "low" }` so thinking does not exhaust the output cap.
         let mut retry_body = body.clone();
         if let Some(obj) = retry_body.as_object_mut() {
             obj.remove("response_format");
-            let boosted_tokens = self
-                .config
-                .max_tokens
-                .saturating_mul(2)
-                .clamp(8192, 16384)
-                .max(self.config.max_tokens)
-                .min(32768);
-            obj.insert("max_tokens".to_string(), json!(boosted_tokens));
+            if let Some(mt) = self.config.max_tokens {
+                let boosted = mt.saturating_mul(2).max(16384);
+                obj.insert("max_tokens".to_string(), json!(boosted));
+            }
             if (first_empty.has_reasoning || first_empty.reasoning_tokens.unwrap_or(0) > 0)
                 && self.config.reasoning_effort.is_none()
                 && is_openrouter
@@ -727,8 +803,45 @@ impl LlmCurator {
             return Ok(text);
         }
 
+        // OpenRouter returns HTTP 402 when `max_tokens` is omitted (or too high) on a paid
+        // account whose remaining credits don't cover the model's full theoretical ceiling.
+        // Automatically retry with a bounded cap (respecting any affordable limit in the message).
+        if status.as_u16() == 402 {
+            let low = text.to_ascii_lowercase();
+            if low.contains("max_tokens") || low.contains("afford") {
+                let mut retry_body = body.clone();
+                if let Some(obj) = retry_body.as_object_mut() {
+                    let fallback_cap = extract_affordable_tokens(&text)
+                        .map(|n| n.clamp(2048, 16384))
+                        .unwrap_or(8192);
+                    obj.insert("max_tokens".to_string(), json!(fallback_cap));
+                }
+                let retry_resp = self
+                    .http
+                    .post(&self.config.completions_url)
+                    .headers(headers.clone())
+                    .json(&retry_body)
+                    .send()
+                    .await
+                    .map_err(|e| err_msg(format!("LLM 402 retry request failed: {e}")))?;
+                let retry_status = retry_resp.status();
+                let retry_text = retry_resp
+                    .text()
+                    .await
+                    .map_err(|e| err_msg(format!("Failed reading LLM 402 retry response: {e}")))?;
+                if retry_status.is_success() {
+                    return Ok(retry_text);
+                }
+                return Err(err_msg(format!(
+                    "LLM API returned {}: {}",
+                    retry_status.as_u16(),
+                    truncate_str(&retry_text, 280)
+                )));
+            }
+        }
+
         // Compatibility retry for OpenAI-compatible servers or reasoning models that reject
-        // `response_format`, `temperature`, `reasoning`, or `max_tokens`.
+        // `response_format`, `temperature`, `reasoning`, or require/restrict `max_tokens`.
         if status.as_u16() == 400 || status.as_u16() == 422 {
             let low = text.to_ascii_lowercase();
             let mut retry_body = body.clone();
@@ -743,14 +856,22 @@ impl LlmCurator {
                     if let Some(mt) = obj.remove("max_tokens") {
                         obj.insert("max_completion_tokens".to_string(), mt);
                         changed = true;
+                    } else {
+                        obj.insert("max_completion_tokens".to_string(), json!(16384));
+                        changed = true;
                     }
                 } else if low.contains("max_tokens") {
-                    let cur = obj.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    if cur > 4096 {
-                        obj.insert("max_tokens".to_string(), json!(4096));
-                        changed = true;
-                    } else if let Some(mt) = obj.remove("max_tokens") {
-                        obj.insert("max_completion_tokens".to_string(), mt);
+                    if let Some(cur) = obj.get("max_tokens").and_then(|v| v.as_u64()) {
+                        if cur > 4096 {
+                            obj.insert("max_tokens".to_string(), json!(4096));
+                            changed = true;
+                        } else if let Some(mt) = obj.remove("max_tokens") {
+                            obj.insert("max_completion_tokens".to_string(), mt);
+                            changed = true;
+                        }
+                    } else {
+                        // Some strict proxies require `max_tokens` to be present.
+                        obj.insert("max_tokens".to_string(), json!(16384));
                         changed = true;
                     }
                 }
@@ -864,6 +985,21 @@ fn is_openrouter_endpoint(url: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Parse an affordable token count from an OpenRouter 402 error message like
+/// `"You requested up to 65536 tokens, but can only afford 8888"`.
+fn extract_affordable_tokens(text: &str) -> Option<u32> {
+    let low = text.to_ascii_lowercase();
+    let idx = low.find("afford")?;
+    let rest = &text[idx + "afford".len()..];
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u32>().ok()
 }
 
 #[derive(Debug)]
@@ -1103,7 +1239,11 @@ fn extract_valid_experience_json(raw: &str) -> Option<&str> {
         if let Some(end) = matched_end {
             let candidate = &raw[i..=end];
             if let Ok(parsed) = serde_json::from_str::<RawLlmResponse>(candidate) {
-                if !parsed.daily_mixes.is_empty() || !parsed.explore_categories.is_empty() {
+                if !parsed.daily_mixes.is_empty()
+                    || !parsed.explore_categories.is_empty()
+                    || !parsed.custom_moods.is_empty()
+                    || !parsed.era_mixes.is_empty()
+                {
                     best = Some(candidate);
                 }
             }
@@ -1351,6 +1491,12 @@ fn build_user_taste_digest(
                 previous_titles.push(m.title.clone());
             }
         }
+        for m in &prev.custom_moods {
+            previous_titles.push(m.label.clone());
+        }
+        for e in &prev.era_mixes {
+            previous_titles.push(e.title.clone());
+        }
     }
 
     let peak_hour_label = stats_all
@@ -1386,20 +1532,26 @@ fn build_user_taste_digest(
 
 fn build_system_prompt(extra: Option<&str>) -> String {
     let mut prompt = String::from(
-        "You are Beatlab's overnight music editorial director and personal DJ. \
-Each night while the listener sleeps, you craft a fresh, deeply personalized daily edition \
-of their music streaming app: custom Home & Explore headlines, 4 custom-named Daily Mixes, \
-custom descriptions/titles for their signature auto-playlists, 3 custom Explore categories \
-full of clickable curated mixes, personalized Mood ordering & subtitles, and daily vibe \
-search prompts.\n\n\
+        "You are Beatlab's overnight music editorial director, art director, and personal DJ. \
+Each night while the listener sleeps, you redesign their ENTIRE Home & Explore experience \
+from scratch so the app feels freshly hand-crafted around their exact taste today:\n\
+- Custom Home greeting, Explore headline, edition title, and Home/Explore editorial taglines\n\
+- Custom editorial headings for EVERY shelf on Home & Explore\n\
+- 4 custom-named Daily Mixes (with custom cover palettes & seed strategies)\n\
+- Custom titles & daily notes for all 6 signature auto-playlists\n\
+- 3 custom Explore categories full of clickable curated mixes (9-12 mixes)\n\
+- 8-9 COMPLETELY CUSTOM Moods & Vibes tiles tailored to this listener (invent fresh, evocative moods/headspaces with custom colors and music seeds — DO NOT use generic defaults like \"Chill & Lo-Fi\", \"High Energy\", or \"Feel Good\")\n\
+- 4-5 COMPLETELY CUSTOM Era & Time-Machine mixes tailored to their favorite decades, scenes, and sonic movements (DO NOT use generic \"70s Classics\" / \"80s Hits\" / \"90s Anthems\" titles)\n\
+- 6-8 personalized Genre & Micro-Scene spotlights for Explore (specific real genres/subgenres/scenes they love or should dive into, with custom colors & notes)\n\
+- 5-6 clickable daily vibe prompts for Search\n\n\
 Style guidelines:\n\
-- Be genuinely creative, musical, grounded, and specific to their actual taste (artists, scenes, eras, playlists, chronotype, day of week/season). Avoid generic cliches, cringe slang, or excessive emojis (no emojis at all — keep typography clean and editorial).\n\
-- Never repeat yesterday's mix or category names.\n\
-- Every mix you design will be populated with real songs by Beatlab's search & taste engine using your `seedQueries`, `seedArtists`, `genres`, `mood`, and `yearRange`. Therefore:\n\
-  * `seedQueries` MUST be realistic music search/playlist queries that work well on Deezer/YouTube Music (e.g., \"japanese city pop\", \"90s shoegaze\", \"melodic house\", \"indie folk acoustic\", \"uk garage classics\").\n\
+- Be genuinely creative, musical, grounded, and specific to their actual taste (artists, scenes, eras, playlists, chronotype, day of week/season). Avoid generic cliches, cringe slang, or emojis (no emojis at all — keep typography clean and editorial).\n\
+- Never repeat yesterday's mix, mood, era, or category names.\n\
+- Every mix, mood, and era you design will be populated with REAL playable songs by Beatlab's search & taste engine using your `query`/`seedQueries`, `seedArtists`, `genres`, `mood`, and `yearRange`. Therefore:\n\
+  * `query` / `seedQueries` MUST be realistic music search/playlist queries that return great real songs on Deezer/YouTube Music (e.g., \"japanese city pop\", \"90s shoegaze\", \"melodic house\", \"indie folk acoustic\", \"uk garage classics\", \"dark synthwave\").\n\
   * `seedArtists` MUST be real musical artists (a mix of the listener's favorites and genuinely adjacent artists they would love).\n\
-  * `mood` MUST be either null or one of: \"chill\", \"energy\", \"late_night\", \"upbeat\", \"melancholy\", \"party\", \"acoustic\", \"groove\", \"rock_indie\".\n\
-  * `c1` (bright accent) and `c2` (deep dark background) MUST be valid 6-digit hex colors like \"#38bdf8\" and \"#0c2d48\" with strong contrast for white text.\n\
+  * `mood` (the optional acoustic hint field) MUST be either null or one of: \"chill\", \"energy\", \"late_night\", \"upbeat\", \"melancholy\", \"party\", \"acoustic\", \"groove\", \"rock_indie\".\n\
+  * `c1` (bright accent) and `c2` (deep dark background) MUST be valid 6-digit hex colors like \"#38bdf8\" and \"#0c2d48\" with strong contrast for white text, varied across cards so the UI looks vivid and cohesive.\n\
 - Respond ONLY with a single valid JSON object matching the requested schema. No markdown fences, no commentary.",
     );
     if let Some(extra_text) = extra {
@@ -1469,18 +1621,28 @@ fn build_user_prompt(d: &UserTasteDigest) -> String {
 Return a JSON object with this exact shape:
 {
   "editionTitle": "Short 2-4 word name for today's edition",
+  "homeGreeting": "Personalized greeting line for Home (e.g. 'Late-night signal, cross' or 'Thursday frequency, cross')",
+  "exploreTitle": "Custom title for the Explore page (2-4 words, e.g. 'Tonight's Crate' or 'Sonic Atlas')",
   "homeTagline": "One crisp editorial sentence under the Home greeting tailored to today & their taste",
   "exploreTagline": "One crisp editorial sentence under the Explore heading",
   "sections": {
     "quickPicks": "Custom heading for Quick Picks (2-4 words)",
+    "newReleases": "Custom heading for New Releases (2-4 words)",
     "mixedForYou": "Custom heading for Daily Mixes rail (2-4 words)",
     "madeForYou": "Custom heading for Made For You rail (2-4 words)",
     "recent": "Custom heading for Recently Played (2-4 words)",
     "relatedTracks": "Custom heading for Related Tracks (2-5 words)",
     "recommendedArtists": "Custom heading for Artists You Might Like (2-5 words)",
     "moods": "Custom heading for Moods & Vibes (2-4 words)",
-    "decades": "Custom heading for Decades section (2-4 words)",
-    "discovery": "Custom heading for Fresh Discovery Picks (2-4 words)"
+    "decades": "Custom heading for Era & Time Machine mixes (2-4 words)",
+    "discovery": "Custom heading for Fresh Discovery Picks (2-4 words)",
+    "trending": "Custom heading for Trending Now (2-4 words)",
+    "albums": "Custom heading for Popular Albums (2-4 words)",
+    "artists": "Custom heading for Top Artists (2-4 words)",
+    "genres": "Custom heading for Genres & Scenes (2-4 words)",
+    "featuredArtists": "Custom heading for Featured Artists on Explore (2-4 words)",
+    "chartAlbums": "Custom heading for Chart Albums on Explore (2-4 words)",
+    "charts": "Custom heading for Top 30 Charts on Explore (2-4 words)"
   },
   "dailyMixes": [
     {
@@ -1532,18 +1694,57 @@ Return a JSON object with this exact shape:
       ]
     }
   ],
-  "moodOverrides": [
-    { "slug": "late_night", "label": "Fresh label or keep classic", "subtitle": "Personalized 1-line subtitle" }
+  "customMoods": [
+    {
+      "slug": "2am-neon-drift",
+      "label": "2AM Neon Drift",
+      "subtitle": "Hazy analog synths & nocturnal basslines for after-hours listening",
+      "query": "late night synthwave dream pop",
+      "seedArtists": ["Real Artist 1", "Real Artist 2", "Real Artist 3"],
+      "genres": ["Synthwave", "Dream Pop"],
+      "mood": "late_night",
+      "yearRange": null,
+      "c1": "#38bdf8",
+      "c2": "#0c2d48"
+    }
+  ],
+  "eraMixes": [
+    {
+      "key": "late-90s-shibuya",
+      "kicker": "1995-2002",
+      "title": "Velvet Static 90s",
+      "subtitle": "Reverb-drenched shoegaze, trip-hop & nocturnal alt cuts",
+      "query": "90s shoegaze trip hop",
+      "seedArtists": ["Real Artist A", "Real Artist B"],
+      "genres": ["Shoegaze", "Trip-Hop"],
+      "mood": "melancholy",
+      "yearRange": [1990, 1999],
+      "c1": "#f472b6",
+      "c2": "#4a1230"
+    }
+  ],
+  "featuredGenres": [
+    {
+      "name": "Japanese City Pop",
+      "subtitle": "Glossy 80s Tokyo funk & neon ballads",
+      "query": "japanese city pop",
+      "c1": "#fb923c",
+      "c2": "#4c1d0d"
+    }
   ],
   "searchPrompts": [
     { "label": "Short clickable vibe label (2-5 words)", "query": "instant mix query string" }
   ]
 }
-Requirements:
-- Provide exactly 4 items in `dailyMixes` with `part` values `"1"`, `"2"`, `"3"`, `"supermix"`.
+Requirements (fill EVERY array completely — do NOT return just 1 example item):
+- Provide ALL fields in `sections` with fresh, creative editorial headings.
+- Provide exactly 4 complete items in `dailyMixes` with `part` values `"1"`, `"2"`, `"3"`, `"supermix"`.
+- Provide all 6 keys in `autoMixOverrides`.
 - Provide 3 distinct categories in `exploreCategories`, each with 3 to 4 mixes (9-12 total custom Explore mixes).
-- Provide 5 to 9 items in `moodOverrides` ordered from most relevant to this listener first, using only valid mood slugs (`chill`, `energy`, `late_night`, `upbeat`, `melancholy`, `party`, `acoustic`, `groove`, `rock_indie`).
-- Provide 4 to 6 items in `searchPrompts`.
+- Provide 8 to 9 completely custom, distinct items in `customMoods` tailored to this listener (each with its own unique label, subtitle, query, seedArtists, genres, and vivid `c1`/`c2` colors — NO generic default mood names!).
+- Provide 4 to 5 distinct items in `eraMixes` tailored to eras/movements that resonate with this listener (each with `kicker` like an era/years tag, `title`, `subtitle`, `query`, `seedArtists`, `yearRange`, `c1`, `c2`).
+- Provide 6 to 8 distinct real music genres/micro-scenes in `featuredGenres` tailored to this listener.
+- Provide 5 to 6 items in `searchPrompts`.
 "##,
     );
     out
@@ -1554,6 +1755,10 @@ Requirements:
 struct RawLlmResponse {
     #[serde(default)]
     edition_title: String,
+    #[serde(default)]
+    home_greeting: String,
+    #[serde(default)]
+    explore_title: String,
     #[serde(default)]
     home_tagline: String,
     #[serde(default)]
@@ -1567,9 +1772,55 @@ struct RawLlmResponse {
     #[serde(default)]
     explore_categories: Vec<RawExploreCategory>,
     #[serde(default)]
+    custom_moods: Vec<RawCustomMood>,
+    #[serde(default)]
+    era_mixes: Vec<RawExploreMix>,
+    #[serde(default)]
+    featured_genres: Vec<RawGenreSpotlight>,
+    #[serde(default)]
     mood_overrides: Vec<LlmMoodOverride>,
     #[serde(default)]
     search_prompts: Vec<LlmSearchPrompt>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawCustomMood {
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    subtitle: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    seed_artists: Vec<String>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    mood: Option<String>,
+    #[serde(default)]
+    year_range: Option<Vec<i32>>,
+    #[serde(default)]
+    c1: String,
+    #[serde(default)]
+    c2: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawGenreSpotlight {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    subtitle: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    c1: String,
+    #[serde(default)]
+    c2: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -1725,11 +1976,14 @@ fn sanitize_experience(
             t
         }
     };
+    let home_greeting = clean_text(&raw.home_greeting, 72);
+    let explore_title = clean_text(&raw.explore_title, 48);
     let home_tagline = clean_text(&raw.home_tagline, 160);
     let explore_tagline = clean_text(&raw.explore_tagline, 160);
 
     let sections = LlmSectionTitles {
         quick_picks: clean_text(&raw.sections.quick_picks, 42),
+        new_releases: clean_text(&raw.sections.new_releases, 42),
         mixed_for_you: clean_text(&raw.sections.mixed_for_you, 42),
         made_for_you: clean_text(&raw.sections.made_for_you, 42),
         recent: clean_text(&raw.sections.recent, 42),
@@ -1738,6 +1992,13 @@ fn sanitize_experience(
         moods: clean_text(&raw.sections.moods, 42),
         decades: clean_text(&raw.sections.decades, 42),
         discovery: clean_text(&raw.sections.discovery, 42),
+        trending: clean_text(&raw.sections.trending, 42),
+        albums: clean_text(&raw.sections.albums, 42),
+        artists: clean_text(&raw.sections.artists, 42),
+        genres: clean_text(&raw.sections.genres, 42),
+        charts: clean_text(&raw.sections.charts, 42),
+        featured_artists: clean_text(&raw.sections.featured_artists, 42),
+        chart_albums: clean_text(&raw.sections.chart_albums, 42),
     };
 
     // Normalize daily mixes to canonical parts ["1", "2", "3", "supermix"].
@@ -1929,6 +2190,130 @@ fn sanitize_experience(
         }
     }
 
+    let mut used_custom_moods = HashSet::new();
+    let mut custom_moods = Vec::new();
+    for (idx, cm) in raw.custom_moods.into_iter().take(9).enumerate() {
+        let label = clean_text(&cm.label, 38);
+        if label.is_empty() {
+            continue;
+        }
+        let raw_slug = if cm.slug.trim().is_empty() {
+            slug(&label)
+        } else {
+            slug(&cm.slug)
+        };
+        let base_slug = if raw_slug.starts_with("llm-mood-") {
+            raw_slug
+        } else {
+            format!("llm-mood-{raw_slug}")
+        };
+        let mut mood_slug = truncate_str(&base_slug, 48);
+        if !used_custom_moods.insert(mood_slug.clone()) {
+            mood_slug = format!("{}-{}", truncate_str(&base_slug, 42), idx + 1);
+            used_custom_moods.insert(mood_slug.clone());
+        }
+        let query = {
+            let q = clean_text(&cm.query, 70);
+            if q.is_empty() {
+                label.clone()
+            } else {
+                q
+            }
+        };
+        let (c1, c2) = sanitize_colors(&cm.c1, &cm.c2, idx);
+        custom_moods.push(LlmCustomMood {
+            slug: mood_slug,
+            label,
+            subtitle: clean_text(&cm.subtitle, 96),
+            query,
+            seed_artists: clean_list(cm.seed_artists, 5, 60),
+            genres: clean_list(cm.genres, 3, 36),
+            mood: sanitize_mood(cm.mood),
+            year_range: sanitize_year_range(cm.year_range),
+            c1,
+            c2,
+        });
+    }
+
+    let mut era_mixes = Vec::new();
+    for (ei, em) in raw.era_mixes.into_iter().take(6).enumerate() {
+        let title = clean_text(&em.title, 48);
+        if title.is_empty() {
+            continue;
+        }
+        let raw_key = if em.key.trim().is_empty() {
+            slug(&title)
+        } else {
+            slug(&em.key)
+        };
+        let base_key = if raw_key.starts_with("llm-era-") {
+            raw_key
+        } else {
+            format!("llm-era-{raw_key}")
+        };
+        let mut key = truncate_str(&base_key, 48);
+        if !used_mix_keys.insert(key.clone()) {
+            key = format!("{}-{}", truncate_str(&base_key, 42), ei + 1);
+            used_mix_keys.insert(key.clone());
+        }
+        let query = {
+            let q = clean_text(&em.query, 70);
+            if q.is_empty() {
+                title.clone()
+            } else {
+                q
+            }
+        };
+        let kicker = {
+            let k = clean_text(&em.kicker, 22).to_ascii_uppercase();
+            if k.is_empty() {
+                "ERA MIX".to_string()
+            } else {
+                k
+            }
+        };
+        let (c1, c2) = sanitize_colors(&em.c1, &em.c2, palette_idx);
+        palette_idx += 1;
+        era_mixes.push(LlmExploreMixSpec {
+            key,
+            kicker,
+            title,
+            subtitle: clean_text(&em.subtitle, 100),
+            query,
+            seed_artists: clean_list(em.seed_artists, 5, 60),
+            genres: clean_list(em.genres, 3, 36),
+            mood: sanitize_mood(em.mood),
+            year_range: sanitize_year_range(em.year_range),
+            c1,
+            c2,
+        });
+    }
+
+    let mut seen_genres = HashSet::new();
+    let mut featured_genres = Vec::new();
+    for (gi, fg) in raw.featured_genres.into_iter().take(10).enumerate() {
+        let name = clean_text(&fg.name, 40);
+        if name.is_empty() || !seen_genres.insert(name.to_lowercase()) {
+            continue;
+        }
+        let query = {
+            let q = clean_text(&fg.query, 64);
+            if q.is_empty() {
+                name.clone()
+            } else {
+                q
+            }
+        };
+        let (c1, c2) = sanitize_colors(&fg.c1, &fg.c2, gi + 2);
+        featured_genres.push(LlmGenreSpotlight {
+            name,
+            subtitle: clean_text(&fg.subtitle, 84),
+            query,
+            c1,
+            c2,
+        });
+    }
+
     let mut seen_moods = HashSet::new();
     let mut mood_overrides = Vec::new();
     for mo in raw.mood_overrides {
@@ -1940,8 +2325,10 @@ fn sanitize_experience(
         }
         mood_overrides.push(LlmMoodOverride {
             slug: mood.slug().to_string(),
-            label: clean_text(&mo.label, 32),
-            subtitle: clean_text(&mo.subtitle, 84),
+            label: clean_text(&mo.label, 38),
+            subtitle: clean_text(&mo.subtitle, 96),
+            c1: valid_hex_color(&mo.c1).unwrap_or_default(),
+            c2: valid_hex_color(&mo.c2).unwrap_or_default(),
         });
     }
 
@@ -1965,12 +2352,17 @@ fn sanitize_experience(
         date_label: date_label.to_string(),
         edition_title,
         model: model.to_string(),
+        home_greeting,
+        explore_title,
         home_tagline,
         explore_tagline,
         sections,
         daily_mixes,
         auto_mix_overrides,
         explore_categories,
+        custom_moods,
+        era_mixes,
+        featured_genres,
         mood_overrides,
         search_prompts,
     }
@@ -2136,7 +2528,7 @@ mod tests {
             model: "demo-model".to_string(),
             refresh_hour: 4,
             temperature: 0.7,
-            max_tokens: 1024,
+            max_tokens: None,
             timeout_secs: 15,
             extra_system_prompt: None,
             extra_headers: vec![],
@@ -2165,13 +2557,18 @@ mod tests {
 
         let llm_reply = json!({
             "editionTitle": "Midnight Neon Edition",
+            "homeGreeting": "After-hours signal, alice",
+            "exploreTitle": "Tonight's Crate",
             "homeTagline": "Crisp synth hooks and late-night guitars tuned to your week.",
             "exploreTagline": "Fresh detours hand-picked overnight.",
             "sections": {
                 "quickPicks": "Jump Right In",
+                "newReleases": "Fresh Off The Press",
                 "mixedForYou": "Tonight's Custom Mixes",
                 "madeForYou": "Your Signature Stacks",
-                "moods": "Headspaces"
+                "moods": "Headspaces",
+                "decades": "Time Machine Detours",
+                "genres": "Scenes In Orbit"
             },
             "dailyMixes": [
                 {
@@ -2253,6 +2650,43 @@ mod tests {
                     ]
                 }
             ],
+            "customMoods": [
+                {
+                    "slug": "2am-neon-drift",
+                    "label": "2AM Neon Drift",
+                    "subtitle": "Nocturnal synths & dreamy haze for late hours",
+                    "query": "synthwave",
+                    "seedArtists": ["The Midnight", "Beach House"],
+                    "genres": ["Synthwave", "Dream Pop"],
+                    "mood": "late_night",
+                    "c1": "#38bdf8",
+                    "c2": "#0c2d48"
+                }
+            ],
+            "eraMixes": [
+                {
+                    "key": "2010s-neon-wave",
+                    "kicker": "2010S REVIVAL",
+                    "title": "2010s Neon & Haze",
+                    "subtitle": "Modern synthwave and dream-pop landmarks",
+                    "query": "synthwave dream pop",
+                    "seedArtists": ["The Midnight", "Slowdive"],
+                    "genres": ["Synthwave", "Indie"],
+                    "mood": "late_night",
+                    "yearRange": [2010, 2019],
+                    "c1": "#c084fc",
+                    "c2": "#35144f"
+                }
+            ],
+            "featuredGenres": [
+                {
+                    "name": "Dream Pop",
+                    "subtitle": "Lush reverb walls and nocturnal hooks",
+                    "query": "dream pop",
+                    "c1": "#f472b6",
+                    "c2": "#4a1230"
+                }
+            ],
             "moodOverrides": [
                 { "slug": "late_night", "label": "After Dark", "subtitle": "Tailored for your midnight sessions" }
             ],
@@ -2325,7 +2759,7 @@ mod tests {
             model: "local-test-model".to_string(),
             refresh_hour: 4,
             temperature: 0.8,
-            max_tokens: 2000,
+            max_tokens: None,
             timeout_secs: 20,
             extra_system_prompt: None,
             extra_headers: vec![],
@@ -2343,8 +2777,15 @@ mod tests {
 
         let exp = LlmCurator::load_experience(&store, user.id).unwrap();
         assert_eq!(exp.edition_title, "Midnight Neon Edition");
+        assert_eq!(exp.home_greeting, "After-hours signal, alice");
+        assert_eq!(exp.explore_title, "Tonight's Crate");
         assert_eq!(exp.explore_categories.len(), 1);
         assert_eq!(exp.explore_categories[0].mixes[0].key, "llm-tokyo-midnight");
+        assert_eq!(exp.custom_moods.len(), 1);
+        assert_eq!(exp.custom_moods[0].slug, "llm-mood-2am-neon-drift");
+        assert_eq!(exp.era_mixes.len(), 1);
+        assert_eq!(exp.era_mixes[0].key, "llm-era-2010s-neon-wave");
+        assert_eq!(exp.featured_genres.len(), 1);
 
         // Custom Daily Mix cards reflect the LLM's titles & colors.
         let cards = taste.mixed_for_you_cards(user.id);
@@ -2361,11 +2802,21 @@ mod tests {
             .unwrap();
         assert_eq!(supermix_pl.name, "Midnight Core");
 
-        // Custom Explore category mix has real materialized tracks & preview covers.
+        // Custom Explore category mix, custom Mood, and custom Era mix all materialize tracks.
         let llm_mix = exp.find_explore_mix("llm-tokyo-midnight").unwrap();
         let (cnt, covers) = taste.curated_llm_explore_preview(user.id, llm_mix);
         assert!(cnt > 0);
         assert!(!covers.is_empty());
+
+        let llm_mood = exp.find_custom_mood("llm-mood-2am-neon-drift").unwrap();
+        let (m_cnt, m_covers) = taste.curated_llm_mood_preview(user.id, llm_mood);
+        assert!(m_cnt > 0);
+        assert!(!m_covers.is_empty());
+
+        let llm_era = exp.find_explore_mix("llm-era-2010s-neon-wave").unwrap();
+        let (e_cnt, e_covers) = taste.curated_llm_explore_preview(user.id, llm_era);
+        assert!(e_cnt > 0);
+        assert!(!e_covers.is_empty());
 
         server.abort();
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2433,7 +2884,7 @@ mod tests {
             model: "baidu/ernie-5.5-flash-preview:free".to_string(),
             refresh_hour: 4,
             temperature: 0.85,
-            max_tokens: 2600,
+            max_tokens: Some(2600),
             timeout_secs: 15,
             extra_system_prompt: None,
             extra_headers: vec![],
@@ -2480,7 +2931,7 @@ mod tests {
             model: "reasoning-model".to_string(),
             refresh_hour: 4,
             temperature: 0.8,
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             timeout_secs: 15,
             extra_system_prompt: None,
             extra_headers: vec![],
@@ -2491,6 +2942,73 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["editionTitle"], "Nocturne");
         assert_eq!(parsed["dailyMixes"][0]["title"], "Midnight Pulse");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn omits_max_tokens_by_default_and_falls_back_on_openrouter_402() {
+        use axum::http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        assert!(payload.get("max_tokens").is_none());
+                        (
+                            StatusCode::PAYMENT_REQUIRED,
+                            Json(json!({
+                                "error": {
+                                    "message": "This request requires more credits, or fewer max_tokens. You requested up to 65536 tokens, but can only afford 6400."
+                                }
+                            })),
+                        )
+                    } else {
+                        assert_eq!(payload["max_tokens"], 6400);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "choices": [{
+                                    "finish_reason": "stop",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "{\"editionTitle\":\"Affordable Edition\"}"
+                                    }
+                                }]
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = LlmConfig {
+            endpoint_base: format!("http://{addr}/v1"),
+            completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "sk-test".to_string(),
+            model: "paid-model".to_string(),
+            refresh_hour: 4,
+            temperature: 0.85,
+            max_tokens: None,
+            timeout_secs: 15,
+            extra_system_prompt: None,
+            extra_headers: vec![],
+            reasoning_effort: None,
+        };
+        let curator = LlmCurator::new_with_config(cfg);
+        let out = curator.call_chat_completions("sys", "usr").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["editionTitle"], "Affordable Edition");
         server.abort();
     }
 

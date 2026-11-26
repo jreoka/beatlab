@@ -2190,11 +2190,11 @@
     sync();
   }
 
-  function newReleasesSectionHtml(newReleases) {
+  function newReleasesSectionHtml(newReleases, title = 'New Releases') {
     if (!newReleases.length) return '';
     return `<section class="section" id="new-releases-section">
       <div class="section-head">
-        <h2>New Releases</h2>
+        <h2>${esc(title)}</h2>
       </div>
       <div class="card-grid rail">${newReleases.slice(0, 8).map(renderNewReleaseCard).join('')}</div>
     </section>`;
@@ -2213,6 +2213,7 @@
       const relatedTracks = cacheTracks(d.relatedTracks || []);
       const mixes = d.madeForYou || [];
       const mixedForYou = d.mixedForYou || [];
+      const homeCategories = d.homeCategories || [];
       const albums = d.albums || [];
       const artists = d.artists || [];
       const recommendedArtists = d.recommendedArtists || [];
@@ -2224,11 +2225,14 @@
         state.llmSearchPrompts = llm.searchPrompts;
       }
 
-      let html = `<h1 class="page-greeting${llm ? ' has-edition' : ''}">${greetingText()}, ${esc(state.user.username)}</h1>`;
-      if (llm && (llm.editionTitle || llm.homeTagline)) {
+      const greetingHeading = (llm && llm.homeGreeting && String(llm.homeGreeting).trim())
+        ? String(llm.homeGreeting).trim()
+        : `${greetingText()}, ${state.user.username}`;
+      const hasHomeTagline = Boolean(llm && llm.homeTagline && String(llm.homeTagline).trim());
+      let html = `<h1 class="page-greeting${hasHomeTagline ? ' has-edition' : ''}">${esc(greetingHeading)}</h1>`;
+      if (hasHomeTagline) {
         html += `<div class="daily-edition-note">
-          ${llm.editionTitle ? `<span class="daily-edition-pill">${esc(llm.editionTitle)}</span>` : ''}
-          ${llm.homeTagline ? `<span class="daily-edition-tagline">${esc(llm.homeTagline)}</span>` : ''}
+          <span class="daily-edition-tagline">${esc(llm.homeTagline)}</span>
         </div>`;
       }
 
@@ -2237,7 +2241,8 @@
       }
 
       // New releases from artists the user listens to sit right under Quick Picks.
-      html += `<div id="new-releases-slot">${newReleasesSectionHtml(newReleases)}</div>`;
+      const newReleasesTitle = secTitle('newReleases', 'New Releases');
+      html += `<div id="new-releases-slot">${newReleasesSectionHtml(newReleases, newReleasesTitle)}</div>`;
 
       if (mixedForYou.length > 0) {
         html += `<section class="section">
@@ -2252,6 +2257,22 @@
         html += `<section class="section">
           <div class="section-head"><h2>${esc(secTitle('madeForYou', 'Made For You'))}</h2></div>
           <div class="card-grid rail">${mixes.map(renderPlaylistCard).join('')}</div>
+        </section>`;
+      }
+
+      for (const cat of homeCategories) {
+        const catMixes = Array.isArray(cat.mixes) ? cat.mixes : [];
+        if (!catMixes.length) continue;
+        html += `<section class="section llm-explore-section">
+          <div class="section-head">
+            <div class="llm-section-title-group">
+              ${cat.kicker ? `<div class="llm-cat-kicker">${esc(cat.kicker)}</div>` : ''}
+              <h2>${esc(cat.title)}</h2>
+              ${cat.subtitle ? `<p class="llm-cat-sub">${esc(cat.subtitle)}</p>` : ''}
+            </div>
+            <button class="text-btn" onclick="App.navigate('explore')">See all</button>
+          </div>
+          <div class="explore-mix-grid">${catMixes.map(renderExploreMixCard).join('')}</div>
         </section>`;
       }
 
@@ -2285,21 +2306,21 @@
 
       if (trending.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Trending Now</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(trending.map((t) => t.id)))}, 0)">Play All</button></div>
+          <div class="section-head"><h2>${esc(secTitle('trending', 'Trending Now'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(trending.map((t) => t.id)))}, 0)">Play All</button></div>
           <div class="track-table">${renderTrackRows(trending.slice(0, 12))}</div>
         </section>`;
       }
 
       if (albums.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Popular Albums</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('albums', 'Popular Albums'))}</h2></div>
           <div class="card-grid rail">${albums.map(renderAlbumCard).join('')}</div>
         </section>`;
       }
 
       if (artists.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Top Artists</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('artists', 'Top Artists'))}</h2></div>
           <div class="card-grid rail">${artists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
@@ -2317,7 +2338,7 @@
               const items = nr.newReleases || [];
               if (items.length > 0) {
                 const slot = $('new-releases-slot');
-                if (slot) slot.innerHTML = newReleasesSectionHtml(items);
+                if (slot) slot.innerHTML = newReleasesSectionHtml(items, newReleasesTitle);
                 return;
               }
               if (!nr.pending) return;
@@ -2392,14 +2413,17 @@
       if (llm && Array.isArray(llm.searchPrompts) && llm.searchPrompts.length) {
         state.llmSearchPrompts = llm.searchPrompts;
       }
+      const exploreHeading = (llm && llm.exploreTitle && String(llm.exploreTitle).trim())
+        ? String(llm.exploreTitle).trim()
+        : 'Explore';
+      const featuredGenres = (llm && Array.isArray(llm.featuredGenres)) ? llm.featuredGenres : [];
       const curatorBadge = curator
-        ? `<span class="curator-pill" title="Server continuously curates moods, decades, and discovery pools in the background"><span class="curator-dot"></span>Live Curator · ${Number(curator.catalogTracks || 0).toLocaleString()} tracks · ${curator.readyMoods || 0}/${curator.totalMoods || 10} moods ready</span>`
+        ? `<span class="curator-pill" title="Server continuously curates moods, decades, and discovery pools in the background"><span class="curator-dot"></span>Live Curator · ${Number(curator.catalogTracks || 0).toLocaleString()} tracks · ${curator.readyMoods || 0}/${curator.totalMoods || 9} moods ready</span>`
         : '';
 
       let html = `<div class="section-head" style="margin-bottom:${llm && llm.exploreTagline ? '8px' : '18px'};gap:12px;flex-wrap:wrap">
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-          <h1 class="page-greeting" style="margin-bottom:0">Explore</h1>
-          ${llm && llm.editionTitle ? `<span class="daily-edition-pill">${esc(llm.editionTitle)}</span>` : ''}
+          <h1 class="page-greeting" style="margin-bottom:0">${esc(exploreHeading)}</h1>
           ${curatorBadge}
         </div>
         <button class="btn-secondary" onclick="App.promptInstantMix()">Create Instant Mix</button>
@@ -2459,14 +2483,23 @@
 
       if (artists.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Featured Artists</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('featuredArtists', 'Featured Artists'))}</h2></div>
           <div class="card-grid">${artists.map(renderArtistCard).join('')}</div>
         </section>`;
       }
 
-      if ((d.genres || []).length > 0) {
+      if (featuredGenres.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Genres</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('genres', 'Scenes & Genres'))}</h2></div>
+          <div class="llm-genre-grid">${featuredGenres.map((g) => `
+            <div class="llm-genre-card" style="background:${esc(g.c2 || '#1e293b')};border-color:${esc(g.c1 || '#38bdf8')}55;border-left:4px solid ${esc(g.c1 || '#38bdf8')}" onclick="App.navigate('genre/${encodeURIComponent(g.name)}')">
+              <div class="llm-genre-name">${esc(g.name)}</div>
+              ${g.subtitle ? `<div class="llm-genre-sub">${esc(g.subtitle)}</div>` : ''}
+            </div>`).join('')}</div>
+        </section>`;
+      } else if ((d.genres || []).length > 0) {
+        html += `<section class="section">
+          <div class="section-head"><h2>${esc(secTitle('genres', 'Genres'))}</h2></div>
           <div class="card-grid">${d.genres.slice(0, 24).map((g) => `
             <div class="media-card" onclick="App.navigate('genre/${encodeURIComponent(g.name)}')">
               <div class="card-art-wrap"><img src="${esc(g.coverUrl)}" loading="lazy" alt="${esc(g.name)}" /></div>
@@ -2478,14 +2511,14 @@
 
       if ((d.newAlbums || []).length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Chart Albums</h2></div>
+          <div class="section-head"><h2>${esc(secTitle('chartAlbums', 'Chart Albums'))}</h2></div>
           <div class="card-grid">${d.newAlbums.map(renderAlbumCard).join('')}</div>
         </section>`;
       }
 
       if (charts.length > 0) {
         html += `<section class="section">
-          <div class="section-head"><h2>Top 30 Charts</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(charts.map((t) => t.id)))}, 0)">Play Charts</button></div>
+          <div class="section-head"><h2>${esc(secTitle('charts', 'Top 30 Charts'))}</h2><button class="mini-btn" onclick="App.playListByIds(${esc(JSON.stringify(charts.map((t) => t.id)))}, 0)">Play Charts</button></div>
           <div class="track-table">${renderTrackRows(charts)}</div>
         </section>`;
       }

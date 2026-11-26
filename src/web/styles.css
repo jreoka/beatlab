@@ -5573,17 +5573,6 @@ html, body {
   flex-wrap: wrap;
   margin-bottom: 24px;
 }
-.daily-edition-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 10px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  color: var(--accent);
-  font-size: 11.5px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-}
 .daily-edition-tagline,
 .explore-daily-tagline {
   font-size: 13.5px;
@@ -5645,6 +5634,36 @@ html, body {
 .llm-prompt-chip:hover {
   background: var(--surface-2);
   color: var(--accent);
+}
+.llm-genre-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+}
+.llm-genre-card {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  padding: 15px 16px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: transform 0.14s ease, filter 0.14s ease;
+}
+.llm-genre-card:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.08);
+}
+.llm-genre-name {
+  font-size: 15px;
+  font-weight: 800;
+  color: #fff;
+  letter-spacing: -0.01em;
+}
+.llm-genre-sub {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.8);
+  line-height: 1.35;
 }
 .section {
   margin-bottom: 36px;
