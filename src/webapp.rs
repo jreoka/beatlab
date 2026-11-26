@@ -3867,9 +3867,9 @@ pub async fn instant_mix(
         Err(r) => return r,
     };
     let query = q.q.unwrap_or_default().trim().to_string();
-    let explicit_ai = matches!(
+    let explicit_standard = matches!(
         q.mode.as_deref().map(str::trim).map(str::to_lowercase).as_deref(),
-        Some("ai") | Some("prompt")
+        Some("standard") | Some("classic") | Some("noai")
     );
     let mode_override = match q.mode.as_deref().map(str::trim).map(str::to_lowercase).as_deref() {
         Some("topic") | Some("genre") | Some("vibe") => Some("topic".to_string()),
@@ -3884,12 +3884,7 @@ pub async fn instant_mix(
         }));
     }
 
-    let mut tried_llm = false;
-    let should_try_llm_first = state.llm.is_some()
-        && mode_override.as_deref() != Some("entity")
-        && (explicit_ai || crate::llm::looks_like_natural_language_mix_prompt(&query));
-    if should_try_llm_first {
-        tried_llm = true;
+    if !explicit_standard {
         if let Some(ref curator) = state.llm {
             if let Some(resp) = try_build_llm_instant_mix(&state, curator, user.id, &query).await {
                 return resp;
@@ -4136,13 +4131,6 @@ pub async fn instant_mix(
                 &ytm_hints,
             )
             .await;
-            if refined.instant_mix.is_none() && !tried_llm && mode_override.as_deref() != Some("entity") {
-                if let Some(ref curator) = state.llm {
-                    if let Some(resp) = try_build_llm_instant_mix(&state, curator, user.id, &query).await {
-                        return resp;
-                    }
-                }
-            }
             return format_instant_mix_response(
                 &state,
                 user.id,
@@ -4165,14 +4153,6 @@ pub async fn instant_mix(
         &ytm_hints,
     )
     .await;
-
-    if refined.instant_mix.is_none() && !tried_llm && mode_override.as_deref() != Some("entity") {
-        if let Some(ref curator) = state.llm {
-            if let Some(resp) = try_build_llm_instant_mix(&state, curator, user.id, &query).await {
-                return resp;
-            }
-        }
-    }
 
     format_instant_mix_response(
         &state,
@@ -4220,7 +4200,7 @@ async fn try_build_llm_instant_mix(
         }
     }
     let refinements = crate::taste::SearchRefinements {
-        detected_intent: "AI Vibe Mix".to_string(),
+        detected_intent: "AI Curated Mix".to_string(),
         filter_chips: Vec::new(),
         query_suggestions: suggestions,
     };
@@ -9574,6 +9554,176 @@ mod tests {
             .expect("closing tab-a must not clear tab-b");
         assert_eq!(still_b.0.id, t2.id);
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn instant_mix_always_uses_llm_picked_songs_for_short_queries_when_available() {
+        use crate::engine::StreamEngine;
+        use crate::llm::{LlmConfig, LlmCurator};
+        use crate::sources::{
+            archive::ArchiveSource, deezer::DeezerSource, local::LocalSource,
+            soulseek::SoulseekSource, ytm::YtmSource, SourceRegistry,
+        };
+        use crate::store::Store;
+        use axum::body::to_bytes;
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Json(json!({
+                        "choices": [{
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": json!({
+                                    "title": "Daft Punk French Touch Radio",
+                                    "subtitle": "Robotic funk, filtered disco hooks, and Parisian electro peers.",
+                                    "tracks": [
+                                        { "artist": "Daft Punk", "title": "Digital Love" },
+                                        { "artist": "Justice", "title": "D.A.N.C.E." },
+                                        { "artist": "Daft Punk", "title": "One More Time" },
+                                        { "artist": "Modjo", "title": "Lady (Hear Me Tonight)" },
+                                        { "artist": "Cassius", "title": "1999" },
+                                        { "artist": "Stardust", "title": "Music Sounds Better With You" },
+                                        { "artist": "Daft Punk", "title": "Voyager" },
+                                        { "artist": "Phoenix", "title": "Lisztomania" },
+                                        { "artist": "Air", "title": "Sexy Boy" },
+                                        { "artist": "Kavinsky", "title": "Nightcall" },
+                                        { "artist": "Daft Punk", "title": "Instant Crush" },
+                                        { "artist": "Breakbot", "title": "Baby I'm Yours" }
+                                    ],
+                                    "seedQueries": ["french house", "daft punk radio"],
+                                    "seedArtists": ["Daft Punk", "Justice", "Cassius", "Air"],
+                                    "genres": ["French House", "Electronic"],
+                                    "mood": "groove",
+                                    "yearRange": [1997, 2015],
+                                    "familiarity": "balanced"
+                                }).to_string()
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tmp = std::env::temp_dir().join(format!(
+            "beatlab_llm_always_imix_test_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open_memory().unwrap();
+        let sources = SourceRegistry::new(
+            DeezerSource::new(),
+            YtmSource::new(None),
+            ArchiveSource::new(),
+            Arc::new(LocalSource::new(store.clone(), vec![])),
+            SoulseekSource::new(store.clone(), tmp.clone()),
+        );
+        let engine = Arc::new(StreamEngine::new(store.clone(), sources.clone(), &tmp, 1.0));
+        let taste = Arc::new(crate::taste::TasteEngine::new(store.clone(), sources.clone()));
+
+        let catalog: Vec<(&str, &str, &str)> = vec![
+            ("loc:dp1", "Daft Punk", "Digital Love"),
+            ("loc:ju1", "Justice", "D.A.N.C.E."),
+            ("loc:dp2", "Daft Punk", "One More Time"),
+            ("loc:mo1", "Modjo", "Lady (Hear Me Tonight)"),
+            ("loc:ca1", "Cassius", "1999"),
+            ("loc:st1", "Stardust", "Music Sounds Better With You"),
+            ("loc:dp3", "Daft Punk", "Voyager"),
+            ("loc:ph1", "Phoenix", "Lisztomania"),
+            ("loc:ai1", "Air", "Sexy Boy"),
+            ("loc:ka1", "Kavinsky", "Nightcall"),
+            ("loc:dp4", "Daft Punk", "Instant Crush"),
+            ("loc:br1", "Breakbot", "Baby I'm Yours"),
+        ];
+        let tracks: Vec<Track> = catalog
+            .iter()
+            .map(|(id, artist, title)| Track {
+                id: (*id).into(),
+                source: "local".into(),
+                title: (*title).into(),
+                artist: (*artist).into(),
+                album: "French Touch".into(),
+                genre: "Electronic".into(),
+                year: 2001,
+                duration: 240,
+                bitrate: 900,
+                format: "flac".into(),
+                ..Default::default()
+            })
+            .collect();
+        store.upsert_tracks(&tracks).unwrap();
+
+        let (u, _) = store.authenticate_or_create_user("llmuser", "pw123").unwrap();
+        let tok = store.create_session(u.id, "web").unwrap();
+        let cfg = LlmConfig {
+            endpoint_base: format!("http://{addr}/v1"),
+            completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: String::new(),
+            model: "test-model".to_string(),
+            refresh_hour: 4,
+            temperature: 0.7,
+            max_tokens: None,
+            timeout_secs: 15,
+            extra_system_prompt: None,
+            extra_headers: vec![],
+            reasoning_effort: None,
+        };
+        let state = AppState {
+            store: store.clone(),
+            sources,
+            engine,
+            taste,
+            llm: Some(Arc::new(LlmCurator::new_with_config(cfg))),
+            now_playing: Arc::new(Mutex::new(Default::default())),
+            new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
+        };
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
+
+        // Short artist query (not natural language) still routes through the LLM when available.
+        assert!(!crate::llm::looks_like_natural_language_mix_prompt("Daft Punk"));
+        let resp = instant_mix(
+            State(state),
+            Query(SearchQuery {
+                q: Some("Daft Punk".into()),
+                mode: None,
+                phase: None,
+            }),
+            hdrs,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 256).await.unwrap()).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(body["instantMix"]["aiInterpreted"], true);
+        assert_eq!(body["instantMix"]["title"], "Daft Punk French Touch Radio");
+        let got_ids: Vec<&str> = body["instantMix"]["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        let expected_ids: Vec<&str> = catalog.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(got_ids, expected_ids);
+
+        server.abort();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

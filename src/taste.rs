@@ -3462,9 +3462,10 @@ impl TasteEngine {
         tracks
     }
 
-    /// Materialize an on-demand LLM-interpreted Instant Mix specification into a
-    /// real playable `InstantMix` using the same verified search & taste ranking
-    /// pipeline used for overnight Explore/Mood mixes.
+    /// Materialize an on-demand LLM-curated Instant Mix specification into a
+    /// real playable `InstantMix`. When the LLM picked specific songs (`spec.tracks`),
+    /// resolve each pick to a real track in order first and only backfill from
+    /// `curate_llm_mix_tracks` if resolved picks are sparse.
     pub async fn materialize_llm_instant_mix(
         &self,
         user_id: i64,
@@ -3472,30 +3473,55 @@ impl TasteEngine {
         spec: &crate::llm::LlmInstantMixSpec,
         limit: usize,
     ) -> Option<InstantMix> {
-        let context_text = format!(
-            "{} {} {} {} {}",
-            raw_query,
-            spec.title,
-            spec.subtitle,
-            spec.seed_queries.join(" "),
-            spec.genres.join(" ")
-        );
-        let empty_excl = HashSet::new();
-        let tracks = self
-            .curate_llm_mix_tracks(
-                user_id,
-                LlmMixKind::Thematic,
-                &context_text,
-                &spec.seed_queries,
-                &spec.seed_artists,
-                &spec.genres,
-                spec.mood.as_deref(),
-                spec.year_range,
-                &spec.familiarity,
-                &empty_excl,
-                limit,
-            )
-            .await;
+        let target_limit = limit.max(1);
+        let mut tracks = if !spec.tracks.is_empty() {
+            self.resolve_llm_picked_tracks(user_id, &spec.tracks, target_limit)
+                .await
+        } else {
+            Vec::new()
+        };
+
+        let min_without_backfill = if spec.tracks.is_empty() {
+            target_limit
+        } else {
+            target_limit.min(12)
+        };
+        if tracks.len() < min_without_backfill {
+            let context_text = format!(
+                "{} {} {} {} {}",
+                raw_query,
+                spec.title,
+                spec.subtitle,
+                spec.seed_queries.join(" "),
+                spec.genres.join(" ")
+            );
+            let mut seen_ids: HashSet<String> = tracks.iter().map(|t| t.id.clone()).collect();
+            let mut seen_keys: HashSet<String> = tracks.iter().map(|t| t.song_key()).collect();
+            let backfill = self
+                .curate_llm_mix_tracks(
+                    user_id,
+                    LlmMixKind::Thematic,
+                    &context_text,
+                    &spec.seed_queries,
+                    &spec.seed_artists,
+                    &spec.genres,
+                    spec.mood.as_deref(),
+                    spec.year_range,
+                    &spec.familiarity,
+                    &seen_keys,
+                    target_limit,
+                )
+                .await;
+            for t in backfill {
+                if tracks.len() >= target_limit {
+                    break;
+                }
+                if seen_ids.insert(t.id.clone()) && seen_keys.insert(t.song_key()) {
+                    tracks.push(t);
+                }
+            }
+        }
+
         let visible = self.filter_hidden_tracks_for_user(user_id, tracks);
         if visible.is_empty() {
             return None;
@@ -3510,6 +3536,151 @@ impl TasteEngine {
             tracks: visible,
             total_duration,
         })
+    }
+
+    /// Resolve a list of LLM-picked `{ artist, title }` songs into real playable tracks,
+    /// preserving the LLM's sequencing order. Checks SQLite/local catalog first, then
+    /// resolves remaining picks concurrently via YouTube Music with Deezer fallback.
+    async fn resolve_llm_picked_tracks(
+        &self,
+        user_id: i64,
+        picks: &[crate::llm::LlmInstantMixTrack],
+        limit: usize,
+    ) -> Vec<Track> {
+        use crate::sources::MusicSource;
+        use futures::stream::{self, StreamExt};
+
+        if picks.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let sctx = self.build_scoring_context(user_id);
+        let capped_picks: Vec<(usize, crate::llm::LlmInstantMixTrack)> = picks
+            .iter()
+            .take(limit.max(30).min(35))
+            .cloned()
+            .enumerate()
+            .collect();
+
+        let mut resolved_by_idx: Vec<Option<Track>> = vec![None; capped_picks.len()];
+        let mut unresolved: Vec<(usize, crate::llm::LlmInstantMixTrack)> = Vec::new();
+
+        // Phase 1: Instant lookup in SQLite (local FLACs + previously indexed tracks).
+        for (idx, pick) in capped_picks {
+            let q_full = format!("{} {}", pick.artist, pick.title);
+            let mut local_cands = self.store.search_tracks(&q_full, 12, 0).unwrap_or_default();
+            if local_cands.is_empty() {
+                local_cands = self
+                    .store
+                    .search_tracks(&pick.title, 12, 0)
+                    .unwrap_or_default();
+            }
+            let best_local = local_cands
+                .into_iter()
+                .filter(|t| {
+                    !is_hidden_track(t, &sctx.prof)
+                        && !is_strongly_disliked(t, &sctx.prof, &sctx.stats)
+                })
+                .filter_map(|t| {
+                    let score = score_picked_track_match(&t, &pick.artist, &pick.title, false)?;
+                    Some((score, t))
+                })
+                .max_by_key(|(score, _)| *score)
+                .map(|(_, t)| t);
+
+            if let Some(found) = best_local {
+                resolved_by_idx[idx] = Some(found);
+            } else {
+                unresolved.push((idx, pick));
+            }
+        }
+
+        // Phase 2: Concurrent remote resolution for picks not yet in SQLite.
+        if !unresolved.is_empty() {
+            let remote_results: Vec<(usize, Option<Track>)> = stream::iter(unresolved)
+                .map(|(idx, pick)| {
+                    let sources = self.sources.clone();
+                    let prof = sctx.prof.clone();
+                    let stats = sctx.stats.clone();
+                    async move {
+                        let pa = primary_artist(&pick.artist);
+                        let artist_for_q = if pa.is_empty() {
+                            pick.artist.as_str()
+                        } else {
+                            pa.as_str()
+                        };
+                        let search_q = format!("{artist_for_q} {}", pick.title);
+
+                        let pick_best = |cands: Vec<Track>| -> Option<Track> {
+                            cands
+                                .into_iter()
+                                .filter(|t| {
+                                    !t.stream_url.contains("/preview/")
+                                        && !is_hidden_track(t, &prof)
+                                        && !is_strongly_disliked(t, &prof, &stats)
+                                })
+                                .filter_map(|t| {
+                                    let score =
+                                        score_picked_track_match(&t, &pick.artist, &pick.title, true)?;
+                                    Some((score, t))
+                                })
+                                .max_by_key(|(score, _)| *score)
+                                .map(|(_, t)| t)
+                        };
+
+                        let ytm_hits = tokio::time::timeout(
+                            std::time::Duration::from_secs(4),
+                            sources.ytm.search(&search_q, 6),
+                        )
+                        .await
+                        .unwrap_or_default();
+                        if let Some(best) = pick_best(ytm_hits) {
+                            return (idx, Some(best));
+                        }
+
+                        if !sources.deezer.is_blocked() {
+                            let dz_hits = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                sources.deezer.search_tracks(&search_q, 6),
+                            )
+                            .await
+                            .unwrap_or_default();
+                            if let Some(best) = pick_best(dz_hits) {
+                                return (idx, Some(best));
+                            }
+                        }
+
+                        (idx, None)
+                    }
+                })
+                .buffer_unordered(8)
+                .collect()
+                .await;
+
+            let mut to_upsert: Vec<Track> = Vec::new();
+            for (idx, maybe_track) in remote_results {
+                if let Some(track) = maybe_track {
+                    to_upsert.push(track.clone());
+                    resolved_by_idx[idx] = Some(track);
+                }
+            }
+            if !to_upsert.is_empty() {
+                let _ = self.store.upsert_tracks(&to_upsert);
+            }
+        }
+
+        let mut out: Vec<Track> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        for maybe_track in resolved_by_idx {
+            let Some(t) = maybe_track else { continue };
+            if seen_ids.insert(t.id.clone()) && seen_keys.insert(t.song_key()) {
+                out.push(t);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Materialize a freshly generated `DailyLlmExperience` into real playlists and
@@ -10087,6 +10258,162 @@ fn track_matches_seed_artist(t: &Track, seed_artist_low: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Scores how well a candidate track matches a specific LLM-picked `(artist, title)`.
+/// Returns `None` if the candidate is not a confident match for that song.
+fn score_picked_track_match(
+    cand: &Track,
+    want_artist: &str,
+    want_title: &str,
+    allow_cross_script_artist: bool,
+) -> Option<i32> {
+    if cand.duration > 0 && (cand.duration < 30 || cand.duration > 1800) {
+        return None;
+    }
+    let want_title_low = want_title.to_lowercase();
+    let cand_title_low = cand.title.to_lowercase();
+    let cand_artist_low = cand.artist.to_lowercase();
+
+    // Reject karaoke/tribute/ringtone/8-bit/sped-up clutter unless explicitly asked for.
+    for bad in [
+        "karaoke",
+        "tribute",
+        "made famous by",
+        "originally performed by",
+        "in the style of",
+        "ringtone",
+        "8-bit",
+        "8 bit",
+        "nightcore",
+        "sped up",
+        "slowed + reverb",
+        "slowed and reverb",
+        "backing track",
+        "instrumental version",
+    ] {
+        if !want_title_low.contains(bad)
+            && (cand_title_low.contains(bad) || cand_artist_low.contains(bad))
+        {
+            return None;
+        }
+    }
+
+    let want_core = {
+        let c = crate::models::core_song_title(want_title);
+        if c.is_empty() {
+            slug(want_title).replace('-', " ")
+        } else {
+            c
+        }
+    };
+    let cand_core = {
+        let c = crate::models::core_song_title(&cand.title);
+        if c.is_empty() {
+            slug(&cand.title).replace('-', " ")
+        } else {
+            c
+        }
+    };
+    if want_core.is_empty() || cand_core.is_empty() {
+        return None;
+    }
+
+    let want_slug = slug(want_title);
+    let cand_slug = slug(&cand.title);
+    let exact_title = want_core == cand_core
+        || (!want_slug.is_empty() && want_slug != "unknown" && want_slug == cand_slug);
+
+    let title_score: i32 = if exact_title {
+        65
+    } else if (cand_core.starts_with(&want_core) || want_core.starts_with(&cand_core))
+        && want_core.chars().count().min(cand_core.chars().count()) * 10
+            >= want_core.chars().count().max(cand_core.chars().count()) * 5
+    {
+        42
+    } else {
+        let w_words: HashSet<&str> = want_core.split_whitespace().collect();
+        let c_words: HashSet<&str> = cand_core.split_whitespace().collect();
+        if w_words.len() >= 2 && c_words.len() <= w_words.len() * 2 + 1 {
+            let shared = w_words.iter().filter(|w| c_words.contains(*w)).count();
+            if shared * 4 >= w_words.len() * 3 {
+                30
+            } else {
+                return None;
+            }
+        } else if w_words.len() == 1
+            && want_core.chars().count() >= 5
+            && contains_term(&cand_core, &want_core)
+            && c_words.len() <= 3
+        {
+            28
+        } else {
+            return None;
+        }
+    };
+
+    let want_artist_pa = primary_artist(want_artist).to_lowercase();
+    let want_artist_eff = if want_artist_pa.is_empty() {
+        want_artist.trim().to_lowercase()
+    } else {
+        want_artist_pa
+    };
+    let want_artist_slug = slug(&want_artist_eff);
+    let cand_artist_pa = primary_artist(&cand.artist).to_lowercase();
+    let cand_artist_slug = slug(&cand_artist_pa);
+
+    let artist_score: i32 = if cand_artist_pa == want_artist_eff
+        || cand_artist_low == want_artist_eff
+        || (!want_artist_slug.is_empty()
+            && want_artist_slug != "unknown"
+            && cand_artist_slug == want_artist_slug)
+    {
+        55
+    } else if track_matches_seed_artist(cand, &want_artist_eff)
+        || (cand_artist_pa.len() >= 4 && contains_term(&want_artist_eff, &cand_artist_pa))
+    {
+        40
+    } else {
+        // Check significant word overlap for multi-word artist names (e.g. "Earth Wind Fire").
+        let norm_words = |s: &str| -> HashSet<String> {
+            s.split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 2 && !matches!(*w, "the" | "and" | "of" | "feat" | "ft"))
+                .map(|w| w.to_lowercase())
+                .collect()
+        };
+        let wa_words = norm_words(&want_artist_eff);
+        let ca_words = norm_words(&cand_artist_low);
+        let shared = wa_words.iter().filter(|w| ca_words.contains(*w)).count();
+        if !wa_words.is_empty() && shared * 2 >= wa_words.len() && (wa_words.len() >= 2 || shared >= 1)
+        {
+            28
+        } else if allow_cross_script_artist && exact_title && want_core.chars().count() >= 4 {
+            // Handle romanized vs native-script artist names on remote search hits
+            // (e.g. LLM picked "Mariya Takeuchi - Plastic Love", YTM returns "竹内まりや").
+            let want_ascii = want_artist.chars().all(|c| c.is_ascii());
+            let cand_ascii = cand.artist.chars().all(|c| c.is_ascii());
+            if want_ascii != cand_ascii {
+                12
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    };
+
+    let mut score = title_score + artist_score;
+    if crate::models::titles_have_version_mismatch(want_title, &cand.title) {
+        score -= 35;
+    }
+    if is_mood_clutter_track(cand) && !want_title_low.contains("rain") && !want_title_low.contains("sleep") {
+        return None;
+    }
+    score += (cand.quality_score() / 40).min(15);
+    if score < 50 {
+        return None;
+    }
+    Some(score)
 }
 
 fn genre_variants(term_low: &str) -> &'static [&'static str] {

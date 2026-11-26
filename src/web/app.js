@@ -866,7 +866,9 @@
   const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
   const NORM_MIN_GAIN_DB = -18.0;
   const NORM_MAX_GAIN_DB = 12.0;
-  const NORM_DEFAULT_UNMEASURED_GAIN = 0.9;
+  // Matches a typical -8 LUFS modern master normalized to -10.5 LUFS (~-2.5 dB)
+  // so unmeasured tracks never blast louder than normalized ones.
+  const NORM_DEFAULT_UNMEASURED_GAIN = 0.75;
 
   const audioNorm = {
     ctx: null,
@@ -881,6 +883,7 @@
     metaRetryDoneFor: '',
     reqToken: 0,
     abortController: null,
+    retryTimer: null,
   };
 
   function isValidLoudness(l) {
@@ -1018,7 +1021,10 @@
       const now = audioNorm.ctx.currentTime;
       try {
         param.cancelScheduledValues(now);
-        if (rampSec > 0) {
+        if (rampSec > 0.05) {
+          param.setValueAtTime(param.value, now);
+          param.linearRampToValueAtTime(target, now + rampSec);
+        } else if (rampSec > 0) {
           param.setTargetAtTime(target, now, 0.012);
         } else {
           param.setValueAtTime(target, now);
@@ -1032,6 +1038,10 @@
   }
 
   function cancelLoudnessSync() {
+    if (audioNorm.retryTimer) {
+      clearTimeout(audioNorm.retryTimer);
+      audioNorm.retryTimer = null;
+    }
     if (audioNorm.abortController) {
       try {
         audioNorm.abortController.abort();
@@ -1052,11 +1062,11 @@
     return norm;
   }
 
-  function canStillApplyPrePlayGain() {
-    return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.25;
+  function isPrePlayGainWindow() {
+    return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.35;
   }
 
-  function fetchTrackLoudnessPrePlay(trackId) {
+  function fetchTrackLoudness(trackId, attempt = 0) {
     if (!trackId || !state.token) return;
     if (audioNorm.currentTrackId !== trackId || audioNorm.currentLoudness) return;
     const reqToken = audioNorm.reqToken;
@@ -1069,12 +1079,22 @@
         if (reqToken !== audioNorm.reqToken || audioNorm.currentTrackId !== trackId) return;
         if (res && isValidLoudness(res)) {
           const norm = storeTrackLoudness(trackId, res);
-          // Only apply BEFORE audible playback is underway so a song NEVER
-          // shifts volume a few seconds into playback.
-          if (norm && canStillApplyPrePlayGain()) {
+          if (norm) {
             audioNorm.currentLoudness = norm;
-            applyOutputVolume(0);
+            // Instant when applied before playback begins; gentle glide if loudness
+            // finished slightly after playback started so songs never play unnormalized.
+            applyOutputVolume(isPrePlayGainWindow() ? 0 : 0.6);
           }
+          return;
+        }
+        // Background caching + EBU R128 scan may still be running (e.g. Soulseek,
+        // Archive.org, or a YouTube track without pre-computed audioConfig).
+        const retryDelays = [2500, 4500];
+        if (res && res.pending && attempt < retryDelays.length) {
+          audioNorm.retryTimer = setTimeout(() => {
+            audioNorm.retryTimer = null;
+            fetchTrackLoudness(trackId, attempt + 1);
+          }, retryDelays[attempt]);
         }
       })
       .catch(() => {});
@@ -1100,7 +1120,7 @@
     }
     audioNorm.currentLoudness = null;
     applyOutputVolume(0);
-    fetchTrackLoudnessPrePlay(trackId);
+    fetchTrackLoudness(trackId, 0);
   }
 
   function setMediaPlaybackState(value) {
@@ -3656,7 +3676,7 @@
         : `<img class="mix-single-art" src="${esc(covers[0] || '')}" alt="" />`;
     const previewCount = expanded ? mix.tracks.length : Math.min(6, mix.tracks.length);
     const intentTag = mix.aiInterpreted
-      ? ' · AI VIBE MIX'
+      ? ' · AI CURATED'
       : refinements?.detectedIntent
         ? ` · ${esc(refinements.detectedIntent)}`
         : '';
@@ -6214,9 +6234,20 @@
     state.queueWarmTimer = setTimeout(() => {
       state.queueWarmTimer = null;
       if (loadToken !== state.activeAudioToken) return;
+      const prefetchLoudness = (track) => {
+        if (!track || !track.id) return;
+        const already = normalizeLoudnessObj(track.loudness || state.trackMap.get(track.id)?.loudness);
+        if (already) return;
+        api(`/api/web/loudness/${encodeURIComponent(track.id)}`)
+          .then((lr) => {
+            if (lr && isValidLoudness(lr)) storeTrackLoudness(track.id, lr);
+          })
+          .catch(() => {});
+      };
       api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' })
         .then((res) => {
-          if (res && res.loudness) storeTrackLoudness(next.id, res.loudness);
+          if (res && res.loudness && storeTrackLoudness(next.id, res.loudness)) return;
+          prefetchLoudness(next);
         })
         .catch(() => {});
       if (next2) {
@@ -6224,7 +6255,8 @@
           if (loadToken !== state.activeAudioToken) return;
           api(`/api/web/warm/${encodeURIComponent(next2.id)}`, { method: 'POST' })
             .then((res) => {
-              if (res && res.loudness) storeTrackLoudness(next2.id, res.loudness);
+              if (res && res.loudness && storeTrackLoudness(next2.id, res.loudness)) return;
+              prefetchLoudness(next2);
             })
             .catch(() => {});
         }, 1050);
@@ -7561,6 +7593,7 @@
     });
     audio.addEventListener('playing', () => {
       clearStallWatch();
+      ensureAudioNormGraph();
       setAudioLoading(false);
       state.intentionalPause = false;
       state.hiddenResumeAttempted = false;
@@ -7616,16 +7649,16 @@
       if (state.queue.length) saveServerQueue();
     });
     audio.addEventListener('loadedmetadata', () => {
+      ensureAudioNormGraph();
       const cur = currentTrack();
       if (
         cur &&
         cur.id === audioNorm.currentTrackId &&
         !audioNorm.currentLoudness &&
-        audioNorm.metaRetryDoneFor !== cur.id &&
-        canStillApplyPrePlayGain()
+        audioNorm.metaRetryDoneFor !== cur.id
       ) {
         audioNorm.metaRetryDoneFor = cur.id;
-        fetchTrackLoudnessPrePlay(cur.id);
+        fetchTrackLoudness(cur.id, 0);
       }
       if (state.pendingSeekSec > 0) {
         const target = state.pendingSeekSec;

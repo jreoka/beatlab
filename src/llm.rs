@@ -20,7 +20,7 @@
 //! personalized Genre/Scene spotlights, and Search vibe prompts), and then uses `TasteEngine`
 //! + music sources to materialize every mix and mood into real playable tracks stored in SQLite.
 
-use crate::models::{err_msg, primary_artist, slug, AppResult, Mood};
+use crate::models::{core_song_title, err_msg, primary_artist, slug, AppResult, Mood};
 use crate::stats::{build_user_stats, StatsRange};
 use crate::store::Store;
 use crate::taste::TasteEngine;
@@ -40,7 +40,7 @@ pub const TASTE_NOTE_MAX_CHARS: usize = 280;
 const USER_MANUAL_REFRESH_COOLDOWN_SECS: i64 = 30 * 60;
 const INSTANT_MIX_CACHE_TTL_SECS: i64 = 24 * 3600;
 const INSTANT_MIX_RATE_WINDOW_SECS: i64 = 3600;
-const INSTANT_MIX_MAX_PER_HOUR: usize = 15;
+const INSTANT_MIX_MAX_PER_HOUR: usize = 60;
 
 const CURATED_PALETTES: &[(&str, &str)] = &[
     ("#38bdf8", "#0c2d48"),
@@ -243,7 +243,7 @@ fn user_refresh_kv_key(user_id: i64) -> String {
 }
 
 fn instant_mix_spec_kv_key(user_id: i64, norm_query: &str) -> String {
-    format!("llm:instant_spec:v1:{user_id}:{}", slug(norm_query))
+    format!("llm:instant_spec:v2:{user_id}:{}", slug(norm_query))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -433,11 +433,20 @@ impl LlmTastePortrait {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmInstantMixTrack {
+    pub artist: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmInstantMixSpec {
     pub title: String,
     pub subtitle: String,
+    #[serde(default)]
+    pub tracks: Vec<LlmInstantMixTrack>,
     #[serde(default)]
     pub seed_queries: Vec<String>,
     #[serde(default)]
@@ -658,7 +667,9 @@ impl LlmCurator {
         if let Some(raw_cached) = store.kv_get(&cache_key) {
             if let Ok(cached) = serde_json::from_str::<CachedInstantMixSpec>(&raw_cached) {
                 if now - cached.created_at < INSTANT_MIX_CACHE_TTL_SECS
-                    && (!cached.spec.seed_queries.is_empty() || !cached.spec.seed_artists.is_empty())
+                    && (!cached.spec.tracks.is_empty()
+                        || !cached.spec.seed_queries.is_empty()
+                        || !cached.spec.seed_artists.is_empty())
                 {
                     return Ok(cached.spec);
                 }
@@ -1527,7 +1538,10 @@ fn extract_valid_experience_json(raw: &str) -> Option<&str> {
                     best = Some(candidate);
                 }
             } else if let Ok(parsed_mix) = serde_json::from_str::<RawInstantMixSpec>(candidate) {
-                if !parsed_mix.seed_queries.is_empty() || !parsed_mix.seed_artists.is_empty() {
+                if !parsed_mix.tracks.is_empty()
+                    || !parsed_mix.seed_queries.is_empty()
+                    || !parsed_mix.seed_artists.is_empty()
+                {
                     best = Some(candidate);
                 }
             }
@@ -2215,6 +2229,18 @@ struct RawExploreMix {
     c2: String,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawInstantMixTrack {
+    Obj {
+        #[serde(default, alias = "artistName")]
+        artist: String,
+        #[serde(default, alias = "song", alias = "name", alias = "track")]
+        title: String,
+    },
+    Str(String),
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct RawInstantMixSpec {
@@ -2222,6 +2248,8 @@ struct RawInstantMixSpec {
     title: String,
     #[serde(default)]
     subtitle: String,
+    #[serde(default, alias = "songs", alias = "tracklist")]
+    tracks: Vec<RawInstantMixTrack>,
     #[serde(default)]
     seed_queries: Vec<String>,
     #[serde(default)]
@@ -2289,17 +2317,23 @@ pub fn looks_like_natural_language_mix_prompt(raw: &str) -> bool {
 
 fn build_instant_mix_system_prompt(extra: Option<&str>) -> String {
     let mut prompt = String::from(
-        "You are Beatlab's Instant Mix DJ. Given a listener's natural-language prompt describing \
-a mood, scene, activity, era, or musical vibe, translate it into a crisp JSON specification \
-that Beatlab's music search & taste engine will populate with real playable songs.\n\
+        "You are Beatlab's Instant Mix DJ. Given any listener request — an artist, a specific \
+song, a genre, a decade/era, a mood/activity, or a descriptive natural-language vibe — pick a \
+cohesive, well-sequenced tracklist of real playable songs and return a crisp JSON specification.\n\
 Rules:\n\
 - `title`: Evocative 2-5 word mix title (no emojis, clean editorial typography).\n\
 - `subtitle`: One concise sentence (under 95 chars) describing the sonic direction.\n\
-- `seedQueries`: 2-3 crisp 2-4 word music search/playlist queries that match real playlists on Deezer/YouTube Music (e.g. \"japanese city pop\", \"warm analog synthwave\", \"rainy lofi jazz\", \"early 2000s garage rock\"). If the prompt specifies a region or language, include it in every query and in `genres`.\n\
-- `seedArtists`: 3-5 REAL musical artists who authentically fit the exact prompt (scene, era, language, energy, instrumentation). NEVER force unrelated artists from the listener's profile if the prompt asks for a specific genre or vibe.\n\
+- `tracks`: 24-30 REAL, released songs as `{\"artist\": \"Canonical Artist\", \"title\": \"Clean Song Title\"}` ordered for smooth DJ flow.\n\
+  - Never invent songs, mashups, or placeholder titles. Use clean studio titles (no \"(Remastered 2011)\" or \"(Official Video)\" clutter unless a specific version is essential).\n\
+  - If the request names a specific song, put that exact song FIRST and follow with tracks matching its tempo, era, mood, and production.\n\
+  - If the request names a single artist, blend ~6-8 standout tracks by that artist with closely related peers/influences so it plays like a rich artist radio mix (lead with the requested artist).\n\
+  - For genres, eras, moods, activities, or descriptive prompts, pick a diverse selection (at most 2 songs per artist) that strictly honors every constraint (era, region/language, instrumentation, vocal/instrumental, energy).\n\
+  - NEVER force unrelated artists from the listener's profile if they do not authentically fit the request.\n\
+- `seedQueries`: 2-3 crisp 2-4 word fallback music search queries matching real playlists on Deezer/YouTube Music. If the request specifies a region or language, include it in every query and in `genres`.\n\
+- `seedArtists`: 3-5 REAL artists representing the mix (used as fallback if any tracks are unavailable).\n\
 - `genres`: 1-3 real genre/subgenre names.\n\
 - `mood`: null or one of \"chill\", \"energy\", \"late_night\", \"upbeat\", \"melancholy\", \"party\", \"acoustic\", \"groove\", \"rock_indie\".\n\
-- `yearRange`: null or [startYear, endYear] if the prompt implies a specific era/decade.\n\
+- `yearRange`: null or [startYear, endYear] if the request implies a specific era/decade.\n\
 - `familiarity`: \"familiar\", \"balanced\", or \"discovery\".\n\
 - Respond ONLY with a single valid JSON object matching the schema. No markdown fences, no commentary.",
     );
@@ -2319,10 +2353,10 @@ fn build_instant_mix_user_prompt(
     top_genres: &[String],
     taste_note: &str,
 ) -> String {
-    let mut out = format!("Listener prompt: \"{prompt_text}\"\n");
+    let mut out = format!("Listener request: \"{prompt_text}\"\n");
     if !top_artists.is_empty() {
         out.push_str(&format!(
-            "Listener's recent artists (use ONLY if they genuinely fit the prompt): {}\n",
+            "Listener's recent artists (use ONLY if they genuinely fit the request): {}\n",
             top_artists.join(", ")
         ));
     }
@@ -2341,6 +2375,10 @@ Return JSON with this exact shape:
 {
   "title": "Short evocative mix title",
   "subtitle": "Concise description of the mix vibe",
+  "tracks": [
+    { "artist": "Real Artist 1", "title": "Real Song 1" },
+    { "artist": "Real Artist 2", "title": "Real Song 2" }
+  ],
   "seedQueries": ["query 1", "query 2"],
   "seedArtists": ["Real Artist 1", "Real Artist 2", "Real Artist 3", "Real Artist 4"],
   "genres": ["Genre 1", "Genre 2"],
@@ -2350,6 +2388,26 @@ Return JSON with this exact shape:
 }"##,
     );
     out
+}
+
+fn parse_raw_instant_mix_track(raw: RawInstantMixTrack) -> Option<LlmInstantMixTrack> {
+    let (artist_raw, title_raw) = match raw {
+        RawInstantMixTrack::Obj { artist, title } => (artist, title),
+        RawInstantMixTrack::Str(s) => {
+            let trimmed = s.trim();
+            let split = trimmed
+                .split_once(" - ")
+                .or_else(|| trimmed.split_once(" — "))
+                .or_else(|| trimmed.split_once(" – "))?;
+            (split.0.to_string(), split.1.to_string())
+        }
+    };
+    let artist = clean_text(&artist_raw, 80);
+    let title = clean_text(&title_raw, 100);
+    if artist.is_empty() || title.is_empty() {
+        return None;
+    }
+    Some(LlmInstantMixTrack { artist, title })
 }
 
 fn sanitize_instant_mix_spec(raw: RawInstantMixSpec, fallback_query: &str) -> LlmInstantMixSpec {
@@ -2369,8 +2427,34 @@ fn sanitize_instant_mix_spec(raw: RawInstantMixSpec, fallback_query: &str) -> Ll
             s
         }
     };
+    let mut seen_tracks = HashSet::new();
+    let mut tracks = Vec::new();
+    for item in raw.tracks {
+        let Some(track) = parse_raw_instant_mix_track(item) else {
+            continue;
+        };
+        let pa = primary_artist(&track.artist);
+        let a_key = slug(if pa.is_empty() { &track.artist } else { &pa });
+        let t_core = core_song_title(&track.title);
+        let t_key = if t_core.is_empty() {
+            slug(&track.title)
+        } else {
+            t_core
+        };
+        let dedup_key = format!("{a_key}|{t_key}");
+        if seen_tracks.insert(dedup_key) {
+            tracks.push(track);
+            if tracks.len() >= 35 {
+                break;
+            }
+        }
+    }
     let mut seed_queries = clean_list(raw.seed_queries, 3, 64);
-    let seed_artists = clean_list(raw.seed_artists, 5, 60);
+    let mut seed_artists = clean_list(raw.seed_artists, 5, 60);
+    if seed_artists.is_empty() && !tracks.is_empty() {
+        let derived: Vec<String> = tracks.iter().map(|t| t.artist.clone()).collect();
+        seed_artists = clean_list(derived, 5, 60);
+    }
     let genres = clean_list(raw.genres, 3, 36);
     if seed_queries.is_empty() {
         if !genres.is_empty() {
@@ -2387,6 +2471,7 @@ fn sanitize_instant_mix_spec(raw: RawInstantMixSpec, fallback_query: &str) -> Ll
     LlmInstantMixSpec {
         title,
         subtitle,
+        tracks,
         seed_queries,
         seed_artists,
         genres,
@@ -3689,6 +3774,21 @@ mod tests {
                                 "content": json!({
                                     "title": "Rainy Neon Expressway",
                                     "subtitle": "Warm analog synthwave and hazy midnight grooves for a 2am drive.",
+                                    "tracks": [
+                                        { "artist": "Kavinsky", "title": "Neon Highway 3" },
+                                        { "artist": "The Midnight", "title": "Neon Highway 2" },
+                                        "Kavinsky - Neon Highway 1",
+                                        { "artist": "Kavinsky", "title": "Neon Highway 3" },
+                                        { "artist": "The Midnight", "title": "Neon Highway 4" },
+                                        { "artist": "Kavinsky", "title": "Neon Highway 5" },
+                                        { "artist": "The Midnight", "title": "Neon Highway 6" },
+                                        { "artist": "Kavinsky", "title": "Neon Highway 7" },
+                                        { "artist": "The Midnight", "title": "Neon Highway 8" },
+                                        { "artist": "Kavinsky", "title": "Neon Highway 9" },
+                                        { "artist": "The Midnight", "title": "Neon Highway 10" },
+                                        { "artist": "Kavinsky", "title": "Neon Highway 11" },
+                                        { "artist": "The Midnight", "title": "Neon Highway 12" }
+                                    ],
                                     "seedQueries": ["synthwave night"],
                                     "seedArtists": ["The Midnight", "Kavinsky"],
                                     "genres": ["Synthwave"],
@@ -3719,7 +3819,7 @@ mod tests {
         );
         let taste = TasteEngine::new(store.clone(), sources);
         let (user, _) = store.authenticate_or_create_user("carol", "password123").unwrap();
-        let tracks: Vec<Track> = (1..=8)
+        let tracks: Vec<Track> = (1..=12)
             .map(|i| Track {
                 id: format!("loc:neon-{i}"),
                 source: "local".into(),
@@ -3763,6 +3863,11 @@ mod tests {
             .unwrap();
         assert_eq!(spec1.title, "Rainy Neon Expressway");
         assert_eq!(spec1.mood.as_deref(), Some("late_night"));
+        assert_eq!(spec1.tracks.len(), 12);
+        assert_eq!(spec1.tracks[0].title, "Neon Highway 3");
+        assert_eq!(spec1.tracks[1].title, "Neon Highway 2");
+        assert_eq!(spec1.tracks[2].artist, "Kavinsky");
+        assert_eq!(spec1.tracks[2].title, "Neon Highway 1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Second request with the same prompt (different casing/whitespace) hits SQLite cache.
@@ -3771,16 +3876,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spec2.title, spec1.title);
+        assert_eq!(spec2.tracks, spec1.tracks);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Materialize into real playable InstantMix tracks.
+        // Materialize into real playable InstantMix tracks preserving LLM song order.
         let mix = taste
             .materialize_llm_instant_mix(user.id, prompt, &spec1, 20)
             .await
             .expect("expected materialized instant mix");
         assert_eq!(mix.title, "Rainy Neon Expressway");
         assert!(mix.is_theme_mix);
-        assert!(!mix.tracks.is_empty());
+        assert_eq!(mix.tracks.len(), 12);
+        assert_eq!(mix.tracks[0].id, "loc:neon-3");
+        assert_eq!(mix.tracks[1].id, "loc:neon-2");
+        assert_eq!(mix.tracks[2].id, "loc:neon-1");
         assert_eq!(mix.total_duration, mix.tracks.iter().map(|t| t.duration).sum::<i32>());
 
         server.abort();

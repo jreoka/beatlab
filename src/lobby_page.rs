@@ -1296,10 +1296,10 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     }
     const NORM_TARGET_LUFS = -10.5;
     const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
-    const NORM_DEFAULT_GAIN = 0.9;
+    const NORM_DEFAULT_GAIN = 0.75;
     const NORM = {
       ctx: null, source: null, gainNode: null, limiterNode: null, ready: false, failed: false, connecting: false,
-      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0, cache: new Map(),
+      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0, retryTimer: null, cache: new Map(),
     };
     function computeNormGain(vol, muted, loudness) {
       if (muted || vol <= 0) return 0;
@@ -1372,7 +1372,10 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         const now = NORM.ctx.currentTime;
         try {
           p.cancelScheduledValues(now);
-          if (rampSec > 0) {
+          if (rampSec > 0.05) {
+            p.setValueAtTime(p.value, now);
+            p.linearRampToValueAtTime(target, now + rampSec);
+          } else if (rampSec > 0) {
             p.setTargetAtTime(target, now, 0.012);
           } else {
             p.setValueAtTime(target, now);
@@ -1385,9 +1388,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       $('vol').value = String(S.volume);
     }
     function canApplyPrePlayLobbyGain() {
-      return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.25;
+      return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.35;
     }
-    function fetchLobbyLoudnessPrePlay(t) {
+    function fetchLobbyLoudnessPrePlay(t, attempt = 0) {
       if (!t || !t.id || NORM.trackId !== t.id || NORM.loudness) return;
       const tok = NORM.reqToken;
       fetch(`/api/lobby/${encodeURIComponent(CODE)}/loudness/${encodeURIComponent(t.id)}?lid=${encodeURIComponent(lid)}`)
@@ -1397,15 +1400,22 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
           if (Number.isFinite(Number(d.lufs))) {
             const norm = { lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 };
             NORM.cache.set(t.id, norm);
-            if (canApplyPrePlayLobbyGain()) {
-              NORM.loudness = norm;
-              applyVolume(0);
-            }
+            NORM.loudness = norm;
+            applyVolume(canApplyPrePlayLobbyGain() ? 0 : 0.6);
+            return;
+          }
+          const retryDelays = [2500, 4500];
+          if (d.pending && attempt < retryDelays.length) {
+            NORM.retryTimer = setTimeout(() => {
+              NORM.retryTimer = null;
+              fetchLobbyLoudnessPrePlay(t, attempt + 1);
+            }, retryDelays[attempt]);
           }
         })
         .catch(() => {});
     }
     function syncLobbyLoudness(t) {
+      if (NORM.retryTimer) { clearTimeout(NORM.retryTimer); NORM.retryTimer = null; }
       NORM.reqToken++;
       NORM.metaRetryDoneFor = '';
       if (!t || !t.id) { NORM.trackId = ''; NORM.loudness = null; applyVolume(0); return; }
@@ -1563,7 +1573,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     audio.addEventListener('loadedmetadata', () => {
       if (!S.loadedId) return;
       const t = curTrack();
-      if (t && t.id === NORM.trackId && !NORM.loudness && NORM.metaRetryDoneFor !== t.id && canApplyPrePlayLobbyGain()) {
+      if (t && t.id === NORM.trackId && !NORM.loudness && NORM.metaRetryDoneFor !== t.id) {
         NORM.metaRetryDoneFor = t.id;
         fetchLobbyLoudnessPrePlay(t);
       }

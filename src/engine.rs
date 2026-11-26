@@ -652,6 +652,20 @@ impl StreamEngine {
             }
             return Some(m);
         }
+        // If ffmpeg timed out on a large file, try embedded ReplayGain/R128/iTunNORM
+        // tags immediately and continue exact EBU R128 analysis in the background.
+        let p_tag = path.to_path_buf();
+        if let Ok(Some(tag_m)) =
+            tokio::task::spawn_blocking(move || crate::loudness::read_tag_loudness(&p_tag)).await
+        {
+            let _ = self.store.upsert_track_loudness(track_id, tag_m, "tag");
+            if owner_id != track_id {
+                let _ = self.store.upsert_track_loudness(owner_id, tag_m, "tag");
+            }
+            self.spawn_analyze_loudness(track_id, path.to_path_buf());
+            return Some(tag_m);
+        }
+        self.spawn_analyze_loudness(track_id, path.to_path_buf());
         self.store.get_track_loudness(track_id).ok().flatten()
     }
 
@@ -659,9 +673,9 @@ impl StreamEngine {
     /// - Already measured in DB -> returns immediately.
     /// - Present on local disk (local library, hot cache, or local/cached sibling) ->
     ///   measures directly (fast, ~0.3-0.6s) and persists for all future plays.
-    /// - Known YouTube video ID or active stream resolution -> reads YouTube's
-    ///   pre-computed BS.1770 LKFS (~120ms) or awaits the active resolution so
-    ///   playback starts at exact normalized loudness from 0:00.
+    /// - Known YouTube video ID or cold `resolve:` track -> fetches YouTube's
+    ///   pre-computed BS.1770 LKFS (~120ms) or shares the single-flight stream
+    ///   resolution so playback starts at exact normalized loudness from 0:00.
     pub async fn ensure_track_loudness(&self, track: &Track) -> (Option<TrackLoudness>, bool) {
         if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
             if m.exact {
@@ -698,7 +712,8 @@ impl StreamEngine {
             let m = self
                 .ensure_local_file_loudness(&track.id, &owner_id, &path, Duration::from_secs(12))
                 .await;
-            return (m, false);
+            let pending = m.is_none();
+            return (m, pending);
         }
 
         // Known YouTube video ID -> fetch YouTube's pre-computed BS.1770 LKFS directly (~120ms).
@@ -718,11 +733,24 @@ impl StreamEngine {
                 let _ = self.store.upsert_track_loudness(&track.id, m, "ytm_lkfs");
                 return (Some(m), false);
             }
+        } else if track.stream_url.starts_with("resolve:") {
+            // Cold Deezer / `resolve:ytm:` track: run single-flight YTM resolution
+            // directly (shared with `/api/web/stream/:id` so there is zero wasted work
+            // and no race if `/api/web/loudness/:id` arrives before `/api/web/stream/:id`).
+            let _ = tokio::time::timeout(
+                Duration::from_secs(8),
+                self.resolve_ytm_singleflight(track, false),
+            )
+            .await;
+            if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
+                if m.exact {
+                    return (Some(m), false);
+                }
+            }
         }
 
-        // If stream resolution is currently running (e.g. cold `resolve:ytm:` track),
-        // wait briefly for it so we pick up the `ytm_lkfs` written during resolution
-        // before audio begins playing.
+        // If stream resolution is currently running (e.g. cold `slsk://` fallback),
+        // wait briefly for it so we pick up any loudness written during resolution.
         let res_notify = {
             self.in_flight_resolutions
                 .lock()
@@ -757,7 +785,14 @@ impl StreamEngine {
         }
 
         let stored = self.store.get_track_loudness(&track.id).ok().flatten();
-        (stored, false)
+        // If still unmeasured and background caching/loudness analysis is active or
+        // likely to run once streaming begins, report `pending = true` so the client
+        // can smoothly apply loudness once ffmpeg finishes scanning the cached file.
+        let is_pending = stored.is_none()
+            && self.ffmpeg_available
+            && track.source != "radio"
+            && !track.stream_url.contains("/preview/");
+        (stored, is_pending)
     }
 
     fn existing_local_audio_path(&self, track: &Track) -> Option<PathBuf> {
@@ -874,14 +909,18 @@ impl StreamEngine {
             return self.sources.ytm.resolve_stream(video_id).await;
         }
         // Fetch YouTube's pre-computed BS.1770 LKFS (~120ms) concurrently with yt-dlp
-        // stream resolution so loudness is persisted before the first audio byte streams.
-        let (stream_res, loud_opt) = tokio::join!(
+        // stream resolution and persist immediately so `/api/web/loudness` sees it
+        // even before the stream begins.
+        let store = self.store.clone();
+        let tid = track.id.clone();
+        let (stream_res, _) = tokio::join!(
             self.sources.ytm.resolve_stream(video_id),
-            self.sources.ytm.fetch_video_loudness(video_id)
+            async move {
+                if let Some(m) = self.sources.ytm.fetch_video_loudness(video_id).await {
+                    let _ = store.upsert_track_loudness(&tid, m, "ytm_lkfs");
+                }
+            }
         );
-        if let Some(m) = loud_opt {
-            let _ = self.store.upsert_track_loudness(&track.id, m, "ytm_lkfs");
-        }
         stream_res
     }
 

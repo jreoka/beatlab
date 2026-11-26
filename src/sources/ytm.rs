@@ -82,8 +82,9 @@ impl YtmSource {
     }
 
     /// Fetches YouTube's pre-computed ITU-R BS.1770 integrated loudness (LKFS/LUFS)
-    /// for a video ID via the Android Innertube player endpoint (~120ms, zero audio
-    /// bytes downloaded) so cold streams start at the exact normalized volume from 0:00.
+    /// for a video ID via Innertube player endpoints (~120ms, zero audio bytes
+    /// downloaded) so cold streams start at exact normalized volume from 0:00.
+    /// Falls back from `ANDROID` to `WEB_REMIX` when a client omits `audioConfig`.
     pub async fn fetch_video_loudness(
         &self,
         video_id: &str,
@@ -92,56 +93,53 @@ impl YtmSource {
         if vid.is_empty() || vid.len() > 32 || vid.contains('/') || vid.contains('?') {
             return None;
         }
-        let body = serde_json::json!({
-            "context": {
-                "client": {
-                    "clientName": "ANDROID",
-                    "clientVersion": "20.10.38",
-                    "hl": "en",
-                    "gl": "US"
-                }
-            },
-            "videoId": vid
-        });
-        let resp = tokio::time::timeout(
-            Duration::from_millis(2500),
-            self.http
-                .post(INNERTUBE_PLAYER_URL)
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send(),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        if !resp.status().is_success() {
-            return None;
+        let clients: &[(&str, &str, &str)] = &[
+            (INNERTUBE_PLAYER_URL, "ANDROID", "20.10.38"),
+            (
+                "https://music.youtube.com/youtubei/v1/player?prettyPrint=false",
+                "WEB_REMIX",
+                "1.20250115.01.00",
+            ),
+        ];
+        for &(url, client_name, client_version) in clients {
+            let body = serde_json::json!({
+                "context": {
+                    "client": {
+                        "clientName": client_name,
+                        "clientVersion": client_version,
+                        "hl": "en",
+                        "gl": "US"
+                    }
+                },
+                "videoId": vid
+            });
+            let mut req = self
+                .http
+                .post(url)
+                .header("Content-Type", "application/json");
+            if client_name == "WEB_REMIX" {
+                req = req
+                    .header("Origin", "https://music.youtube.com")
+                    .header("Referer", "https://music.youtube.com/");
+            }
+            let Ok(Ok(resp)) =
+                tokio::time::timeout(Duration::from_millis(2500), req.json(&body).send()).await
+            else {
+                continue;
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let Ok(Ok(val)) =
+                tokio::time::timeout(Duration::from_millis(2000), resp.json::<Value>()).await
+            else {
+                continue;
+            };
+            if let Some(m) = parse_innertube_audio_config_loudness(&val) {
+                return Some(m);
+            }
         }
-        let val = tokio::time::timeout(Duration::from_millis(2000), resp.json::<Value>())
-            .await
-            .ok()?
-            .ok()?;
-        let audio_cfg = val.pointer("/playerConfig/audioConfig")?;
-        let lufs = audio_cfg
-            .get("trackAbsoluteLoudnessLkfs")
-            .and_then(|v| v.as_f64())
-            .or_else(|| {
-                audio_cfg
-                    .get("perceptualLoudnessDb")
-                    .and_then(|v| v.as_f64())
-            })
-            .or_else(|| {
-                audio_cfg
-                    .get("loudnessDb")
-                    .and_then(|v| v.as_f64())
-                    .map(|d| -14.0 + d)
-            })?;
-        let m = crate::loudness::TrackLoudness {
-            lufs: (lufs * 100.0).round() / 100.0,
-            true_peak_db: 0.0,
-            exact: true,
-        };
-        m.is_valid().then_some(m)
+        None
     }
 
     async fn innertube_post(&self, url: &str, body: Value) -> Option<Value> {
@@ -554,6 +552,38 @@ impl MusicSource for YtmSource {
             .filter_map(|c| candidate_to_track(c, now))
             .collect()
     }
+}
+
+fn parse_innertube_audio_config_loudness(val: &Value) -> Option<crate::loudness::TrackLoudness> {
+    let audio_cfg = val.pointer("/playerConfig/audioConfig")?;
+    let target_lkfs = audio_cfg
+        .get("loudnessTargetLkfs")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v <= -6.0 && *v >= -30.0)
+        .unwrap_or(-14.0);
+    let lufs = audio_cfg
+        .get("trackAbsoluteLoudnessLkfs")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v < 0.0 && *v > -70.0)
+        .or_else(|| {
+            audio_cfg
+                .get("perceptualLoudnessDb")
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite() && *v < 0.0 && *v > -70.0)
+        })
+        .or_else(|| {
+            audio_cfg
+                .get("loudnessDb")
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite())
+                .map(|d| target_lkfs + d)
+        })?;
+    let m = crate::loudness::TrackLoudness {
+        lufs: (lufs * 100.0).round() / 100.0,
+        true_peak_db: 0.0,
+        exact: true,
+    };
+    m.is_valid().then_some(m)
 }
 
 fn candidate_to_track(c: YtmCandidate, created: i64) -> Option<Track> {

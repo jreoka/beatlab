@@ -1152,10 +1152,10 @@ pub fn render_share_html(
     let masterVolume = 0.9;
     const NORM_TARGET_LUFS = -10.5;
     const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
-    const NORM_DEFAULT_GAIN = 0.9;
+    const NORM_DEFAULT_GAIN = 0.75;
     const normState = {{
       ctx: null, source: null, gainNode: null, limiterNode: null, ready: false, failed: false, connecting: false,
-      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0,
+      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0, retryTimer: null,
     }};
 
     function computeNormGain(vol, loudness) {{
@@ -1232,7 +1232,10 @@ pub fn render_share_html(
         const now = normState.ctx.currentTime;
         try {{
           p.cancelScheduledValues(now);
-          if (rampSec > 0) {{
+          if (rampSec > 0.05) {{
+            p.setValueAtTime(p.value, now);
+            p.linearRampToValueAtTime(target, now + rampSec);
+          }} else if (rampSec > 0) {{
             p.setTargetAtTime(target, now, 0.012);
           }} else {{
             p.setValueAtTime(target, now);
@@ -1244,10 +1247,10 @@ pub fn render_share_html(
     }}
 
     function canApplyPrePlayShareGain() {{
-      return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.25;
+      return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.35;
     }}
 
-    function fetchShareLoudnessPrePlay(t) {{
+    function fetchShareLoudnessPrePlay(t, attempt = 0) {{
       if (!t || !t.id || normState.trackId !== t.id || normState.loudness) return;
       const tok = normState.reqToken;
       fetch(`/api/public/share/${{encodeURIComponent(DATA.id)}}/loudness/${{encodeURIComponent(t.id)}}`)
@@ -1256,16 +1259,23 @@ pub fn render_share_html(
           if (!d || tok !== normState.reqToken || normState.trackId !== t.id) return;
           if (Number.isFinite(Number(d.lufs))) {{
             t.loudness = {{ lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 }};
-            if (canApplyPrePlayShareGain()) {{
-              normState.loudness = t.loudness;
-              applyOutputVolume(0);
-            }}
+            normState.loudness = t.loudness;
+            applyOutputVolume(canApplyPrePlayShareGain() ? 0 : 0.6);
+            return;
+          }}
+          const retryDelays = [2500, 4500];
+          if (d.pending && attempt < retryDelays.length) {{
+            normState.retryTimer = setTimeout(() => {{
+              normState.retryTimer = null;
+              fetchShareLoudnessPrePlay(t, attempt + 1);
+            }}, retryDelays[attempt]);
           }}
         }})
         .catch(() => {{}});
     }}
 
     function syncShareLoudness(t) {{
+      if (normState.retryTimer) {{ clearTimeout(normState.retryTimer); normState.retryTimer = null; }}
       normState.reqToken++;
       normState.metaRetryDoneFor = '';
       if (!t || !t.id) {{ normState.trackId = ''; normState.loudness = null; applyOutputVolume(0); return; }}
@@ -1582,7 +1592,7 @@ pub fn render_share_html(
     applyOutputVolume();
     audio.addEventListener('loadedmetadata', () => {{
       const t = tracks[state.idx];
-      if (t && t.id === normState.trackId && !normState.loudness && normState.metaRetryDoneFor !== t.id && canApplyPrePlayShareGain()) {{
+      if (t && t.id === normState.trackId && !normState.loudness && normState.metaRetryDoneFor !== t.id) {{
         normState.metaRetryDoneFor = t.id;
         fetchShareLoudnessPrePlay(t);
       }}
