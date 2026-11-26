@@ -2134,7 +2134,7 @@
         return;
       }
       const titleEl = e.target.closest('#pb-title');
-      const artistEl = e.target.closest('#pb-artist');
+      const artistEl = e.target.closest('#pb-artist .pb-artist-name');
       if (window.innerWidth > 780 && titleEl) {
         App.goCurrentAlbum();
         return;
@@ -6640,7 +6640,7 @@
       setFsTint(track.coverUrl);
     }
     setMarqueeText($('pb-title'), track.title);
-    $('pb-artist').innerHTML = `${esc(track.artist)}${yearTag(track.year)}`;
+    $('pb-artist').innerHTML = `<span class="pb-artist-name">${esc(track.artist)}</span>${yearTag(track.year)}`;
     $('pb-like').classList.toggle('active', !!track.isStarred);
     $('pb-quality').textContent = track.qualityBadge;
     $('pb-quality').classList.remove('hidden');
@@ -6725,7 +6725,7 @@
 
     const cur = currentTrack();
     if (cur && cur.id === trackId) {
-      $('pb-artist').innerHTML = `${esc(cur.artist)}${yearTag(cur.year)}`;
+      $('pb-artist').innerHTML = `<span class="pb-artist-name">${esc(cur.artist)}</span>${yearTag(cur.year)}`;
       $('fs-artist').innerHTML = `<span class="clickable" onclick="App.goCurrentArtist()">${esc(cur.artist)}</span>${cur.album ? ` · <span class="clickable" onclick="App.goCurrentAlbum()">${esc(cur.album)}</span>` : ''}${yearTag(cur.year)}`;
       if ($('fs-mini-artist')) $('fs-mini-artist').innerHTML = `${esc(cur.artist)}${yearTag(cur.year)}`;
     }
