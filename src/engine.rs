@@ -58,6 +58,7 @@ pub struct CachedResolved {
     pub headers: Vec<(String, String)>,
     pub ext: String,
     pub webpage_url: String,
+    pub has_video: bool,
     pub expires_at: i64,
 }
 
@@ -73,6 +74,7 @@ pub enum PlayTarget {
         ext: String,
         webpage_url: String,
         cacheable: bool,
+        has_video: bool,
     },
     /// A Soulseek download still being written; served progressively.
     Growing {
@@ -313,6 +315,7 @@ impl StreamEngine {
                             } else {
                                 obj.ext.clone()
                             };
+                            let has_video = ext.eq_ignore_ascii_case("mp4");
                             return Ok(PlayTarget::RemoteHttp {
                                 url,
                                 headers,
@@ -320,6 +323,7 @@ impl StreamEngine {
                                 ext,
                                 webpage_url: String::new(),
                                 cacheable: true,
+                                has_video,
                             });
                         }
                     }
@@ -412,6 +416,7 @@ impl StreamEngine {
                 webpage_url: resolved.webpage_url,
                 // Keep resolved URL in memory without overwriting a lossless track's disk cache.
                 cacheable: false,
+                has_video: resolved.has_video,
             });
         }
 
@@ -428,11 +433,18 @@ impl StreamEngine {
                 ext: resolved.ext,
                 webpage_url: resolved.webpage_url,
                 cacheable: true,
+                has_video: resolved.has_video,
             });
         }
 
         // 5. Direct HTTP stream (Archive.org FLAC/MP3, radio, etc.).
         if track.stream_url.starts_with("http://") || track.stream_url.starts_with("https://") {
+            let ext = if track.format.is_empty() {
+                "mp3".to_string()
+            } else {
+                track.format.clone()
+            };
+            let has_video = ext.eq_ignore_ascii_case("mp4");
             return Ok(PlayTarget::RemoteHttp {
                 url: track.stream_url.clone(),
                 headers: vec![(
@@ -440,13 +452,10 @@ impl StreamEngine {
                     "Beatlab/0.3 (HighQualityAudio)".to_string(),
                 )],
                 content_type: mime_for_audio_ext(&track.format).to_string(),
-                ext: if track.format.is_empty() {
-                    "mp3".to_string()
-                } else {
-                    track.format.clone()
-                },
+                ext,
                 webpage_url: track.stream_url.clone(),
                 cacheable: !track.stream_url.contains("/preview/") && track.source != "radio",
+                has_video,
             });
         }
 
@@ -615,6 +624,7 @@ impl StreamEngine {
             headers: resolved.headers,
             ext: resolved.ext,
             webpage_url: resolved.source_webpage_url,
+            has_video: resolved.has_video,
         };
         let mut guard = self.resolved_cache.write().await;
         guard.insert(track.id.clone(), item.clone());
@@ -669,10 +679,11 @@ impl StreamEngine {
                 headers,
                 ext,
                 cacheable,
+                has_video,
                 ..
             } => {
                 if cacheable {
-                    self.spawn_background_cache(&track.id, &url, &headers, &ext);
+                    self.spawn_background_cache(&track.id, &url, &headers, &ext, has_video);
                 }
                 Ok(())
             }
@@ -730,7 +741,20 @@ impl StreamEngine {
 
         let resolved_ext = play_target_ext(&resolved, track);
         let is_alac = is_alac_m4a(&resolved_ext, track);
+        // Chrome on Android pauses `<audio>` on screen lock whenever the demuxed
+        // container contains a video track (`HasVideo() == true`), e.g. YouTube
+        // progressive MP4 fallbacks or previously unstripped cached MP4s.
+        let has_video = match &resolved {
+            PlayTarget::RemoteHttp { has_video, .. } => *has_video,
+            PlayTarget::LocalFile { path, .. }
+                if matches!(resolved_ext.as_str(), "mp4" | "m4a") =>
+            {
+                mp4_file_has_video_track(path).await
+            }
+            _ => false,
+        };
         let needs_compat = force_compat
+            || has_video
             || !is_browser_native_ext(&resolved_ext)
             || (is_alac && !is_safari_ua(req_headers))
             || (is_safari_ua(req_headers) && is_safari_unfriendly_ext(&resolved_ext));
@@ -777,6 +801,7 @@ impl StreamEngine {
                 ext,
                 webpage_url,
                 cacheable,
+                has_video,
             } => {
                 let resp = self
                     .serve_remote_http_range(
@@ -786,6 +811,7 @@ impl StreamEngine {
                         &content_type,
                         &webpage_url,
                         range_hdr.as_deref(),
+                        has_video,
                     )
                     .await;
                 if cacheable
@@ -797,7 +823,7 @@ impl StreamEngine {
                     let tid = track.id.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
-                        this.spawn_background_cache(&tid, &url, &headers, &ext);
+                        this.spawn_background_cache(&tid, &url, &headers, &ext, has_video);
                     });
                 }
                 resp
@@ -811,6 +837,7 @@ impl StreamEngine {
         headers: &[(String, String)],
         content_type: &str,
         range_hdr: Option<&str>,
+        no_store: bool,
     ) -> Result<Response, reqwest::StatusCode> {
         let mut req = self.stream_http.get(url);
         for (k, v) in headers {
@@ -830,11 +857,16 @@ impl StreamEngine {
                 } else {
                     StatusCode::OK
                 };
+                let cache_ctl = if no_store {
+                    "no-store"
+                } else {
+                    "private, max-age=3600"
+                };
                 let mut builder = Response::builder()
                     .status(status)
                     .header(header::CONTENT_TYPE, content_type)
                     .header(header::ACCEPT_RANGES, "bytes")
-                    .header(header::CACHE_CONTROL, "private, max-age=3600");
+                    .header(header::CACHE_CONTROL, cache_ctl);
                 if let Some(len) = resp.headers().get(header::CONTENT_LENGTH) {
                     builder = builder.header(header::CONTENT_LENGTH, len);
                 }
@@ -867,10 +899,12 @@ impl StreamEngine {
         content_type: &str,
         webpage_url: &str,
         range_hdr: Option<&str>,
+        initial_has_video: bool,
     ) -> Response {
         let mut active_url = url.to_string();
         let mut active_headers = headers.to_vec();
         let mut active_ct = content_type.to_string();
+        let mut active_has_video = initial_has_video;
         let is_ytm_origin = webpage_url.contains("youtube.com")
             || webpage_url.contains("youtu.be")
             || track.stream_url.starts_with("resolve:")
@@ -878,7 +912,13 @@ impl StreamEngine {
 
         for attempt in 0..2 {
             match self
-                .send_stream_proxy(&active_url, &active_headers, &active_ct, range_hdr)
+                .send_stream_proxy(
+                    &active_url,
+                    &active_headers,
+                    &active_ct,
+                    range_hdr,
+                    active_has_video,
+                )
                 .await
             {
                 Ok(resp) => return resp,
@@ -891,9 +931,30 @@ impl StreamEngine {
                     // Cached upstream signed URL expired or IP-shifted; re-resolve cleanly.
                     debug!(track_id = %track.id, status = %status, "refreshing expired stream URL");
                     if let Ok(fresh) = self.resolve_ytm_singleflight(track, true).await {
+                        if fresh.has_video && self.ffmpeg_available {
+                            let target = PlayTarget::RemoteHttp {
+                                url: fresh.url,
+                                headers: fresh.headers,
+                                content_type: mime_for_audio_ext(&fresh.ext).to_string(),
+                                ext: fresh.ext.clone(),
+                                webpage_url: fresh.webpage_url,
+                                cacheable: true,
+                                has_video: true,
+                            };
+                            let (fmt, br) = choose_web_compat_transcode_params(
+                                &fresh.ext,
+                                track,
+                                false,
+                                false,
+                            );
+                            return self
+                                .serve_ffmpeg_transcode(track, &target, &fmt, br, 0.0)
+                                .await;
+                        }
                         active_url = fresh.url;
                         active_headers = fresh.headers;
                         active_ct = mime_for_audio_ext(&fresh.ext).to_string();
+                        active_has_video = fresh.has_video;
                         continue;
                     }
                     break;
@@ -916,9 +977,25 @@ impl StreamEngine {
                 return serve_local_file_range(&path, &content_type, range_hdr).await;
             }
             if let Ok(fresh) = self.resolve_ytm_singleflight(track, false).await {
+                if fresh.has_video && self.ffmpeg_available {
+                    let target = PlayTarget::RemoteHttp {
+                        url: fresh.url,
+                        headers: fresh.headers,
+                        content_type: mime_for_audio_ext(&fresh.ext).to_string(),
+                        ext: fresh.ext.clone(),
+                        webpage_url: fresh.webpage_url,
+                        cacheable: true,
+                        has_video: true,
+                    };
+                    let (fmt, br) =
+                        choose_web_compat_transcode_params(&fresh.ext, track, false, false);
+                    return self
+                        .serve_ffmpeg_transcode(track, &target, &fmt, br, 0.0)
+                        .await;
+                }
                 let ct = mime_for_audio_ext(&fresh.ext);
                 if let Ok(resp) = self
-                    .send_stream_proxy(&fresh.url, &fresh.headers, ct, range_hdr)
+                    .send_stream_proxy(&fresh.url, &fresh.headers, ct, range_hdr, fresh.has_video)
                     .await
                 {
                     return resp;
@@ -957,7 +1034,7 @@ impl StreamEngine {
             "--extractor-args",
             "youtube:player_client=android",
             "-f",
-            "bestaudio[ext=m4a][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[protocol!=m3u8][protocol!=m3u8_native]/bestaudio/best",
+            "bestaudio[vcodec=none][ext=m4a][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[vcodec=none][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[vcodec=none]/bestaudio",
             "-o",
             "-",
             watch_url,
@@ -1011,10 +1088,11 @@ impl StreamEngine {
                 headers,
                 ext,
                 cacheable,
+                has_video,
                 ..
             } => {
                 if *cacheable {
-                    self.spawn_background_cache(&track.id, url, headers, ext);
+                    self.spawn_background_cache(&track.id, url, headers, ext, *has_video);
                 }
                 (url.clone(), headers.clone(), mime_for_audio_ext(fmt))
             }
@@ -1124,6 +1202,7 @@ impl StreamEngine {
         url: &str,
         headers: &[(String, String)],
         ext: &str,
+        has_video: bool,
     ) {
         if let Ok(Some(entry)) = self.store.get_cache_entry(track_id) {
             if Path::new(&entry.path).exists() {
@@ -1170,7 +1249,9 @@ impl StreamEngine {
                 }
             }
             let _permit = permit;
-            let _ = this.download_to_disk_cache(&tid, &u, &hdrs, &ext_s).await;
+            let _ = this
+                .download_to_disk_cache(&tid, &u, &hdrs, &ext_s, has_video)
+                .await;
         });
     }
 
@@ -1180,6 +1261,7 @@ impl StreamEngine {
         url: &str,
         headers: &[(String, String)],
         ext: &str,
+        has_video: bool,
     ) -> AppResult<()> {
         let hash = sha1_hex(track_id);
         let part_path = self.cache_dir.join(format!("{}.part", hash));
@@ -1234,8 +1316,9 @@ impl StreamEngine {
             return Err(err_msg("Downloaded file too small"));
         }
 
-        // Convert mp4 progressive streams cleanly into fast-start audio-only m4a if ffmpeg is installed.
-        let remuxed = if self.ffmpeg_available && (ext == "mp4" || ext == "m4a") {
+        // Convert mp4/m4a streams (or any video-bearing stream) into fast-start audio-only files.
+        let need_strip_video = has_video || ext == "mp4" || ext == "m4a";
+        let remuxed = if self.ffmpeg_available && need_strip_video {
             let mut cmd = Command::new("ffmpeg");
             cmd.kill_on_drop(true)
                 .args([
@@ -1248,10 +1331,11 @@ impl StreamEngine {
                     "-vn",
                     "-c:a",
                     "copy",
-                    "-movflags",
-                    "+faststart",
-                    &final_path.to_string_lossy(),
-                ])
+                ]);
+            if final_ext == "m4a" {
+                cmd.args(["-movflags", "+faststart"]);
+            }
+            cmd.arg(&final_path)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             let status = match cmd.spawn() {
@@ -1270,6 +1354,7 @@ impl StreamEngine {
                 let _ = tokio::fs::remove_file(&part_path).await;
                 true
             } else {
+                let _ = tokio::fs::remove_file(&final_path).await;
                 false
             }
         } else {
@@ -1277,6 +1362,11 @@ impl StreamEngine {
         };
 
         if !remuxed {
+            if has_video {
+                // Never poison the disk/cool cache with an unstripped video-bearing stream.
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Err(err_msg("Refusing to cache unstripped video stream as audio"));
+            }
             tokio::fs::rename(&part_path, &final_path).await?;
         }
 
@@ -2317,6 +2407,115 @@ fn is_alac_m4a(resolved_ext: &str, track: &Track) -> bool {
         && (track.bit_depth > 0 || track.bitrate > 450)
 }
 
+/// Inspects an ISO-BMFF/MP4/M4A file's `moov -> trak -> mdia -> hdlr` boxes to detect
+/// whether the container holds a video track (`vide`). Skips `mdat` via O(1) seek so
+/// large cached files are checked in under a millisecond without spawning `ffprobe`.
+async fn mp4_file_has_video_track(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path).await else {
+        return false;
+    };
+    let Ok(file_len) = file.metadata().await.map(|m| m.len()) else {
+        return false;
+    };
+    let mut offset = 0u64;
+    let mut header_buf = [0u8; 8];
+    let mut ext_size_buf = [0u8; 8];
+    // Cap box iterations to guard against malformed inputs.
+    for _ in 0..128 {
+        if offset + 8 > file_len {
+            break;
+        }
+        if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+            break;
+        }
+        if file.read_exact(&mut header_buf).await.is_err() {
+            break;
+        }
+        let raw_size = u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]) as u64;
+        let box_type = [header_buf[4], header_buf[5], header_buf[6], header_buf[7]];
+        let (box_size, header_len) = if raw_size == 1 {
+            if offset + 16 > file_len || file.read_exact(&mut ext_size_buf).await.is_err() {
+                break;
+            }
+            (u64::from_be_bytes(ext_size_buf), 16u64)
+        } else if raw_size == 0 {
+            (file_len.saturating_sub(offset), 8u64)
+        } else {
+            (raw_size, 8u64)
+        };
+        if box_size < header_len || offset.saturating_add(box_size) > file_len {
+            break;
+        }
+        if &box_type == b"moov" {
+            let payload_len = (box_size - header_len).min(4 * 1024 * 1024) as usize;
+            let mut moov = vec![0u8; payload_len];
+            if file.read_exact(&mut moov).await.is_ok() {
+                return mp4_moov_has_video_track(&moov);
+            }
+            return false;
+        }
+        offset = offset.saturating_add(box_size);
+    }
+    false
+}
+
+fn mp4_moov_has_video_track(moov: &[u8]) -> bool {
+    mp4_iter_boxes(moov, |btype, payload| {
+        if btype != b"trak" {
+            return false;
+        }
+        mp4_iter_boxes(payload, |t_type, t_payload| {
+            if t_type != b"mdia" {
+                return false;
+            }
+            mp4_iter_boxes(t_payload, |m_type, m_payload| {
+                // `hdlr` FullBox: 4 bytes version/flags + 4 bytes pre_defined + 4 bytes handler_type
+                m_type == b"hdlr" && m_payload.len() >= 12 && &m_payload[8..12] == b"vide"
+            })
+        })
+    })
+}
+
+fn mp4_iter_boxes<F: FnMut(&[u8; 4], &[u8]) -> bool>(buf: &[u8], mut f: F) -> bool {
+    let mut pos = 0usize;
+    while pos + 8 <= buf.len() {
+        let raw_size = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as u64;
+        let btype: [u8; 4] = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
+        let (box_size, header_len) = if raw_size == 1 {
+            if pos + 16 > buf.len() {
+                break;
+            }
+            let ext = u64::from_be_bytes([
+                buf[pos + 8],
+                buf[pos + 9],
+                buf[pos + 10],
+                buf[pos + 11],
+                buf[pos + 12],
+                buf[pos + 13],
+                buf[pos + 14],
+                buf[pos + 15],
+            ]);
+            (ext, 16usize)
+        } else if raw_size == 0 {
+            ((buf.len() - pos) as u64, 8usize)
+        } else {
+            (raw_size, 8usize)
+        };
+        if box_size < header_len as u64 {
+            break;
+        }
+        let end = match pos.checked_add(box_size as usize) {
+            Some(e) if e <= buf.len() => e,
+            _ => break,
+        };
+        if f(&btype, &buf[pos + header_len..end]) {
+            return true;
+        }
+        pos = end;
+    }
+    false
+}
+
 fn choose_web_compat_transcode_params(
     resolved_ext: &str,
     track: &Track,
@@ -2656,8 +2855,52 @@ mod tests {
             ext: "webm".to_string(),
             webpage_url: String::new(),
             cacheable: false,
+            has_video: false,
         };
         assert_eq!(play_target_ext(&remote, &track), "webm");
+    }
+
+    #[tokio::test]
+    async fn mp4_video_track_detector_distinguishes_audio_only_and_muxed_mp4() {
+        fn make_box(btype: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(payload);
+            out
+        }
+        fn make_trak(handler: &[u8; 4]) -> Vec<u8> {
+            let mut hdlr_payload = vec![0u8; 12];
+            hdlr_payload[8..12].copy_from_slice(handler);
+            let hdlr = make_box(b"hdlr", &hdlr_payload);
+            let mdia = make_box(b"mdia", &hdlr);
+            make_box(b"trak", &mdia)
+        }
+
+        let dir = std::env::temp_dir().join(format!("beatlab_mp4_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Audio-only m4a (ftyp + mdat + moov with only `soun`)
+        let ftyp = make_box(b"ftyp", b"M4A \x00\x00\x00\x00M4A ");
+        let mdat = make_box(b"mdat", &[0u8; 128]);
+        let audio_moov = make_box(b"moov", &make_trak(b"soun"));
+        let audio_only_path = dir.join("audio_only.m4a");
+        std::fs::write(&audio_only_path, [&ftyp[..], &mdat[..], &audio_moov[..]].concat()).unwrap();
+        assert!(!mp4_file_has_video_track(&audio_only_path).await);
+
+        // 2. Muxed mp4 (ftyp + mdat + moov with `vide` + `soun`)
+        let muxed_tracks = [make_trak(b"vide"), make_trak(b"soun")].concat();
+        let muxed_moov = make_box(b"moov", &muxed_tracks);
+        let muxed_path = dir.join("muxed.m4a");
+        std::fs::write(&muxed_path, [&ftyp[..], &mdat[..], &muxed_moov[..]].concat()).unwrap();
+        assert!(mp4_file_has_video_track(&muxed_path).await);
+
+        // 3. Corrupt/non-MP4 bytes must safely return false
+        let corrupt_path = dir.join("corrupt.m4a");
+        std::fs::write(&corrupt_path, b"not an mp4 file").unwrap();
+        assert!(!mp4_file_has_video_track(&corrupt_path).await);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub struct ResolvedStream {
     pub headers: Vec<(String, String)>,
     pub ext: String,
     pub source_webpage_url: String,
+    pub has_video: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -320,25 +321,61 @@ impl YtmSource {
             format!("https://www.youtube.com/watch?v={}", vid)
         };
 
-        // Empirically verified on Windows + YouTube 2026: `android` client yields direct
-        // progressive/audio URLs that return HTTP 206 Partial Content when fetched with
-        // the returned `http_headers`. Try `android` first, then `ios`, then default.
-        let attempts = [
-            ("youtube:player_client=android", "bestaudio[protocol!=m3u8][protocol!=m3u8_native]/best[protocol!=m3u8][protocol!=m3u8_native]/best"),
-            ("youtube:player_client=ios", "bestaudio[protocol!=m3u8][protocol!=m3u8_native]/best[protocol!=m3u8][protocol!=m3u8_native]/best"),
-            ("", "bestaudio/best"),
+        // Prefer audio-only streams (`vcodec=none`) across every client before ever
+        // falling back to a muxed video+audio format (e.g. progressive MP4 itag 18).
+        // Chrome on Android pauses `<audio>` elements on screen lock whenever the
+        // demuxed container reports a video track (`HasVideo() == true`).
+        let clients = [
+            "youtube:player_client=android",
+            "youtube:player_client=ios",
+            "",
         ];
+        let audio_only_fmt = "bestaudio[vcodec=none][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[protocol!=m3u8][protocol!=m3u8_native]";
+        let fallback_fmt = "bestaudio[protocol!=m3u8][protocol!=m3u8_native]/best[protocol!=m3u8][protocol!=m3u8_native]/best";
 
         let mut last_err = String::new();
-        for idx in client_attempt_order(self.preferred_client.load(Ordering::Relaxed), attempts.len()) {
-            let (extractor_args, fmt) = attempts[idx];
+        let order = client_attempt_order(self.preferred_client.load(Ordering::Relaxed), clients.len());
+
+        // Pass 1: try to obtain a pure audio-only direct stream from any client.
+        let mut first_muxed: Option<(usize, ResolvedStream)> = None;
+        for &idx in &order {
+            let extractor_args = clients[idx];
+            match self.run_ytdlp_json(&watch_url, extractor_args, audio_only_fmt).await {
+                Ok(res) if !res.has_video => {
+                    self.preferred_client.store(idx, Ordering::Relaxed);
+                    return Ok(res);
+                }
+                Ok(res) => {
+                    if first_muxed.is_none() {
+                        first_muxed = Some((idx, res));
+                    }
+                }
+                Err(e) => {
+                    warn!(client = extractor_args, error = %e, "yt-dlp audio-only resolution attempt failed");
+                    last_err = e.to_string();
+                }
+            }
+        }
+        if let Some((idx, res)) = first_muxed {
+            self.preferred_client.store(idx, Ordering::Relaxed);
+            return Ok(res);
+        }
+
+        // Pass 2: allow muxed fallback (tagged `has_video = true` so the engine strips video via ffmpeg `-vn`).
+        for &idx in &order {
+            let extractor_args = clients[idx];
+            let fmt = if extractor_args.is_empty() {
+                "bestaudio/best"
+            } else {
+                fallback_fmt
+            };
             match self.run_ytdlp_json(&watch_url, extractor_args, fmt).await {
                 Ok(res) => {
                     self.preferred_client.store(idx, Ordering::Relaxed);
                     return Ok(res);
                 }
                 Err(e) => {
-                    warn!(client = extractor_args, error = %e, "yt-dlp resolution attempt failed");
+                    warn!(client = extractor_args, error = %e, "yt-dlp fallback resolution attempt failed");
                     last_err = e.to_string();
                 }
             }
@@ -408,14 +445,23 @@ impl YtmSource {
             .and_then(|s| s.as_str())
             .unwrap_or("m4a")
             .to_lowercase();
+        let has_video = parse_ytdlp_has_video(&v);
 
         Ok(ResolvedStream {
             url,
             headers,
             ext,
             source_webpage_url: watch_url.to_string(),
+            has_video,
         })
     }
+}
+
+fn parse_ytdlp_has_video(v: &Value) -> bool {
+    v.get("vcodec")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .is_some_and(|vc| !vc.is_empty() && !vc.eq_ignore_ascii_case("none"))
 }
 
 #[async_trait]
@@ -1267,5 +1313,15 @@ mod tests {
         assert_eq!(items[0].album, "1984");
         assert_eq!(items[0].year, 1983);
         assert_eq!(items[0].duration, 241);
+    }
+
+    #[test]
+    fn parse_ytdlp_has_video_distinguishes_audio_only_from_muxed_streams() {
+        assert!(!parse_ytdlp_has_video(&serde_json::json!({ "vcodec": "none", "acodec": "mp4a.40.2" })));
+        assert!(!parse_ytdlp_has_video(&serde_json::json!({ "vcodec": "NONE" })));
+        assert!(!parse_ytdlp_has_video(&serde_json::json!({ "vcodec": "" })));
+        assert!(!parse_ytdlp_has_video(&serde_json::json!({ "acodec": "opus" })));
+        assert!(parse_ytdlp_has_video(&serde_json::json!({ "vcodec": "avc1.42001E", "acodec": "mp4a.40.2" })));
+        assert!(parse_ytdlp_has_video(&serde_json::json!({ "vcodec": "vp9", "acodec": "opus" })));
     }
 }

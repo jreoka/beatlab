@@ -174,6 +174,10 @@
     queueRestoreFailed: false,
     compatAttemptedId: '',
     isSwitchingTrack: false,
+    switchGuardUntil: 0,
+    intentionalPause: false,
+    hiddenWhilePlayingAt: 0,
+    hiddenResumeAttempted: false,
     networkRetryTimer: null,
     networkRetryCount: 0,
     pendingNetworkResume: null,
@@ -592,10 +596,40 @@
     });
 
     document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        const cur = currentTrack();
+        if (cur && !audio.paused && !audio.ended) {
+          state.hiddenWhilePlayingAt = Date.now();
+          state.hiddenResumeAttempted = false;
+          // Re-assert active MediaSession state right before Android backgrounds the PWA.
+          setMediaPlaybackState('playing');
+          updateMediaPositionState(true);
+          if (state.queueSaveDirty) flushServerQueue(true);
+        } else {
+          state.hiddenWhilePlayingAt = 0;
+        }
+        return;
+      }
+
       if (document.visibilityState === 'visible') {
+        state.hiddenWhilePlayingAt = 0;
+        state.hiddenResumeAttempted = false;
         checkServerHealth();
         if (state.pendingNetworkResume && navigator.onLine !== false) {
           resumePendingNetworkPlayback();
+        }
+        const cur = currentTrack();
+        if (cur) {
+          if (!audio.paused && !audio.ended) {
+            updatePlayButton(true);
+            setMediaPlaybackState('playing');
+            updateMediaPositionState(true);
+            syncActiveLyricLine((audio.currentTime || 0) * 1000);
+          } else {
+            // Android SystemUI can drop Chrome's idle media notification while backgrounded;
+            // force the next play() to republish full metadata & handlers.
+            mediaSessionState.publishedWhilePlaying = '';
+          }
         }
       }
     });
@@ -1552,6 +1586,10 @@
 
   function resetPlayerAndSessionUI() {
     clearPlaybackRecovery();
+    state.intentionalPause = true;
+    state.hiddenWhilePlayingAt = 0;
+    state.hiddenResumeAttempted = false;
+    state.switchGuardUntil = 0;
     audio.pause();
     audio.removeAttribute('src');
     audio.load();
@@ -5723,7 +5761,9 @@
         return;
       }
       state.pendingSeekSec = safePos;
+      state.intentionalPause = false;
       state.isSwitchingTrack = true;
+      state.switchGuardUntil = Date.now() + 800;
       try {
         audio.src = buildStreamUrl(nowCur, state.compatAttemptedId === nowCur.id, 0, attempt);
         audio.play().catch((e) => {
@@ -5761,7 +5801,9 @@
     state.pendingNetworkResume = null;
     state.networkRetryCount = 0;
     state.pendingSeekSec = pending.pos > 0.5 ? pending.pos : 0;
+    state.intentionalPause = false;
     state.isSwitchingTrack = true;
+    state.switchGuardUntil = Date.now() + 800;
     try {
       audio.src = buildStreamUrl(cur, state.compatAttemptedId === cur.id, 0, Date.now() % 10000);
       audio.play().catch((e) => {
@@ -5815,7 +5857,10 @@
     clearPlaybackRecovery();
 
     applyCommittedMediaUI(track);
+    state.intentionalPause = false;
+    state.hiddenResumeAttempted = false;
     state.isSwitchingTrack = true;
+    state.switchGuardUntil = Date.now() + 800;
     try {
       audio.src = buildStreamUrl(track);
       audio.play().catch((e) => {
@@ -5953,7 +5998,11 @@
     }
     recordRecentHeard(track);
     const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
-    const isBurst = state.lastPlaySwitchAt > 0 && now - state.lastPlaySwitchAt < 280;
+    // Never defer audio commitment into a throttled setTimeout while backgrounded/locked.
+    const isBurst =
+      document.visibilityState === 'visible' &&
+      state.lastPlaySwitchAt > 0 &&
+      now - state.lastPlaySwitchAt < 280;
     state.lastPlaySwitchAt = now;
 
     cancelPendingPlaybackWork();
@@ -5968,7 +6017,7 @@
       !!state.autoplay &&
       !state.radioLoading &&
       !state.radioInFlight &&
-      state.queue.length - 1 <= index &&
+      state.queue.length - 1 - index <= 2 &&
       (state.queue.length === 1 || state.repeat !== 'all');
     if (needsAutoRadio) {
       state.radioLoading = true;
@@ -6931,19 +6980,46 @@
     const cur = currentTrack();
     if (!cur) return;
     clearPlaybackRecovery();
+    state.intentionalPause = false;
+    state.hiddenResumeAttempted = false;
     syncMediaSession(cur, true);
     ensureUpcomingRadio();
-    if (!audio.getAttribute('src')) {
-      audio.src = buildStreamUrl(cur);
+    const needsReload =
+      !audio.getAttribute('src') ||
+      !!audio.error ||
+      audio.networkState === HTMLMediaElement.NETWORK_NO_SOURCE;
+    const playToken = state.activeAudioToken;
+    const resumePos =
+      Number.isFinite(audio.currentTime) && audio.currentTime > 0.5
+        ? audio.currentTime
+        : state.pendingSeekSec > 0.5
+          ? state.pendingSeekSec
+          : 0;
+    if (needsReload) {
+      state.pendingSeekSec = resumePos;
+      state.isSwitchingTrack = true;
+      state.switchGuardUntil = Date.now() + 800;
+      try {
+        audio.src = buildStreamUrl(cur, state.compatAttemptedId === cur.id, 0, Date.now() % 10000);
+      } finally {
+        state.isSwitchingTrack = false;
+      }
     }
     if (audio.paused) {
-      audio.play().catch(() => {
+      audio.play().catch((e) => {
+        if (playToken !== state.activeAudioToken) return;
+        if (e && e.name === 'AbortError') return;
+        if (e && e.name !== 'NotAllowedError') {
+          if (scheduleNetworkRetry(playToken, cur, resumePos, false)) return;
+        }
         updatePlayButton(false);
       });
     }
   }
 
   function pauseCurrent() {
+    state.intentionalPause = true;
+    state.hiddenWhilePlayingAt = 0;
     clearPlaybackRecovery();
     if (!audio.paused) {
       audio.pause();
@@ -6965,6 +7041,7 @@
     if (!state.queue.length) return;
     haptic('medium');
     if (audio.currentTime > 4 || (state.queueIndex === 0 && state.repeat !== 'all')) {
+      state.intentionalPause = false;
       audio.currentTime = 0;
       if (audio.paused) audio.play().catch(() => {});
       return;
@@ -7058,6 +7135,7 @@
 
     audio.addEventListener('play', () => {
       clearStallWatch();
+      state.intentionalPause = false;
       updatePlayButton(true);
       syncMediaSession(currentTrack(), false);
       setMediaPlaybackState('playing');
@@ -7066,6 +7144,8 @@
     audio.addEventListener('playing', () => {
       clearStallWatch();
       setAudioLoading(false);
+      state.intentionalPause = false;
+      state.hiddenResumeAttempted = false;
       state.networkRetryCount = 0;
       state.pendingNetworkResume = null;
       updatePlayButton(true);
@@ -7080,7 +7160,34 @@
     });
     audio.addEventListener('pause', () => {
       clearStallWatch();
-      if (state.isSwitchingTrack || audio.ended || state.playCommitTimer) return;
+      if (state.isSwitchingTrack || !audio.paused || audio.ended || state.playCommitTimer) return;
+      if (Date.now() < state.switchGuardUntil && !state.intentionalPause) return;
+
+      // Single-shot recovery if Android Chrome WebAPK fires an unsolicited pause
+      // right during the visible -> hidden screen-lock transition. Never retries more
+      // than once per hide cycle so legitimate interruptions (calls/headphone unplug)
+      // are respected immediately.
+      if (
+        document.visibilityState === 'hidden' &&
+        !state.intentionalPause &&
+        !state.hiddenResumeAttempted &&
+        state.hiddenWhilePlayingAt > 0 &&
+        Date.now() - state.hiddenWhilePlayingAt < 1500 &&
+        currentTrack() &&
+        !audio.error
+      ) {
+        state.hiddenResumeAttempted = true;
+        setMediaPlaybackState('playing');
+        audio.play().catch(() => {
+          mediaSessionState.publishedWhilePlaying = '';
+          updatePlayButton(false);
+          setMediaPlaybackState('paused');
+          updateMediaPositionState(true);
+          if (state.queue.length) saveServerQueue();
+        });
+        return;
+      }
+
       mediaSessionState.publishedWhilePlaying = '';
       updatePlayButton(false);
       setMediaPlaybackState('paused');
@@ -7122,7 +7229,9 @@
         !audio.src.includes('compat=1')
       ) {
         state.compatAttemptedId = cur.id;
+        state.intentionalPause = false;
         state.isSwitchingTrack = true;
+        state.switchGuardUntil = Date.now() + 800;
         try {
           audio.src = buildStreamUrl(cur, true, pos);
           audio.play().catch(() => {
@@ -7149,6 +7258,7 @@
       if (state.playCommitTimer) return;
       const cur = currentTrack();
       if (state.repeat === 'one') {
+        state.intentionalPause = false;
         audio.currentTime = 0;
         audio.play().catch(() => {});
         return;
@@ -7165,10 +7275,15 @@
       if (!audio.paused && audio.readyState >= 3 && document.body.classList.contains('audio-loading')) {
         setAudioLoading(false);
       }
-      if (state.seeking) return;
       const cur = currentTrack();
       const total = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : cur ? cur.duration : 0;
       const pos = audio.currentTime || 0;
+      updateMediaPositionState(false);
+      if (cur && total > 20 && pos / total >= 0.75 && state.lastScrobbleCompleteId !== cur.id) {
+        state.lastScrobbleCompleteId = cur.id;
+        sendTrackEvent(cur.id, 'complete', 1);
+      }
+      if (state.seeking || document.visibilityState === 'hidden') return;
       const elapsedStr = fmtTime(pos);
       $('pb-elapsed').textContent = elapsedStr;
       if ($('fs-elapsed')) $('fs-elapsed').textContent = elapsedStr;
@@ -7181,11 +7296,6 @@
         if ($('fs-seek')) $('fs-seek').value = String(pct);
         if ($('pb-mini-progress-fill')) $('pb-mini-progress-fill').style.width = `${pct.toFixed(2)}%`;
         paintSeekFill();
-      }
-      updateMediaPositionState(false);
-      if (cur && total > 20 && pos / total >= 0.75 && state.lastScrobbleCompleteId !== cur.id) {
-        state.lastScrobbleCompleteId = cur.id;
-        sendTrackEvent(cur.id, 'complete', 1);
       }
       syncActiveLyricLine(pos * 1000);
     });
@@ -7359,6 +7469,7 @@
   }
 
   function syncActiveLyricLine(posMs) {
+    if (document.visibilityState === 'hidden') return;
     if (!state.lyrics.synced || !state.lyrics.lines.length) return;
     let active = -1;
     for (let i = 0; i < state.lyrics.lines.length; i++) {
@@ -7878,6 +7989,8 @@
           cancelPendingPlaybackWork();
           state.activeAudioToken++;
           state.queueIndex = -1;
+          state.intentionalPause = true;
+          state.hiddenWhilePlayingAt = 0;
           audio.pause();
           audio.removeAttribute('src');
           syncPlayingTrackRows('');
@@ -9759,6 +9872,7 @@
     seekMs: (ms) => {
       if (Number.isFinite(ms)) {
         haptic('tap');
+        state.intentionalPause = false;
         audio.currentTime = ms / 1000;
         if (audio.paused) audio.play().catch(() => {});
       }
