@@ -70,6 +70,9 @@ impl LocalSource {
                     continue;
                 }
                 if let Some(track) = read_local_track(path, &ext) {
+                    if let Some(m) = crate::loudness::read_tag_loudness(path) {
+                        let _ = self.store.upsert_track_loudness(&track.id, m, "tag");
+                    }
                     batch.push(track);
                     count += 1;
                     if batch.len() >= 100 {

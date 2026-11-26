@@ -808,6 +808,7 @@
         if (prev) {
           if (!t.year && prev.year > 0) t.year = prev.year;
           if (!t.genre && prev.genre) t.genre = prev.genre;
+          if (!t.loudness && prev.loudness) t.loudness = prev.loudness;
         }
         state.trackMap.set(t.id, t);
       }
@@ -855,12 +856,233 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Playback output
+  // Playback output & always-on EBU R128 loudness normalization
   // ---------------------------------------------------------------------------
-  function applyOutputVolume() {
+  // Single constant scalar gain per track (ITU-R BS.1770-4 -> -14 LUFS) capped
+  // by true-peak headroom (-0.5 dBTP). Never compresses or pumps dynamic range.
+  const NORM_TARGET_LUFS = -14.0;
+  const NORM_CEILING_LIN = Math.pow(10, -0.5 / 20);
+  const NORM_MIN_GAIN_DB = -18.0;
+  const NORM_MAX_GAIN_DB = 12.0;
+  const NORM_DEFAULT_UNMEASURED_GAIN = Math.pow(10, -3.0 / 20);
+
+  const audioNorm = {
+    ctx: null,
+    source: null,
+    gainNode: null,
+    ready: false,
+    failed: false,
+    connecting: false,
+    currentTrackId: '',
+    currentLoudness: null,
+    reqToken: 0,
+    retryTimer: null,
+    abortController: null,
+  };
+
+  function isValidLoudness(l) {
+    return (
+      !!l &&
+      typeof l === 'object' &&
+      Number.isFinite(Number(l.lufs)) &&
+      Number(l.lufs) > -70 &&
+      Number(l.lufs) <= 6
+    );
+  }
+
+  function normalizeLoudnessObj(l) {
+    if (!isValidLoudness(l)) return null;
+    const tp = Number(l.truePeakDb);
+    return {
+      lufs: Number(l.lufs),
+      truePeakDb: Number.isFinite(tp) && tp > -70 && tp <= 12 ? tp : 0,
+    };
+  }
+
+  function computeNormalizedOutputGain(userVol, muted, loudness) {
+    if (muted || userVol <= 0) return 0;
+    if (loudness && Number.isFinite(loudness.lufs)) {
+      const gainDb = Math.max(NORM_MIN_GAIN_DB, Math.min(NORM_MAX_GAIN_DB, NORM_TARGET_LUFS - loudness.lufs));
+      const trackGain = Math.pow(10, gainDb / 20);
+      const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
+      const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
+      const maxSafeTotal = NORM_CEILING_LIN / tpLin;
+      return Math.min(userVol * trackGain, maxSafeTotal);
+    }
+    return Math.min(userVol * NORM_DEFAULT_UNMEASURED_GAIN, NORM_CEILING_LIN);
+  }
+
+  function ensureAudioNormGraph() {
+    if (audioNorm.ready) {
+      if (audioNorm.ctx && audioNorm.ctx.state !== 'running') {
+        audioNorm.ctx.resume().catch(() => {});
+      }
+      return;
+    }
+    if (audioNorm.failed || audioNorm.connecting) return;
+    const AC = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+    if (!AC) {
+      audioNorm.failed = true;
+      return;
+    }
+    if (typeof navigator !== 'undefined' && navigator.audioSession) {
+      try {
+        navigator.audioSession.type = 'playback';
+      } catch {}
+    }
+    try {
+      if (!audioNorm.ctx) audioNorm.ctx = new AC();
+    } catch {
+      audioNorm.failed = true;
+      return;
+    }
+    const ctx = audioNorm.ctx;
+    const wireGraph = () => {
+      if (audioNorm.ready) return;
+      try {
+        const source = ctx.createMediaElementSource(audio);
+        const gainNode = ctx.createGain();
+        source.connect(gainNode);
+        gainNode.connect(ctx.destination);
+        audioNorm.source = source;
+        audioNorm.gainNode = gainNode;
+        audioNorm.ready = true;
+        audioNorm.connecting = false;
+        ctx.addEventListener('statechange', () => {
+          if (ctx.state !== 'running' && !audio.paused && !audio.ended) {
+            ctx.resume().catch(() => {});
+          }
+        });
+        applyOutputVolume(0);
+      } catch {
+        audioNorm.failed = true;
+        audioNorm.connecting = false;
+      }
+    };
+    if (ctx.state === 'running') {
+      wireGraph();
+      return;
+    }
+    audioNorm.connecting = true;
+    ctx
+      .resume()
+      .then(() => {
+        if (ctx.state === 'running' && !audioNorm.ready) {
+          wireGraph();
+        } else {
+          audioNorm.connecting = false;
+        }
+      })
+      .catch(() => {
+        audioNorm.connecting = false;
+      });
+  }
+
+  function applyOutputVolume(rampSec = 0) {
     const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
+    const target = computeNormalizedOutputGain(effectiveVol, state.muted, audioNorm.currentLoudness);
     audio.muted = state.muted;
-    audio.volume = effectiveVol;
+    if (audioNorm.ready && audioNorm.gainNode && audioNorm.ctx) {
+      audio.volume = 1;
+      const param = audioNorm.gainNode.gain;
+      const now = audioNorm.ctx.currentTime;
+      try {
+        param.cancelScheduledValues(now);
+        if (rampSec > 0.05) {
+          param.setValueAtTime(param.value, now);
+          param.linearRampToValueAtTime(target, now + rampSec);
+        } else if (rampSec > 0) {
+          param.setTargetAtTime(target, now, 0.012);
+        } else {
+          param.setValueAtTime(target, now);
+        }
+      } catch {
+        param.value = target;
+      }
+    } else {
+      audio.volume = Math.max(0, Math.min(1, target));
+    }
+  }
+
+  function cancelLoudnessSync() {
+    if (audioNorm.retryTimer) {
+      clearTimeout(audioNorm.retryTimer);
+      audioNorm.retryTimer = null;
+    }
+    if (audioNorm.abortController) {
+      try {
+        audioNorm.abortController.abort();
+      } catch {}
+      audioNorm.abortController = null;
+    }
+    audioNorm.reqToken++;
+  }
+
+  function storeTrackLoudness(trackId, loudness) {
+    const norm = normalizeLoudnessObj(loudness);
+    if (!trackId || !norm) return null;
+    const mapped = state.trackMap.get(trackId);
+    if (mapped) mapped.loudness = norm;
+    for (const q of state.queue) {
+      if (q && q.id === trackId) q.loudness = norm;
+    }
+    return norm;
+  }
+
+  function syncLoudnessForTrack(track) {
+    cancelLoudnessSync();
+    if (!track || !track.id) {
+      audioNorm.currentTrackId = '';
+      audioNorm.currentLoudness = null;
+      applyOutputVolume(0);
+      return;
+    }
+    const trackId = track.id;
+    audioNorm.currentTrackId = trackId;
+    const known = normalizeLoudnessObj(track.loudness || state.trackMap.get(trackId)?.loudness);
+    if (known) {
+      audioNorm.currentLoudness = known;
+      applyOutputVolume(0);
+      return;
+    }
+    audioNorm.currentLoudness = null;
+    applyOutputVolume(0);
+
+    const reqToken = audioNorm.reqToken;
+    const retryDelays = [2500, 4000, 6000];
+    let attempt = 0;
+
+    const pollOnce = () => {
+      if (reqToken !== audioNorm.reqToken || audioNorm.currentTrackId !== trackId) return;
+      if (!state.token) return;
+      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      audioNorm.abortController = ctrl;
+      api(`/api/web/loudness/${encodeURIComponent(trackId)}`, {
+        signal: ctrl ? ctrl.signal : undefined,
+      })
+        .then((res) => {
+          if (reqToken !== audioNorm.reqToken || audioNorm.currentTrackId !== trackId) return;
+          if (res && isValidLoudness(res)) {
+            const norm = storeTrackLoudness(trackId, res);
+            if (norm) {
+              audioNorm.currentLoudness = norm;
+              const smooth = !audio.paused && audio.currentTime > 0.25 ? 1.2 : 0;
+              applyOutputVolume(smooth);
+            }
+            if (res.ready) return;
+          }
+          if (res && res.pending && attempt < retryDelays.length) {
+            const delay = retryDelays[attempt++];
+            audioNorm.retryTimer = setTimeout(() => {
+              audioNorm.retryTimer = null;
+              pollOnce();
+            }, delay);
+          }
+        })
+        .catch(() => {});
+    };
+
+    pollOnce();
   }
 
   function setMediaPlaybackState(value) {
@@ -2518,6 +2740,7 @@
         syncPlayingTrackRows(cur ? cur.id : '');
         renderQueuePanel();
         if (cur) {
+          syncLoudnessForTrack(cur);
           audio.src = buildStreamUrl(cur);
           syncMediaSession(cur, true);
           if (savedSec > 0) {
@@ -5893,6 +6116,7 @@
       state.lyricsAbortController = null;
     }
     state.lyricsReqToken++;
+    cancelLoudnessSync();
   }
 
   function beginQueueFetch() {
@@ -5917,6 +6141,8 @@
     clearPlaybackRecovery();
 
     applyCommittedMediaUI(track);
+    ensureAudioNormGraph();
+    syncLoudnessForTrack(track);
     state.intentionalPause = false;
     state.hiddenResumeAttempted = false;
     state.isSwitchingTrack = true;
@@ -5970,11 +6196,19 @@
     state.queueWarmTimer = setTimeout(() => {
       state.queueWarmTimer = null;
       if (loadToken !== state.activeAudioToken) return;
-      api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' }).catch(() => {});
+      api(`/api/web/warm/${encodeURIComponent(next.id)}`, { method: 'POST' })
+        .then((res) => {
+          if (res && res.loudness) storeTrackLoudness(next.id, res.loudness);
+        })
+        .catch(() => {});
       if (next2) {
         setTimeout(() => {
           if (loadToken !== state.activeAudioToken) return;
-          api(`/api/web/warm/${encodeURIComponent(next2.id)}`, { method: 'POST' }).catch(() => {});
+          api(`/api/web/warm/${encodeURIComponent(next2.id)}`, { method: 'POST' })
+            .then((res) => {
+              if (res && res.loudness) storeTrackLoudness(next2.id, res.loudness);
+            })
+            .catch(() => {});
         }, 1050);
       }
     }, 150);
@@ -7300,6 +7534,7 @@
 
     audio.addEventListener('play', () => {
       clearStallWatch();
+      ensureAudioNormGraph();
       state.intentionalPause = false;
       updatePlayButton(true);
       syncMediaSession(currentTrack(), false);
@@ -7506,7 +7741,7 @@
       state.volume = clamped;
       state.muted = clamped === 0;
       $('pb-volume').value = String(clamped);
-      applyOutputVolume();
+      applyOutputVolume(0.015);
       localStorage.setItem('beatlab_vol', String(clamped));
       updateVolumeIcon();
     };

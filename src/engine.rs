@@ -1,3 +1,4 @@
+use crate::loudness::{measure_file_loudness, TrackLoudness};
 use crate::models::{err_msg, primary_artist, upgrade_cover_url, AppResult, LyricLine, LyricsData, Track};
 use crate::sources::local::extract_embedded_cover;
 use crate::sources::soulseek::{GrowingFile, SlskFile};
@@ -104,12 +105,14 @@ pub struct StreamEngine {
     in_flight_resolutions: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     in_flight_downloads: Arc<StdMutex<HashSet<String>>>,
     in_flight_warms: Arc<StdMutex<HashSet<String>>>,
+    in_flight_loudness: Arc<StdMutex<HashSet<String>>>,
     in_flight_embeds: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     warm_sem: Arc<Semaphore>,
     light_warm_sem: Arc<Semaphore>,
     cache_sem: Arc<Semaphore>,
     stream_proc_sem: Arc<Semaphore>,
     embed_sem: Arc<Semaphore>,
+    loudness_sem: Arc<Semaphore>,
 }
 
 impl StreamEngine {
@@ -187,12 +190,14 @@ impl StreamEngine {
             in_flight_resolutions: Arc::new(StdMutex::new(HashMap::new())),
             in_flight_downloads: Arc::new(StdMutex::new(HashSet::new())),
             in_flight_warms: Arc::new(StdMutex::new(HashSet::new())),
+            in_flight_loudness: Arc::new(StdMutex::new(HashSet::new())),
             in_flight_embeds: Arc::new(StdMutex::new(HashMap::new())),
             warm_sem: Arc::new(Semaphore::new(2)),
             light_warm_sem: Arc::new(Semaphore::new(1)),
             cache_sem: Arc::new(Semaphore::new(3)),
             stream_proc_sem: Arc::new(Semaphore::new(8)),
             embed_sem: Arc::new(Semaphore::new(2)),
+            loudness_sem: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -292,6 +297,7 @@ impl StreamEngine {
                     .unwrap_or(&track.format)
                     .to_string();
                 self.note_audio_access(&track.id, &p, &ext);
+                self.spawn_analyze_loudness(&track.id, p.clone());
                 return Ok(PlayTarget::LocalFile {
                     content_type: mime_for_audio_ext(&ext).to_string(),
                     path: p,
@@ -335,6 +341,7 @@ impl StreamEngine {
         if let Some(local_path) = track.stream_url.strip_prefix("file:") {
             let p = PathBuf::from(local_path);
             if p.exists() {
+                self.spawn_analyze_loudness(&track.id, p.clone());
                 return Ok(PlayTarget::LocalFile {
                     content_type: mime_for_audio_ext(&track.format).to_string(),
                     path: p,
@@ -370,6 +377,7 @@ impl StreamEngine {
                             );
                             let _ = this.store.prune_cache(this.max_cache_bytes);
                             this.note_audio_access(&tid, &p, &ext2);
+                            this.spawn_analyze_loudness(&tid, p);
                         }
                     });
                 }
@@ -397,6 +405,7 @@ impl StreamEngine {
                             .unwrap_or(&track.format)
                             .to_string();
                         self.note_audio_access(&track.id, &local_path, &ext);
+                        self.spawn_analyze_loudness(&track.id, local_path.clone());
                         return Ok(PlayTarget::LocalFile {
                             content_type: mime_for_audio_ext(&ext).to_string(),
                             path: local_path,
@@ -463,6 +472,25 @@ impl StreamEngine {
     }
 
     fn find_local_or_cached_sibling(&self, track: &Track) -> Option<PlayTarget> {
+        let (sib_id, path, format) = self.find_local_or_cached_sibling_path(track)?;
+        if let Ok(Some(m)) = self.store.get_track_loudness(&sib_id) {
+            if m.exact {
+                let src = if self.store.has_ebur128_loudness(&sib_id) {
+                    "ebur128"
+                } else {
+                    "tag"
+                };
+                let _ = self.store.upsert_track_loudness(&track.id, m, src);
+            }
+        }
+        self.spawn_analyze_loudness(&track.id, path.clone());
+        Some(PlayTarget::LocalFile {
+            content_type: mime_for_audio_ext(&format).to_string(),
+            path,
+        })
+    }
+
+    fn find_local_or_cached_sibling_path(&self, track: &Track) -> Option<(String, PathBuf, String)> {
         let key = track.song_key();
         let (clean_art, clean_title_str) = clean_track_query_for_fallback(track);
         let cleaned_key = format!(
@@ -491,23 +519,213 @@ impl StreamEngine {
             if let Some(path_str) = c.stream_url.strip_prefix("file:") {
                 let p = PathBuf::from(path_str);
                 if p.exists() {
-                    return Some(PlayTarget::LocalFile {
-                        content_type: mime_for_audio_ext(&c.format).to_string(),
-                        path: p,
-                    });
+                    return Some((c.id, p, c.format));
                 }
             }
             if let Ok(Some(entry)) = self.store.get_cache_entry(&c.id) {
                 let p = PathBuf::from(&entry.path);
                 if p.exists() && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 4096 {
-                    return Some(PlayTarget::LocalFile {
-                        content_type: mime_for_audio_ext(&c.format).to_string(),
-                        path: p,
-                    });
+                    return Some((c.id, p, c.format));
                 }
             }
         }
         None
+    }
+
+    /// Background EBU R128 loudness analysis for any local or cached audio file.
+    pub fn spawn_analyze_loudness(&self, track_id: &str, path: PathBuf) {
+        if track_id.trim().is_empty() || !path.exists() {
+            return;
+        }
+        if self.store.has_ebur128_loudness(track_id) {
+            return;
+        }
+        if !self.ffmpeg_available
+            && self
+                .store
+                .get_track_loudness(track_id)
+                .ok()
+                .flatten()
+                .is_some_and(|m| m.exact)
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        {
+            let mut set = self
+                .in_flight_loudness
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !set.insert(track_id.to_string()) {
+                return;
+            }
+        }
+        let this = self.clone();
+        let tid = track_id.to_string();
+        handle.spawn(async move {
+            let _guard = InFlightSetGuard {
+                set: Arc::clone(&this.in_flight_loudness),
+                key: tid.clone(),
+            };
+            let Ok(Ok(_permit)) = tokio::time::timeout(
+                Duration::from_secs(120),
+                this.loudness_sem.clone().acquire_owned(),
+            )
+            .await
+            else {
+                return;
+            };
+            if this.store.has_ebur128_loudness(&tid) {
+                return;
+            }
+            if let Some((m, src)) = measure_file_loudness(&path, this.ffmpeg_available).await {
+                let _ = this.store.upsert_track_loudness(&tid, m, src);
+                debug!(
+                    track_id = %tid,
+                    lufs = m.lufs,
+                    true_peak_db = m.true_peak_db,
+                    source = src,
+                    "measured track loudness"
+                );
+            }
+        });
+    }
+
+    /// Resolves a track's loudness on demand. Returns `(loudness, pending)`:
+    /// - Already measured in DB -> returns immediately.
+    /// - Present on local disk (local library, hot cache, or local/cached sibling) ->
+    ///   measures directly (fast, ~0.3-0.8s) and persists for all future plays.
+    /// - Remote track still downloading to hot cache -> returns `(None, true)` so the
+    ///   client can re-check once caching completes.
+    pub async fn ensure_track_loudness(&self, track: &Track) -> (Option<TrackLoudness>, bool) {
+        if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
+            if m.exact {
+                if self.ffmpeg_available && !self.store.has_ebur128_loudness(&track.id) {
+                    if let Some(p) = self.existing_local_audio_path(track) {
+                        self.spawn_analyze_loudness(&track.id, p);
+                    }
+                }
+                return (Some(m), false);
+            }
+        }
+
+        // Check if this exact track or a matching sibling already lives on local disk.
+        let disk_path = if let Some(p) = self.existing_local_audio_path(track) {
+            Some((track.id.clone(), p))
+        } else if let Some((sib_id, p, _)) = self.find_local_or_cached_sibling_path(track) {
+            if let Ok(Some(m)) = self.store.get_track_loudness(&sib_id) {
+                if m.exact {
+                    let src = if self.store.has_ebur128_loudness(&sib_id) {
+                        "ebur128"
+                    } else {
+                        "tag"
+                    };
+                    let _ = self.store.upsert_track_loudness(&track.id, m, src);
+                    return (Some(m), false);
+                }
+            }
+            Some((sib_id, p))
+        } else {
+            None
+        };
+
+        if let Some((owner_id, path)) = disk_path {
+            if let Ok(Ok(_permit)) = tokio::time::timeout(
+                Duration::from_secs(12),
+                self.loudness_sem.clone().acquire_owned(),
+            )
+            .await
+            {
+                if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
+                    if m.exact {
+                        return (Some(m), false);
+                    }
+                }
+                if let Some((m, src)) = measure_file_loudness(&path, self.ffmpeg_available).await {
+                    let _ = self.store.upsert_track_loudness(&track.id, m, src);
+                    if owner_id != track.id {
+                        let _ = self.store.upsert_track_loudness(&owner_id, m, src);
+                    }
+                    return (Some(m), false);
+                }
+            }
+            return (self.store.get_track_loudness(&track.id).ok().flatten(), false);
+        }
+
+        let in_flight = self
+            .in_flight_downloads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&track.id)
+            || self
+                .in_flight_loudness
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&track.id)
+            || self
+                .in_flight_warms
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&track.id);
+        let cacheable_remote = track.source != "radio"
+            && !track.stream_url.contains("/preview/")
+            && (track.stream_url.starts_with("resolve:")
+                || track.stream_url.starts_with("ytm:")
+                || track.stream_url.starts_with("slsk://")
+                || track.stream_url.starts_with("http://")
+                || track.stream_url.starts_with("https://"));
+        let stored = self.store.get_track_loudness(&track.id).ok().flatten();
+        (stored, in_flight || (self.ffmpeg_available && cacheable_remote))
+    }
+
+    fn existing_local_audio_path(&self, track: &Track) -> Option<PathBuf> {
+        if let Ok(Some(entry)) = self.store.get_cache_entry(&track.id) {
+            let p = PathBuf::from(&entry.path);
+            if p.exists() && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) > 4096 {
+                return Some(p);
+            }
+        }
+        if let Some(local_path) = track.stream_url.strip_prefix("file:") {
+            let p = PathBuf::from(local_path);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Gently analyzes already-cached and local tracks that don't yet have an
+    /// EBU R128 loudness row, one file at a time so playback stays unaffected.
+    pub async fn backfill_missing_loudness(&self, limit: usize) -> usize {
+        if !self.ffmpeg_available {
+            return 0;
+        }
+        let items = match self.store.tracks_missing_loudness(limit) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let mut analyzed = 0usize;
+        for (tid, path_str) in items {
+            let p = PathBuf::from(&path_str);
+            if !p.exists() {
+                continue;
+            }
+            if self.store.has_ebur128_loudness(&tid) {
+                continue;
+            }
+            let Ok(_permit) = self.loudness_sem.clone().acquire_owned().await else {
+                break;
+            };
+            if let Some((m, src)) = measure_file_loudness(&p, self.ffmpeg_available).await {
+                if self.store.upsert_track_loudness(&tid, m, src).is_ok() {
+                    analyzed += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        analyzed
     }
 
     async fn resolve_ytm_singleflight(
@@ -693,8 +911,16 @@ impl StreamEngine {
     /// Deduplicates and bounds background warm hints so rapid track skipping cannot pile up tasks.
     pub fn spawn_warm_track(&self, track: Track) {
         if let Ok(Some(entry)) = self.store.get_cache_entry(&track.id) {
-            let p = Path::new(&entry.path);
+            let p = PathBuf::from(&entry.path);
             if p.exists() {
+                self.spawn_analyze_loudness(&track.id, p);
+                return;
+            }
+        }
+        if let Some(local_path) = track.stream_url.strip_prefix("file:") {
+            let p = PathBuf::from(local_path);
+            if p.exists() {
+                self.spawn_analyze_loudness(&track.id, p);
                 return;
             }
         }
@@ -1278,6 +1504,7 @@ impl StreamEngine {
                     &final_path.to_string_lossy(),
                     meta.len() as i64,
                 );
+                self.spawn_analyze_loudness(track_id, final_path);
                 return Ok(());
             }
             let _ = tokio::fs::remove_file(&final_path).await;
@@ -1377,6 +1604,7 @@ impl StreamEngine {
         self.store
             .upsert_cache_entry(track_id, &final_path.to_string_lossy(), final_bytes)?;
         let _ = self.store.prune_cache(self.max_cache_bytes);
+        self.spawn_analyze_loudness(track_id, final_path.clone());
 
         // Mirror the hot copy into the optional cool tier. A failure here is
         // non-fatal: the local cache is already usable.

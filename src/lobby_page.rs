@@ -1294,11 +1294,116 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (offsetSec > 0.5) u += `&t=${offsetSec.toFixed(2)}`;
       return u;
     }
-    function applyVolume() {
-      audio.volume = S.volume;
-      audio.muted = S.muted || S.volume === 0;
+    const NORM_TARGET_LUFS = -14.0;
+    const NORM_CEILING_LIN = Math.pow(10, -0.5 / 20);
+    const NORM_DEFAULT_GAIN = Math.pow(10, -3.0 / 20);
+    const NORM = {
+      ctx: null, source: null, gainNode: null, ready: false, failed: false, connecting: false,
+      trackId: '', loudness: null, reqToken: 0, retryTimer: null, cache: new Map(),
+    };
+    function computeNormGain(vol, muted, loudness) {
+      if (muted || vol <= 0) return 0;
+      if (loudness && Number.isFinite(loudness.lufs)) {
+        const gainDb = Math.max(-18, Math.min(12, NORM_TARGET_LUFS - loudness.lufs));
+        const trackGain = Math.pow(10, gainDb / 20);
+        const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
+        const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
+        return Math.min(vol * trackGain, NORM_CEILING_LIN / tpLin);
+      }
+      return Math.min(vol * NORM_DEFAULT_GAIN, NORM_CEILING_LIN);
+    }
+    function ensureNormGraph() {
+      if (NORM.ready) {
+        if (NORM.ctx && NORM.ctx.state !== 'running') NORM.ctx.resume().catch(() => {});
+        return;
+      }
+      if (NORM.failed || NORM.connecting) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) { NORM.failed = true; return; }
+      if (navigator.audioSession) { try { navigator.audioSession.type = 'playback'; } catch {} }
+      try { if (!NORM.ctx) NORM.ctx = new AC(); } catch { NORM.failed = true; return; }
+      const ctx = NORM.ctx;
+      const wire = () => {
+        if (NORM.ready) return;
+        try {
+          NORM.source = ctx.createMediaElementSource(audio);
+          NORM.gainNode = ctx.createGain();
+          NORM.source.connect(NORM.gainNode);
+          NORM.gainNode.connect(ctx.destination);
+          NORM.ready = true;
+          NORM.connecting = false;
+          ctx.addEventListener('statechange', () => {
+            if (ctx.state !== 'running' && !audio.paused && !audio.ended) ctx.resume().catch(() => {});
+          });
+          applyVolume(0);
+        } catch {
+          NORM.failed = true;
+          NORM.connecting = false;
+        }
+      };
+      if (ctx.state === 'running') { wire(); return; }
+      NORM.connecting = true;
+      ctx.resume().then(() => {
+        if (ctx.state === 'running' && !NORM.ready) wire();
+        else NORM.connecting = false;
+      }).catch(() => { NORM.connecting = false; });
+    }
+    function applyVolume(rampSec = 0) {
+      const muted = S.muted || S.volume === 0;
+      const target = computeNormGain(S.volume, muted, NORM.loudness);
+      audio.muted = muted;
+      if (NORM.ready && NORM.gainNode && NORM.ctx) {
+        audio.volume = 1;
+        const p = NORM.gainNode.gain;
+        const now = NORM.ctx.currentTime;
+        try {
+          p.cancelScheduledValues(now);
+          if (rampSec > 0.05) {
+            p.setValueAtTime(p.value, now);
+            p.linearRampToValueAtTime(target, now + rampSec);
+          } else if (rampSec > 0) {
+            p.setTargetAtTime(target, now, 0.012);
+          } else {
+            p.setValueAtTime(target, now);
+          }
+        } catch { p.value = target; }
+      } else {
+        audio.volume = Math.max(0, Math.min(1, target));
+      }
       $('vol-icon').innerHTML = audio.muted ? ICON.volOff : ICON.volOn;
       $('vol').value = String(S.volume);
+    }
+    function syncLobbyLoudness(t) {
+      if (NORM.retryTimer) { clearTimeout(NORM.retryTimer); NORM.retryTimer = null; }
+      const tok = ++NORM.reqToken;
+      if (!t || !t.id) { NORM.trackId = ''; NORM.loudness = null; applyVolume(0); return; }
+      NORM.trackId = t.id;
+      const cached = NORM.cache.get(t.id);
+      if (cached) { NORM.loudness = cached; applyVolume(0); return; }
+      NORM.loudness = null;
+      applyVolume(0);
+      const delays = [2500, 4000, 6000];
+      let attempt = 0;
+      const poll = () => {
+        if (tok !== NORM.reqToken || NORM.trackId !== t.id) return;
+        fetch(`/api/lobby/${encodeURIComponent(CODE)}/loudness/${encodeURIComponent(t.id)}?lid=${encodeURIComponent(lid)}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (!d || tok !== NORM.reqToken || NORM.trackId !== t.id) return;
+            if (Number.isFinite(Number(d.lufs))) {
+              const norm = { lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 };
+              NORM.cache.set(t.id, norm);
+              NORM.loudness = norm;
+              applyVolume(!audio.paused && audio.currentTime > 0.25 ? 1.2 : 0);
+              if (d.ready) return;
+            }
+            if (d.pending && attempt < delays.length) {
+              NORM.retryTimer = setTimeout(() => { NORM.retryTimer = null; poll(); }, delays[attempt++]);
+            }
+          })
+          .catch(() => {});
+      };
+      poll();
     }
     function unlockAudio() {
       // iOS/Safari only let audio start inside a tap; play a blip of silence now
@@ -1340,6 +1445,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     }
     function playAudio() {
       if (!shouldPlay()) return;
+      ensureNormGraph();
       let p;
       try { p = audio.play(); } catch { return; }
       if (p && p.catch) {
@@ -1356,6 +1462,8 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       S.compatTried = '';
       S.settleUntil = Date.now() + 2500;
       audio.playbackRate = 1;
+      ensureNormGraph();
+      syncLobbyLoudness(t);
       const compat = !canPlay(t.format);
       const exp = expectedSec();
       if (compat && exp > 2) {
@@ -2142,7 +2250,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       S.volume = Math.max(0, Math.min(1, parseFloat(e.target.value) || 0));
       S.muted = S.volume === 0;
       store.set('beatlab_vol', String(S.volume));
-      applyVolume();
+      applyVolume(0.015);
     });
     window.addEventListener('pagehide', () => {
       if (!S.joined || !navigator.sendBeacon) return;

@@ -323,6 +323,8 @@ pub struct WebTrack {
     pub is_starred: bool,
     pub play_count: i32,
     pub rating: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loudness: Option<crate::loudness::TrackLoudness>,
 }
 
 /// Track ids that are part of the listener's own rotation — used to badge
@@ -381,6 +383,7 @@ fn to_web_track_with_maps(
     starred: &HashSet<String>,
     stats: &HashMap<String, UserTrackStats>,
     ratings: &HashMap<String, i32>,
+    loudness: &HashMap<String, crate::loudness::TrackLoudness>,
     is_taste_match: bool,
 ) -> WebTrack {
     WebTrack {
@@ -407,6 +410,7 @@ fn to_web_track_with_maps(
         is_starred: starred.contains(&t.id),
         play_count: stats.get(&t.id).map(|s| s.play_count).unwrap_or(0),
         rating: ratings.get(&t.id).copied().unwrap_or(0),
+        loudness: loudness.get(&t.id).copied(),
     }
 }
 
@@ -415,10 +419,11 @@ fn to_web_tracks_from_maps(
     starred: &HashSet<String>,
     stats: &HashMap<String, UserTrackStats>,
     ratings: &HashMap<String, i32>,
+    loudness: &HashMap<String, crate::loudness::TrackLoudness>,
 ) -> Vec<WebTrack> {
     tracks
         .iter()
-        .map(|t| to_web_track_with_maps(t, starred, stats, ratings, false))
+        .map(|t| to_web_track_with_maps(t, starred, stats, ratings, loudness, false))
         .collect()
 }
 
@@ -447,6 +452,8 @@ fn to_web_tracks_with_taste(
     } else {
         Default::default()
     };
+    let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+    let loudness = state.store.loudness_map_for_ids(&ids).unwrap_or_default();
 
     tracks
         .iter()
@@ -456,6 +463,7 @@ fn to_web_tracks_with_taste(
                 &starred,
                 &stats,
                 &ratings,
+                &loudness,
                 taste_match_ids.contains(&t.id),
             )
         })
@@ -3161,15 +3169,26 @@ pub async fn home(
         let moods = build_moods_json(&st_block, uid, llm_exp.as_ref(), Some(5));
         let home_categories = build_llm_categories_json(&st_block, uid, llm_exp.as_ref(), 1);
 
+        let mut home_track_ids: Vec<String> = Vec::new();
+        for list in [&recs.quick_picks, &recent, &related_tracks, &trending_tracks] {
+            for t in list {
+                home_track_ids.push(t.id.clone());
+            }
+        }
+        let home_loudness = st_block
+            .store
+            .loudness_map_for_ids(&home_track_ids)
+            .unwrap_or_default();
+
         let payload = json!({
-            "quickPicks": to_web_tracks_from_maps(&recs.quick_picks, &recs.starred, &recs.stats, &recs.ratings),
-            "recent": to_web_tracks_from_maps(&recent, &recs.starred, &recs.stats, &recs.ratings),
+            "quickPicks": to_web_tracks_from_maps(&recs.quick_picks, &recs.starred, &recs.stats, &recs.ratings, &home_loudness),
+            "recent": to_web_tracks_from_maps(&recent, &recs.starred, &recs.stats, &recs.ratings, &home_loudness),
             "mixedForYou": json!(mixed_for_you),
             "madeForYou": auto_mixes,
             "homeCategories": home_categories,
-            "relatedTracks": to_web_tracks_from_maps(&related_tracks, &recs.starred, &recs.stats, &recs.ratings),
+            "relatedTracks": to_web_tracks_from_maps(&related_tracks, &recs.starred, &recs.stats, &recs.ratings, &home_loudness),
             "recommendedArtists": recs.recommended_artists.iter().map(|a| artist_json(a, recs.followed_artists.contains(&a.id))).collect::<Vec<_>>(),
-            "trending": to_web_tracks_from_maps(&trending_tracks, &recs.starred, &recs.stats, &recs.ratings),
+            "trending": to_web_tracks_from_maps(&trending_tracks, &recs.starred, &recs.stats, &recs.ratings, &home_loudness),
             "albums": albums.iter().map(|a| album_json(a, recs.saved_albums.contains(&a.id))).collect::<Vec<_>>(),
             "artists": artists.iter().map(|a| artist_json(a, recs.followed_artists.contains(&a.id))).collect::<Vec<_>>(),
             "moods": moods,
@@ -5198,7 +5217,8 @@ fn stats_payload(
         computed.recent_events.clear();
         computed.library.hidden_tracks = 0;
     }
-    let wrap_track = |t: &Track| to_web_track_with_maps(t, starred, track_stats, ratings, false);
+    let empty_loudness = HashMap::new();
+    let wrap_track = |t: &Track| to_web_track_with_maps(t, starred, track_stats, ratings, &empty_loudness, false);
 
     let top_tracks: Vec<Value> = computed
         .top_tracks
@@ -6012,7 +6032,34 @@ pub async fn warm_track(
             state.engine.spawn_warm_track(t);
         }
     }
-    json_res(json!({ "ok": true }))
+    let loudness = state.store.get_track_loudness(&id).ok().flatten();
+    json_res(json!({ "ok": true, "loudness": loudness }))
+}
+
+pub async fn track_loudness(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = require_web_user(&state, &headers) {
+        return r;
+    }
+    let Some(track) = state.store.get_track(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Track not found");
+    };
+    let (loudness, pending) = state.engine.ensure_track_loudness(&track).await;
+    match loudness {
+        Some(m) => json_res(json!({
+            "ready": m.exact,
+            "pending": !m.exact && pending,
+            "lufs": m.lufs,
+            "truePeakDb": m.true_peak_db,
+        })),
+        None => json_res(json!({
+            "ready": false,
+            "pending": pending,
+        })),
+    }
 }
 
 pub async fn stream_track(
@@ -6573,6 +6620,35 @@ pub async fn public_share_lyrics(
     };
     let lyrics = state.engine.fetch_lyrics(&track).await;
     json_res(serde_json::to_value(lyrics).unwrap_or_else(|_| json!({ "synced": false, "plain": "", "lines": [] })))
+}
+
+pub async fn public_share_loudness(
+    State(state): State<AppState>,
+    Path((id, track_id)): Path<(String, String)>,
+) -> Response {
+    let Some(share) = state.store.get_share(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Share not found");
+    };
+    let decoded = urlencoding::decode(&track_id)
+        .map(|s| s.into_owned())
+        .unwrap_or(track_id);
+    let tracks = resolve_share_tracks_live(&state, &share);
+    let Some(track) = tracks.into_iter().find(|t| t.id == decoded) else {
+        return err_res(StatusCode::NOT_FOUND, "Track not part of this share");
+    };
+    let (loudness, pending) = state.engine.ensure_track_loudness(&track).await;
+    match loudness {
+        Some(m) => json_res(json!({
+            "ready": m.exact,
+            "pending": !m.exact && pending,
+            "lufs": m.lufs,
+            "truePeakDb": m.true_peak_db,
+        })),
+        None => json_res(json!({
+            "ready": false,
+            "pending": pending,
+        })),
+    }
 }
 
 fn album_json(a: &AlbumSummary, is_saved: bool) -> Value {

@@ -1150,11 +1150,120 @@ pub fn render_share_html(
     }};
 
     let masterVolume = 0.9;
+    const NORM_TARGET_LUFS = -14.0;
+    const NORM_CEILING_LIN = Math.pow(10, -0.5 / 20);
+    const NORM_DEFAULT_GAIN = Math.pow(10, -3.0 / 20);
+    const normState = {{
+      ctx: null, source: null, gainNode: null, ready: false, failed: false, connecting: false,
+      trackId: '', loudness: null, reqToken: 0, retryTimer: null,
+    }};
 
-    function applyOutputVolume() {{
+    function computeNormGain(vol, loudness) {{
+      if (vol <= 0) return 0;
+      if (loudness && Number.isFinite(loudness.lufs)) {{
+        const gainDb = Math.max(-18, Math.min(12, NORM_TARGET_LUFS - loudness.lufs));
+        const trackGain = Math.pow(10, gainDb / 20);
+        const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
+        const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
+        return Math.min(vol * trackGain, NORM_CEILING_LIN / tpLin);
+      }}
+      return Math.min(vol * NORM_DEFAULT_GAIN, NORM_CEILING_LIN);
+    }}
+
+    function ensureNormGraph() {{
+      if (normState.ready) {{
+        if (normState.ctx && normState.ctx.state !== 'running') normState.ctx.resume().catch(() => {{}});
+        return;
+      }}
+      if (normState.failed || normState.connecting) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) {{ normState.failed = true; return; }}
+      if (navigator.audioSession) {{ try {{ navigator.audioSession.type = 'playback'; }} catch {{}} }}
+      try {{ if (!normState.ctx) normState.ctx = new AC(); }} catch {{ normState.failed = true; return; }}
+      const ctx = normState.ctx;
+      const wire = () => {{
+        if (normState.ready) return;
+        try {{
+          normState.source = ctx.createMediaElementSource(audio);
+          normState.gainNode = ctx.createGain();
+          normState.source.connect(normState.gainNode);
+          normState.gainNode.connect(ctx.destination);
+          normState.ready = true;
+          normState.connecting = false;
+          ctx.addEventListener('statechange', () => {{
+            if (ctx.state !== 'running' && !audio.paused && !audio.ended) ctx.resume().catch(() => {{}});
+          }});
+          applyOutputVolume(0);
+        }} catch {{
+          normState.failed = true;
+          normState.connecting = false;
+        }}
+      }};
+      if (ctx.state === 'running') {{ wire(); return; }}
+      normState.connecting = true;
+      ctx.resume().then(() => {{
+        if (ctx.state === 'running' && !normState.ready) wire();
+        else normState.connecting = false;
+      }}).catch(() => {{ normState.connecting = false; }});
+    }}
+
+    function applyOutputVolume(rampSec = 0) {{
       const v = Math.max(0, Math.min(1, Number(masterVolume) || 0));
-      audio.volume = v;
+      const target = computeNormGain(v, normState.loudness);
       audio.muted = v === 0;
+      if (normState.ready && normState.gainNode && normState.ctx) {{
+        audio.volume = 1;
+        const p = normState.gainNode.gain;
+        const now = normState.ctx.currentTime;
+        try {{
+          p.cancelScheduledValues(now);
+          if (rampSec > 0.05) {{
+            p.setValueAtTime(p.value, now);
+            p.linearRampToValueAtTime(target, now + rampSec);
+          }} else if (rampSec > 0) {{
+            p.setTargetAtTime(target, now, 0.012);
+          }} else {{
+            p.setValueAtTime(target, now);
+          }}
+        }} catch {{ p.value = target; }}
+      }} else {{
+        audio.volume = Math.max(0, Math.min(1, target));
+      }}
+    }}
+
+    function syncShareLoudness(t) {{
+      if (normState.retryTimer) {{ clearTimeout(normState.retryTimer); normState.retryTimer = null; }}
+      const tok = ++normState.reqToken;
+      if (!t || !t.id) {{ normState.trackId = ''; normState.loudness = null; applyOutputVolume(0); return; }}
+      normState.trackId = t.id;
+      if (t.loudness && Number.isFinite(t.loudness.lufs)) {{
+        normState.loudness = t.loudness;
+        applyOutputVolume(0);
+        return;
+      }}
+      normState.loudness = null;
+      applyOutputVolume(0);
+      const delays = [2500, 4000, 6000];
+      let attempt = 0;
+      const poll = () => {{
+        if (tok !== normState.reqToken || normState.trackId !== t.id) return;
+        fetch(`/api/public/share/${{encodeURIComponent(DATA.id)}}/loudness/${{encodeURIComponent(t.id)}}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {{
+            if (!d || tok !== normState.reqToken || normState.trackId !== t.id) return;
+            if (Number.isFinite(Number(d.lufs))) {{
+              t.loudness = {{ lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 }};
+              normState.loudness = t.loudness;
+              applyOutputVolume(!audio.paused && audio.currentTime > 0.25 ? 1.2 : 0);
+              if (d.ready) return;
+            }}
+            if (d.pending && attempt < delays.length) {{
+              normState.retryTimer = setTimeout(() => {{ normState.retryTimer = null; poll(); }}, delays[attempt++]);
+            }}
+          }})
+          .catch(() => {{}});
+      }};
+      poll();
     }}
 
     function esc(s) {{
@@ -1325,6 +1434,8 @@ pub fn render_share_html(
       try {{
         if (!audio.paused) audio.pause();
       }} catch {{}}
+      ensureNormGraph();
+      syncShareLoudness(t);
       audio.src = buildUrl(t, false);
       if (state.lyricsOpen) loadLyrics(t);
       if (autoplay) {{
@@ -1455,7 +1566,7 @@ pub fn render_share_html(
     }}
 
     applyOutputVolume();
-    audio.addEventListener('play', () => {{ updatePlayBtn(true); }});
+    audio.addEventListener('play', () => {{ ensureNormGraph(); updatePlayBtn(true); }});
     audio.addEventListener('pause', () => updatePlayBtn(false));
     audio.addEventListener('ended', () => {{
       if (state.loadCommitTimer) return;
@@ -1507,7 +1618,7 @@ pub fn render_share_html(
     }});
     $('vol-slider').addEventListener('input', (e) => {{
       masterVolume = parseFloat(e.target.value);
-      applyOutputVolume();
+      applyOutputVolume(0.015);
     }});
 
     // Smart Proof-of-Work Captcha & Browser Integrity Check

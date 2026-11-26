@@ -1,4 +1,5 @@
 use crate::auth::{hash_recovery_code, RESTORE_WINDOW_SECS};
+use crate::loudness::TrackLoudness;
 use crate::models::{
     allow_case_insensitive_artist_merge, err_msg, primary_artist, slug, validate_credentials,
     AlbumSummary, AppResult, ArtistSummary, CacheEntry, Event, LobbyRecord, Mood, PlayQueueState,
@@ -374,6 +375,16 @@ impl Store {
                 path TEXT NOT NULL,
                 bytes INTEGER NOT NULL,
                 last_accessed INTEGER NOT NULL
+            );
+
+            -- Per-track EBU R128 integrated loudness & true peak for always-on
+            -- constant-gain loudness normalization (never dynamic compression).
+            CREATE TABLE IF NOT EXISTS track_loudness (
+                track_id TEXT PRIMARY KEY,
+                integrated_lufs REAL NOT NULL,
+                true_peak_db REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'ebur128',
+                updated INTEGER NOT NULL
             );
 
             -- Registry of objects uploaded to the optional S3/R2 cool cache.
@@ -5489,6 +5500,176 @@ impl Store {
         Ok(())
     }
 
+    // -------------------------------------------------------------------------
+    // Per-Track Loudness Metadata (EBU R128 / ReplayGain)
+    // -------------------------------------------------------------------------
+
+    pub fn upsert_track_loudness(
+        &self,
+        track_id: &str,
+        loudness: TrackLoudness,
+        source: &str,
+    ) -> AppResult<()> {
+        if track_id.trim().is_empty() || !loudness.is_valid() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        if source == "ebur128" {
+            conn.execute(
+                "INSERT INTO track_loudness(track_id, integrated_lufs, true_peak_db, source, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(track_id) DO UPDATE SET
+                     integrated_lufs = excluded.integrated_lufs,
+                     true_peak_db = excluded.true_peak_db,
+                     source = excluded.source,
+                     updated = excluded.updated",
+                params![track_id, loudness.lufs, loudness.true_peak_db, source, now],
+            )?;
+        } else {
+            // Never let a tag or metadata hint overwrite an exact EBU R128 scan.
+            conn.execute(
+                "INSERT INTO track_loudness(track_id, integrated_lufs, true_peak_db, source, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(track_id) DO UPDATE SET
+                     integrated_lufs = excluded.integrated_lufs,
+                     true_peak_db = excluded.true_peak_db,
+                     source = excluded.source,
+                     updated = excluded.updated
+                 WHERE track_loudness.source <> 'ebur128'",
+                params![track_id, loudness.lufs, loudness.true_peak_db, source, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_track_loudness(&self, track_id: &str) -> AppResult<Option<TrackLoudness>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT integrated_lufs, true_peak_db, source FROM track_loudness WHERE track_id = ?1",
+                params![track_id],
+                |r| {
+                    let lufs: f64 = r.get(0)?;
+                    let true_peak_db: f64 = r.get(1)?;
+                    let source: String = r.get(2)?;
+                    Ok(TrackLoudness {
+                        lufs,
+                        true_peak_db,
+                        exact: source == "ebur128" || source == "tag",
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row.filter(|m| m.is_valid()))
+    }
+
+    pub fn has_ebur128_loudness(&self, track_id: &str) -> bool {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT 1 FROM track_loudness WHERE track_id = ?1 AND source = 'ebur128'",
+            params![track_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    pub fn loudness_map_for_ids(&self, ids: &[String]) -> AppResult<HashMap<String, TrackLoudness>> {
+        let mut out = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.lock();
+        for chunk in ids.chunks(400) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT track_id, integrated_lufs, true_peak_db, source
+                 FROM track_loudness WHERE track_id IN ({})",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params_iter: Vec<&dyn ToSql> = chunk.iter().map(|s| s as &dyn ToSql).collect();
+            let rows = stmt.query_map(params_from_iter(params_iter), |r| {
+                let tid: String = r.get(0)?;
+                let lufs: f64 = r.get(1)?;
+                let true_peak_db: f64 = r.get(2)?;
+                let source: String = r.get(3)?;
+                Ok((
+                    tid,
+                    TrackLoudness {
+                        lufs,
+                        true_peak_db,
+                        exact: source == "ebur128" || source == "tag",
+                    },
+                ))
+            })?;
+            for row in rows.flatten() {
+                if row.1.is_valid() {
+                    out.insert(row.0, row.1);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Returns `(track_id, file_path)` pairs for cached or local files that do not
+    /// yet have an EBU R128 loudness measurement, newest/most-recent first.
+    pub fn tracks_missing_loudness(&self, limit: usize) -> AppResult<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.lock();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        {
+            let mut stmt = conn.prepare(
+                "SELECT c.track_id, c.path
+                 FROM cache_entries c
+                 LEFT JOIN track_loudness l ON l.track_id = c.track_id AND l.source = 'ebur128'
+                 WHERE l.track_id IS NULL
+                 ORDER BY c.last_accessed DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows.flatten() {
+                if seen.insert(r.0.clone()) {
+                    out.push(r);
+                }
+            }
+        }
+
+        if out.len() < limit {
+            let rem = (limit - out.len()) as i64;
+            let mut stmt = conn.prepare(
+                "SELECT t.id, substr(t.stream_url, 6)
+                 FROM tracks t
+                 LEFT JOIN track_loudness l ON l.track_id = t.id AND l.source = 'ebur128'
+                 WHERE t.stream_url LIKE 'file:%' AND l.track_id IS NULL
+                 ORDER BY t.created DESC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![rem], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows.flatten() {
+                if seen.insert(r.0.clone()) {
+                    out.push(r);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn kv_get(&self, key: &str) -> Option<String> {
         let conn = self.lock();
         conn.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0))
@@ -8839,5 +9020,55 @@ mod tests {
             .expect("yama summary should exist");
         assert_eq!(summary.name, "yama");
         assert_eq!(summary.song_count, 3);
+    }
+
+    #[test]
+    fn track_loudness_persists_protects_ebur128_and_lists_missing() {
+        let store = Store::open_memory().unwrap();
+        let mut local = sample_track("local:1", "Acoustic", "Artist", "Album");
+        local.source = "local".into();
+        local.stream_url = "file:/tmp/acoustic.flac".into();
+        let cached = sample_track("ytm:2", "Loud Pop", "Artist", "Album");
+        store.upsert_tracks(&[local, cached]).unwrap();
+        store
+            .upsert_cache_entry("ytm:2", "/tmp/loud.m4a", 4_000_000)
+            .unwrap();
+
+        let missing = store.tracks_missing_loudness(10).unwrap();
+        assert_eq!(missing.len(), 2);
+
+        let tag_m = TrackLoudness {
+            lufs: -17.5,
+            true_peak_db: -1.2,
+            exact: true,
+        };
+        store.upsert_track_loudness("local:1", tag_m, "tag").unwrap();
+        assert!(!store.has_ebur128_loudness("local:1"));
+        assert_eq!(store.get_track_loudness("local:1").unwrap(), Some(tag_m));
+
+        // Exact EBU R128 scan upgrades tag measurement and cannot be downgraded.
+        let r128 = TrackLoudness {
+            lufs: -18.2,
+            true_peak_db: -0.9,
+            exact: true,
+        };
+        store
+            .upsert_track_loudness("local:1", r128, "ebur128")
+            .unwrap();
+        assert!(store.has_ebur128_loudness("local:1"));
+        store
+            .upsert_track_loudness("local:1", tag_m, "tag")
+            .unwrap();
+        assert_eq!(store.get_track_loudness("local:1").unwrap(), Some(r128));
+
+        let map = store
+            .loudness_map_for_ids(&["local:1".into(), "ytm:2".into()])
+            .unwrap();
+        assert_eq!(map.get("local:1"), Some(&r128));
+        assert!(!map.contains_key("ytm:2"));
+
+        let missing_after = store.tracks_missing_loudness(10).unwrap();
+        assert_eq!(missing_after.len(), 1);
+        assert_eq!(missing_after[0].0, "ytm:2");
     }
 }

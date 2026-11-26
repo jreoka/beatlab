@@ -1573,6 +1573,30 @@ pub async fn guest_lyrics(
     )
 }
 
+pub async fn guest_loudness(
+    State(state): State<AppState>,
+    Path((code, track_id)): Path<(String, String)>,
+    Query(q): Query<LidQuery>,
+) -> Response {
+    let track = match guest_track(&state, &code, &q.lid, &track_id) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let (loudness, pending) = state.engine.ensure_track_loudness(&track).await;
+    match loudness {
+        Some(m) => json_res(json!({
+            "ready": m.exact,
+            "pending": !m.exact && pending,
+            "lufs": m.lufs,
+            "truePeakDb": m.true_peak_db,
+        })),
+        None => json_res(json!({
+            "ready": false,
+            "pending": pending,
+        })),
+    }
+}
+
 /// Album art of whatever the lobby is playing, for link-preview embeds.
 pub async fn public_cover(State(state): State<AppState>, Path(code): Path<String>) -> Response {
     let track_id = normalize_code(&code)

@@ -1,0 +1,451 @@
+//! ITU-R BS.1770-4 / EBU R128 integrated loudness analysis and peak-safe
+//! constant-gain normalization helpers.
+//!
+//! Normalization uses a single fixed scalar gain per track (never dynamic range
+//! compression or real-time AGC) capped by true-peak headroom so every track's
+//! internal dynamics, transients, and quiet-to-loud contrast stay untouched.
+
+use lofty::file::TaggedFileExt;
+use lofty::probe::Probe;
+use lofty::tag::ItemKey;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+
+/// Streaming loudness target (LUFS), aligned with Spotify / YouTube Music / Tidal.
+pub const TARGET_LUFS: f64 = -14.0;
+/// True-peak output ceiling (dBTP) to leave headroom for browser/OS resampling.
+pub const TRUE_PEAK_CEILING_DB: f64 = -0.5;
+/// Minimum/maximum allowed gain adjustment (dB) so corrupt/near-silent files
+/// can never produce extreme attenuation or noise-floor amplification.
+pub const MIN_GAIN_DB: f64 = -18.0;
+pub const MAX_GAIN_DB: f64 = 12.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackLoudness {
+    /// Whole-track gated integrated loudness in LUFS (ITU-R BS.1770-4).
+    pub lufs: f64,
+    /// Oversampled true peak in dBTP (0.0 dBTP = digital full scale).
+    pub true_peak_db: f64,
+    /// True when measured from the actual audio (EBU R128 / embedded RG tags).
+    #[serde(skip_serializing)]
+    pub exact: bool,
+}
+
+impl TrackLoudness {
+    pub fn is_valid(&self) -> bool {
+        self.lufs.is_finite()
+            && self.lufs > -70.0
+            && self.lufs <= 6.0
+            && self.true_peak_db.is_finite()
+            && self.true_peak_db > -70.0
+            && self.true_peak_db <= 12.0
+    }
+}
+
+/// Computes the peak-safe linear output gain for a track at a given user volume
+/// (`0.0..=1.0`). Because this is a single constant multiplier for the whole
+/// track, dynamic range is 100% preserved and the output never clips.
+pub fn compute_output_gain(lufs: f64, true_peak_db: f64, user_volume: f64) -> f64 {
+    let vol = user_volume.clamp(0.0, 1.0);
+    if vol <= 0.0 || !lufs.is_finite() {
+        return 0.0;
+    }
+    let gain_db = (TARGET_LUFS - lufs).clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+    let track_gain = 10.0_f64.powf(gain_db / 20.0);
+    let tp_db = if true_peak_db.is_finite() {
+        true_peak_db
+    } else {
+        0.0
+    };
+    let tp_lin = 10.0_f64.powf(tp_db / 20.0).clamp(0.01, 4.0);
+    let ceiling_lin = 10.0_f64.powf(TRUE_PEAK_CEILING_DB / 20.0);
+    let max_safe_total = ceiling_lin / tp_lin;
+    (vol * track_gain).min(max_safe_total)
+}
+
+/// Measures a local or cached audio file's integrated loudness and true peak.
+///
+/// Prefers exact ITU-R BS.1770-4 measurement via `ffmpeg` (`ebur128=peak=true`)
+/// so every format and source shares an identical loudness reference. Falls
+/// back to embedded ReplayGain / R128 / iTunNORM tags when `ffmpeg` is
+/// unavailable or fails.
+pub async fn measure_file_loudness(
+    path: &Path,
+    ffmpeg_available: bool,
+) -> Option<(TrackLoudness, &'static str)> {
+    if ffmpeg_available {
+        if let Some(m) = measure_with_ffmpeg(path).await {
+            return Some((m, "ebur128"));
+        }
+    }
+    let p = path.to_path_buf();
+    let tag_res = tokio::task::spawn_blocking(move || read_tag_loudness(&p))
+        .await
+        .ok()
+        .flatten();
+    tag_res.map(|m| (m, "tag"))
+}
+
+async fn measure_with_ffmpeg(path: &Path) -> Option<TrackLoudness> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.kill_on_drop(true)
+        .args([
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            &path.to_string_lossy(),
+            "-vn",
+            "-sn",
+            "-dn",
+            "-af",
+            "ebur128=peak=true:framelog=quiet",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let output = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_ebur128_summary(&stderr)
+}
+
+/// Parses FFmpeg's `ebur128=peak=true` summary block from stderr.
+pub fn parse_ebur128_summary(stderr: &str) -> Option<TrackLoudness> {
+    // Take the final `Summary:` section in case multiple streams or retries printed one.
+    let summary_idx = stderr.rfind("Summary:")?;
+    let summary = &stderr[summary_idx..];
+
+    let mut section = "";
+    let mut integrated_lufs: Option<f64> = None;
+    let mut true_peak_db: Option<f64> = None;
+
+    for raw_line in summary.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("Integrated loudness:") {
+            section = "integrated";
+            continue;
+        }
+        if line.starts_with("Loudness range:") {
+            section = "lra";
+            continue;
+        }
+        if line.starts_with("True peak:") || line.starts_with("Sample peak:") {
+            section = "peak";
+            continue;
+        }
+
+        if section == "integrated" {
+            if let Some(rest) = line.strip_prefix("I:") {
+                if let Some(v) = parse_leading_f64(rest) {
+                    integrated_lufs = Some(v);
+                }
+            }
+        } else if section == "peak" {
+            if let Some(rest) = line.strip_prefix("Peak:") {
+                if let Some(v) = parse_leading_f64(rest) {
+                    true_peak_db = Some(v);
+                }
+            }
+        }
+    }
+
+    let lufs = integrated_lufs?;
+    let peak = true_peak_db.unwrap_or(0.0);
+    let m = TrackLoudness {
+        lufs: (lufs * 100.0).round() / 100.0,
+        true_peak_db: (peak * 100.0).round() / 100.0,
+        exact: true,
+    };
+    m.is_valid().then_some(m)
+}
+
+fn parse_leading_f64(s: &str) -> Option<f64> {
+    let tok = s.split_whitespace().next()?;
+    let cleaned = tok.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != '+');
+    let v: f64 = cleaned.parse().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// Reads embedded ReplayGain, Opus R128, or Apple Sound Check (`iTunNORM`) tags.
+pub fn read_tag_loudness(path: &Path) -> Option<TrackLoudness> {
+    let tagged = Probe::open(path).ok()?.read().ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+
+    let mut rg_gain_db: Option<f64> = None;
+    let mut rg_peak_lin: Option<f64> = None;
+    let mut r128_gain_q78: Option<f64> = None;
+    let mut itun_norm: Option<String> = None;
+
+    for item in tag.items() {
+        let Some(val) = item.value().text() else {
+            continue;
+        };
+        let val = val.trim();
+        if val.is_empty() {
+            continue;
+        }
+        match item.key() {
+            ItemKey::ReplayGainTrackGain => {
+                if let Some(db) = parse_db_value(val) {
+                    rg_gain_db = Some(db);
+                }
+            }
+            ItemKey::ReplayGainTrackPeak => {
+                if let Some(pk) = parse_positive_f64(val) {
+                    rg_peak_lin = Some(pk);
+                }
+            }
+            ItemKey::Unknown(name) => {
+                let upper = name.trim().to_ascii_uppercase();
+                match upper.as_str() {
+                    "REPLAYGAIN_TRACK_GAIN" if rg_gain_db.is_none() => {
+                        rg_gain_db = parse_db_value(val);
+                    }
+                    "REPLAYGAIN_TRACK_PEAK" if rg_peak_lin.is_none() => {
+                        rg_peak_lin = parse_positive_f64(val);
+                    }
+                    "R128_TRACK_GAIN" => {
+                        r128_gain_q78 = val.parse::<f64>().ok().filter(|v| v.is_finite());
+                    }
+                    "ITUNNORM" | "----:COM.APPLE.ITUNES:ITUNNORM" => {
+                        itun_norm = Some(val.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 1. Opus R128_TRACK_GAIN (Q7.8 dB relative to -23 LUFS).
+    if let Some(q78) = r128_gain_q78 {
+        let gain_db = q78 / 256.0;
+        let lufs = -23.0 - gain_db;
+        let true_peak_db = rg_peak_lin
+            .map(|p| 20.0 * p.log10())
+            .unwrap_or(0.0);
+        let m = TrackLoudness {
+            lufs: (lufs * 100.0).round() / 100.0,
+            true_peak_db: (true_peak_db * 100.0).round() / 100.0,
+            exact: true,
+        };
+        if m.is_valid() {
+            return Some(m);
+        }
+    }
+
+    // 2. ReplayGain track gain (dB relative to -18 LUFS).
+    if let Some(gain_db) = rg_gain_db {
+        let lufs = -18.0 - gain_db;
+        let true_peak_db = rg_peak_lin
+            .map(|p| 20.0 * p.log10())
+            .unwrap_or(0.0);
+        let m = TrackLoudness {
+            lufs: (lufs * 100.0).round() / 100.0,
+            true_peak_db: (true_peak_db * 100.0).round() / 100.0,
+            exact: true,
+        };
+        if m.is_valid() {
+            return Some(m);
+        }
+    }
+
+    // 3. Apple Sound Check (`iTunNORM`), referenced to -16 LUFS.
+    if let Some(raw) = itun_norm {
+        if let Some(m) = parse_itunnorm(&raw) {
+            return Some(m);
+        }
+    }
+
+    None
+}
+
+fn parse_db_value(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    let num = s.split_whitespace().next().unwrap_or(s);
+    let num = num
+        .trim_end_matches("dB")
+        .trim_end_matches("db")
+        .trim_end_matches("DB")
+        .trim();
+    let v: f64 = num.parse().ok()?;
+    (v.is_finite() && (-40.0..=40.0).contains(&v)).then_some(v)
+}
+
+fn parse_positive_f64(raw: &str) -> Option<f64> {
+    let v: f64 = raw.trim().parse().ok()?;
+    (v.is_finite() && v > 0.0001 && v <= 4.0).then_some(v)
+}
+
+/// Parses Apple's 10-field hex `iTunNORM` Sound Check string into LUFS + peak.
+pub fn parse_itunnorm(raw: &str) -> Option<TrackLoudness> {
+    let vals: Vec<u32> = raw
+        .split_whitespace()
+        .filter_map(|tok| u32::from_str_radix(tok.trim(), 16).ok())
+        .collect();
+    if vals.len() < 8 {
+        return None;
+    }
+    let power = vals[0].max(vals[1]);
+    if power == 0 {
+        return None;
+    }
+    // Sound Check power is in 1/1000ths relative to -16 LUFS reference (`1000` => 0 dB).
+    let gain_db = -10.0 * (power as f64 / 1000.0).log10();
+    let lufs = -16.0 - gain_db;
+
+    // Fields 6 & 7 hold left/right peak amplitude on a 0..32768 scale.
+    let peak_raw = vals[6].max(vals[7]);
+    let true_peak_db = if peak_raw > 0 {
+        20.0 * (peak_raw as f64 / 32768.0).log10()
+    } else {
+        0.0
+    };
+
+    let m = TrackLoudness {
+        lufs: (lufs * 100.0).round() / 100.0,
+        true_peak_db: (true_peak_db * 100.0).round() / 100.0,
+        exact: true,
+    };
+    m.is_valid().then_some(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ffmpeg_ebur128_summary_block() {
+        let sample = r#"
+[Parsed_ebur128_0 @ 0x55] Summary:
+  Integrated loudness:
+    I:         -9.4 LUFS
+    Threshold: -19.5 LUFS
+  Loudness range:
+    LRA:        6.2 LU
+    Threshold: -29.5 LUFS
+    LRA low:   -13.1 LUFS
+    LRA high:  -6.9 LUFS
+  True peak:
+    Peak:      -0.2 dBFS
+"#;
+        let parsed = parse_ebur128_summary(sample).expect("summary should parse");
+        assert!((parsed.lufs - (-9.4)).abs() < 0.001);
+        assert!((parsed.true_peak_db - (-0.2)).abs() < 0.001);
+        assert!(parsed.exact);
+    }
+
+    #[test]
+    fn rejects_silent_ebur128_summary() {
+        let sample = r#"
+[Parsed_ebur128_0 @ 0x55] Summary:
+  Integrated loudness:
+    I:         -70.0 LUFS
+  True peak:
+    Peak:      -inf dBFS
+"#;
+        assert!(parse_ebur128_summary(sample).is_none());
+    }
+
+    #[test]
+    fn parses_itunnorm_sound_check() {
+        // 00000FA0 = 4000 -> -10*log10(4) = -6.02 dB gain -> lufs = -16 - (-6.02) = -9.98 LUFS
+        // Peak 00007FFF = 32767 -> ~0.0 dBFS
+        let raw = " 00000FA0 00000FA0 00001F40 00001F40 00000000 00000000 00007FFF 00007FFF 00000000 00000000";
+        let m = parse_itunnorm(raw).expect("iTunNORM should parse");
+        assert!((m.lufs - (-9.98)).abs() < 0.05);
+        assert!(m.true_peak_db.abs() < 0.05);
+    }
+
+    #[test]
+    fn output_gain_matches_loudness_and_never_clips_peaks() {
+        // Loud modern master (-8 LUFS, 0 dBTP) at 100% volume -> attenuated by -6 dB (~0.501)
+        let loud = compute_output_gain(-8.0, 0.0, 1.0);
+        assert!((loud - 0.5012).abs() < 0.01);
+
+        // Reference track (-14 LUFS, -1 dBTP) at 100% volume -> unity (1.0)
+        let ref_track = compute_output_gain(-14.0, -1.0, 1.0);
+        assert!((ref_track - 1.0).abs() < 0.001);
+
+        // Quiet dynamic track (-20 LUFS, -1 dBTP) at 50% volume -> gets full +6 dB boost (~1.0) without clipping!
+        let quiet_half_vol = compute_output_gain(-20.0, -1.0, 0.5);
+        assert!((quiet_half_vol - 0.9976).abs() < 0.01);
+
+        // Same quiet dynamic track at 100% volume -> capped at peak headroom (-0.5 dBTP ceiling / -1 dBTP peak = +0.5 dB = 1.059)
+        let quiet_full_vol = compute_output_gain(-20.0, -1.0, 1.0);
+        let tp_lin = 10.0_f64.powf(-1.0 / 20.0);
+        let ceiling_lin = 10.0_f64.powf(TRUE_PEAK_CEILING_DB / 20.0);
+        assert!(quiet_full_vol * tp_lin <= ceiling_lin + 1e-6);
+        assert!((quiet_full_vol - (ceiling_lin / tp_lin)).abs() < 0.001);
+
+        // Muted / zero volume always produces silence.
+        assert_eq!(compute_output_gain(-20.0, -6.0, 0.0), 0.0);
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_measures_real_wav_loudness_difference() {
+        let ffmpeg_ok = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ffmpeg_ok {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("beatlab_lufs_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let loud_wav = dir.join("loud.wav");
+        let quiet_wav = dir.join("quiet.wav");
+
+        for (path, vol) in [(&loud_wav, "-6dB"), (&quiet_wav, "-18dB")] {
+            let ok = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("sine=frequency=1000:duration=2:sample_rate=48000,volume={vol}"),
+                    &path.to_string_lossy(),
+                ])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "ffmpeg failed generating test wav");
+        }
+
+        let (m_loud, src_loud) = measure_file_loudness(&loud_wav, true)
+            .await
+            .expect("loud wav should measure");
+        let (m_quiet, src_quiet) = measure_file_loudness(&quiet_wav, true)
+            .await
+            .expect("quiet wav should measure");
+        assert_eq!(src_loud, "ebur128");
+        assert_eq!(src_quiet, "ebur128");
+        // Difference between -6dB and -18dB tones must be ~12 LUFS.
+        let diff = m_loud.lufs - m_quiet.lufs;
+        assert!(
+            (diff - 12.0).abs() < 0.6,
+            "expected ~12 LUFS difference, got {} (loud={}, quiet={})",
+            diff,
+            m_loud.lufs,
+            m_quiet.lufs
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

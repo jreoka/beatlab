@@ -5,6 +5,7 @@ mod engine;
 mod llm;
 mod lobby;
 mod lobby_page;
+mod loudness;
 mod models;
 mod profile_page;
 mod remote_cache;
@@ -212,6 +213,17 @@ async fn main() -> models::AppResult<()> {
     tokio::spawn(webapp::prewarm_charts(state.clone()));
     lobby::spawn_sweeper(state.lobbies.clone(), store.clone());
 
+    // Gently backfill EBU R128 loudness for any already-cached or local audio files
+    // so always-on loudness normalization works from the first millisecond of playback.
+    let loudness_engine = state.engine.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let analyzed = loudness_engine.backfill_missing_loudness(250).await;
+        if analyzed > 0 {
+            info!(tracks = analyzed, "backfilled track loudness measurements");
+        }
+    });
+
     // Fast startup catalog warming + continuous RoPE-QKVO/XSA/GEGLU Transformer training & curation
     let warm_taste = taste.clone();
     let warm_llm = llm_curator.clone();
@@ -351,6 +363,7 @@ async fn main() -> models::AppResult<()> {
             get(webapp::get_queue).put(webapp::save_queue),
         )
         .route("/api/web/warm/{id}", post(webapp::warm_track))
+        .route("/api/web/loudness/{id}", get(webapp::track_loudness))
         .route("/api/web/stream/{id}", get(webapp::stream_track))
         .route("/api/web/cover/{id}", get(webapp::cover_art))
         .route("/api/web/sources", get(webapp::sources_info))
@@ -399,6 +412,10 @@ async fn main() -> models::AppResult<()> {
             "/api/public/share/{id}/lyrics/{track_id}",
             get(webapp::public_share_lyrics),
         )
+        .route(
+            "/api/public/share/{id}/loudness/{track_id}",
+            get(webapp::public_share_loudness),
+        )
         // Listen Together — host controls (signed in)
         .route(
             "/api/web/lobby",
@@ -423,6 +440,7 @@ async fn main() -> models::AppResult<()> {
         .route("/api/lobby/{code}/react", post(lobby::guest_react))
         .route("/api/lobby/{code}/stream/{track_id}", get(lobby::guest_stream))
         .route("/api/lobby/{code}/lyrics/{track_id}", get(lobby::guest_lyrics))
+        .route("/api/lobby/{code}/loudness/{track_id}", get(lobby::guest_loudness))
         // Administrator panel (gated by ADMIN_USERNAME at the API layer).
         // Every tab has its own path so it can be bookmarked, shared and
         // navigated with the browser's back/forward buttons.
