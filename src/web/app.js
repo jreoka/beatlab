@@ -7419,13 +7419,13 @@
   }
 
   function renderQItem(t, idx, active) {
-    return `<div class="q-item ${active ? 'active' : ''}" data-tid="${esc(t.id)}" onclick="App.playQueueAt(${idx})">
+    const queueAttr = !active ? ` data-queue-idx="${idx}"` : '';
+    return `<div class="q-item ${active ? 'active' : ''}" data-tid="${esc(t.id)}"${queueAttr} onclick="App.playQueueAt(${idx})">
       <img src="${esc(t.coverUrl)}" alt="" />
       <div class="q-item-info">
         <div class="q-item-title">${esc(t.title)}</div>
         <div class="q-item-sub">${esc(t.artist)}${yearTag(t.year)}</div>
       </div>
-      ${!active ? `<button class="icon-btn" title="Remove from queue" onclick="event.stopPropagation();App.removeFromQueue(${idx})">${ICONS.close}</button>` : ''}
     </div>`;
   }
 
@@ -7848,7 +7848,7 @@
     }
   }
 
-  function openTrackMenu(event, trackId, editablePlaylistId = null, playlistPos = -1) {
+  function openTrackMenu(event, trackId, editablePlaylistId = null, playlistPos = -1, queueIdx = -1) {
     if (event && typeof event.stopPropagation === 'function') {
       event.stopPropagation();
     }
@@ -7859,6 +7859,18 @@
     const backdrop = $('ctx-backdrop');
     const userPls = state.playlists.filter((p) => !p.isAuto);
     const tidArg = esc(JSON.stringify(trackId));
+    const canRemoveFromQueue =
+      Number.isInteger(queueIdx) &&
+      queueIdx > state.queueIndex &&
+      queueIdx < state.queue.length &&
+      state.queue[queueIdx]?.id === trackId;
+    const queueActions = canRemoveFromQueue
+      ? `<button class="ctx-item ctx-item-icon danger" onclick="App.closeTrackMenu();App.removeFromQueue(${queueIdx}, ${tidArg})">
+          ${ICONS.close}
+          <span>Remove from Queue</span>
+        </button>
+        <hr class="ctx-sep">`
+      : '';
     const plActions =
       editablePlaylistId != null && playlistPos >= 0
         ? `${
@@ -7879,6 +7891,7 @@
         </div>
         <button class="icon-btn" title="Close" onclick="App.closeTrackMenu()">${ICONS.close}</button>
       </div>
+      ${queueActions}
       ${plActions}
       <button class="ctx-item ctx-item-icon accent" onclick="App.closeTrackMenu();App.shareTrack(${tidArg})">
         ${ICONS.share}
@@ -8041,10 +8054,23 @@
       const row = target.closest('[data-tid]');
       if (!row || target.closest('input, textarea, select')) return null;
       const tid = row.dataset.tid;
-      if (!tid || !state.trackMap.has(tid)) return null;
+      if (!tid) return null;
+      const queueIdx = row.dataset.queueIdx != null ? parseInt(row.dataset.queueIdx, 10) : -1;
+      const validQueueIdx = Number.isFinite(queueIdx) ? queueIdx : -1;
+      if (!state.trackMap.has(tid)) {
+        const qTrack = validQueueIdx >= 0 ? state.queue[validQueueIdx] : state.queue.find((t) => t.id === tid);
+        if (qTrack) state.trackMap.set(tid, qTrack);
+      }
+      if (!state.trackMap.has(tid)) return null;
       const plId = row.dataset.plId || null;
       const plPos = row.dataset.plPos != null ? parseInt(row.dataset.plPos, 10) : -1;
-      return { type: 'track', tid, plId, plPos: Number.isFinite(plPos) ? plPos : -1 };
+      return {
+        type: 'track',
+        tid,
+        plId,
+        plPos: Number.isFinite(plPos) ? plPos : -1,
+        queueIdx: validQueueIdx,
+      };
     };
 
     const getEntityArgs = (target) => {
@@ -8067,7 +8093,7 @@
 
     const openTargetMenu = (evt, info) => {
       if (info.type === 'track') {
-        openTrackMenu(evt, info.tid, info.plId, info.plPos);
+        openTrackMenu(evt, info.tid, info.plId, info.plPos, info.queueIdx);
       } else {
         openEntityMenu(evt, info);
       }
@@ -10023,13 +10049,25 @@
     toggleTheme: (isLight) => {
       window.App.setTheme(isLight ? 'light' : 'dark');
     },
-    removeFromQueue: (idx) => {
-      if (idx > state.queueIndex && idx < state.queue.length) {
+    removeFromQueue: (idx, expectedTrackId = null) => {
+      let targetIdx = idx;
+      if (
+        expectedTrackId != null &&
+        !(targetIdx > state.queueIndex && targetIdx < state.queue.length && state.queue[targetIdx]?.id === expectedTrackId)
+      ) {
+        targetIdx = state.queue.findIndex((t, i) => i > state.queueIndex && t.id === expectedTrackId);
+      }
+      if (targetIdx > state.queueIndex && targetIdx < state.queue.length) {
         haptic('tap');
-        state.queue.splice(idx, 1);
+        const [removed] = state.queue.splice(targetIdx, 1);
+        if (removed && Array.isArray(state.unshuffledQueue)) {
+          const uIdx = state.unshuffledQueue.findIndex((item) => item.id === removed.id);
+          if (uIdx >= 0) state.unshuffledQueue.splice(uIdx, 1);
+        }
         renderQueuePanel();
         saveServerQueue();
-        if (idx === state.queueIndex + 1) scheduleWarmNextTrack();
+        if (targetIdx === state.queueIndex + 1) scheduleWarmNextTrack();
+        showToast('Removed from queue');
       }
     },
     startRadioForId,
