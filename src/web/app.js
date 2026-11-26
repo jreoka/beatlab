@@ -170,6 +170,8 @@
     radioReqToken: 0,
     radioLoading: false,
     radioInFlight: null,
+    radioError: false,
+    queueRestoreFailed: false,
     compatAttemptedId: '',
     isSwitchingTrack: false,
     networkRetryTimer: null,
@@ -474,7 +476,11 @@
       state.hasViewNetworkError = false;
       renderCurrentHash();
     }
+    if (state.user && state.queueRestoreFailed && state.queue.length === 0) {
+      await restoreServerQueue();
+    }
     resumePendingNetworkPlayback();
+    ensureUpcomingRadio();
   }
 
   function checkServerHealth() {
@@ -1558,6 +1564,8 @@
     state.radioReqToken++;
     state.radioLoading = false;
     state.radioInFlight = null;
+    state.radioError = false;
+    state.queueRestoreFailed = false;
     state.radioPlaylistId = null;
     state.compatAttemptedId = '';
     state.lastScrobbleCompleteId = '';
@@ -2432,6 +2440,7 @@
   async function restoreServerQueue() {
     try {
       const q = await api('/api/web/queue');
+      state.queueRestoreFailed = false;
       if (q.tracks && q.tracks.length > 0) {
         state.queue = cacheTracks(q.tracks);
         let idx = Math.max(0, Math.min(q.currentIndex || 0, state.queue.length - 1));
@@ -2465,10 +2474,13 @@
             }
           }
           loadLyricsForTrack(cur.id);
+          // If the saved queue has no upcoming tracks (e.g. server crashed or tab closed
+          // before radio finished populating), immediately auto-fill upcoming tracks.
+          ensureUpcomingRadio();
         }
       }
     } catch {
-      // optional
+      state.queueRestoreFailed = true;
     }
   }
 
@@ -6381,6 +6393,8 @@
     state.radioReqToken++;
     state.radioLoading = false;
     state.radioInFlight = null;
+    state.radioError = false;
+    state.queueRestoreFailed = false;
     state.radioPlaylistId = null;
     const idx = setQueueWithShuffle(tracks, startIndex, false);
     playQueueAt(idx);
@@ -6394,6 +6408,8 @@
     state.radioReqToken++;
     state.radioLoading = false;
     state.radioInFlight = null;
+    state.radioError = false;
+    state.queueRestoreFailed = false;
     state.radioPlaylistId = null;
     const idx = setQueueWithShuffle(tracks, 0, true);
     playQueueAt(idx);
@@ -6616,18 +6632,35 @@
     navigate(`search?q=${encodeURIComponent(q)}`);
   }
 
-  function appendRadioTracks(seedId) {
+  function needsUpcomingAutofill() {
+    const cur = currentTrack();
+    if (!cur || !state.autoplay) return false;
+    if (state.queue.length - 1 > state.queueIndex) return false;
+    return state.queue.length === 1 || state.repeat !== 'all';
+  }
+
+  function ensureUpcomingRadio() {
+    const cur = currentTrack();
+    if (!cur || state.radioInFlight || state.radioLoading) return null;
+    if (!needsUpcomingAutofill()) return null;
+    return appendRadioTracks(cur.id);
+  }
+
+  function appendRadioTracks(seedId, { retries = 2 } = {}) {
     if (state.radioInFlight) return state.radioInFlight;
     const reqToken = ++state.radioReqToken;
     state.radioLoading = true;
+    state.radioError = false;
     renderQueuePanel();
     const run = (async () => {
-      try {
-        const excludeIds = state.queue
-          .slice(-80)
-          .map((t) => t.id)
-          .filter(Boolean)
-          .join(',');
+      const fetchOnce = async (minimalExclude) => {
+        const excludeIds = minimalExclude
+          ? seedId || ''
+          : state.queue
+              .slice(-80)
+              .map((t) => t.id)
+              .filter(Boolean)
+              .join(',');
         const recentParam = buildRecentRadioParam(seedId);
         const params = new URLSearchParams();
         if (state.radioPlaylistId) {
@@ -6640,13 +6673,15 @@
         if (state.upcomingMode && state.upcomingMode !== 'default') {
           params.set('mode', state.upcomingMode);
         }
-        const d = await api(`/api/web/radio?${params.toString()}`);
-        if (reqToken !== state.radioReqToken) return 0;
-        const recs = cacheTracks(d.tracks || []);
+        return api(`/api/web/radio?${params.toString()}`);
+      };
+
+      const mergeTracks = (tracks) => {
+        const recs = cacheTracks(tracks || []);
         const existing = new Set(state.queue.map((t) => t.id));
         let added = 0;
         for (const r of recs) {
-          if (!existing.has(r.id)) {
+          if (r && r.id && !existing.has(r.id)) {
             state.queue.push(r);
             if (Array.isArray(state.unshuffledQueue)) {
               state.unshuffledQueue.push(r);
@@ -6655,12 +6690,41 @@
             added++;
           }
         }
-        if (added > 0) {
-          saveServerQueue();
-          scheduleWarmNextTrack();
-        }
         return added;
-      } catch {
+      };
+
+      let hadError = false;
+      try {
+        for (let attempt = 0; attempt <= retries; attempt++) {
+          if (reqToken !== state.radioReqToken) return 0;
+          try {
+            let d = await fetchOnce(false);
+            if (reqToken !== state.radioReqToken) return 0;
+            let added = mergeTracks(d.tracks);
+            if (added === 0 && state.queue.length > 1) {
+              d = await fetchOnce(true);
+              if (reqToken !== state.radioReqToken) return 0;
+              added = mergeTracks(d.tracks);
+            }
+            if (added > 0) {
+              state.radioError = false;
+              saveServerQueue();
+              scheduleWarmNextTrack();
+              return added;
+            }
+            hadError = false;
+          } catch {
+            hadError = true;
+          }
+          if (attempt < retries) {
+            await new Promise((r) => setTimeout(r, (attempt + 1) * 1500));
+            if (reqToken !== state.radioReqToken) return 0;
+            if (seedId && currentTrack()?.id && currentTrack().id !== seedId) return 0;
+          }
+        }
+        if (reqToken === state.radioReqToken && state.queue.length - 1 <= state.queueIndex) {
+          state.radioError = hadError || true;
+        }
         return 0;
       } finally {
         if (state.radioInFlight === run) {
@@ -6768,13 +6832,14 @@
 
   async function setUpcomingMode(mode) {
     const cleanMode = ['default', 'familiar', 'discover'].includes(mode) ? mode : 'default';
-    if (cleanMode === state.upcomingMode) return;
+    const cur = currentTrack();
+    const hasUpcoming = state.queue.length - 1 > state.queueIndex;
+    if (cleanMode === state.upcomingMode && (hasUpcoming || state.radioLoading || !cur)) return;
     state.upcomingMode = cleanMode;
     try {
       localStorage.setItem('beatlab_upcoming_mode', cleanMode);
     } catch {}
     haptic('select');
-    const cur = currentTrack();
     if (!cur && state.queue.length === 0) {
       renderQueuePanel();
       return;
@@ -6788,6 +6853,7 @@
     state.upcomingModeAbortController = ctrl;
     const reqToken = ++state.radioReqToken;
     state.radioLoading = true;
+    state.radioError = false;
     renderQueuePanel();
     const run = (async () => {
       try {
@@ -6819,9 +6885,13 @@
           }
         }
         if (!filtered.length) {
+          if (state.queue.length - 1 <= state.queueIndex) {
+            state.radioError = true;
+          }
           showToast('No matching upcoming tracks found');
           return;
         }
+        state.radioError = false;
         const upcoming = state.shuffle ? shuffleArray(filtered) : filtered;
         const keepLen = nowCur ? state.queueIndex + 1 : 0;
         if (Array.isArray(state.unshuffledQueue) && nowCur) {
@@ -6835,6 +6905,9 @@
         scheduleWarmNextTrack();
       } catch (e) {
         if (reqToken === state.radioReqToken && e && e.name !== 'AbortError') {
+          if (state.queue.length - 1 <= state.queueIndex) {
+            state.radioError = true;
+          }
           showToast(e.message);
         }
       } finally {
@@ -6859,6 +6932,7 @@
     if (!cur) return;
     clearPlaybackRecovery();
     syncMediaSession(cur, true);
+    ensureUpcomingRadio();
     if (!audio.getAttribute('src')) {
       audio.src = buildStreamUrl(cur);
     }
@@ -7211,7 +7285,11 @@
           upcoming.map((t, i) => renderQItem(t, state.queueIndex + 1 + i, false)).join('')
         : state.radioLoading
           ? `<div class="queue-section-label">Next Up</div><p class="muted-center">Loading upcoming tracks...</p>`
-          : '');
+          : cur && state.autoplay && (state.queue.length === 1 || state.repeat !== 'all')
+            ? `<div class="queue-section-label">Next Up</div><div class="queue-empty-state"><p class="muted-center">${
+                state.radioError ? 'Couldn\u2019t load upcoming tracks.' : 'No upcoming tracks loaded.'
+              }</p><button type="button" class="btn-secondary queue-retry-btn" onclick="App.retryUpcoming()">Load Upcoming</button></div>`
+            : '');
 
     $('queue-now-playing').innerHTML = nowHtml;
     $('queue-up-next').innerHTML = upNextHtml;
@@ -9571,6 +9649,12 @@
     },
     startRadioForId,
     setUpcomingMode,
+    retryUpcoming: () => {
+      const cur = currentTrack();
+      if (!cur || state.radioLoading) return;
+      state.radioError = false;
+      appendRadioTracks(cur.id);
+    },
     playListByIds,
     playShuffledIds,
     playSingle,
