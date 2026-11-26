@@ -2274,6 +2274,7 @@ fn sanitize_taste_note(raw: &str) -> String {
 
 /// Returns true when an Instant Mix query reads like a descriptive natural-language
 /// prompt/scenario rather than a short artist, track, album, or simple genre lookup.
+#[cfg(test)]
 pub fn looks_like_natural_language_mix_prompt(raw: &str) -> bool {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
