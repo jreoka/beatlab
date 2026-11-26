@@ -1375,6 +1375,7 @@ impl TasteEngine {
         dedup_and_interleave(ranked, limit, 2)
     }
 
+    #[cfg(test)]
     pub fn quick_picks(&self, user_id: i64, limit: usize) -> Vec<Track> {
         let pool = self.for_you_tracks(user_id, limit * 3);
         dedup_and_interleave(pool, limit, 1)
@@ -1596,6 +1597,7 @@ impl TasteEngine {
     }
 
     /// Returns personalized "Artists You Might Like" based on related artists, genres, and taste profile.
+    #[cfg(test)]
     pub fn recommended_artists_for_user(&self, user_id: i64, limit: usize) -> Vec<ArtistSummary> {
         if limit == 0 {
             return vec![];
@@ -2471,6 +2473,7 @@ impl TasteEngine {
 
     /// Ready-to-render cards for the home rail, including collage covers and a
     /// short artist line derived from each mix's actual tracks.
+    #[cfg(test)]
     pub fn mixed_for_you_cards(&self, user_id: i64) -> Vec<MixedForYouCard> {
         if user_id <= 0 {
             return Vec::new();
