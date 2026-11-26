@@ -544,8 +544,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     .t-status.accent { color: var(--accent); }
 
     .controls { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 14px; }
-    .controls .play-btn { grid-column: 2; }
-    .controls .vol { grid-column: 3; justify-self: start; }
+    .controls .play-btn { grid-column: 2; grid-row: 1; }
+    .controls .vol { grid-column: 3; grid-row: 1; justify-self: start; }
+    .controls .invite-btn { grid-row: 1; }
     .play-btn {
       width: 56px;
       height: 56px;
@@ -707,8 +708,238 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       .vol input { width: 72px; }
       .react-btn { width: 42px; height: 42px; font-size: 20px; }
     }
+    /* Phone-only pieces stay out of the desktop/tablet layout. */
+    .art-zone { display: flex; justify-content: center; }
+    .sheet-head, .sheet-backdrop, .chat-ticker, .dock, .invite-btn { display: none; }
+
+    /* ---------- Phone: one-screen player + bottom dock + sheet ---------- */
+    @media (max-width: 760px) {
+      body.in-room { overflow: hidden; overscroll-behavior: none; }
+      .shell { padding: 0 16px; }
+      .topbar { height: 56px; padding-top: env(safe-area-inset-top); }
+      /* Join screen fills the phone: big cover up top, form at thumb height. */
+      .gate { display: flex; padding: 4px 0 calc(16px + env(safe-area-inset-bottom)); }
+      .gate-card {
+        max-width: none;
+        flex: 1;
+        min-height: calc(100dvh - 56px - 20px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+        gap: 16px;
+        padding: 20px 18px;
+      }
+      .gate-title { text-align: center; }
+      .gate-host { justify-content: center; text-align: left; }
+      .now-card {
+        flex-direction: column;
+        text-align: center;
+        background: transparent;
+        padding: 0;
+        gap: 12px;
+      }
+      .now-card img, .now-card .now-empty {
+        width: min(64vw, 28dvh, 260px);
+        height: auto;
+        aspect-ratio: 1 / 1;
+        border-radius: 14px;
+        box-shadow: var(--shadow);
+      }
+      .now-card .now-empty svg { width: 40px; height: 40px; }
+      .now-meta { align-items: center; max-width: 100%; }
+      .people-line { justify-content: center; }
+      .gate-form { margin-top: auto; }
+      .gate-fine { margin-top: -4px; }
+
+      .room {
+        display: flex;
+        flex-direction: column;
+        height: calc(100dvh - 56px - env(safe-area-inset-top));
+        padding-bottom: calc(74px + env(safe-area-inset-bottom));
+        gap: 0;
+      }
+      .stage {
+        flex: 1;
+        min-height: 0;
+        background: transparent;
+        border-radius: 0;
+        padding: 2px 0 14px;
+        gap: 14px;
+      }
+      .stage-head { gap: 10px; }
+      .room-title { display: block; max-width: 45%; font-size: 12px; }
+      /* The art area takes whatever height is left; JS (fitArt) sizes the
+         square cover to the smaller of its width and height. */
+      .art-zone {
+        flex: 1 1 0;
+        min-height: 140px;
+        align-items: center;
+      }
+      .art-wrap { width: min(100%, 260px); max-width: 100%; margin: 0; }
+      .art, .art-empty { border-radius: 12px; }
+      .meta { text-align: left; }
+      .t-title { font-size: 22px; }
+      .t-sub { font-size: 14px; margin-top: 2px; }
+      .badges { justify-content: flex-start; margin-top: 8px; }
+      .progress { gap: 6px; }
+      .controls { gap: 8px; }
+      .controls .vol { grid-column: 1; justify-self: start; }
+      .controls .vol input { display: none; }
+      .invite-btn { display: inline-flex; grid-column: 3; justify-self: end; width: 44px; height: 44px; }
+      .controls .icon-btn { width: 44px; height: 44px; }
+      .play-btn { width: 60px; height: 60px; }
+      .reactions { gap: 6px; flex-wrap: nowrap; justify-content: space-between; }
+      .react-btn { width: auto; flex: 1; max-width: 52px; height: 42px; font-size: 20px; }
+
+      .side {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 40;
+        height: 86vh;
+        height: 86dvh;
+        min-height: 0;
+        contain: none;
+        border-radius: 22px 22px 0 0;
+        padding-bottom: env(safe-area-inset-bottom);
+        transform: translateY(105%);
+        transition: transform 0.32s cubic-bezier(0.2, 0.8, 0.2, 1);
+        box-shadow: 0 -16px 48px rgba(0, 0, 0, 0.45);
+        visibility: hidden;
+      }
+      .side.open { transform: none; visibility: visible; }
+      .side.dragging { transition: none; }
+      .sheet-head {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        height: 30px;
+        flex-shrink: 0;
+        touch-action: none;
+      }
+      .sheet-grip { width: 40px; height: 5px; border-radius: 999px; background: var(--border-bright); }
+      .sheet-head .icon-btn { position: absolute; right: 8px; top: 2px; width: 34px; height: 34px; }
+      .people-box { padding: 4px 16px 10px; }
+      .sheet-backdrop {
+        display: block;
+        position: fixed;
+        inset: 0;
+        z-index: 39;
+        background: rgba(0, 0, 0, 0.5);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.25s;
+      }
+      .sheet-backdrop.open { opacity: 1; pointer-events: auto; }
+
+      .dock {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 30;
+        padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+        background: var(--surface);
+        border-top: 1px solid var(--border);
+      }
+      .dock-btn {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        padding: 6px 0;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--text-muted);
+      }
+      .dock-btn:active { background: var(--surface-2); }
+      .dock-icon { position: relative; display: inline-flex; }
+      .dock-icon svg { width: 22px; height: 22px; }
+      .dock-dot {
+        position: absolute;
+        top: -5px;
+        right: -10px;
+        min-width: 17px;
+        height: 17px;
+        padding: 0 4px;
+        border-radius: 999px;
+        background: var(--accent);
+        color: var(--accent-ink);
+        font-size: 10px;
+        font-weight: 800;
+        display: grid;
+        place-items: center;
+        box-shadow: 0 0 0 2px var(--surface);
+      }
+      .dock-people {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px 6px 6px;
+        border-radius: 999px;
+        background: var(--surface-2);
+        flex-shrink: 0;
+      }
+      .dock-people .stack .avatar { box-shadow: 0 0 0 2px var(--surface-2); }
+      .dock-count { font-size: 13px; font-weight: 800; }
+
+      .chat-ticker {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        position: fixed;
+        left: 16px;
+        right: 16px;
+        bottom: calc(82px + env(safe-area-inset-bottom));
+        z-index: 31;
+        padding: 9px 14px 9px 9px;
+        border-radius: 16px;
+        background: var(--surface-3);
+        color: var(--text);
+        text-align: left;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+        animation: tickerIn 0.25s ease;
+      }
+      .chat-ticker b { font-size: 12.5px; display: block; }
+      .chat-ticker span.tk-text {
+        font-size: 13px;
+        color: var(--text-muted);
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .chat-ticker .tk-body { min-width: 0; flex: 1; }
+      .toast { bottom: calc(90px + env(safe-area-inset-bottom)); }
+    }
+    /* Short phones (SE-class): tighten the join screen so it fits without scrolling. */
+    @media (max-width: 760px) and (max-height: 700px) {
+      .gate-card { gap: 10px; padding: 14px 16px; }
+      .gate-title { font-size: 22px; }
+      .gate-host .avatar.lg { width: 34px; height: 34px; font-size: 14px; }
+      .now-card { gap: 8px; }
+      .now-card img, .now-card .now-empty { width: min(64vw, 22dvh, 260px); }
+      .gate-form { gap: 8px; }
+      .text-input { padding: 10px 14px; }
+      .btn-lg { padding: 11px 22px; }
+    }
+    @media (max-width: 760px) and (max-height: 640px) {
+      .stage-head { display: none; }
+      .badges { display: none; }
+      .reactions .react-btn { height: 38px; }
+    }
+    @keyframes tickerIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: none; }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       .live-dot, .gate-card, .notice-card { animation: none; }
+      .side { transition: none; }
       .float-emoji { animation-duration: 1.2s; }
     }
   </style>
@@ -771,6 +1002,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
           </div>
           <div id="room-title" class="room-title"></div>
         </div>
+        <div class="art-zone">
         <div class="art-wrap">
           <img id="art" class="art hidden" alt="" />
           <div id="art-empty" class="art-empty">
@@ -781,6 +1013,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
           </div>
           <div id="float-layer" class="float-layer"></div>
           <span id="sync-badge" class="sync-badge idle"><i></i><span id="sync-text">Connecting</span></span>
+        </div>
         </div>
         <div class="meta">
           <h2 id="t-title" class="t-title">Nothing playing yet</h2>
@@ -801,11 +1034,20 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
             </button>
             <input id="vol" type="range" min="0" max="1" step="0.01" value="0.9" aria-label="Volume" />
           </div>
+          <button id="btn-invite" class="icon-btn invite-btn" type="button" title="Invite a friend" aria-label="Invite a friend">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg>
+          </button>
         </div>
         <div id="reactions" class="reactions" aria-label="Send a reaction"></div>
       </section>
 
-      <aside class="side" aria-label="Lobby">
+      <aside id="side" class="side" aria-label="Lobby">
+        <div id="sheet-head" class="sheet-head">
+          <span class="sheet-grip" aria-hidden="true"></span>
+          <button id="sheet-close" class="icon-btn" type="button" title="Close" aria-label="Close">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+        </div>
         <div class="people-box">
           <div class="people-head"><h3>Listening now</h3><span id="count-chip" class="count-chip">0</span></div>
           <div id="people" class="people"></div>
@@ -828,6 +1070,28 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         <div id="pane-next" class="pane hidden"><div id="next-list" class="pane-scroll"></div></div>
         <div id="pane-lyrics" class="pane hidden"><div id="lyrics-box" class="pane-scroll"></div></div>
       </aside>
+
+      <!-- Phone only: backdrop for the sheet, live chat ticker and bottom dock -->
+      <div id="sheet-backdrop" class="sheet-backdrop"></div>
+      <button id="chat-ticker" class="chat-ticker hidden" type="button" aria-live="polite"></button>
+      <nav id="dock" class="dock" aria-label="Lobby panels">
+        <button class="dock-btn" type="button" data-open="chat">
+          <span class="dock-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/></svg><span id="dock-chat-dot" class="dock-dot hidden"></span></span>
+          <span>Chat</span>
+        </button>
+        <button class="dock-btn" type="button" data-open="next">
+          <span class="dock-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1" fill="currentColor"/><circle cx="3.5" cy="12" r="1" fill="currentColor"/><circle cx="3.5" cy="18" r="1" fill="currentColor"/></svg></span>
+          <span>Up Next</span>
+        </button>
+        <button class="dock-btn" type="button" data-open="lyrics">
+          <span class="dock-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></span>
+          <span>Lyrics</span>
+        </button>
+        <button class="dock-people" type="button" data-open="chat" aria-label="Who's listening">
+          <span id="dock-stack" class="stack"></span>
+          <span id="dock-count" class="dock-count">0</span>
+        </button>
+      </nav>
     </main>
   </div>
 
@@ -908,7 +1172,22 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       lastReactAt: 0,
       selfPauseUntil: 0,
       forceSyncTimer: null,
+      sheetOpen: false,
+      tickerTimer: null,
     };
+    const MQ_PHONE = window.matchMedia('(max-width: 760px)');
+    const isPhone = () => MQ_PHONE.matches;
+    // Phones: make the square cover as big as the space left on screen allows.
+    function fitArt() {
+      const zone = document.querySelector('.art-zone');
+      const wrap = document.querySelector('.art-wrap');
+      if (!zone || !wrap) return;
+      if (!isPhone()) { wrap.style.width = ''; return; }
+      const size = Math.floor(Math.min(zone.clientWidth, zone.clientHeight));
+      wrap.style.width = size > 0 ? `${size}px` : '';
+    }
+    // Chat counts as "seen" when its tab is showing (and, on phones, the sheet is up).
+    const chatVisible = () => S.tab === 'chat' && (!isPhone() || S.sheetOpen);
 
     // ---------- Utilities ----------
     function esc(s) {
@@ -1349,6 +1628,8 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       $('people').innerHTML = people.length
         ? people.map((p) => `<span class="person ${p.pid === S.pid ? 'you' : ''}" title="${esc(p.name)}${p.username ? ` (@${esc(p.username)})` : ''}">${avatarHtml(p, 'sm')}<span>${esc(p.name)}${p.pid === S.pid ? ' (you)' : ''}</span></span>`).join('')
         : '<span style="color:var(--text-muted);font-size:13px">Nobody else yet</span>';
+      $('dock-stack').innerHTML = people.slice(0, 3).map((p) => avatarHtml(p, 'sm')).join('');
+      $('dock-count').textContent = String(people.length);
     }
     function renderUpNext() {
       const list = (S.state && S.state.upNext) || [];
@@ -1409,10 +1690,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (S.chat.length === 1) box.innerHTML = '';
       box.insertAdjacentHTML('beforeend', chatRowHtml(m, prev));
       if (nearBottom || m.pid === S.pid) box.scrollTop = box.scrollHeight;
-      if (S.tab !== 'chat' && m.kind !== 'system') {
-        S.unread += 1;
-        $('chat-dot').textContent = S.unread > 9 ? '9+' : String(S.unread);
-        $('chat-dot').classList.remove('hidden');
+      if (!chatVisible() && m.kind !== 'system' && m.pid !== S.pid) {
+        setUnread(S.unread + 1);
+        if (isPhone()) showTicker(m);
       }
     }
     function floatReaction(emoji, name) {
@@ -1508,6 +1788,56 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       rows.forEach((el, i) => el.classList.toggle('active', i === idx));
       if (idx >= 0 && rows[idx]) rows[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
+    function setUnread(n) {
+      S.unread = n;
+      const label = n > 9 ? '9+' : String(n);
+      for (const id of ['chat-dot', 'dock-chat-dot']) {
+        $(id).textContent = label;
+        $(id).classList.toggle('hidden', !n);
+      }
+    }
+    function showTicker(m) {
+      const el = $('chat-ticker');
+      el.innerHTML = `${avatarHtml({ name: m.name, color: m.color, avatarUrl: m.avatarUrl }, 'sm')}<span class="tk-body"><b style="color:${esc(m.color)}">${esc(m.name)}</b><span class="tk-text">${esc(m.text)}</span></span>`;
+      el.classList.remove('hidden');
+      el.style.animation = 'none';
+      void el.offsetWidth;
+      el.style.animation = '';
+      clearTimeout(S.tickerTimer);
+      S.tickerTimer = setTimeout(hideTicker, 4500);
+    }
+    function hideTicker() {
+      clearTimeout(S.tickerTimer);
+      $('chat-ticker').classList.add('hidden');
+    }
+    function openSheet(tab) {
+      S.sheetOpen = true;
+      $('side').classList.add('open');
+      $('sheet-backdrop').classList.add('open');
+      hideTicker();
+      setTab(tab);
+    }
+    function closeSheet() {
+      if (!S.sheetOpen) return;
+      S.sheetOpen = false;
+      $('side').classList.remove('open');
+      $('side').style.transform = '';
+      $('sheet-backdrop').classList.remove('open');
+      if (document.activeElement && $('side').contains(document.activeElement)) document.activeElement.blur();
+    }
+    function inviteFriend() {
+      const url = location.href.split('#')[0];
+      const title = (S.state && S.state.name) || 'Listen Together';
+      if (typeof navigator.share === 'function') {
+        navigator.share({ title, text: `Listen along with ${hostName()} on Beatlab`, url }).catch(() => {});
+        return;
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(() => toast('Invite link copied'), () => toast(url));
+      } else {
+        toast(url);
+      }
+    }
     function setTab(tab) {
       S.tab = tab;
       document.querySelectorAll('.tab').forEach((b) => {
@@ -1518,9 +1848,8 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       $('pane-chat').classList.toggle('hidden', tab !== 'chat');
       $('pane-next').classList.toggle('hidden', tab !== 'next');
       $('pane-lyrics').classList.toggle('hidden', tab !== 'lyrics');
-      if (tab === 'chat') {
-        S.unread = 0;
-        $('chat-dot').classList.add('hidden');
+      if (tab === 'chat' && chatVisible()) {
+        setUnread(0);
         const box = $('chat-list');
         box.scrollTop = box.scrollHeight;
       }
@@ -1633,6 +1962,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     }
     function teardown() {
       S.joined = false;
+      document.body.classList.remove('in-room');
+      closeSheet();
+      hideTicker();
       if (S.es) { try { S.es.close(); } catch {} S.es = null; }
       clearTimeout(S.rejoinTimer);
       S.rejoinTimer = null;
@@ -1698,6 +2030,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         S.state = d.state;
         $('gate').classList.add('hidden');
         $('room').classList.remove('hidden');
+        document.body.classList.add('in-room');
         renderChat();
         renderAll();
         syncAudio();
@@ -1762,6 +2095,37 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (b) sendReaction(b.dataset.emoji);
     });
     document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => setTab(b.dataset.tab)));
+    document.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => openSheet(b.dataset.open)));
+    $('chat-ticker').addEventListener('click', () => openSheet('chat'));
+    $('sheet-close').addEventListener('click', closeSheet);
+    $('sheet-backdrop').addEventListener('click', closeSheet);
+    $('btn-invite').addEventListener('click', inviteFriend);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
+    MQ_PHONE.addEventListener('change', () => { if (!isPhone()) { closeSheet(); hideTicker(); } fitArt(); });
+    if (typeof ResizeObserver === 'function') new ResizeObserver(fitArt).observe(document.querySelector('.art-zone'));
+    window.addEventListener('resize', fitArt);
+    // Swipe the sheet down by its handle to close it.
+    (() => {
+      const head = $('sheet-head');
+      const side = $('side');
+      let startY = null;
+      let dy = 0;
+      head.addEventListener('touchstart', (e) => { startY = e.touches[0].clientY; dy = 0; side.classList.add('dragging'); }, { passive: true });
+      head.addEventListener('touchmove', (e) => {
+        if (startY === null) return;
+        dy = Math.max(0, e.touches[0].clientY - startY);
+        side.style.transform = `translateY(${dy}px)`;
+      }, { passive: true });
+      const end = () => {
+        if (startY === null) return;
+        side.classList.remove('dragging');
+        side.style.transform = '';
+        if (dy > 90) closeSheet();
+        startY = null;
+      };
+      head.addEventListener('touchend', end);
+      head.addEventListener('touchcancel', end);
+    })();
     $('btn-listen').addEventListener('click', () => setLocalPaused(!S.localPaused));
     $('tap-resume-btn').addEventListener('click', () => {
       S.blocked = false;
