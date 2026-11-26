@@ -418,7 +418,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       display: grid;
       grid-template-columns: minmax(0, 1fr) 380px;
       gap: 20px;
-      align-items: start;
+      align-items: stretch;
     }
     .stage {
       background: var(--surface);
@@ -511,7 +511,10 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     .sync-badge.warn i { background: #fbbf24; }
     .sync-badge.idle i { background: #a0a0ab; }
 
-    .meta { text-align: center; min-width: 0; }
+    /* Positioned so they paint above the cover art's drop shadow (the
+       art wrapper is position: relative and would otherwise cover them). */
+    .meta { position: relative; text-align: center; min-width: 0; }
+    .progress, .controls, .reactions { position: relative; }
     .t-title {
       font-size: clamp(20px, 3.2vw, 28px);
       font-weight: 800;
@@ -540,7 +543,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     .t-status { flex: 1; text-align: center; font-weight: 600; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .t-status.accent { color: var(--accent); }
 
-    .controls { display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap; }
+    .controls { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 14px; }
+    .controls .play-btn { grid-column: 2; }
+    .controls .vol { grid-column: 3; justify-self: start; }
     .play-btn {
       width: 56px;
       height: 56px;
@@ -578,11 +583,10 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       border-radius: 20px;
       display: flex;
       flex-direction: column;
-      height: calc(100vh - 64px - 28px);
-      height: calc(100dvh - 64px - 28px);
+      /* Size containment: the panel takes the player card's height (grid
+         stretch) instead of growing with the chat, which scrolls inside. */
+      contain: size;
       min-height: 440px;
-      position: sticky;
-      top: 12px;
       overflow: hidden;
       min-width: 0;
     }
@@ -689,7 +693,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
 
     @media (max-width: 960px) {
       .room { grid-template-columns: minmax(0, 1fr); }
-      .side { position: static; height: 72vh; height: 72dvh; min-height: 380px; }
+      .side { height: 72vh; height: 72dvh; min-height: 380px; }
     }
     @media (max-width: 560px) {
       .shell { padding: 0 16px 20px; }
@@ -700,7 +704,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       .side { border-radius: 18px; }
       .art-wrap { width: min(100%, 320px); }
       .room-title { display: none; }
-      .vol input { width: 84px; }
+      .vol input { width: 72px; }
       .react-btn { width: 42px; height: 42px; font-size: 20px; }
     }
     @media (prefers-reduced-motion: reduce) {
@@ -788,19 +792,15 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
           <div class="times"><span id="t-elapsed">0:00</span><span id="t-status" class="t-status"></span><span id="t-duration">0:00</span></div>
         </div>
         <div class="controls">
+          <button id="btn-listen" class="play-btn" type="button" title="Pause for me" aria-label="Pause for me">
+            <svg id="listen-icon" viewBox="0 0 24 24" fill="currentColor"></svg>
+          </button>
           <div class="vol">
             <button id="btn-mute" class="icon-btn" type="button" title="Mute" aria-label="Mute">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><g id="vol-icon"></g></svg>
             </button>
             <input id="vol" type="range" min="0" max="1" step="0.01" value="0.9" aria-label="Volume" />
           </div>
-          <button id="btn-listen" class="play-btn" type="button" title="Pause for me" aria-label="Pause for me">
-            <svg id="listen-icon" viewBox="0 0 24 24" fill="currentColor"></svg>
-          </button>
-          <button id="btn-resync" class="btn-secondary btn-sm" type="button" title="Jump back to the live position">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
-            <span>Resync</span>
-          </button>
         </div>
         <div id="reactions" class="reactions" aria-label="Send a reaction"></div>
       </section>
@@ -907,6 +907,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       muted: false,
       lastReactAt: 0,
       selfPauseUntil: 0,
+      forceSyncTimer: null,
     };
 
     // ---------- Utilities ----------
@@ -1133,6 +1134,11 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         if (!S.localPaused && Math.abs(currentSec() - expectedSec()) > 1) seekTo(expectedSec());
       }
     }
+    // Ignore the post-seek settling window and correct immediately.
+    function forceSync() {
+      S.settleUntil = 0;
+      correctDrift();
+    }
     function correctDrift() {
       if (!shouldPlay() || audio.paused || audio.seeking || audio.readyState < 3) {
         if (!shouldPlay()) audio.playbackRate = 1;
@@ -1144,7 +1150,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (t && t.duration > 0 && exp > t.duration - 1.5) return;
       const drift = currentSec() - exp;
       S.drift = drift;
-      if (Math.abs(drift) > 2) {
+      if (Math.abs(drift) > 1) {
         audio.playbackRate = 1;
         seekTo(exp + 0.2);
       } else if (Math.abs(drift) > 0.12) {
@@ -1177,6 +1183,10 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       S.blocked = false;
       $('tap-resume').classList.add('hidden');
       renderTransport();
+      // Coming out of a stall or a resume: snap back to the live point right
+      // away instead of waiting for the next correction tick.
+      clearTimeout(S.forceSyncTimer);
+      S.forceSyncTimer = setTimeout(forceSync, 350);
     });
     audio.addEventListener('pause', () => {
       // Paused by the OS/browser (headphones out, call, lock screen) while the
@@ -1376,7 +1386,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (m.kind === 'system') return `<div class="chat-sys">${esc(m.text)}</div>`;
       const cont = prev && prev.kind !== 'system' && prev.pid === m.pid && m.at - prev.at < 120000;
       return `<div class="chat-msg ${cont ? 'cont' : ''}">
-        ${avatarHtml({ name: m.name, color: m.color }, 'sm')}
+        ${avatarHtml({ name: m.name, color: m.color, avatarUrl: m.avatarUrl }, 'sm')}
         <div class="chat-body">
           ${cont ? '' : `<div class="chat-meta"><span class="chat-name" style="color:${esc(m.color)}">${esc(m.name)}</span>${m.kind === 'host' ? '<span class="host-tag">HOST</span>' : ''}<span class="chat-time">${esc(clockTime(m.at))}</span></div>`}
           <div class="chat-text">${esc(m.text)}</div>
@@ -1753,16 +1763,6 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     });
     document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => setTab(b.dataset.tab)));
     $('btn-listen').addEventListener('click', () => setLocalPaused(!S.localPaused));
-    $('btn-resync').addEventListener('click', () => {
-      S.localPaused = false;
-      S.blocked = false;
-      const t = curTrack();
-      if (!t) { toast('Nothing is playing yet'); return; }
-      if (t.id !== S.loadedId) loadTrack(t);
-      else { audio.playbackRate = 1; seekTo(expectedSec() + 0.2); playAudio(); }
-      toast('Back in sync with the host');
-      renderTransport();
-    });
     $('tap-resume-btn').addEventListener('click', () => {
       S.blocked = false;
       $('tap-resume').classList.add('hidden');
@@ -1791,7 +1791,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && S.joined) {
-        syncClock(2).then(() => { syncAudio(); renderAll(); });
+        syncClock(2).then(() => { syncAudio(); forceSync(); renderAll(); });
       }
     });
 

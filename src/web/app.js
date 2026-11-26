@@ -9963,6 +9963,7 @@
     chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/></svg>',
     shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v6c0 4.5 3 7.8 7 9 4-1.2 7-4.5 7-9V6l-7-3z"/><path d="m9.5 12 1.8 1.8 3.5-3.8"/></svg>',
     note: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+    power: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v8"/><path d="M6.3 6.6a8 8 0 1 0 11.4 0"/></svg>',
   };
 
   const lobby = {
@@ -9980,6 +9981,7 @@
     lastChatToastAt: 0,
     reactions: ['🔥', '❤️', '🙌', '😂', '😮', '🎉'],
     starting: false,
+    last: null, // { name, allowChat } from your previous lobby, to prefill the next
   };
 
   // Identifies this tab as a broadcaster. Kept in sessionStorage so a reload
@@ -10064,6 +10066,7 @@
       try {
         const d = await api(`/api/web/lobby?clientId=${encodeURIComponent(lobbyClientId())}`);
         if (Array.isArray(d.reactions) && d.reactions.length) lobby.reactions = d.reactions;
+        if (d.last && d.last.name) lobby.last = d.last;
         setLobbyData(d.lobby || null);
       } catch {
         // Keep whatever we had; the next heartbeat or visit retries.
@@ -10077,6 +10080,8 @@
   }
 
   function setLobbyData(data) {
+    // Remember the lobby you're leaving so the next one starts with its settings.
+    if (!data && lobby.data) lobby.last = { name: lobby.data.name, allowChat: !!lobby.data.allowChat };
     lobby.data = data;
     if (data) {
       lobby.conflict = !!data.broadcastingElsewhere;
@@ -10122,6 +10127,7 @@
   function resetLobbyForSignOut() {
     stopLobbySession();
     lobby.data = null;
+    lobby.last = null;
     lobby.loaded = false;
     lobby.clockSynced = false;
     updateLobbyIndicators();
@@ -10422,7 +10428,7 @@
       when = new Date(m.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
     } catch {}
     return `<div class="lobby-chat-msg ${cont ? 'cont' : ''}">
-      ${lobbyAvatar({ name: m.name, color: m.color }, 'sm')}
+      ${lobbyAvatar({ name: m.name, color: m.color, avatarUrl: m.avatarUrl }, 'sm')}
       <div class="lobby-chat-body">
         ${cont ? '' : `<div class="lobby-chat-meta"><span class="lobby-chat-name" style="color:${esc(m.color)}">${esc(m.kind === 'host' ? 'You' : m.name)}</span>${m.kind === 'host' ? '<span class="lobby-host-tag">HOST</span>' : ''}<span class="lobby-chat-time">${esc(when)}</span></div>`}
         <div class="lobby-chat-text">${esc(m.text)}</div>
@@ -10461,7 +10467,9 @@
 
   function lobbyStartHtml() {
     const me = state.user || {};
-    const defaultName = `${me.username || 'My'}'s Lobby`;
+    const fallbackName = `${me.username || 'My'}'s Lobby`;
+    const defaultName = (lobby.last && lobby.last.name) || fallbackName;
+    const chatOn = lobby.last ? lobby.last.allowChat !== false : true;
     return `<div class="lobby-page">
       <section class="lobby-start">
         <div class="lobby-start-visual" aria-hidden="true">
@@ -10479,10 +10487,10 @@
           </ul>
           <form class="lobby-start-form" onsubmit="App.startLobby(event)">
             <label class="kv-label" for="lobby-name-input">Lobby name</label>
-            <input id="lobby-name-input" class="lobby-input" type="text" maxlength="48" autocomplete="off" value="${esc(defaultName)}" placeholder="${esc(defaultName)}" />
+            <input id="lobby-name-input" class="lobby-input" type="text" maxlength="48" autocomplete="off" value="${esc(defaultName)}" placeholder="${esc(fallbackName)}" />
             <label class="lobby-switch-row">
               <span><b>Allow chat</b><small>You can change this later</small></span>
-              <span class="switch-toggle"><input id="lobby-chat-input" type="checkbox" checked /><span class="switch-track"></span></span>
+              <span class="switch-toggle"><input id="lobby-chat-input" type="checkbox" ${chatOn ? 'checked' : ''} /><span class="switch-track"></span></span>
             </label>
             <button id="lobby-start-btn" class="btn-primary lobby-start-btn" type="submit">${LOBBY_ICON_SVG}<span>Start Lobby</span></button>
           </form>
@@ -10520,7 +10528,7 @@
             ${canNativeShare ? `<button class="btn-secondary" onclick="App.shareLobbyLink()">${ICONS.share} Share</button>` : ''}
             <button class="btn-secondary" onclick="App.showLobbyQr()">${LOBBY_ICONS.qr} QR Code</button>
             <a class="btn-secondary" href="${esc(d.path)}" target="_blank" rel="noopener">${LOBBY_ICONS.external} Listener View</a>
-            <button class="btn-secondary danger-btn" onclick="App.endLobby()">End Lobby</button>
+            <button class="btn-secondary danger-btn" onclick="App.endLobby()">${LOBBY_ICONS.power} End Lobby</button>
           </div>
         </div>
       </section>

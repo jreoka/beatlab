@@ -8454,7 +8454,7 @@ html[data-theme="light"] .stats-portrait-badge {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.lobby-hero-info { flex: 1; min-width: 0; }
+.lobby-hero-info { position: relative; flex: 1; min-width: 0; }
 .lobby-live-kicker {
   display: inline-flex;
   align-items: center;
@@ -8490,7 +8490,13 @@ html[data-theme="light"] .stats-portrait-badge {
 .lobby-hero .hero-actions .btn-primary {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 7px;
+  /* <button>s don't inherit font-size but the <a> does; pin both so the row matches. */
+  height: 36px;
+  padding: 0 16px;
+  font-size: 13.5px;
+  line-height: 1;
 }
 .lobby-hero .hero-actions svg { width: 16px; height: 16px; }
 .lobby-hero .hero-actions .danger-btn { color: #fda4af; }

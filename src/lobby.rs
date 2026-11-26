@@ -315,13 +315,24 @@ impl Lobby {
         self.emit("state", &self.snapshot(now), None);
     }
 
-    fn post_chat(&mut self, kind: &str, pid: &str, name: &str, color: &str, text: &str, now: i64) {
+    #[allow(clippy::too_many_arguments)]
+    fn post_chat(
+        &mut self,
+        kind: &str,
+        pid: &str,
+        name: &str,
+        color: &str,
+        avatar_url: &str,
+        text: &str,
+        now: i64,
+    ) {
         let msg = json!({
             "id": self.next_msg_id,
             "kind": kind,
             "pid": pid,
             "name": name,
             "color": color,
+            "avatarUrl": avatar_url,
             "text": text,
             "at": now,
         });
@@ -602,6 +613,21 @@ fn host_lobby_code(state: &AppState, user_id: i64) -> Option<String> {
     Some(rec.code)
 }
 
+/// Re-reads the host's name and picture (cached when the lobby loaded) so a
+/// profile change shows up without restarting the lobby.
+fn refresh_host_info(state: &AppState, code: &str, user_id: i64) {
+    let fresh = host_info(&state.store, user_id);
+    state.lobbies.with(code, |l| {
+        let changed = l.host.avatar_url != fresh.avatar_url
+            || l.host.display_name != fresh.display_name
+            || l.host.avatar_color != fresh.avatar_color;
+        l.host = fresh;
+        if changed {
+            l.emit_state(now_ms());
+        }
+    });
+}
+
 fn host_view(state: &AppState, headers: &HeaderMap, code: &str, client_id: &str) -> Value {
     let url = lobby_url(headers, code);
     let qr_svg = crate::auth::qr_svg(&url).unwrap_or_default();
@@ -777,9 +803,20 @@ pub async fn get_my_lobby(
         Err(r) => return r,
     };
     let lobby = host_lobby_code(&state, user.id)
-        .map(|code| host_view(&state, &headers, &code, &q.client_id))
+        .map(|code| {
+            refresh_host_info(&state, &code, user.id);
+            host_view(&state, &headers, &code, &q.client_id)
+        })
         .unwrap_or(Value::Null);
-    no_store(json_res(json!({ "lobby": lobby, "reactions": REACTIONS })))
+    // Prefill for the next "Start Lobby" form: the settings you last used.
+    let last = state
+        .store
+        .last_lobby_for_user(user.id)
+        .ok()
+        .flatten()
+        .map(|r| json!({ "name": r.name, "allowChat": r.allow_chat }))
+        .unwrap_or(Value::Null);
+    no_store(json_res(json!({ "lobby": lobby, "last": last, "reactions": REACTIONS })))
 }
 
 pub async fn create_lobby(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1057,6 +1094,7 @@ pub async fn host_chat(State(state): State<AppState>, headers: HeaderMap, body: 
     let Some(code) = host_lobby_code(&state, user.id) else {
         return err_res(StatusCode::NOT_FOUND, "You don't have an open lobby");
     };
+    refresh_host_info(&state, &code, user.id);
     let now = now_ms();
     state.lobbies.with(&code, |l| {
         let name = l.host.display_name.clone();
@@ -1065,7 +1103,8 @@ pub async fn host_chat(State(state): State<AppState>, headers: HeaderMap, body: 
         } else {
             l.host.avatar_color.clone()
         };
-        l.post_chat("host", "host", &name, &color, &text, now);
+        let avatar = l.host.avatar_url.clone();
+        l.post_chat("host", "host", &name, &color, &avatar, &text, now);
     });
     json_res(json!({ "ok": true }))
 }
@@ -1309,7 +1348,7 @@ pub async fn guest_join(
             }
             if l.welcomed.insert(lid.clone()) {
                 let text = format!("{name} joined");
-                l.post_chat("system", &pid, &name, &color, &text, now);
+                l.post_chat("system", &pid, &name, &color, "", &text, now);
             }
         }
         l.emit_state(now);
@@ -1422,13 +1461,14 @@ pub async fn guest_chat(State(state): State<AppState>, Path(code): Path<String>,
         if !listener.take_chat_token(now) {
             return Err(coded_err(StatusCode::TOO_MANY_REQUESTS, "slow", "Slow down a little."));
         }
-        let (kind, pid, name, color) = (
+        let (kind, pid, name, color, avatar) = (
             listener.kind(),
             listener.pid.clone(),
             listener.name.clone(),
             listener.color.clone(),
+            listener.avatar_url.clone(),
         );
-        l.post_chat(kind, &pid, &name, &color, &text, now);
+        l.post_chat(kind, &pid, &name, &color, &avatar, &text, now);
         Ok(())
     });
     match result {
@@ -1711,7 +1751,7 @@ mod tests {
     #[tokio::test]
     async fn host_creates_lobby_and_guests_listen_without_accounts() {
         let state = test_state();
-        let (h, _) = host_headers(&state, "dj");
+        let (h, host_uid) = host_headers(&state, "dj");
 
         // Create: default name, invite URL on the public origin, QR code.
         let created = body_json(create_lobby(State(state.clone()), h.clone(), Bytes::new()).await).await;
@@ -1800,6 +1840,8 @@ mod tests {
             assert_eq!(chat(&format!("hi {i}")).await.status(), StatusCode::OK);
         }
         assert_eq!(chat("spam").await.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The host adds a profile picture mid-session; their next message carries it.
+        state.store.set_avatar(host_uid, b"fake-png-bytes", "image/png").unwrap();
         let r = host_chat(State(state.clone()), h.clone(), body(json!({ "text": "welcome!" }))).await;
         assert_eq!(r.status(), StatusCode::OK);
         let view = body_json(
@@ -1809,6 +1851,13 @@ mod tests {
         let chat_log = view["lobby"]["chat"].as_array().unwrap();
         assert_eq!(chat_log.last().unwrap()["kind"], "host");
         assert_eq!(chat_log.last().unwrap()["text"], "welcome!");
+        assert!(
+            chat_log.last().unwrap()["avatarUrl"].as_str().unwrap().starts_with("/api/web/social/avatar/"),
+            "host chat shows the profile picture"
+        );
+        assert!(view["lobby"]["host"]["avatarUrl"].as_str().unwrap().starts_with("/api/web/social/avatar/"));
+        // Guests without a picture send an empty avatar (letter fallback).
+        assert_eq!(chat_log[1]["avatarUrl"], "");
         assert_eq!(view["lobby"]["broadcastingElsewhere"], false);
 
         // Reactions are limited to the fixed palette.
@@ -1865,6 +1914,9 @@ mod tests {
         )
         .await;
         assert!(view["lobby"].is_null());
+        // The next "Start Lobby" form is prefilled with what you last used.
+        assert_eq!(view["last"]["name"], "Friday Night");
+        assert_eq!(view["last"]["allowChat"], false);
         let r = push(&state, &h, json!({ "clientId": "tab-2", "playing": false })).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
 

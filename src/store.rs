@@ -5711,6 +5711,16 @@ impl Store {
         Ok(conn.query_row(&sql, params![user_id], Self::row_to_lobby).optional()?)
     }
 
+    /// The user's most recent lobby, open or ended (used to prefill the next one).
+    pub fn last_lobby_for_user(&self, user_id: i64) -> AppResult<Option<LobbyRecord>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {} FROM lobbies WHERE user_id = ?1 ORDER BY created DESC LIMIT 1",
+            Self::LOBBY_COLS
+        );
+        Ok(conn.query_row(&sql, params![user_id], Self::row_to_lobby).optional()?)
+    }
+
     pub fn update_lobby_settings(
         &self,
         code: &str,
