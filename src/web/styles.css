@@ -7465,10 +7465,10 @@ body:not(.audio-playing) .fs-player .fs-cover {
   }
   .fs-inner {
     max-width: 560px;
-    padding: calc(8px + env(safe-area-inset-top)) 24px calc(16px + env(safe-area-inset-bottom));
+    padding: calc(clamp(8px, 1.6dvh, 14px) + env(safe-area-inset-top)) 24px calc(clamp(16px, 2.8dvh, 24px) + env(safe-area-inset-bottom));
   }
   .fs-topbar {
-    margin: 0 -8px 8px;
+    margin: 0 -8px 0;
   }
   .fs-collapse svg {
     width: 26px;
@@ -7487,12 +7487,13 @@ body:not(.audio-playing) .fs-player .fs-cover {
     flex-direction: column;
     gap: 0;
   }
-  /* Cover centred in the free space; title block sits right above the controls */
+  /* Cover centred between topbar and title block; title sits above the controls */
   .fs-art-col {
-    --cover: min(100%, max(180px, calc(100dvh - 400px - env(safe-area-inset-top) - env(safe-area-inset-bottom))));
+    --cover: min(100%, max(180px, calc(100dvh - 380px - env(safe-area-inset-top) - env(safe-area-inset-bottom))));
     flex: 1;
     justify-content: flex-end;
-    gap: 0;
+    padding-top: 16px;
+    gap: 14px;
     touch-action: pan-y;
   }
   .fs-cover-wrap {
@@ -7503,15 +7504,19 @@ body:not(.audio-playing) .fs-player .fs-cover {
   }
   .fs-info-row {
     width: 100%;
-    margin: 0 -8px 0 0;
-    padding-top: 20px;
+    margin: 0;
+    padding-top: 0;
+    gap: 12px;
+  }
+  .fs-like-btn {
+    margin-right: -9px;
   }
   .fs-info h2 {
     font-size: 22px;
   }
   .fs-info p {
     font-size: 15px;
-    margin-top: 2px;
+    margin-top: 4px;
   }
 
   /* View switching: player / up next / lyrics */
@@ -7542,7 +7547,7 @@ body:not(.audio-playing) .fs-player .fs-cover {
     align-items: center;
     gap: 12px;
     width: 100%;
-    padding: 4px 0 12px;
+    padding: 10px 0 12px;
     border: 0;
     background: none;
     color: inherit;
@@ -7600,8 +7605,8 @@ body:not(.audio-playing) .fs-player .fs-cover {
   .fs-mobile-controls {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding-top: 14px;
+    gap: clamp(14px, 2.8dvh, 24px);
+    padding-top: clamp(16px, 2.6dvh, 24px);
     flex-shrink: 0;
   }
   .fs-progress-row {
@@ -7611,7 +7616,7 @@ body:not(.audio-playing) .fs-player .fs-cover {
   .fs-times {
     display: flex;
     justify-content: space-between;
-    margin-top: -2px;
+    margin-top: 0;
   }
   .fs-times .time-lbl {
     min-width: 0;
@@ -7631,15 +7636,20 @@ body:not(.audio-playing) .fs-player .fs-cover {
   }
   .fs-player.fs-view-queue .fs-mobile-controls,
   .fs-player.fs-view-lyrics .fs-mobile-controls {
-    padding-top: 8px;
+    gap: 10px;
+    padding-top: 10px;
   }
 
   /* Bottom view switcher: two quiet text buttons */
   .fs-mobile-tabs {
     display: flex;
     justify-content: space-between;
-    margin: 10px -12px 0;
+    margin: clamp(18px, 3.6dvh, 34px) -12px 0;
     flex-shrink: 0;
+  }
+  .fs-player.fs-view-queue .fs-mobile-tabs,
+  .fs-player.fs-view-lyrics .fs-mobile-tabs {
+    margin-top: 12px;
   }
   .fs-mobile-tab {
     display: inline-flex;
