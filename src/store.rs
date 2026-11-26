@@ -1,8 +1,8 @@
 use crate::auth::{hash_recovery_code, RESTORE_WINDOW_SECS};
 use crate::models::{
     allow_case_insensitive_artist_merge, err_msg, primary_artist, slug, validate_credentials,
-    AlbumSummary, AppResult, ArtistSummary, CacheEntry, Event, Mood, PlayQueueState, Playlist,
-    PublicUser, ShareRecord, Track, User, UserEventRow, UserProfile, UserTrackStats,
+    AlbumSummary, AppResult, ArtistSummary, CacheEntry, Event, LobbyRecord, Mood, PlayQueueState,
+    Playlist, PublicUser, ShareRecord, Track, User, UserEventRow, UserProfile, UserTrackStats,
 };
 use chrono::Utc;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, ToSql};
@@ -483,6 +483,22 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_user_radios_target
                 ON user_radios(target_id);
+
+            -- Listen Together lobbies: a host broadcasts their playback to
+            -- anyone holding the invite code (no account required).
+            CREATE TABLE IF NOT EXISTS lobbies (
+                code TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                allow_chat INTEGER NOT NULL DEFAULT 1,
+                locked INTEGER NOT NULL DEFAULT 0,
+                created INTEGER NOT NULL,
+                last_active INTEGER NOT NULL,
+                ended INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_lobbies_user_active
+                ON lobbies(user_id, ended);
             ",
         )?;
 
@@ -5607,6 +5623,122 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    // -------------------------------------------------------------------------
+    // Listen Together lobbies
+    // -------------------------------------------------------------------------
+
+    const LOBBY_COLS: &'static str =
+        "code, user_id, name, allow_chat, locked, created, last_active, ended";
+
+    fn row_to_lobby(r: &Row) -> rusqlite::Result<LobbyRecord> {
+        Ok(LobbyRecord {
+            code: r.get(0)?,
+            user_id: r.get(1)?,
+            name: r.get(2)?,
+            allow_chat: r.get::<_, i64>(3)? != 0,
+            locked: r.get::<_, i64>(4)? != 0,
+            created: r.get(5)?,
+            last_active: r.get(6)?,
+            ended: r.get::<_, i64>(7)? != 0,
+        })
+    }
+
+    /// Creates a lobby for `user_id`, or returns their current open one so a
+    /// host never ends up with two competing invite links.
+    pub fn create_lobby(&self, user_id: i64, name: &str, allow_chat: bool) -> AppResult<LobbyRecord> {
+        const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+        let now = Utc::now().timestamp();
+        // One connection lock for check + insert, so a double-submit can't
+        // leave the host with two open lobbies.
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {} FROM lobbies WHERE user_id = ?1 AND ended = 0 ORDER BY created DESC LIMIT 1",
+            Self::LOBBY_COLS
+        );
+        if let Some(existing) = conn.query_row(&sql, params![user_id], Self::row_to_lobby).optional()? {
+            return Ok(existing);
+        }
+        let mut code;
+        loop {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            code = (0..8)
+                .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+                .collect::<String>();
+            let taken = conn
+                .query_row("SELECT 1 FROM lobbies WHERE code = ?1", params![code], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .optional()?
+                .is_some();
+            if !taken {
+                break;
+            }
+        }
+        conn.execute(
+            "INSERT INTO lobbies(code, user_id, name, allow_chat, locked, created, last_active, ended)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0)",
+            params![code, user_id, name, allow_chat as i64, now],
+        )?;
+        Ok(LobbyRecord {
+            code,
+            user_id,
+            name: name.to_string(),
+            allow_chat,
+            locked: false,
+            created: now,
+            last_active: now,
+            ended: false,
+        })
+    }
+
+    pub fn get_lobby(&self, code: &str) -> AppResult<Option<LobbyRecord>> {
+        let conn = self.lock();
+        let sql = format!("SELECT {} FROM lobbies WHERE code = ?1", Self::LOBBY_COLS);
+        Ok(conn
+            .query_row(&sql, params![code.trim().to_ascii_lowercase()], Self::row_to_lobby)
+            .optional()?)
+    }
+
+    pub fn active_lobby_for_user(&self, user_id: i64) -> AppResult<Option<LobbyRecord>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {} FROM lobbies WHERE user_id = ?1 AND ended = 0 ORDER BY created DESC LIMIT 1",
+            Self::LOBBY_COLS
+        );
+        Ok(conn.query_row(&sql, params![user_id], Self::row_to_lobby).optional()?)
+    }
+
+    pub fn update_lobby_settings(
+        &self,
+        code: &str,
+        name: &str,
+        allow_chat: bool,
+        locked: bool,
+    ) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE lobbies SET name = ?1, allow_chat = ?2, locked = ?3 WHERE code = ?4",
+            params![name, allow_chat as i64, locked as i64, code],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_lobby(&self, code: &str, at: i64) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE lobbies SET last_active = MAX(last_active, ?1) WHERE code = ?2",
+            params![at, code],
+        )?;
+        Ok(())
+    }
+
+    pub fn end_lobby(&self, code: &str) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute("UPDATE lobbies SET ended = 1 WHERE code = ?1", params![code])?;
+        Ok(())
     }
 }
 

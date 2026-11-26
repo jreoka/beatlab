@@ -34,6 +34,8 @@ pub struct AppState {
     pub llm: Option<Arc<LlmCurator>>,
     pub now_playing: NowPlayingMap,
     pub new_releases_inflight: NewReleasesInflight,
+    /// Live "Listen Together" lobbies (playback anchors, listeners, chat).
+    pub lobbies: crate::lobby::LobbyHub,
 }
 
 /// Internal header carrying the TCP peer address, stamped by `main::stamp_peer_ip`

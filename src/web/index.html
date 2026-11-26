@@ -182,6 +182,13 @@
             </span>
             <span>Instant Mix</span>
           </button>
+          <button class="lib-row lobby-lib-row" data-route="lobby" onclick="App.openLobby()">
+            <span class="lib-badge lobby-bg">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19.5v-.6a6 6 0 0 1 12 0v.6"/><path d="M17.2 6.6a4.4 4.4 0 0 1 0 6.2"/><path d="M19.9 4a8.2 8.2 0 0 1 0 11.4"/></svg>
+            </span>
+            <span>Listen Together</span>
+            <span id="sidebar-lobby-badge" class="lib-live-badge hidden">LIVE</span>
+          </button>
         </div>
 
         <div id="sidebar-playlists" class="sidebar-playlists"></div>
@@ -224,6 +231,11 @@
         </div>
 
         <div class="topbar-right">
+          <button id="lobby-live-pill" class="lobby-live-pill hidden" onclick="App.openLobby()" title="Listen Together">
+            <span class="live-dot" aria-hidden="true"></span>
+            <span id="lobby-live-label">LIVE</span>
+            <span id="lobby-live-unread" class="lobby-unread hidden" aria-label="Unread messages"></span>
+          </button>
           <button id="pwa-install-btn" class="pill-btn topbar-install-btn hidden" onclick="App.installPwa()" title="Install Beatlab app">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
             <span>Install</span>
@@ -250,6 +262,10 @@
               <button class="user-menu-item" onclick="App.goCommunity()">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M2.8 19.5v-1.2a5.2 5.2 0 0 1 10.4 0v1.2"/><path d="M16 5.2a3.2 3.2 0 0 1 0 6.1M17.5 14.4a4.6 4.6 0 0 1 3.7 4.5v.6"/></svg>
                 <span>Community</span>
+              </button>
+              <button class="user-menu-item" onclick="App.openLobby()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19.5v-.6a6 6 0 0 1 12 0v.6"/><path d="M17.2 6.6a4.4 4.4 0 0 1 0 6.2"/><path d="M19.9 4a8.2 8.2 0 0 1 0 11.4"/></svg>
+                <span>Listen Together</span>
               </button>
               <button class="user-menu-item" onclick="App.goSettings()">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -381,6 +397,9 @@
     </div>
 
     <div class="pb-right">
+      <button id="pb-lobby" class="icon-btn pb-lobby-btn" title="Listen together" aria-label="Listen together" onclick="App.openLobby()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19.5v-.6a6 6 0 0 1 12 0v.6"/><path d="M17.2 6.6a4.4 4.4 0 0 1 0 6.2"/><path d="M19.9 4a8.2 8.2 0 0 1 0 11.4"/></svg>
+      </button>
       <button class="icon-btn" title="Lyrics" onclick="App.openPanelTab('lyrics')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M9 17.5V5l12-2v12.5"/><circle cx="6" cy="17.5" r="3"/><circle cx="18" cy="15.5" r="3"/></svg>
       </button>
@@ -403,16 +422,24 @@
   <div id="fullscreen-player" class="fs-player fs-view-player" aria-hidden="true">
     <div class="fs-inner">
       <div class="fs-topbar">
-        <button class="fs-round-btn fs-collapse" title="Collapse player" onclick="App.toggleFullscreen(false)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8.5 7 7 7-7"/></svg>
-        </button>
+        <div class="fs-top-side">
+          <button class="fs-round-btn fs-collapse" title="Collapse player" onclick="App.toggleFullscreen(false)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8.5 7 7 7-7"/></svg>
+          </button>
+          <span class="fs-round-btn fs-top-spacer" aria-hidden="true"></span>
+        </div>
         <div class="fs-topbar-title" onclick="App.setFsMobileView('player')">
           <span class="fs-eyebrow">Now Playing</span>
           <span id="fs-quality" class="quality-badge hidden">AAC</span>
         </div>
-        <button class="fs-round-btn fs-top-share" title="Share song link" onclick="App.shareCurrentTrack()">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-        </button>
+        <div class="fs-top-side end">
+          <button id="fs-lobby" class="fs-round-btn fs-top-lobby" title="Listen together" aria-label="Listen together" onclick="App.openLobby()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19.5v-.6a6 6 0 0 1 12 0v.6"/><path d="M17.2 6.6a4.4 4.4 0 0 1 0 6.2"/><path d="M19.9 4a8.2 8.2 0 0 1 0 11.4"/></svg>
+          </button>
+          <button class="fs-round-btn fs-top-share" title="Share song link" onclick="App.shareCurrentTrack()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+          </button>
+        </div>
       </div>
 
       <button type="button" class="fs-mini-head" onclick="App.setFsMobileView('player')" title="Back to player">

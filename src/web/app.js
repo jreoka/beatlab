@@ -1596,6 +1596,7 @@
   }
 
   function resetPlayerAndSessionUI() {
+    resetLobbyForSignOut();
     clearPlaybackRecovery();
     stopNowPlayingHeartbeat();
     state.nowPlayingReported = false;
@@ -2203,9 +2204,11 @@
         resetAuthForm();
       }
     });
+    wireLobbyAudioHooks();
     const flushOnExit = () => {
       if (state.queueSaveDirty) flushServerQueue(true);
       if (state.nowPlayingReported) clearNowPlaying(true);
+      lobbyBroadcastOnExit();
     };
     window.addEventListener('pagehide', flushOnExit);
     window.addEventListener('beforeunload', flushOnExit);
@@ -2479,6 +2482,7 @@
     $('user-avatar').innerHTML = avatarInner(selfAvatarUser());
     await Promise.all([refreshSidebarPlaylists(), restoreServerQueue()]);
     renderCurrentHash();
+    refreshLobby();
   }
 
   async function refreshSidebarPlaylists() {
@@ -2733,6 +2737,7 @@
     if (hash === 'home') return renderHome();
     if (hash === 'explore') return renderExplore();
     if (hash === 'community') return renderCommunity();
+    if (hash === 'lobby') return renderLobbyView();
     if (hash === 'profile' || hash.startsWith('profile/') || hash.startsWith('user/')) {
       const { reference, tab } = parseProfileHash(hash);
       return renderProfileView(reference, tab);
@@ -7533,6 +7538,7 @@
 
     $('queue-now-playing').innerHTML = nowHtml;
     $('queue-up-next').innerHTML = upNextHtml;
+    lobbyPush('queue');
     if ($('fs-queue-now-playing')) $('fs-queue-now-playing').innerHTML = nowHtml;
     if ($('fs-queue-up-next')) $('fs-queue-up-next').innerHTML = upNextHtml;
     if (cur) {
@@ -9857,7 +9863,10 @@
           <h2>Your community</h2>
           <p>Live radios from the people you follow. Each one is an evolving mix of what that listener actually plays, refreshed automatically as their taste changes.</p>
         </div>
-        <button class="btn-primary" onclick="App.openMyProfile()">${ICONS.play} My Radio</button>
+        <div class="community-intro-actions">
+          <button class="btn-secondary" onclick="App.openLobby()">${LOBBY_ICON_SVG} Listen Together</button>
+          <button class="btn-primary" onclick="App.openMyProfile()">${ICONS.play} My Radio</button>
+        </div>
       </div>`;
       html += `<section class="section">
         <div class="section-head"><h2>People to follow</h2><button class="mini-btn" onclick="App.focusSearch()">Find people with @</button></div>
@@ -9934,9 +9943,870 @@
     openSettingsModal();
   }
 
+  // ---------------------------------------------------------------------------
+  // Listen Together — host a live lobby friends can join from a link
+  // ---------------------------------------------------------------------------
+  // The host's player pushes a playback anchor ("track X at position P, at
+  // server time T, playing?") on every play/pause/seek/track change plus a
+  // heartbeat. Listeners on /l/{code} project that anchor and follow along.
+  const LOBBY_CLIENT_KEY = 'beatlab_lobby_client';
+  const LOBBY_HEARTBEAT_MS = 10000;
+  const LOBBY_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19.5v-.6a6 6 0 0 1 12 0v.6"/><path d="M17.2 6.6a4.4 4.4 0 0 1 0 6.2"/><path d="M19.9 4a8.2 8.2 0 0 1 0 11.4"/></svg>';
+  const LOBBY_ICONS = {
+    pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+    qr: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3"/></svg>',
+    external: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg>',
+    remove: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
+    sync: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
+    chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/></svg>',
+    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v6c0 4.5 3 7.8 7 9 4-1.2 7-4.5 7-9V6l-7-3z"/><path d="m9.5 12 1.8 1.8 3.5-3.8"/></svg>',
+    note: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+  };
+
+  const lobby = {
+    data: null, // host view from the server, or null when no lobby is open
+    loaded: false,
+    loading: null,
+    es: null,
+    esRetry: null,
+    heartbeat: null,
+    pushTimer: null,
+    conflict: false,
+    clockOffset: 0,
+    clockSynced: false,
+    unread: 0,
+    lastChatToastAt: 0,
+    reactions: ['🔥', '❤️', '🙌', '😂', '😮', '🎉'],
+    starting: false,
+  };
+
+  // Identifies this tab as a broadcaster. Kept in sessionStorage so a reload
+  // keeps broadcasting without a "take over" prompt.
+  let lobbyClientIdCache = '';
+  function setLobbyClientId(id) {
+    lobbyClientIdCache = id;
+    try {
+      sessionStorage.setItem(LOBBY_CLIENT_KEY, id);
+    } catch {}
+  }
+  function lobbyClientId() {
+    if (lobbyClientIdCache) return lobbyClientIdCache;
+    let id = '';
+    try {
+      id = sessionStorage.getItem(LOBBY_CLIENT_KEY) || '';
+    } catch {}
+    setLobbyClientId(id || state.nowPlayingClientId);
+    return lobbyClientIdCache;
+  }
+
+  // "Duplicate tab" copies sessionStorage, which would let two tabs broadcast
+  // under one id (an idle copy would keep pausing everyone). Ask the other
+  // tabs whether our id is taken and mint a fresh one if so.
+  function wireLobbyTabGuard() {
+    if (typeof BroadcastChannel !== 'function') return;
+    const nonce = `${Date.now()}-${Math.random()}`;
+    let channel;
+    try {
+      channel = new BroadcastChannel('beatlab-lobby-client');
+    } catch {
+      return;
+    }
+    channel.onmessage = (e) => {
+      const d = e.data || {};
+      if (d.type === 'hello' && d.nonce !== nonce && d.id === lobbyClientId()) {
+        channel.postMessage({ type: 'taken', nonce: d.nonce });
+      } else if (d.type === 'taken' && d.nonce === nonce) {
+        setLobbyClientId(
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+        );
+      }
+    };
+    channel.postMessage({ type: 'hello', id: lobbyClientId(), nonce });
+  }
+
+  function isLobbyRoute() {
+    return (location.hash.replace(/^#/, '') || 'home') === 'lobby';
+  }
+
+  function parseLobbyJson(raw) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  async function syncLobbyClock() {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const t0 = Date.now();
+      try {
+        const r = await fetch('/api/lobby/clock', { cache: 'no-store' });
+        const d = await r.json();
+        const t1 = Date.now();
+        if (t1 - t0 < best && Number.isFinite(d.now)) {
+          best = t1 - t0;
+          lobby.clockOffset = d.now - (t0 + t1) / 2;
+        }
+      } catch {}
+    }
+    lobby.clockSynced = best < Infinity;
+  }
+
+  async function refreshLobby() {
+    if (!state.user) return null;
+    if (lobby.loading) return lobby.loading;
+    lobby.loading = (async () => {
+      try {
+        const d = await api(`/api/web/lobby?clientId=${encodeURIComponent(lobbyClientId())}`);
+        if (Array.isArray(d.reactions) && d.reactions.length) lobby.reactions = d.reactions;
+        setLobbyData(d.lobby || null);
+      } catch {
+        // Keep whatever we had; the next heartbeat or visit retries.
+      } finally {
+        lobby.loaded = true;
+        lobby.loading = null;
+      }
+      return lobby.data;
+    })();
+    return lobby.loading;
+  }
+
+  function setLobbyData(data) {
+    lobby.data = data;
+    if (data) {
+      lobby.conflict = !!data.broadcastingElsewhere;
+      startLobbySession();
+    } else {
+      stopLobbySession();
+    }
+    updateLobbyIndicators();
+    if (isLobbyRoute()) paintLobbyView();
+  }
+
+  function startLobbySession() {
+    if (!lobby.es) connectLobbyEvents();
+    if (!lobby.heartbeat) {
+      lobby.heartbeat = setInterval(() => {
+        if (!lobby.data) return;
+        // While another tab/device broadcasts, poll until it lets go.
+        if (lobby.conflict) refreshLobby();
+        else lobbyPush('heartbeat', { immediate: true });
+      }, LOBBY_HEARTBEAT_MS);
+    }
+    if (!lobby.clockSynced) syncLobbyClock().then(() => lobbyPush('clock'));
+    else lobbyPush('start', { immediate: true });
+  }
+
+  function stopLobbySession() {
+    if (lobby.es) {
+      try {
+        lobby.es.close();
+      } catch {}
+      lobby.es = null;
+    }
+    clearTimeout(lobby.esRetry);
+    lobby.esRetry = null;
+    clearInterval(lobby.heartbeat);
+    lobby.heartbeat = null;
+    clearTimeout(lobby.pushTimer);
+    lobby.pushTimer = null;
+    lobby.conflict = false;
+    lobby.unread = 0;
+  }
+
+  function resetLobbyForSignOut() {
+    stopLobbySession();
+    lobby.data = null;
+    lobby.loaded = false;
+    lobby.clockSynced = false;
+    updateLobbyIndicators();
+  }
+
+  function connectLobbyEvents() {
+    if (!state.token) return;
+    const es = new EventSource(`/api/web/lobby/events?token=${encodeURIComponent(state.token)}`);
+    lobby.es = es;
+    es.addEventListener('init', (e) => {
+      const d = parseLobbyJson(e.data);
+      if (!d || !lobby.data) return;
+      Object.assign(lobby.data, d.state || {});
+      lobby.data.chat = d.chat || [];
+      updateLobbyIndicators();
+      if (isLobbyRoute()) paintLobbyView();
+    });
+    es.addEventListener('state', (e) => {
+      const d = parseLobbyJson(e.data);
+      if (d) onLobbyState(d);
+    });
+    es.addEventListener('chat', (e) => {
+      const m = parseLobbyJson(e.data);
+      if (m) onLobbyChat(m);
+    });
+    es.addEventListener('react', (e) => {
+      const r = parseLobbyJson(e.data);
+      if (r && r.pid !== 'host') floatLobbyReaction(r.emoji, r.name);
+    });
+    es.addEventListener('ended', () => {
+      if (lobby.es !== es) return;
+      setLobbyData(null);
+      showToast('Your lobby has ended');
+    });
+    es.onerror = () => {
+      if (es.readyState !== 2 || lobby.es !== es) return;
+      // A closed stream (lobby gone, signed out, server restarted): re-check.
+      lobby.es = null;
+      clearTimeout(lobby.esRetry);
+      lobby.esRetry = setTimeout(() => {
+        lobby.esRetry = null;
+        refreshLobby();
+      }, 4000);
+    };
+  }
+
+  function onLobbyState(st) {
+    if (!lobby.data) return;
+    const known = new Set((lobby.data.listeners || []).map((l) => l.pid));
+    Object.assign(lobby.data, st);
+    if (!isLobbyRoute()) {
+      const fresh = (st.listeners || []).filter((l) => !known.has(l.pid) && l.kind !== 'host');
+      if (fresh.length === 1) showToast(`${fresh[0].name} joined your lobby`);
+      else if (fresh.length > 1) showToast(`${fresh.length} people joined your lobby`);
+    }
+    updateLobbyIndicators();
+    if (isLobbyRoute()) paintLobbyLive();
+  }
+
+  function onLobbyChat(m) {
+    if (!lobby.data) return;
+    const list = lobby.data.chat || (lobby.data.chat = []);
+    const prev = list[list.length - 1];
+    list.push(m);
+    if (list.length > 120) list.shift();
+    if (isLobbyRoute()) {
+      appendLobbyChat(m, prev);
+      return;
+    }
+    if (m.kind === 'system' || m.kind === 'host') return;
+    lobby.unread += 1;
+    updateLobbyIndicators();
+    const now = Date.now();
+    if (now - lobby.lastChatToastAt > 4000) {
+      lobby.lastChatToastAt = now;
+      const text = m.text.length > 60 ? `${m.text.slice(0, 57)}…` : m.text;
+      showToast(`${m.name}: ${text}`);
+    }
+  }
+
+  // Position of the host's audio within the current track. Streams reopened
+  // with `?t=` (on-the-fly transcodes) restart their clock at that offset.
+  function hostAudioOffsetSec() {
+    const m = /[?&]t=([\d.]+)/.exec(audio.getAttribute('src') || '');
+    return m ? parseFloat(m[1]) || 0 : 0;
+  }
+
+  function lobbyPayload() {
+    const cur = currentTrack();
+    const src = audio.getAttribute('src') || '';
+    const loaded = !!cur && src.includes(`/stream/${encodeURIComponent(cur.id)}?`);
+    // A tapped track that hasn't reached the <audio> element yet.
+    const switching = !!cur && (!loaded || !!state.playCommitTimer);
+    const playing = switching ? true : !!cur && !audio.paused && !audio.ended;
+    const buffering = switching || (playing && audio.readyState < 3);
+    let positionSec = 0;
+    if (cur && !switching) {
+      positionSec = audio.readyState > 0 ? hostAudioOffsetSec() + (audio.currentTime || 0) : state.pendingSeekSec || 0;
+    }
+    return {
+      clientId: lobbyClientId(),
+      trackId: cur ? cur.id : '',
+      positionMs: Math.max(0, positionSec * 1000),
+      playing,
+      buffering,
+      at: Math.round(Date.now() + lobby.clockOffset),
+      upNext: cur ? state.queue.slice(state.queueIndex + 1, state.queueIndex + 9).map((t) => t.id) : [],
+    };
+  }
+
+  function lobbyPush(reason = '', { immediate = false, keepalive = false, extra = null, force = false } = {}) {
+    if (!lobby.data || !state.token) return;
+    if (lobby.conflict && !force) return;
+    if (immediate || keepalive || force) {
+      clearTimeout(lobby.pushTimer);
+      lobby.pushTimer = null;
+      sendLobbyState({ keepalive, extra, force });
+      return;
+    }
+    // Coalesce bursts (track switch fires loadstart/pause/waiting/playing).
+    if (lobby.pushTimer) return;
+    lobby.pushTimer = setTimeout(() => {
+      lobby.pushTimer = null;
+      sendLobbyState({});
+    }, 150);
+  }
+
+  async function sendLobbyState({ keepalive = false, extra = null, force = false } = {}) {
+    const payload = { ...lobbyPayload(), ...(extra || {}) };
+    if (force) payload.force = true;
+    try {
+      const resp = await fetch('/api/web/lobby/state', {
+        method: 'POST',
+        keepalive,
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+        body: JSON.stringify(payload),
+      });
+      if (keepalive) return;
+      if (resp.status === 409) {
+        if (!lobby.conflict) {
+          lobby.conflict = true;
+          updateLobbyIndicators();
+          if (isLobbyRoute()) paintLobbyView();
+        }
+        return;
+      }
+      if (resp.status === 404) {
+        refreshLobby();
+        return;
+      }
+      if (resp.ok) {
+        const d = await resp.json().catch(() => ({}));
+        if (lobby.data && typeof d.listenerCount === 'number') lobby.data.listenerCount = d.listenerCount;
+        if (lobby.conflict) {
+          lobby.conflict = false;
+          updateLobbyIndicators();
+          if (isLobbyRoute()) paintLobbyView();
+        }
+      }
+    } catch {}
+  }
+
+  function wireLobbyAudioHooks() {
+    wireLobbyTabGuard();
+    ['loadstart', 'playing', 'pause', 'seeked', 'waiting', 'ended'].forEach((ev) => {
+      audio.addEventListener(ev, () => lobbyPush(ev));
+    });
+    // Background tabs get throttled timers; check in as soon as we're back.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') lobbyPush('visible', { immediate: true });
+    });
+    window.addEventListener('online', () => {
+      if (lobby.data && !lobby.es) refreshLobby();
+    });
+  }
+
+  function lobbyBroadcastOnExit() {
+    if (!lobby.data || lobby.conflict) return;
+    lobbyPush('exit', { keepalive: true, extra: { playing: false, buffering: false, away: true } });
+  }
+
+  function updateLobbyIndicators() {
+    const live = !!lobby.data;
+    const count = live ? lobby.data.listenerCount || 0 : 0;
+    const pill = $('lobby-live-pill');
+    if (pill) {
+      pill.classList.toggle('hidden', !live);
+      pill.classList.toggle('conflict', live && lobby.conflict);
+      const label = $('lobby-live-label');
+      if (label) label.textContent = lobby.conflict ? 'LIVE ELSEWHERE' : `LIVE · ${count}`;
+      const unread = $('lobby-live-unread');
+      if (unread) {
+        unread.textContent = lobby.unread > 9 ? '9+' : String(lobby.unread);
+        unread.classList.toggle('hidden', !lobby.unread);
+      }
+      pill.title = live
+        ? `${lobby.data.name} · ${count} ${count === 1 ? 'listener' : 'listeners'}`
+        : 'Listen Together';
+    }
+    const badge = $('sidebar-lobby-badge');
+    if (badge) {
+      badge.classList.toggle('hidden', !live);
+      badge.textContent = count ? `LIVE · ${count}` : 'LIVE';
+    }
+    if ($('pb-lobby')) $('pb-lobby').classList.toggle('active', live);
+    if ($('fs-lobby')) $('fs-lobby').classList.toggle('active', live);
+    document.body.classList.toggle('lobby-live', live);
+  }
+
+  function lobbyAvatar(p, cls = '') {
+    const inner = p.avatarUrl
+      ? `<img class="avatar-img" src="${esc(p.avatarUrl)}" alt="" />`
+      : esc((p.avatarLetter || p.name || '?').trim().charAt(0).toUpperCase() || '?');
+    return `<span class="lobby-avatar ${cls}" style="background:${esc(p.color || p.avatarColor || 'var(--accent)')}">${inner}</span>`;
+  }
+
+  function lobbyTimeAgo(ms) {
+    const mins = Math.max(0, Math.round((Date.now() + lobby.clockOffset - ms) / 60000));
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const hrs = Math.floor(mins / 60);
+    return `${hrs} hr${hrs === 1 ? '' : 's'} ago`;
+  }
+
+  function lobbyStatus() {
+    const d = lobby.data;
+    if (lobby.conflict) return { label: 'Broadcasting elsewhere', cls: 'warn' };
+    const p = d.playback || {};
+    if (!p.track) return { label: 'Nothing playing', cls: 'idle' };
+    if (p.buffering) return { label: 'Buffering', cls: 'warn' };
+    if (!p.playing) return { label: 'Paused', cls: 'idle' };
+    return { label: 'On air', cls: 'live' };
+  }
+
+  function lobbyHeroSubHtml() {
+    const d = lobby.data;
+    const n = d.listenerCount || 0;
+    return `Hosted by you · Started ${esc(lobbyTimeAgo(d.createdAt))} · <b>${n}</b> ${n === 1 ? 'listener' : 'listeners'}`;
+  }
+
+  function lobbyNowCardHtml() {
+    const d = lobby.data;
+    const t = d.playback && d.playback.track;
+    const status = lobbyStatus();
+    const next = (d.upNext || [])[0];
+    const head = `<div class="lobby-card-head"><h2>Now broadcasting</h2><span class="lobby-status ${status.cls}"><i></i>${esc(status.label)}</span></div>`;
+    if (!t) {
+      return `${head}<div class="lobby-now-empty">
+        <span class="lobby-now-empty-icon">${LOBBY_ICONS.note}</span>
+        <div><b>Play any song to go on air</b><p>Everyone in the lobby hears whatever you play: albums, playlists, radio, Instant Mixes.</p></div>
+      </div>
+      <div class="lobby-now-actions"><button class="btn-secondary" onclick="App.navigate('home')">Browse Home</button><button class="btn-secondary" onclick="App.promptInstantMix()">Instant Mix</button></div>`;
+    }
+    return `${head}<div class="lobby-now-track">
+        <img src="${esc(t.coverUrl)}" alt="" />
+        <div class="lobby-now-meta">
+          <div class="lobby-now-title">${esc(t.title)}</div>
+          <div class="lobby-now-sub">${esc(t.artist)}${t.album ? ` · ${esc(t.album)}` : ''}</div>
+          ${t.qualityBadge ? `<span class="quality-badge ${t.isLossless ? 'lossless' : ''}">${esc(t.qualityBadge)}</span>` : ''}
+        </div>
+      </div>
+      ${next ? `<div class="lobby-up-next"><span>Up next</span> ${esc(next.title)} — ${esc(next.artist)}</div>` : '<div class="lobby-up-next"><span>Up next</span> Autoplay keeps the music going</div>'}`;
+  }
+
+  function lobbyListenersHtml() {
+    const d = lobby.data;
+    const people = d.listeners || [];
+    const head = `<div class="lobby-card-head"><h2>Listeners</h2><span class="lobby-count">${people.length}</span></div>`;
+    if (!people.length) {
+      return `${head}<div class="lobby-empty"><b>No one's here yet</b><p>Send your invite link. Friends join from any browser with just a name.</p><button class="btn-secondary" onclick="App.copyLobbyLink()">Copy Invite Link</button></div>`;
+    }
+    return `${head}<div class="lobby-people">${people
+      .map((p) => {
+        const sub =
+          p.kind === 'host'
+            ? 'You, on another device'
+            : p.kind === 'member'
+              ? `@${esc(p.username)} · joined ${esc(lobbyTimeAgo(p.joinedAt))}`
+              : `Guest · joined ${esc(lobbyTimeAgo(p.joinedAt))}`;
+        const removeBtn =
+          p.kind === 'host'
+            ? ''
+            : `<button class="icon-btn lobby-remove-btn" title="Remove ${esc(p.name)}" aria-label="Remove ${esc(p.name)}" onclick="App.kickLobbyListener(${esc(JSON.stringify(p.pid))}, ${esc(JSON.stringify(p.name))})">${LOBBY_ICONS.remove}</button>`;
+        return `<div class="lobby-person">
+          ${lobbyAvatar(p)}
+          <div class="lobby-person-meta"><div class="lobby-person-name">${esc(p.name)}${p.kind === 'member' ? '<span class="lobby-member-tag">Beatlab</span>' : ''}</div><div class="lobby-person-sub">${sub}</div></div>
+          ${removeBtn}
+        </div>`;
+      })
+      .join('')}</div>`;
+  }
+
+  function lobbyChatRowHtml(m, prev) {
+    if (m.kind === 'system') return `<div class="lobby-chat-sys">${esc(m.text)}</div>`;
+    const cont = prev && prev.kind !== 'system' && prev.pid === m.pid && m.at - prev.at < 120000;
+    let when = '';
+    try {
+      when = new Date(m.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    } catch {}
+    return `<div class="lobby-chat-msg ${cont ? 'cont' : ''}">
+      ${lobbyAvatar({ name: m.name, color: m.color }, 'sm')}
+      <div class="lobby-chat-body">
+        ${cont ? '' : `<div class="lobby-chat-meta"><span class="lobby-chat-name" style="color:${esc(m.color)}">${esc(m.kind === 'host' ? 'You' : m.name)}</span>${m.kind === 'host' ? '<span class="lobby-host-tag">HOST</span>' : ''}<span class="lobby-chat-time">${esc(when)}</span></div>`}
+        <div class="lobby-chat-text">${esc(m.text)}</div>
+      </div>
+    </div>`;
+  }
+
+  function lobbyChatListHtml() {
+    const chat = (lobby.data && lobby.data.chat) || [];
+    return chat.length
+      ? chat.map((m, i) => lobbyChatRowHtml(m, chat[i - 1])).join('')
+      : '<p class="lobby-chat-empty">Messages from your listeners show up here.</p>';
+  }
+
+  function appendLobbyChat(m, prev) {
+    const box = $('lobby-chat-list');
+    if (!box) return;
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    if (box.querySelector('.lobby-chat-empty')) box.innerHTML = '';
+    box.insertAdjacentHTML('beforeend', lobbyChatRowHtml(m, prev));
+    if (nearBottom || m.kind === 'host') box.scrollTop = box.scrollHeight;
+  }
+
+  function lobbySettingsHtml() {
+    const d = lobby.data;
+    return `<div class="lobby-card-head"><h2>Lobby settings</h2></div>
+      <label class="lobby-switch-row">
+        <span><b>Allow chat</b><small>Listeners can send messages. You can always post.</small></span>
+        <span class="switch-toggle"><input type="checkbox" ${d.allowChat ? 'checked' : ''} onchange="App.setLobbyOption('allowChat', this.checked)" /><span class="switch-track"></span></span>
+      </label>
+      <label class="lobby-switch-row">
+        <span><b>Lock lobby</b><small>Stop new people from joining. Current listeners stay.</small></span>
+        <span class="switch-toggle"><input type="checkbox" ${d.locked ? 'checked' : ''} onchange="App.setLobbyOption('locked', this.checked)" /><span class="switch-track"></span></span>
+      </label>`;
+  }
+
+  function lobbyStartHtml() {
+    const me = state.user || {};
+    const defaultName = `${me.username || 'My'}'s Lobby`;
+    return `<div class="lobby-page">
+      <section class="lobby-start">
+        <div class="lobby-start-visual" aria-hidden="true">
+          <span class="lobby-orb">${LOBBY_ICON_SVG}</span>
+          <span class="lobby-orb-ring r1"></span><span class="lobby-orb-ring r2"></span>
+        </div>
+        <div class="lobby-start-body">
+          <div class="hero-kicker">Listen Together</div>
+          <h1 class="lobby-start-title">Share what you're hearing, live</h1>
+          <p class="lobby-start-copy">Open a lobby and send the link to friends. They hear exactly what you play, in sync, right in their browser. No Beatlab account needed.</p>
+          <ul class="lobby-features">
+            <li><span>${LOBBY_ICONS.sync}</span><div><b>Perfectly in sync</b><small>Plays, pauses, skips and seeks follow you.</small></div></li>
+            <li><span>${LOBBY_ICONS.chat}</span><div><b>Chat &amp; reactions</b><small>Friends talk and send emoji while they listen.</small></div></li>
+            <li><span>${LOBBY_ICONS.shield}</span><div><b>You're in control</b><small>Lock it, remove listeners, end it anytime.</small></div></li>
+          </ul>
+          <form class="lobby-start-form" onsubmit="App.startLobby(event)">
+            <label class="kv-label" for="lobby-name-input">Lobby name</label>
+            <input id="lobby-name-input" class="lobby-input" type="text" maxlength="48" autocomplete="off" value="${esc(defaultName)}" placeholder="${esc(defaultName)}" />
+            <label class="lobby-switch-row">
+              <span><b>Allow chat</b><small>You can change this later</small></span>
+              <span class="switch-toggle"><input id="lobby-chat-input" type="checkbox" checked /><span class="switch-track"></span></span>
+            </label>
+            <button id="lobby-start-btn" class="btn-primary lobby-start-btn" type="submit">${LOBBY_ICON_SVG}<span>Start Lobby</span></button>
+          </form>
+        </div>
+      </section>
+    </div>`;
+  }
+
+  function lobbyLiveHtml() {
+    const d = lobby.data;
+    const t = d.playback && d.playback.track;
+    const canNativeShare = typeof navigator.share === 'function';
+    const conflict = lobby.conflict
+      ? `<div class="lobby-conflict" role="status">
+          <div><b>Broadcasting from another tab or device</b><span>Listeners are hearing your other player. Take over to broadcast what's playing here.</span></div>
+          <button class="btn-primary" onclick="App.claimLobbyBroadcast()">Broadcast from here</button>
+        </div>`
+      : '';
+    return `<div class="lobby-page live">
+      ${conflict}
+      <section class="lobby-hero">
+        <div class="lobby-hero-art">
+          <div id="lobby-hero-art-inner">${t ? `<img src="${esc(t.coverUrl)}" alt="" />` : `<div class="lobby-hero-art-empty">${LOBBY_ICON_SVG}</div>`}</div>
+          <div id="lobby-float-layer" class="lobby-float-layer"></div>
+        </div>
+        <div class="lobby-hero-info">
+          <div id="lobby-live-kicker" class="lobby-live-kicker"><span class="live-dot"></span>LIVE LOBBY${d.locked ? ' · LOCKED' : ''}</div>
+          <h1 class="hero-title lobby-title"><span id="lobby-title-text">${esc(d.name)}</span><button class="icon-btn lobby-rename-btn" title="Rename lobby" aria-label="Rename lobby" onclick="App.renameLobby()">${LOBBY_ICONS.pencil}</button></h1>
+          <div id="lobby-hero-sub" class="hero-sub">${lobbyHeroSubHtml()}</div>
+          <div class="share-url-row lobby-link-row">
+            <input id="lobby-url-input" type="text" readonly value="${esc(d.url)}" onclick="this.select()" aria-label="Invite link" />
+            <button class="btn-primary" onclick="App.copyLobbyLink()">Copy Link</button>
+          </div>
+          <div class="hero-actions">
+            ${canNativeShare ? `<button class="btn-secondary" onclick="App.shareLobbyLink()">${ICONS.share} Share</button>` : ''}
+            <button class="btn-secondary" onclick="App.showLobbyQr()">${LOBBY_ICONS.qr} QR Code</button>
+            <a class="btn-secondary" href="${esc(d.path)}" target="_blank" rel="noopener">${LOBBY_ICONS.external} Listener View</a>
+            <button class="btn-secondary danger-btn" onclick="App.endLobby()">End Lobby</button>
+          </div>
+        </div>
+      </section>
+      <div class="lobby-grid">
+        <div class="lobby-col">
+          <section id="lobby-now-card" class="lobby-card">${lobbyNowCardHtml()}</section>
+          <section id="lobby-settings-card" class="lobby-card">${lobbySettingsHtml()}</section>
+        </div>
+        <div class="lobby-col">
+          <section id="lobby-listeners-card" class="lobby-card">${lobbyListenersHtml()}</section>
+          <section class="lobby-card lobby-chat-card">
+            <div class="lobby-card-head"><h2>Chat</h2><span id="lobby-chat-off" class="lobby-chat-off ${d.allowChat ? 'hidden' : ''}">Listeners muted</span></div>
+            <div id="lobby-chat-list" class="lobby-chat-list">${lobbyChatListHtml()}</div>
+            <div class="lobby-react-row">${lobby.reactions
+              .map((e) => `<button class="lobby-react-btn" type="button" onclick="App.sendLobbyReaction(${esc(JSON.stringify(e))})" aria-label="React ${esc(e)}">${esc(e)}</button>`)
+              .join('')}</div>
+            <form class="lobby-chat-form" onsubmit="App.sendLobbyChat(event)">
+              <input id="lobby-chat-input-text" class="lobby-input" type="text" maxlength="300" autocomplete="off" placeholder="Message your listeners…" aria-label="Chat message" />
+              <button class="lobby-send-btn" type="submit" title="Send" aria-label="Send">${LOBBY_ICONS.send}</button>
+            </form>
+          </section>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function paintLobbyView() {
+    const main = $('main-view');
+    if (!main || !isLobbyRoute()) return;
+    const draft = $('lobby-chat-input-text') ? $('lobby-chat-input-text').value : '';
+    const hadFocus = document.activeElement && document.activeElement.id === 'lobby-chat-input-text';
+    main.innerHTML = lobby.data ? lobbyLiveHtml() : lobbyStartHtml();
+    lobby.unread = 0;
+    updateLobbyIndicators();
+    const input = $('lobby-chat-input-text');
+    if (input) {
+      input.value = draft;
+      if (hadFocus) input.focus();
+    }
+    const box = $('lobby-chat-list');
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+
+  // Cheap in-place refresh for frequent state events (keeps chat + inputs intact).
+  function paintLobbyLive() {
+    if (!lobby.data || !$('lobby-now-card')) {
+      paintLobbyView();
+      return;
+    }
+    const d = lobby.data;
+    const t = d.playback && d.playback.track;
+    $('lobby-hero-sub').innerHTML = lobbyHeroSubHtml();
+    $('lobby-title-text').textContent = d.name;
+    $('lobby-live-kicker').innerHTML = `<span class="live-dot"></span>LIVE LOBBY${d.locked ? ' · LOCKED' : ''}`;
+    const art = $('lobby-hero-art-inner');
+    const wantArt = t ? t.coverUrl : '';
+    if (art && art.dataset.src !== wantArt) {
+      art.dataset.src = wantArt;
+      art.innerHTML = t ? `<img src="${esc(t.coverUrl)}" alt="" />` : `<div class="lobby-hero-art-empty">${LOBBY_ICON_SVG}</div>`;
+    }
+    $('lobby-now-card').innerHTML = lobbyNowCardHtml();
+    $('lobby-listeners-card').innerHTML = lobbyListenersHtml();
+    if (!$('lobby-settings-card').contains(document.activeElement)) {
+      $('lobby-settings-card').innerHTML = lobbySettingsHtml();
+    }
+    if ($('lobby-chat-off')) $('lobby-chat-off').classList.toggle('hidden', !!d.allowChat);
+  }
+
+  async function renderLobbyView() {
+    abortActiveViewRequest();
+    if (!lobby.loaded) {
+      setMainLoading('Loading Listen Together...');
+      await refreshLobby();
+      if (!isLobbyRoute()) return;
+    }
+    paintLobbyView();
+    $('main-view').scrollTop = 0;
+  }
+
+  function floatLobbyReaction(emoji, name) {
+    const layer = $('lobby-float-layer');
+    if (!layer || layer.childElementCount > 24) return;
+    const el = document.createElement('div');
+    el.className = 'lobby-float';
+    el.style.left = `${10 + Math.random() * 70}%`;
+    el.style.setProperty('--dx1', `${Math.round(Math.random() * 30 - 15)}px`);
+    el.style.setProperty('--dx2', `${Math.round(Math.random() * 70 - 35)}px`);
+    el.innerHTML = `<span class="lobby-float-icon">${esc(emoji)}</span>${name ? `<span class="lobby-float-name">${esc(name)}</span>` : ''}`;
+    layer.appendChild(el);
+    setTimeout(() => el.remove(), 2700);
+  }
+
+  async function startLobby(event) {
+    if (event) event.preventDefault();
+    if (lobby.starting) return;
+    lobby.starting = true;
+    const btn = $('lobby-start-btn');
+    if (btn) btn.disabled = true;
+    haptic('success');
+    try {
+      const name = ($('lobby-name-input') && $('lobby-name-input').value.trim()) || '';
+      const allowChat = $('lobby-chat-input') ? $('lobby-chat-input').checked : true;
+      const d = await api('/api/web/lobby', { method: 'POST', body: JSON.stringify({ name, allowChat }) });
+      if (Array.isArray(d.reactions) && d.reactions.length) lobby.reactions = d.reactions;
+      lobby.loaded = true;
+      setLobbyData(d.lobby || null);
+      let copied = false;
+      try {
+        if (lobby.data && navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(lobby.data.url);
+          copied = true;
+        }
+      } catch {}
+      showToast(
+        currentTrack()
+          ? copied ? "You're live · invite link copied" : "You're live"
+          : copied ? 'Lobby open · link copied. Play a song to go on air' : 'Lobby open · play a song to go on air'
+      );
+    } catch (e) {
+      showToast(e.message || 'Could not start a lobby');
+    } finally {
+      lobby.starting = false;
+      if ($('lobby-start-btn')) $('lobby-start-btn').disabled = false;
+    }
+  }
+
+  async function endLobby() {
+    if (!lobby.data) return;
+    const n = lobby.data.listenerCount || 0;
+    const ok = await confirmModal({
+      title: 'End this lobby?',
+      message:
+        n > 0
+          ? `${n} ${n === 1 ? 'person is' : 'people are'} listening. Ending the lobby disconnects everyone and the invite link stops working.`
+          : 'The invite link will stop working. You can start a new lobby anytime.',
+      confirmLabel: 'End Lobby',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api('/api/web/lobby', { method: 'DELETE' });
+      setLobbyData(null);
+      haptic('warning');
+      showToast('Lobby ended');
+    } catch (e) {
+      showToast(e.message || 'Could not end the lobby');
+    }
+  }
+
+  async function updateLobbySettings(patch) {
+    try {
+      const d = await api('/api/web/lobby', { method: 'PATCH', body: JSON.stringify(patch) });
+      if (lobby.data) {
+        lobby.data.name = d.name;
+        lobby.data.allowChat = d.allowChat;
+        lobby.data.locked = d.locked;
+      }
+      if (isLobbyRoute()) paintLobbyLive();
+      return d;
+    } catch (e) {
+      showToast(e.message || 'Could not update the lobby');
+      if (isLobbyRoute()) paintLobbyLive();
+      return null;
+    }
+  }
+
+  async function renameLobby() {
+    if (!lobby.data) return;
+    const name = await promptModal({
+      title: 'Rename lobby',
+      label: 'Lobby name',
+      defaultValue: lobby.data.name,
+      confirmLabel: 'Save',
+    });
+    if (name === null) return;
+    const d = await updateLobbySettings({ name });
+    if (d) showToast('Lobby renamed');
+  }
+
+  async function setLobbyOption(key, value) {
+    if (!['allowChat', 'locked'].includes(key)) return;
+    haptic('select');
+    const d = await updateLobbySettings({ [key]: !!value });
+    if (!d) return;
+    if (key === 'locked') showToast(value ? 'Lobby locked · no new listeners' : 'Lobby unlocked');
+    else showToast(value ? 'Chat is on' : 'Listener chat is off');
+  }
+
+  async function kickLobbyListener(pid, name) {
+    const ok = await confirmModal({
+      title: `Remove ${name}?`,
+      message: `${name} will stop hearing your music and can't rejoin this lobby. To keep everyone else out too, lock the lobby.`,
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api('/api/web/lobby/kick', { method: 'POST', body: JSON.stringify({ pid }) });
+      showToast(`${name} was removed`);
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  async function sendLobbyChat(event) {
+    if (event) event.preventDefault();
+    const input = $('lobby-chat-input-text');
+    const text = input ? input.value.trim() : '';
+    if (!text) return;
+    input.value = '';
+    try {
+      await api('/api/web/lobby/chat', { method: 'POST', body: JSON.stringify({ text }) });
+    } catch (e) {
+      input.value = text;
+      showToast(e.message);
+    }
+    input.focus();
+  }
+
+  function sendLobbyReaction(emoji) {
+    haptic('tap');
+    floatLobbyReaction(emoji, 'You');
+    api('/api/web/lobby/react', { method: 'POST', body: JSON.stringify({ emoji }) }).catch(() => {});
+  }
+
+  function copyLobbyLink() {
+    if (!lobby.data) return;
+    window.App.copyText(lobby.data.url, 'Invite link copied');
+  }
+
+  async function shareLobbyLink() {
+    if (!lobby.data) return;
+    try {
+      await navigator.share({
+        title: lobby.data.name,
+        text: 'Listen along with me on Beatlab',
+        url: lobby.data.url,
+      });
+    } catch (e) {
+      if (e && e.name !== 'AbortError') copyLobbyLink();
+    }
+  }
+
+  function showLobbyQr() {
+    if (!lobby.data) return;
+    openModal(`
+      <div class="modal-head">
+        <h3>Scan to join</h3>
+        <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+      </div>
+      <div class="lobby-qr-box">${lobby.data.qrSvg || ''}</div>
+      <p class="share-modal-note lobby-qr-note">Point a phone camera at the code to join <b>${esc(lobby.data.name)}</b>. No app or account needed.</p>
+      <div class="share-url-row">
+        <input id="lobby-qr-url" type="text" readonly value="${esc(lobby.data.url)}" onclick="this.select()" />
+        <button class="btn-primary" onclick="App.copyLobbyLink()">Copy Link</button>
+      </div>
+    `);
+  }
+
+  function claimLobbyBroadcast() {
+    haptic('success');
+    lobbyPush('claim', { force: true });
+    showToast('Broadcasting from this device');
+  }
+
+  function openLobby() {
+    closeUserMenu();
+    navigate('lobby');
+  }
+
   // Expose public handlers for template onclick attributes
   window.App = {
     navigate,
+    // Listen Together
+    openLobby,
+    startLobby,
+    endLobby,
+    renameLobby,
+    setLobbyOption,
+    kickLobbyListener,
+    sendLobbyChat,
+    sendLobbyReaction,
+    copyLobbyLink,
+    shareLobbyLink,
+    showLobbyQr,
+    claimLobbyBroadcast,
     // Social
     openUserProfile,
     openMyProfile,
@@ -9987,6 +10857,8 @@
     signOut: async () => {
       const oldToken = state.token;
       clearNowPlaying(true, oldToken);
+      // Tell lobby listeners the host stepped away before the session dies.
+      lobbyBroadcastOnExit();
       localStorage.removeItem('beatlab_token');
       state.token = '';
       state.user = null;

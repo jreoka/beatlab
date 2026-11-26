@@ -35,7 +35,7 @@ const FAVICON_SVG: &str = include_str!("web/favicon.svg");
 const MANIFEST_JSON: &str = include_str!("web/manifest.webmanifest");
 const SW_JS_TEMPLATE: &str = include_str!("web/sw.js");
 const ICON_192_PNG: &[u8] = include_bytes!("web/icon-192.png");
-const ICON_512_PNG: &[u8] = include_bytes!("web/icon-512.png");
+pub(crate) const ICON_512_PNG: &[u8] = include_bytes!("web/icon-512.png");
 const ICON_MASKABLE_512_PNG: &[u8] = include_bytes!("web/icon-maskable-512.png");
 const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("web/apple-touch-icon.png");
 
@@ -453,7 +453,7 @@ fn track_is_popular(meta: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn cover_api_url(id: &str) -> String {
+pub(crate) fn cover_api_url(id: &str) -> String {
     format!("/api/web/cover/{}?v=2", urlencoding::encode(id))
 }
 
@@ -479,12 +479,12 @@ fn extract_web_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<S
     None
 }
 
-fn resolve_web_user(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> Option<User> {
+pub(crate) fn resolve_web_user(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> Option<User> {
     let tok = extract_web_token(headers, query_token)?;
     state.store.get_session_user(&tok).ok().flatten()
 }
 
-fn require_web_user(state: &AppState, headers: &HeaderMap) -> Result<User, Response> {
+pub(crate) fn require_web_user(state: &AppState, headers: &HeaderMap) -> Result<User, Response> {
     resolve_web_user(state, headers, None).ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
@@ -507,7 +507,7 @@ fn self_avatar_url(state: &AppState, user_id: i64) -> String {
         .unwrap_or_default()
 }
 
-fn json_res(val: Value) -> Response {
+pub(crate) fn json_res(val: Value) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -516,7 +516,7 @@ fn json_res(val: Value) -> Response {
         .into_response()
 }
 
-fn err_res(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn err_res(status: StatusCode, msg: &str) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -5944,7 +5944,7 @@ pub async fn sources_info(State(state): State<AppState>, headers: HeaderMap) -> 
     }))
 }
 
-fn request_origin(headers: &HeaderMap) -> String {
+pub(crate) fn request_origin(headers: &HeaderMap) -> String {
     let host = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get(header::HOST))
@@ -5985,7 +5985,7 @@ fn request_origin(headers: &HeaderMap) -> String {
     "http://localhost:4533".to_string()
 }
 
-fn is_link_preview_bot(headers: &HeaderMap) -> bool {
+pub(crate) fn is_link_preview_bot(headers: &HeaderMap) -> bool {
     let Some(ua) = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) else {
         return false;
     };
@@ -7578,6 +7578,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         }
     }
 
@@ -7849,6 +7850,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -7951,6 +7953,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -8303,6 +8306,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
 
         // Unauthenticated fails
@@ -8445,6 +8449,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
 
         let mut h1 = HeaderMap::new();
@@ -8626,6 +8631,7 @@ mod tests {
             llm: None,
             now_playing: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             new_releases_inflight: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            lobbies: Default::default(),
         };
 
         let mut hdr = HeaderMap::new();
@@ -8742,6 +8748,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -8838,6 +8845,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::AUTHORIZATION, format!("Bearer {}", tok).parse().unwrap());
@@ -8965,6 +8973,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
         let (u, _) = store.authenticate_or_create_user("avataruser", "pw").unwrap();
         let tok = store.create_session(u.id, "web").unwrap();
@@ -9222,6 +9231,7 @@ mod tests {
             llm: None,
             now_playing: Arc::new(Mutex::new(Default::default())),
             new_releases_inflight: Arc::new(Mutex::new(Default::default())),
+            lobbies: Default::default(),
         };
 
         let t1 = Track {

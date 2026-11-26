@@ -3,6 +3,8 @@ mod auth;
 mod captcha;
 mod engine;
 mod llm;
+mod lobby;
+mod lobby_page;
 mod models;
 mod profile_page;
 mod remote_cache;
@@ -204,9 +206,11 @@ async fn main() -> models::AppResult<()> {
         llm: llm_curator.clone(),
         now_playing: Arc::new(Mutex::new(HashMap::new())),
         new_releases_inflight: Arc::new(Mutex::new(HashMap::new())),
+        lobbies: Default::default(),
     };
 
     tokio::spawn(webapp::prewarm_charts(state.clone()));
+    lobby::spawn_sweeper(state.lobbies.clone(), store.clone());
 
     // Fast startup catalog warming + continuous RoPE-QKVO/XSA/GEGLU Transformer training & curation
     let warm_taste = taste.clone();
@@ -395,6 +399,30 @@ async fn main() -> models::AppResult<()> {
             "/api/public/share/{id}/lyrics/{track_id}",
             get(webapp::public_share_lyrics),
         )
+        // Listen Together — host controls (signed in)
+        .route(
+            "/api/web/lobby",
+            get(lobby::get_my_lobby)
+                .post(lobby::create_lobby)
+                .patch(lobby::update_lobby)
+                .delete(lobby::end_lobby),
+        )
+        .route("/api/web/lobby/state", post(lobby::host_state))
+        .route("/api/web/lobby/chat", post(lobby::host_chat))
+        .route("/api/web/lobby/react", post(lobby::host_react))
+        .route("/api/web/lobby/kick", post(lobby::host_kick))
+        .route("/api/web/lobby/events", get(lobby::host_events))
+        // Listen Together — public listener page & API (no account needed)
+        .route("/l/{code}", get(lobby::public_page))
+        .route("/l/{code}/cover", get(lobby::public_cover))
+        .route("/api/lobby/clock", get(lobby::clock))
+        .route("/api/lobby/{code}/join", post(lobby::guest_join))
+        .route("/api/lobby/{code}/leave", post(lobby::guest_leave))
+        .route("/api/lobby/{code}/events", get(lobby::guest_events))
+        .route("/api/lobby/{code}/chat", post(lobby::guest_chat))
+        .route("/api/lobby/{code}/react", post(lobby::guest_react))
+        .route("/api/lobby/{code}/stream/{track_id}", get(lobby::guest_stream))
+        .route("/api/lobby/{code}/lyrics/{track_id}", get(lobby::guest_lyrics))
         // Administrator panel (gated by ADMIN_USERNAME at the API layer).
         // Every tab has its own path so it can be bookmarked, shared and
         // navigated with the browser's back/forward buttons.
@@ -787,6 +815,11 @@ fn compression_layer() -> CompressionLayer<impl Predicate> {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
+        // Compressing Server-Sent Events buffers them, which would stall live
+        // lobby updates until the encoder flushes.
+        if ct.starts_with("text/event-stream") {
+            return false;
+        }
         ct.starts_with("text/")
             || ct.starts_with("application/json")
             || ct.starts_with("application/javascript")

@@ -521,6 +521,21 @@ pub struct ShareRecord {
     pub created: i64,
 }
 
+/// A persisted "Listen Together" lobby. Live playback/listener state lives in
+/// memory (`crate::lobby::LobbyHub`); this row only keeps the invite link
+/// alive across restarts and records the host's settings.
+#[derive(Debug, Clone)]
+pub struct LobbyRecord {
+    pub code: String,
+    pub user_id: i64,
+    pub name: String,
+    pub allow_chat: bool,
+    pub locked: bool,
+    pub created: i64,
+    pub last_active: i64,
+    pub ended: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub path: String,
