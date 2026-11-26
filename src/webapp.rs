@@ -3744,12 +3744,12 @@ pub async fn search(
         if !slow_tracks.is_empty() {
             let store = state.store.clone();
             let to_save = slow_tracks.clone();
-            tokio::spawn(async move {
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = store.upsert_tracks(&to_save);
-                })
-                .await;
-            });
+            // Persist before responding so immediate playback or lossless hot-swap
+            // requests for newly discovered Soulseek/Archive tracks never race 404.
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = store.upsert_tracks(&to_save);
+            })
+            .await;
         }
         return json_res(json!({
             "query": query,

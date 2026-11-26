@@ -1294,23 +1294,47 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (offsetSec > 0.5) u += `&t=${offsetSec.toFixed(2)}`;
       return u;
     }
-    const NORM_TARGET_LUFS = -10.5;
-    const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
-    const NORM_DEFAULT_GAIN = 0.75;
+    const NORM_TARGET_LUFS = -7.0;
+    const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 13.5) / 20);
+    const NORM_DEFAULT_GAIN = 1.0;
     const NORM = {
-      ctx: null, source: null, gainNode: null, limiterNode: null, ready: false, failed: false, connecting: false,
-      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0, retryTimer: null, cache: new Map(),
+      ctx: null, source: null, gainNode: null, limiterNode: null, softClipNode: null, ready: false, failed: false, connecting: false,
+      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0, retryTimer: null, inFlight: false, cache: new Map(),
     };
+    function createSoftClipCurve(kneeStart = 0.94, ceiling = 0.996, samples = 4096) {
+      const curve = new Float32Array(samples);
+      const headroom = ceiling - kneeStart;
+      for (let i = 0; i < samples; i++) {
+        const x = (i * 2) / (samples - 1) - 1;
+        const ax = Math.abs(x);
+        curve[i] = ax <= kneeStart ? x : Math.sign(x) * (kneeStart + headroom * Math.tanh((ax - kneeStart) / headroom));
+      }
+      return curve;
+    }
     function computeNormGain(vol, muted, loudness) {
       if (muted || vol <= 0) return 0;
       if (loudness && Number.isFinite(loudness.lufs)) {
-        const gainDb = Math.max(-18, Math.min(12, NORM_TARGET_LUFS - loudness.lufs));
+        const gainDb = Math.max(-18, Math.min(16, NORM_TARGET_LUFS - loudness.lufs));
         const trackGain = Math.pow(10, gainDb / 20);
         const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
         const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
         return Math.min(vol * trackGain, NORM_MAX_CEILING_LIN / tpLin);
       }
       return Math.min(vol * NORM_DEFAULT_GAIN, 1.0);
+    }
+    function updateLimiterParams(targetGain, loudness, now) {
+      const lim = NORM.limiterNode;
+      if (!lim) return;
+      const tpDb = loudness && Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
+      const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
+      const engage = targetGain * tpLin > 1.12;
+      try {
+        lim.threshold.setValueAtTime(engage ? -0.6 : 0.0, now);
+        lim.knee.setValueAtTime(engage ? 1.5 : 0.0, now);
+        lim.ratio.setValueAtTime(engage ? 20.0 : 1.0, now);
+        lim.attack.setValueAtTime(0.001, now);
+        lim.release.setValueAtTime(0.08, now);
+      } catch {}
     }
     function ensureNormGraph() {
       if (NORM.ready) {
@@ -1329,19 +1353,27 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
           NORM.source = ctx.createMediaElementSource(audio);
           NORM.gainNode = ctx.createGain();
           NORM.source.connect(NORM.gainNode);
+          let tail = NORM.gainNode;
           if (typeof ctx.createDynamicsCompressor === 'function') {
             const lim = ctx.createDynamicsCompressor();
-            lim.threshold.value = -1.0;
-            lim.knee.value = 1.0;
-            lim.ratio.value = 20.0;
+            lim.threshold.value = 0.0;
+            lim.knee.value = 0.0;
+            lim.ratio.value = 1.0;
             lim.attack.value = 0.001;
-            lim.release.value = 0.05;
-            NORM.gainNode.connect(lim);
-            lim.connect(ctx.destination);
+            lim.release.value = 0.08;
+            tail.connect(lim);
+            tail = lim;
             NORM.limiterNode = lim;
-          } else {
-            NORM.gainNode.connect(ctx.destination);
           }
+          if (typeof ctx.createWaveShaper === 'function') {
+            const shaper = ctx.createWaveShaper();
+            shaper.curve = createSoftClipCurve();
+            shaper.oversample = '2x';
+            tail.connect(shaper);
+            tail = shaper;
+            NORM.softClipNode = shaper;
+          }
+          tail.connect(ctx.destination);
           NORM.ready = true;
           NORM.connecting = false;
           ctx.addEventListener('statechange', () => {
@@ -1370,6 +1402,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         audio.volume = 1;
         const p = NORM.gainNode.gain;
         const now = NORM.ctx.currentTime;
+        updateLimiterParams(target, NORM.loudness, now);
         try {
           p.cancelScheduledValues(now);
           if (rampSec > 0.05) {
@@ -1391,11 +1424,13 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.35;
     }
     function fetchLobbyLoudnessPrePlay(t, attempt = 0) {
-      if (!t || !t.id || NORM.trackId !== t.id || NORM.loudness) return;
+      if (!t || !t.id || NORM.trackId !== t.id || NORM.loudness || NORM.inFlight) return;
       const tok = NORM.reqToken;
+      NORM.inFlight = true;
       fetch(`/api/lobby/${encodeURIComponent(CODE)}/loudness/${encodeURIComponent(t.id)}?lid=${encodeURIComponent(lid)}`)
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
+          if (tok === NORM.reqToken) NORM.inFlight = false;
           if (!d || tok !== NORM.reqToken || NORM.trackId !== t.id) return;
           if (Number.isFinite(Number(d.lufs))) {
             const norm = { lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 };
@@ -1404,7 +1439,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
             applyVolume(canApplyPrePlayLobbyGain() ? 0 : 0.6);
             return;
           }
-          const retryDelays = [2500, 4500];
+          const retryDelays = [1500, 2500, 4000, 6000, 8000, 10000];
           if (d.pending && attempt < retryDelays.length) {
             NORM.retryTimer = setTimeout(() => {
               NORM.retryTimer = null;
@@ -1412,11 +1447,14 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
             }, retryDelays[attempt]);
           }
         })
-        .catch(() => {});
+        .catch(() => {
+          if (tok === NORM.reqToken) NORM.inFlight = false;
+        });
     }
     function syncLobbyLoudness(t) {
       if (NORM.retryTimer) { clearTimeout(NORM.retryTimer); NORM.retryTimer = null; }
       NORM.reqToken++;
+      NORM.inFlight = false;
       NORM.metaRetryDoneFor = '';
       if (!t || !t.id) { NORM.trackId = ''; NORM.loudness = null; applyVolume(0); return; }
       NORM.trackId = t.id;

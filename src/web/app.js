@@ -193,6 +193,7 @@
     lastPlaySwitchAt: 0,
     lastCommittedTrackId: '',
     activeAudioToken: 0,
+    qualityUpgradeProbe: null,
     lyricsAbortController: null,
     lyricsReqToken: 0,
     queueActionToken: 0,
@@ -858,33 +859,53 @@
   // ---------------------------------------------------------------------------
   // Playback output & always-on EBU R128 loudness normalization
   // ---------------------------------------------------------------------------
-  // Single constant scalar gain per track (ITU-R BS.1770-4 -> -10.5 LUFS) with
-  // a transparent -1 dBFS brickwall peak catcher so loud tracks play untouched
-  // (0 dB limiting) and quiet tracks lift cleanly to match without clipping or
-  // mid-song volume shifts.
-  const NORM_TARGET_LUFS = -10.5;
-  const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
+  // Single constant scalar gain per track (ITU-R BS.1770-4 -> -7.0 LUFS) so
+  // max-volume playback matches YouTube Music's full punchy output. Modern
+  // masters (~-7 LUFS) pass through at unity with the peak limiter bypassed
+  // (1:1 ratio, zero unintended attenuation), while ultra-hot masters are tamed
+  // and older/dynamic tracks (-14 to -20 LUFS) lift cleanly up to match through
+  // a lookahead peak limiter + transparent soft ceiling.
+  const NORM_TARGET_LUFS = -7.0;
+  const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 13.5) / 20);
   const NORM_MIN_GAIN_DB = -18.0;
-  const NORM_MAX_GAIN_DB = 12.0;
-  // Matches a typical -8 LUFS modern master normalized to -10.5 LUFS (~-2.5 dB)
-  // so unmeasured tracks never blast louder than normalized ones.
-  const NORM_DEFAULT_UNMEASURED_GAIN = 0.75;
+  const NORM_MAX_GAIN_DB = 16.0;
+  // Matches a typical -7 LUFS modern master normalized to -7.0 LUFS (0 dB) so
+  // unmeasured tracks start at full listening volume without dipping quietly.
+  const NORM_DEFAULT_UNMEASURED_GAIN = 1.0;
 
   const audioNorm = {
     ctx: null,
     source: null,
     gainNode: null,
     limiterNode: null,
+    softClipNode: null,
     ready: false,
     failed: false,
     connecting: false,
     currentTrackId: '',
     currentLoudness: null,
+    hasOwnLoudness: false,
     metaRetryDoneFor: '',
     reqToken: 0,
     abortController: null,
     retryTimer: null,
+    inFlight: false,
   };
+
+  function createSoftClipCurve(kneeStart = 0.94, ceiling = 0.996, samples = 4096) {
+    const curve = new Float32Array(samples);
+    const headroom = ceiling - kneeStart;
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / (samples - 1) - 1;
+      const ax = Math.abs(x);
+      if (ax <= kneeStart) {
+        curve[i] = x;
+      } else {
+        curve[i] = Math.sign(x) * (kneeStart + headroom * Math.tanh((ax - kneeStart) / headroom));
+      }
+    }
+    return curve;
+  }
 
   function isValidLoudness(l) {
     return (
@@ -918,6 +939,24 @@
     return Math.min(userVol * NORM_DEFAULT_UNMEASURED_GAIN, 1.0);
   }
 
+  function updateAudioNormLimiter(targetGain, loudness, now) {
+    const lim = audioNorm.limiterNode;
+    if (!lim) return;
+    const tpDb = loudness && Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
+    const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
+    // Only engage lookahead peak limiting when boosting peaks past ~+1 dBFS;
+    // keep 1:1 bypass on modern/attenuated tracks so DynamicsCompressor never
+    // subtly ducks bright mixes.
+    const engage = targetGain * tpLin > 1.12;
+    try {
+      lim.threshold.setValueAtTime(engage ? -0.6 : 0.0, now);
+      lim.knee.setValueAtTime(engage ? 1.5 : 0.0, now);
+      lim.ratio.setValueAtTime(engage ? 20.0 : 1.0, now);
+      lim.attack.setValueAtTime(0.001, now);
+      lim.release.setValueAtTime(0.08, now);
+    } catch {}
+  }
+
   function ensureAudioNormGraph() {
     if (audioNorm.ready) {
       if (audioNorm.ctx && audioNorm.ctx.state !== 'running') {
@@ -949,22 +988,31 @@
         const source = ctx.createMediaElementSource(audio);
         const gainNode = ctx.createGain();
         source.connect(gainNode);
+        let tail = gainNode;
         let limiterNode = null;
         if (typeof ctx.createDynamicsCompressor === 'function') {
           limiterNode = ctx.createDynamicsCompressor();
-          limiterNode.threshold.value = -1.0;
-          limiterNode.knee.value = 1.0;
-          limiterNode.ratio.value = 20.0;
+          limiterNode.threshold.value = 0.0;
+          limiterNode.knee.value = 0.0;
+          limiterNode.ratio.value = 1.0;
           limiterNode.attack.value = 0.001;
-          limiterNode.release.value = 0.05;
-          gainNode.connect(limiterNode);
-          limiterNode.connect(ctx.destination);
-        } else {
-          gainNode.connect(ctx.destination);
+          limiterNode.release.value = 0.08;
+          tail.connect(limiterNode);
+          tail = limiterNode;
         }
+        let softClipNode = null;
+        if (typeof ctx.createWaveShaper === 'function') {
+          softClipNode = ctx.createWaveShaper();
+          softClipNode.curve = createSoftClipCurve();
+          softClipNode.oversample = '2x';
+          tail.connect(softClipNode);
+          tail = softClipNode;
+        }
+        tail.connect(ctx.destination);
         audioNorm.source = source;
         audioNorm.gainNode = gainNode;
         audioNorm.limiterNode = limiterNode;
+        audioNorm.softClipNode = softClipNode;
         audioNorm.ready = true;
         audioNorm.connecting = false;
         ctx.addEventListener('statechange', () => {
@@ -1019,6 +1067,7 @@
       audio.volume = 1;
       const param = audioNorm.gainNode.gain;
       const now = audioNorm.ctx.currentTime;
+      updateAudioNormLimiter(target, audioNorm.currentLoudness, now);
       try {
         param.cancelScheduledValues(now);
         if (rampSec > 0.05) {
@@ -1048,6 +1097,7 @@
       } catch {}
       audioNorm.abortController = null;
     }
+    audioNorm.inFlight = false;
     audioNorm.reqToken++;
   }
 
@@ -1068,28 +1118,31 @@
 
   function fetchTrackLoudness(trackId, attempt = 0) {
     if (!trackId || !state.token) return;
-    if (audioNorm.currentTrackId !== trackId || audioNorm.currentLoudness) return;
+    if (audioNorm.currentTrackId !== trackId || audioNorm.hasOwnLoudness || audioNorm.inFlight) return;
     const reqToken = audioNorm.reqToken;
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     audioNorm.abortController = ctrl;
+    audioNorm.inFlight = true;
     api(`/api/web/loudness/${encodeURIComponent(trackId)}`, {
       signal: ctrl ? ctrl.signal : undefined,
     })
       .then((res) => {
+        if (reqToken === audioNorm.reqToken) audioNorm.inFlight = false;
         if (reqToken !== audioNorm.reqToken || audioNorm.currentTrackId !== trackId) return;
         if (res && isValidLoudness(res)) {
           const norm = storeTrackLoudness(trackId, res);
           if (norm) {
             audioNorm.currentLoudness = norm;
+            audioNorm.hasOwnLoudness = true;
             // Instant when applied before playback begins; gentle glide if loudness
             // finished slightly after playback started so songs never play unnormalized.
             applyOutputVolume(isPrePlayGainWindow() ? 0 : 0.6);
           }
           return;
         }
-        // Background caching + EBU R128 scan may still be running (e.g. Soulseek,
+        // Background caching + EBU R128 scan may still be running (e.g. Soulseek FLAC,
         // Archive.org, or a YouTube track without pre-computed audioConfig).
-        const retryDelays = [2500, 4500];
+        const retryDelays = [1500, 2500, 4000, 6000, 8000, 10000];
         if (res && res.pending && attempt < retryDelays.length) {
           audioNorm.retryTimer = setTimeout(() => {
             audioNorm.retryTimer = null;
@@ -1097,14 +1150,17 @@
           }, retryDelays[attempt]);
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (reqToken === audioNorm.reqToken) audioNorm.inFlight = false;
+      });
   }
 
-  function syncLoudnessForTrack(track) {
+  function syncLoudnessForTrack(track, { fallbackLoudness = null } = {}) {
     cancelLoudnessSync();
     if (!track || !track.id) {
       audioNorm.currentTrackId = '';
       audioNorm.currentLoudness = null;
+      audioNorm.hasOwnLoudness = false;
       audioNorm.metaRetryDoneFor = '';
       applyOutputVolume(0);
       return;
@@ -1115,10 +1171,13 @@
     const known = normalizeLoudnessObj(track.loudness || state.trackMap.get(trackId)?.loudness);
     if (known) {
       audioNorm.currentLoudness = known;
+      audioNorm.hasOwnLoudness = true;
       applyOutputVolume(0);
       return;
     }
-    audioNorm.currentLoudness = null;
+    const bridge = normalizeLoudnessObj(fallbackLoudness);
+    audioNorm.currentLoudness = bridge;
+    audioNorm.hasOwnLoudness = false;
     applyOutputVolume(0);
     fetchTrackLoudness(trackId, 0);
   }
@@ -3611,28 +3670,31 @@
             const seenIds = new Set(existing.map((t) => t.id));
             const byKey = new Map();
             existing.forEach((t, idx) => {
-              const k = `${String(t.title || '').toLowerCase()}::${String(t.artist || '').toLowerCase()}`;
-              if (!byKey.has(k)) byKey.set(k, idx);
+              const k = searchTrackMatchKey(t);
+              if (k && !byKey.has(k)) byKey.set(k, idx);
             });
             const merged = existing.slice();
+            const upgradedByOldId = new Map();
             let changed = false;
             for (const t of extra) {
               if (seenIds.has(t.id)) continue;
-              const k = `${String(t.title || '').toLowerCase()}::${String(t.artist || '').toLowerCase()}`;
-              const idx = byKey.get(k);
+              const k = searchTrackMatchKey(t);
+              const idx = k ? byKey.get(k) : undefined;
               if (idx !== undefined) {
                 const cur = merged[idx];
-                const curFmt = String(cur.format || '').toLowerCase();
-                const newFmt = String(t.format || '').toLowerCase();
-                const curLossless = curFmt === 'flac' || curFmt === 'alac' || curFmt === 'wav' || curFmt === 'aiff';
-                const newLossless = newFmt === 'flac' || newFmt === 'alac' || newFmt === 'wav' || newFmt === 'aiff';
-                if (newLossless && !curLossless) {
+                if (trackQualityRank(t) > trackQualityRank(cur)) {
+                  if (!t.year && cur.year) t.year = cur.year;
+                  if (!t.genre && cur.genre) t.genre = cur.genre;
+                  if ((!t.album || t.album === t.title) && cur.album && cur.album !== cur.title) {
+                    t.album = cur.album;
+                  }
                   merged[idx] = t;
                   seenIds.add(t.id);
+                  upgradedByOldId.set(cur.id, t);
                   changed = true;
                 }
               } else {
-                byKey.set(k, merged.length);
+                if (k) byKey.set(k, merged.length);
                 merged.push(t);
                 seenIds.add(t.id);
                 changed = true;
@@ -3641,6 +3703,9 @@
             if (changed) {
               state.searchState.tracks = merged;
               renderSearchView();
+              if (upgradedByOldId.size > 0) {
+                applyTrackQualityUpgrades(upgradedByOldId);
+              }
             }
           })
           .catch(() => {});
@@ -6137,8 +6202,250 @@
     }
   }
 
+  function trackQualityRank(track) {
+    if (!track) return 0;
+    const fmt = String(track.format || '').toLowerCase();
+    const badge = String(track.qualityBadge || '').toUpperCase();
+    const isLossless =
+      !!track.isLossless ||
+      fmt === 'flac' ||
+      fmt === 'alac' ||
+      fmt === 'wav' ||
+      fmt === 'aiff' ||
+      fmt === 'aif' ||
+      fmt === 'ape' ||
+      fmt === 'wv' ||
+      fmt === 'dsf';
+    if (isLossless) {
+      return badge.startsWith('HI-RES') ? 5 : 4;
+    }
+    const br = Number(track.bitrate) || 0;
+    if (br >= 256 || badge.startsWith('HQ')) return 3;
+    if (br >= 160 || fmt === 'm4a' || fmt === 'opus' || track.source === 'deezer' || track.source === 'ytm') return 2;
+    return 1;
+  }
+
+  function searchTrackMatchKey(track) {
+    if (!track) return '';
+    const cleanTitle = String(track.title || '')
+      .toLowerCase()
+      .replace(/[\[(]\s*(?:flac|alac|wav|aiff|mp3|aac|m4a|opus|ogg|lossless|hi-?res|hq|v0|320k?(?:bps)?|24-?bit[^)\]]*|16-?bit[^)\]]*|\d{2,3}\s*khz|web|cd)\s*[\])]/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const cleanArtist = String(track.artist || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!cleanTitle && !cleanArtist) return '';
+    return `${cleanTitle}::${cleanArtist}`;
+  }
+
+  function cancelPendingQualityUpgrade() {
+    const p = state.qualityUpgradeProbe;
+    if (!p) return;
+    state.qualityUpgradeProbe = null;
+    if (p.timer) clearTimeout(p.timer);
+    if (p.el) {
+      try {
+        p.el.oncanplay = null;
+        p.el.onerror = null;
+        p.el.pause();
+        p.el.removeAttribute('src');
+        p.el.load();
+      } catch {}
+    }
+  }
+
+  function refreshActiveTrackUpgradeUI(track) {
+    if (!track) return;
+    $('pb-cover').src = track.coverUrl;
+    $('fs-cover').src = track.coverUrl;
+    if ($('fs-mini-cover')) $('fs-mini-cover').src = track.coverUrl;
+    setFsTint(track.coverUrl);
+    $('pb-quality').textContent = track.qualityBadge;
+    $('pb-quality').classList.remove('hidden');
+    $('pb-quality').classList.toggle('lossless', !!track.isLossless);
+    if ($('fs-quality')) {
+      $('fs-quality').textContent = track.qualityBadge;
+      $('fs-quality').classList.remove('hidden');
+      $('fs-quality').classList.toggle('lossless', !!track.isLossless);
+    }
+    syncPlayingTrackRows(track.id);
+    renderQueuePanel();
+    syncMediaSession(track, true);
+    saveServerQueue();
+  }
+
+  function upgradeActiveTrackStream(oldTrack, newTrack) {
+    if (!oldTrack || !newTrack || oldTrack.id === newTrack.id) return;
+    const cur = currentTrack();
+    if (!cur || cur.id !== oldTrack.id) return;
+    const loadToken = state.activeAudioToken;
+    cancelPendingQualityUpgrade();
+
+    const swapQueueSlot = () => {
+      if (state.queueIndex >= 0 && state.queue[state.queueIndex]?.id === oldTrack.id) {
+        state.queue[state.queueIndex] = newTrack;
+      }
+      if (Array.isArray(state.unshuffledQueue)) {
+        for (let i = 0; i < state.unshuffledQueue.length; i++) {
+          if (state.unshuffledQueue[i]?.id === oldTrack.id) {
+            state.unshuffledQueue[i] = newTrack;
+          }
+        }
+      }
+    };
+
+    const currentPos = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+
+    // If audio was intentionally paused, swap immediately in place without starting playback.
+    if (state.intentionalPause && audio.paused) {
+      swapQueueSlot();
+      state.compatAttemptedId = '';
+      state.pendingSeekSec = currentPos > 0.35 ? currentPos : 0;
+      refreshActiveTrackUpgradeUI(newTrack);
+      syncLoudnessForTrack(newTrack, { fallbackLoudness: audioNorm.currentLoudness });
+      state.isSwitchingTrack = true;
+      state.switchGuardUntil = Date.now() + 800;
+      try {
+        audio.src = buildStreamUrl(newTrack);
+      } finally {
+        state.isSwitchingTrack = false;
+      }
+      return;
+    }
+
+    // If playback has barely started or is still buffering, switch immediately from 0:00.
+    if (audio.readyState < 3 || currentPos < 0.5) {
+      swapQueueSlot();
+      state.compatAttemptedId = '';
+      state.pendingSeekSec = 0;
+      updateNowPlayingUI(newTrack, !state.intentionalPause);
+      syncPlayingTrackRows(newTrack.id);
+      renderQueuePanel();
+      saveServerQueue();
+      commitTrackLoad(loadToken, newTrack);
+      return;
+    }
+
+    // Audio is already playing smoothly: pre-connect the higher-quality stream on a
+    // muted offscreen probe so the listener hears zero silence while Soulseek/Archive
+    // connects, and only hot-swap once the upgraded stream is actually ready to play.
+    if (!normalizeLoudnessObj(newTrack.loudness || state.trackMap.get(newTrack.id)?.loudness)) {
+      api(`/api/web/loudness/${encodeURIComponent(newTrack.id)}`)
+        .then((lr) => {
+          if (lr && isValidLoudness(lr)) storeTrackLoudness(newTrack.id, lr);
+        })
+        .catch(() => {});
+    }
+
+    const probe = document.createElement('audio');
+    probe.preload = 'auto';
+    probe.muted = true;
+    const handle = { el: probe, timer: null, done: false };
+    state.qualityUpgradeProbe = handle;
+
+    const cleanup = () => {
+      if (handle.done) return;
+      handle.done = true;
+      if (state.qualityUpgradeProbe === handle) {
+        state.qualityUpgradeProbe = null;
+      }
+      if (handle.timer) {
+        clearTimeout(handle.timer);
+        handle.timer = null;
+      }
+      try {
+        probe.oncanplay = null;
+        probe.onerror = null;
+        probe.pause();
+        probe.removeAttribute('src');
+        probe.load();
+      } catch {}
+    };
+
+    handle.timer = setTimeout(cleanup, 15000);
+    probe.onerror = cleanup;
+    probe.oncanplay = () => {
+      cleanup();
+      if (loadToken !== state.activeAudioToken) return;
+      const latest = currentTrack();
+      if (!latest || latest.id !== oldTrack.id) return;
+
+      const livePos = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+      const wasPlaying = !audio.paused && !state.intentionalPause;
+      const prevLoudness = audioNorm.currentLoudness;
+
+      swapQueueSlot();
+      state.compatAttemptedId = '';
+      state.pendingSeekSec = livePos > 0.35 ? livePos : 0;
+      refreshActiveTrackUpgradeUI(newTrack);
+      ensureAudioNormGraph();
+      syncLoudnessForTrack(newTrack, { fallbackLoudness: prevLoudness });
+
+      state.isSwitchingTrack = true;
+      state.switchGuardUntil = Date.now() + 800;
+      try {
+        audio.src = buildStreamUrl(newTrack);
+        if (wasPlaying) {
+          audio.play().catch((e) => {
+            if (loadToken !== state.activeAudioToken) return;
+            if (e && e.name === 'AbortError') return;
+            updatePlayButton(false);
+          });
+        }
+      } finally {
+        state.isSwitchingTrack = false;
+      }
+      if (newTrack.qualityBadge) {
+        showToast(`Upgraded to ${newTrack.qualityBadge}`);
+      }
+    };
+
+    probe.src = buildStreamUrl(newTrack);
+    try {
+      probe.load();
+    } catch {
+      cleanup();
+    }
+  }
+
+  function applyTrackQualityUpgrades(upgradedByOldId) {
+    if (!upgradedByOldId || upgradedByOldId.size === 0) return;
+    let queueUpdated = false;
+    let activeUpgrade = null;
+    for (let i = 0; i < state.queue.length; i++) {
+      const q = state.queue[i];
+      if (!q || !upgradedByOldId.has(q.id)) continue;
+      const nextTrack = upgradedByOldId.get(q.id);
+      if (i === state.queueIndex) {
+        activeUpgrade = { oldTrack: q, newTrack: nextTrack };
+      } else {
+        state.queue[i] = nextTrack;
+        queueUpdated = true;
+      }
+    }
+    if (Array.isArray(state.unshuffledQueue)) {
+      for (let i = 0; i < state.unshuffledQueue.length; i++) {
+        const q = state.unshuffledQueue[i];
+        if (!q || !upgradedByOldId.has(q.id)) continue;
+        if (activeUpgrade && q.id === activeUpgrade.oldTrack.id) continue;
+        state.unshuffledQueue[i] = upgradedByOldId.get(q.id);
+        queueUpdated = true;
+      }
+    }
+    if (queueUpdated) {
+      renderQueuePanel();
+      saveServerQueue();
+    }
+    if (activeUpgrade) {
+      upgradeActiveTrackStream(activeUpgrade.oldTrack, activeUpgrade.newTrack);
+    }
+  }
+
   function cancelPendingPlaybackWork() {
     clearPlaybackRecovery();
+    cancelPendingQualityUpgrade();
     if (state.playCommitTimer) {
       clearTimeout(state.playCommitTimer);
       state.playCommitTimer = null;
@@ -7654,7 +7961,8 @@
       if (
         cur &&
         cur.id === audioNorm.currentTrackId &&
-        !audioNorm.currentLoudness &&
+        !audioNorm.hasOwnLoudness &&
+        !audioNorm.inFlight &&
         audioNorm.metaRetryDoneFor !== cur.id
       ) {
         audioNorm.metaRetryDoneFor = cur.id;

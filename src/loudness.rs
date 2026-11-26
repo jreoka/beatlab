@@ -14,25 +14,26 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// Loudness target (LUFS). `-10.5 LUFS` keeps tracks at full, punchy listening
-/// volume while still taming loudness-war masters (`-6` to `-8 LUFS`) and
-/// lifting quieter dynamic tracks cleanly to match.
+/// Loudness target (LUFS). `-7.0 LUFS` matches YouTube Music's full, punchy
+/// max-volume output so modern masters (`-6` to `-8 LUFS`) play around unity
+/// gain while ultra-hot masters are tamed and older/dynamic tracks lift cleanly
+/// to match.
 #[cfg(test)]
-pub const TARGET_LUFS: f64 = -10.5;
-/// True-peak reference ceiling (dBTP) before the transparent safety peak catcher.
+pub const TARGET_LUFS: f64 = -7.0;
+/// True-peak reference ceiling (dBTP) before the transparent safety peak limiter.
 #[cfg(test)]
 pub const TRUE_PEAK_CEILING_DB: f64 = -0.3;
-/// Maximum allowed overshoot (dB) into the transparent `-1 dBFS` brickwall safety
-/// peak catcher so quiet, 0-dBFS-normalized tracks can still be lifted to match
-/// louder tracks without ever squashing dynamics or pumping.
+/// Maximum allowed peak overshoot (dB) into the transparent lookahead peak
+/// limiter + soft ceiling so older/dynamic 0-dBFS-normalized tracks (`-14` to
+/// `-20 LUFS`) can still be lifted all the way to match modern tracks cleanly.
 #[cfg(test)]
-pub const MAX_PEAK_CATCH_DB: f64 = 3.5;
+pub const MAX_PEAK_CATCH_DB: f64 = 13.5;
 /// Minimum/maximum allowed gain adjustment (dB) so corrupt/near-silent files
 /// can never produce extreme attenuation or noise-floor amplification.
 #[cfg(test)]
 pub const MIN_GAIN_DB: f64 = -18.0;
 #[cfg(test)]
-pub const MAX_GAIN_DB: f64 = 12.0;
+pub const MAX_GAIN_DB: f64 = 16.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -382,24 +383,27 @@ mod tests {
 
     #[test]
     fn output_gain_matches_loudness_and_never_clips_peaks() {
-        // Loud modern master (-7.5 LUFS, 0 dBTP) at 100% volume -> attenuated by -3 dB (~0.708)
-        let loud = compute_output_gain(-7.5, 0.0, 1.0);
-        assert!((loud - 0.7079).abs() < 0.01);
+        // Ultra-loud modern master (-5.0 LUFS, 0 dBTP) at 100% volume -> attenuated by -2 dB (~0.794)
+        let loud = compute_output_gain(-5.0, 0.0, 1.0);
+        assert!((loud - 10.0_f64.powf(-2.0 / 20.0)).abs() < 0.005);
 
-        // Reference track (-10.5 LUFS, -1 dBTP) at 100% volume -> unity (1.0)
-        let ref_track = compute_output_gain(-10.5, -1.0, 1.0);
+        // Reference modern master (-7.0 LUFS, 0 dBTP) at 100% volume -> unity (1.0)
+        let ref_track = compute_output_gain(-7.0, 0.0, 1.0);
         assert!((ref_track - 1.0).abs() < 0.001);
 
-        // Quiet 80s/indie track (-13.5 LUFS, -0.5 dBTP) at 90% volume -> boosted +3 dB (~1.27)
-        let indie = compute_output_gain(-13.5, -0.5, 0.9);
-        assert!((indie - (0.9 * 10.0_f64.powf(3.0 / 20.0))).abs() < 0.01);
+        // Older 80s dynamic track (-17.0 LUFS, 0 dBTP) at 100% volume -> lifted full +10 dB (~3.162)
+        let eighties = compute_output_gain(-17.0, 0.0, 1.0);
+        assert!((eighties - 10.0_f64.powf(10.0 / 20.0)).abs() < 0.01);
 
-        // Very quiet dynamic track (-20 LUFS, -1 dBTP) at 100% volume -> capped by safe peak-catch budget
-        let quiet_full_vol = compute_output_gain(-20.0, -1.0, 1.0);
-        let tp_lin = 10.0_f64.powf(-1.0 / 20.0);
+        // Very quiet dynamic track (-20.0 LUFS, -0.5 dBTP) at 90% volume -> lifted full +13 dB
+        let quiet_90 = compute_output_gain(-20.0, -0.5, 0.9);
+        assert!((quiet_90 - (0.9 * 10.0_f64.powf(13.0 / 20.0))).abs() < 0.01);
+
+        // Extremely quiet track (-26.0 LUFS, 0 dBTP) at 100% volume -> capped by safe peak-catch budget
+        let ultra_quiet = compute_output_gain(-26.0, 0.0, 1.0);
         let max_lin = 10.0_f64.powf((TRUE_PEAK_CEILING_DB + MAX_PEAK_CATCH_DB) / 20.0);
-        assert!(quiet_full_vol * tp_lin <= max_lin + 1e-6);
-        assert!((quiet_full_vol - (max_lin / tp_lin)).abs() < 0.001);
+        assert!(ultra_quiet <= max_lin + 1e-6);
+        assert!((ultra_quiet - max_lin).abs() < 0.001);
 
         // Muted / zero volume always produces silence.
         assert_eq!(compute_output_gain(-20.0, -6.0, 0.0), 0.0);
