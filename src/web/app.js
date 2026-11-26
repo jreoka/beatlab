@@ -7,6 +7,7 @@
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4.5v15l12-7.5z"/></svg>',
     heart: '<svg class="heart-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+    back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 19 8.5 12l7-7"/></svg>',
     arrowUp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
     eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
@@ -8455,15 +8456,21 @@
     settlePendingConfirm(false);
     settlePendingPrompt(null);
     haptic('tap');
+    const backdrop = $('modal-backdrop');
     const box = $('modal-box');
+    const classes = extraClass ? extraClass.split(/\s+/).filter(Boolean) : [];
+    const isFullscreenMobile = classes.includes('settings-modal');
     box.className = extraClass ? `modal-box ${extraClass}` : 'modal-box';
     box.innerHTML = html;
-    $('modal-backdrop').classList.remove('hidden');
+    backdrop.classList.toggle('modal-fullscreen-mobile', isFullscreenMobile);
+    backdrop.classList.remove('hidden');
   }
 
   function closeModal(event) {
-    if (!event || event.target === $('modal-backdrop')) {
-      $('modal-backdrop').classList.add('hidden');
+    const backdrop = $('modal-backdrop');
+    if (!event || event.target === backdrop) {
+      backdrop.classList.add('hidden');
+      backdrop.classList.remove('modal-fullscreen-mobile');
       settlePendingConfirm(false);
       settlePendingPrompt(null);
     }
@@ -9032,8 +9039,9 @@
     openModal(`
       <div class="settings-shell">
         <div class="modal-head settings-modal-head">
+          <button class="icon-btn settings-back-btn" title="Back" aria-label="Back" onclick="App.closeModal()">${ICONS.back}</button>
           <h3>Settings</h3>
-          <button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button>
+          <button class="icon-btn settings-close-btn" title="Close" aria-label="Close" onclick="App.closeModal()">${ICONS.close}</button>
         </div>
         <div class="settings-layout">
           <nav class="settings-nav" aria-label="Settings sections">
@@ -10418,6 +10426,12 @@
         }).catch(() => {});
       }
       renderSettingsModalBody();
+      const body = $('settings-body');
+      if (body) body.scrollTop = 0;
+      const activeBtn = document.querySelector(`.settings-nav-btn[data-stab="${tab}"]`);
+      if (activeBtn && typeof activeBtn.scrollIntoView === 'function') {
+        activeBtn.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
+      }
     },
     promptResetHidden: () => {
       state.settingsData.confirmResetHidden = true;

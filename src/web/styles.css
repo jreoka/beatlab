@@ -79,6 +79,17 @@ html, body {
   }
 }
 
+@keyframes settingsPageIn {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
 @keyframes ptrSpin {
   to {
     transform: rotate(360deg);
@@ -2783,7 +2794,7 @@ a {
 
 /* ---------------- Redesigned Settings Modal ---------------- */
 .modal-box.settings-modal {
-  max-width: 720px;
+  max-width: min(1200px, calc(100vw - 64px));
   padding: 0;
   overflow: hidden;
   display: flex;
@@ -2795,21 +2806,24 @@ a {
   max-height: 85vh;
 }
 .settings-modal-head {
-  padding: 18px 22px;
+  padding: 18px 26px;
   margin-bottom: 0;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+.settings-back-btn {
+  display: none;
+}
 .settings-layout {
   display: grid;
-  grid-template-columns: 184px minmax(0, 1fr);
-  min-height: 380px;
+  grid-template-columns: 220px minmax(0, 1fr);
+  min-height: 460px;
   overflow: hidden;
 }
 .settings-nav {
   background: var(--surface-2);
   border-right: 1px solid var(--border);
-  padding: 12px 10px;
+  padding: 14px 12px;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -2832,7 +2846,7 @@ a {
   color: var(--accent);
 }
 .settings-body {
-  padding: 20px 22px;
+  padding: 24px 32px;
   overflow-x: hidden;
   overflow-y: auto;
 }
@@ -4852,6 +4866,7 @@ a {
   }
   .modal-box input,
   .modal-box select,
+  .modal-box textarea,
   .auth-form input {
     font-size: 16px;
   }
@@ -7209,15 +7224,85 @@ body:not(.audio-playing) .qp-wave span { animation-play-state: paused; }
   .modal-backdrop {
     padding: calc(12px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
   }
+  /* Full-page Settings experience on mobile */
+  .modal-backdrop.modal-fullscreen-mobile,
+  html[data-theme="light"] .modal-backdrop.modal-fullscreen-mobile {
+    padding: 0;
+    display: block;
+    background: var(--bg);
+  }
+  .modal-box.settings-modal {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: var(--bg);
+    animation: settingsPageIn 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .settings-shell {
+    height: 100%;
+    max-height: none;
+  }
   .settings-modal-head {
-    padding: 14px 16px;
+    padding: calc(10px + env(safe-area-inset-top)) 16px 6px 10px;
+    justify-content: flex-start;
+    gap: 8px;
+    background: var(--bg);
+    border-bottom: 0;
+  }
+  .settings-modal-head h3 {
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+  .settings-back-btn {
+    display: inline-flex;
+    width: 38px;
+    height: 38px;
+  }
+  .settings-back-btn svg {
+    width: 22px;
+    height: 22px;
+  }
+  .settings-close-btn {
+    display: none;
+  }
+  .settings-layout {
+    flex: 1;
+    min-height: 0;
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
   .settings-nav {
+    background: var(--bg);
+    padding: 8px 16px 10px;
+    gap: 6px;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
   }
   .settings-nav::-webkit-scrollbar {
     display: none;
+  }
+  .settings-nav-btn {
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: var(--surface);
+  }
+  .settings-nav-btn.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .settings-body {
+    padding: 18px 16px calc(32px + env(safe-area-inset-bottom));
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+  }
+  .settings-body .hidden-track-list {
+    max-height: none;
+    overflow-y: visible;
   }
   .recent-searches {
     max-height: 48dvh;
