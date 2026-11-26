@@ -760,11 +760,36 @@
     return null;
   }
 
+  function timeOfDaySlot() {
+    const h = new Date().getHours();
+    if (h >= 5 && h < 12) return 'morning';
+    if (h >= 12 && h < 17) return 'afternoon';
+    if (h >= 17 && h < 22) return 'evening';
+    return 'lateNight';
+  }
+
   function greetingText() {
     const h = new Date().getHours();
     if (h < 12) return 'Good morning';
     if (h < 18) return 'Good afternoon';
     return 'Good evening';
+  }
+
+  function hasHardcodedClockHour(text) {
+    return /\bo['’]?clock\b|\b(?:1[0-2]|0?[1-9])(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b/i.test(text);
+  }
+
+  function resolveHomeGreeting(llm) {
+    const fallback = `${greetingText()}, ${state.user.username}`;
+    if (!llm) return fallback;
+    const slot = timeOfDaySlot();
+    const slotted = llm.homeGreetings && llm.homeGreetings[slot]
+      ? String(llm.homeGreetings[slot]).trim()
+      : '';
+    if (slotted && !hasHardcodedClockHour(slotted)) return slotted;
+    const legacy = llm.homeGreeting ? String(llm.homeGreeting).trim() : '';
+    if (legacy && !hasHardcodedClockHour(legacy)) return legacy;
+    return fallback;
   }
 
   // ---------------------------------------------------------------------------
@@ -2225,9 +2250,7 @@
         state.llmSearchPrompts = llm.searchPrompts;
       }
 
-      const greetingHeading = (llm && llm.homeGreeting && String(llm.homeGreeting).trim())
-        ? String(llm.homeGreeting).trim()
-        : `${greetingText()}, ${state.user.username}`;
+      const greetingHeading = resolveHomeGreeting(llm);
       const hasHomeTagline = Boolean(llm && llm.homeTagline && String(llm.homeTagline).trim());
       let html = `<h1 class="page-greeting${hasHomeTagline ? ' has-edition' : ''}">${esc(greetingHeading)}</h1>`;
       if (hasHomeTagline) {

@@ -1083,9 +1083,24 @@ fn is_usable_mix_playlist(p: &DzPlaylist, query_low: &str) -> bool {
         return false;
     }
     if crate::taste::contains_term(&title_low, "instrumental")
-        && !query_low.contains("instrumental")
-        && !query_low.contains("ambient")
-        && !query_low.contains("study")
+        && ![
+            "instrumental",
+            "ambient",
+            "study",
+            "jazz",
+            "fusion",
+            "classical",
+            "lofi",
+            "lo-fi",
+            "soundtrack",
+            "post-rock",
+            "synthwave",
+            "piano",
+            "guitar",
+            "chillhop",
+        ]
+        .iter()
+        .any(|ok| query_low.contains(ok))
     {
         return false;
     }
@@ -1179,6 +1194,16 @@ fn playlist_title_relevance_score(title: &str, query_low: &str) -> Option<i32> {
             return None;
         }
         if crate::taste::has_conflicting_scene_genre(&title_norm, &intent.genres, &q_norm) {
+            return None;
+        }
+    }
+
+    // If the query explicitly asks for a regional/language scene (e.g. "japanese jazz fusion",
+    // "korean indie", "brazilian jazz"), reject generic playlists that omit that scene
+    // (like "Jazz Classics").
+    let required_scenes = crate::taste::requested_scene_families(&q_norm);
+    for fam in &required_scenes {
+        if !crate::taste::scene_family_matches_text(fam, &title_norm) {
             return None;
         }
     }
@@ -1644,6 +1669,26 @@ mod tests {
         assert!(playlist_title_relevance_score("Top J-Rock", "jrock").is_some());
         assert!(playlist_title_relevance_score("Pop Hits", "city pop").is_none());
         assert!(playlist_title_relevance_score("80s Japanese City Pop", "city pop").is_some());
+
+        // Regional jazz queries must reject generic non-Japanese jazz playlists, while
+        // accepting equivalent Japan/Japanese/J-Jazz titles.
+        assert!(playlist_title_relevance_score("Jazz Classics", "japanese jazz fusion").is_none());
+        assert!(playlist_title_relevance_score("Smooth Jazz", "japanese jazz fusion").is_none());
+        assert!(playlist_title_relevance_score("Japanese Jazz Fusion", "japanese jazz fusion").is_some());
+        assert!(playlist_title_relevance_score("Japan Jazz Fusion", "japanese jazz fusion").is_some());
+        assert!(playlist_title_relevance_score("J-Jazz Kissaten Essentials", "japanese jazz fusion").is_some());
+        assert!(!crate::sources::has_unrequested_scene_qualifier(
+            "Japan Jazz Fusion",
+            "japanese jazz fusion"
+        ));
+        assert!(!crate::sources::has_unrequested_scene_qualifier(
+            "Japanese Jazz Fusion",
+            "j-jazz"
+        ));
+        assert!(crate::sources::has_unrequested_scene_qualifier(
+            "Japanese 80s Hits",
+            "80s hits"
+        ));
     }
 
     #[test]

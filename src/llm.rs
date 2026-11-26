@@ -218,11 +218,15 @@ fn attempt_kv_key(user_id: i64) -> String {
 }
 
 pub fn llm_explore_pool_key(user_id: i64, mix_key: &str) -> String {
-    format!("curated:llm_explore:v1:{user_id}:{mix_key}")
+    format!("curated:llm_explore:v2:{user_id}:{mix_key}")
 }
 
 pub fn llm_mood_pool_key(user_id: i64, mood_slug: &str) -> String {
-    format!("curated:llm_mood:v1:{user_id}:{mood_slug}")
+    format!("curated:llm_mood:v2:{user_id}:{mood_slug}")
+}
+
+fn pools_v2_ready_kv_key(user_id: i64) -> String {
+    format!("llm:pools_v2_ready:{user_id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -382,6 +386,19 @@ pub struct LlmSearchPrompt {
     pub query: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmHomeGreetings {
+    #[serde(default)]
+    pub morning: String,
+    #[serde(default)]
+    pub afternoon: String,
+    #[serde(default)]
+    pub evening: String,
+    #[serde(default)]
+    pub late_night: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyLlmExperience {
@@ -393,6 +410,8 @@ pub struct DailyLlmExperience {
     pub model: String,
     #[serde(default)]
     pub home_greeting: String,
+    #[serde(default)]
+    pub home_greetings: LlmHomeGreetings,
     #[serde(default)]
     pub explore_title: String,
     pub home_tagline: String,
@@ -536,6 +555,38 @@ impl LlmCurator {
         }
         let tz = taste.user_tz_offset_min(user_id);
         if !force && !self.needs_refresh(&taste.store, user_id, tz) {
+            // If an existing edition was materialized under an older pool version,
+            // rebuild its Explore/Mood/Daily Mix pools once without spending a new LLM call.
+            if let Some(exp) = Self::load_experience(&taste.store, user_id) {
+                let marker_key = pools_v2_ready_kv_key(user_id);
+                let expected = exp.day_key.to_string();
+                if taste.store.kv_get(&marker_key).as_deref() != Some(expected.as_str()) {
+                    let acquired = {
+                        let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.insert(user_id)
+                    };
+                    if acquired {
+                        let _in_flight_reset = {
+                            struct Reset {
+                                set: Arc<Mutex<HashSet<i64>>>,
+                                uid: i64,
+                            }
+                            impl Drop for Reset {
+                                fn drop(&mut self) {
+                                    let mut g = self.set.lock().unwrap_or_else(|e| e.into_inner());
+                                    g.remove(&self.uid);
+                                }
+                            }
+                            Reset {
+                                set: self.in_flight.clone(),
+                                uid: user_id,
+                            }
+                        };
+                        taste.materialize_llm_experience(user_id, &exp).await;
+                        taste.store.kv_set(&marker_key, &expected);
+                    }
+                }
+            }
             return Ok(false);
         }
 
@@ -649,6 +700,9 @@ impl LlmCurator {
 
         // Materialize all custom Daily Mixes, Made For You copy overrides, and Explore category mixes.
         taste.materialize_llm_experience(user_id, &experience).await;
+        taste
+            .store
+            .kv_set(&pools_v2_ready_kv_key(user_id), &day_key.to_string());
 
         Ok(experience)
     }
@@ -1501,9 +1555,9 @@ fn build_user_taste_digest(
 
     let peak_hour_label = stats_all
         .peak_hour
-        .and_then(|hr| stats_all.hourly.get(hr))
-        .map(|h| h.label.clone())
-        .unwrap_or_else(|| "Evening".to_string());
+        .map(peak_window_label)
+        .unwrap_or("Evening")
+        .to_string();
 
     Ok(UserTasteDigest {
         username: user.username,
@@ -1530,12 +1584,21 @@ fn build_user_taste_digest(
     })
 }
 
+fn peak_window_label(hour: usize) -> &'static str {
+    match hour {
+        5..=11 => "Morning",
+        12..=16 => "Afternoon",
+        17..=21 => "Evening",
+        _ => "Late Night",
+    }
+}
+
 fn build_system_prompt(extra: Option<&str>) -> String {
     let mut prompt = String::from(
         "You are Beatlab's overnight music editorial director, art director, and personal DJ. \
 Each night while the listener sleeps, you redesign their ENTIRE Home & Explore experience \
 from scratch so the app feels freshly hand-crafted around their exact taste today:\n\
-- Custom Home greeting, Explore headline, edition title, and Home/Explore editorial taglines\n\
+- Custom time-of-day Home greetings (`homeGreetings` for morning, afternoon, evening, and lateNight — swapped live as the listener's clock changes), Explore headline, edition title, and Home/Explore editorial taglines\n\
 - Custom editorial headings for EVERY shelf on Home & Explore\n\
 - 4 custom-named Daily Mixes (with custom cover palettes & seed strategies)\n\
 - Custom titles & daily notes for all 6 signature auto-playlists\n\
@@ -1546,10 +1609,11 @@ from scratch so the app feels freshly hand-crafted around their exact taste toda
 - 5-6 clickable daily vibe prompts for Search\n\n\
 Style guidelines:\n\
 - Be genuinely creative, musical, grounded, and specific to their actual taste (artists, scenes, eras, playlists, chronotype, day of week/season). Avoid generic cliches, cringe slang, or emojis (no emojis at all — keep typography clean and editorial).\n\
+- NEVER mention a specific clock hour (like \"6 PM\", \"Six o'clock\", \"2 AM\", \"8:00\") in `homeGreeting`, `homeGreetings`, `homeTagline`, `exploreTagline`, or any `sections` heading. Use broad time-of-day phrasing (\"morning\", \"afternoon\", \"evening\", \"late night\") or timeless phrasing so the app feels right no matter when the listener opens it.\n\
 - Never repeat yesterday's mix, mood, era, or category names.\n\
 - Every mix, mood, and era you design will be populated with REAL playable songs by Beatlab's search & taste engine using your `query`/`seedQueries`, `seedArtists`, `genres`, `mood`, and `yearRange`. Therefore:\n\
-  * `query` / `seedQueries` MUST be realistic music search/playlist queries that return great real songs on Deezer/YouTube Music (e.g., \"japanese city pop\", \"90s shoegaze\", \"melodic house\", \"indie folk acoustic\", \"uk garage classics\", \"dark synthwave\").\n\
-  * `seedArtists` MUST be real musical artists (a mix of the listener's favorites and genuinely adjacent artists they would love).\n\
+  * `query` / `seedQueries` MUST be crisp, realistic 2-4 word music search/playlist queries that return real curated playlists on Deezer/YouTube Music (e.g., \"japanese jazz fusion\", \"japanese city pop\", \"90s shoegaze\", \"melodic house\", \"indie folk acoustic\", \"uk garage classics\", \"dark synthwave\"). Whenever a mix is regional or language-specific (e.g. Japanese, Korean, French, Brazilian), ALWAYS include that qualifier in both `query` and `genres`.\n\
+  * `seedArtists` MUST be real musical artists who GENUINELY belong to that exact mix's genre, scene, language/region, and era. For `dailyMixes`, blend the listener's matching favorites with closely adjacent artists. For `exploreCategories`, `customMoods`, and `eraMixes`, NEVER force an unrelated favorite artist from the listener's profile into `seedArtists` — every seed artist MUST authentically fit that mix's title, subtitle, region/scene, and era (for example, a Japanese jazz-fusion mix must ONLY list real Japanese jazz-fusion artists like Casiopea, T-Square, Ryo Fukui, Himiko Kikuchi, or Masayoshi Takanaka — never Western crooners or J-Pop anime acts).\n\
   * `mood` (the optional acoustic hint field) MUST be either null or one of: \"chill\", \"energy\", \"late_night\", \"upbeat\", \"melancholy\", \"party\", \"acoustic\", \"groove\", \"rock_indie\".\n\
   * `c1` (bright accent) and `c2` (deep dark background) MUST be valid 6-digit hex colors like \"#38bdf8\" and \"#0c2d48\" with strong contrast for white text, varied across cards so the UI looks vivid and cohesive.\n\
 - Respond ONLY with a single valid JSON object matching the requested schema. No markdown fences, no commentary.",
@@ -1577,7 +1641,7 @@ fn build_user_prompt(d: &UserTasteDigest) -> String {
         }
     } else {
         out.push_str(&format!(
-            "Listening profile: {} · Peak hour: {} · 30d streams: {} · Discovery rate: {:.0}%\n",
+            "Listening profile: {} · Peak listening window: {} · 30d streams: {} · Discovery rate: {:.0}%\n",
             d.chronotype, d.peak_hour_label, d.total_streams_30d, d.discovery_rate_pct
         ));
         if !d.top_artists_recent.is_empty() {
@@ -1621,7 +1685,13 @@ fn build_user_prompt(d: &UserTasteDigest) -> String {
 Return a JSON object with this exact shape:
 {
   "editionTitle": "Short 2-4 word name for today's edition",
-  "homeGreeting": "Personalized greeting line for Home (e.g. 'Late-night signal, cross' or 'Thursday frequency, cross')",
+  "homeGreeting": "Timeless personalized fallback greeting for Home (no specific clock hour, e.g. 'Thursday frequency, cross')",
+  "homeGreetings": {
+    "morning": "Morning greeting line for Home (no specific clock hour, e.g. 'Morning frequency, cross')",
+    "afternoon": "Afternoon greeting line for Home (no specific clock hour, e.g. 'Afternoon studio drift, cross')",
+    "evening": "Evening greeting line for Home (no specific clock hour, e.g. 'Evening signal, cross')",
+    "lateNight": "Late-night greeting line for Home (no specific clock hour, e.g. 'Late-night signal, cross')"
+  },
   "exploreTitle": "Custom title for the Explore page (2-4 words, e.g. 'Tonight's Crate' or 'Sonic Atlas')",
   "homeTagline": "One crisp editorial sentence under the Home greeting tailored to today & their taste",
   "exploreTagline": "One crisp editorial sentence under the Explore heading",
@@ -1757,6 +1827,8 @@ struct RawLlmResponse {
     edition_title: String,
     #[serde(default)]
     home_greeting: String,
+    #[serde(default)]
+    home_greetings: LlmHomeGreetings,
     #[serde(default)]
     explore_title: String,
     #[serde(default)]
@@ -1977,6 +2049,12 @@ fn sanitize_experience(
         }
     };
     let home_greeting = clean_text(&raw.home_greeting, 72);
+    let home_greetings = LlmHomeGreetings {
+        morning: clean_text(&raw.home_greetings.morning, 72),
+        afternoon: clean_text(&raw.home_greetings.afternoon, 72),
+        evening: clean_text(&raw.home_greetings.evening, 72),
+        late_night: clean_text(&raw.home_greetings.late_night, 72),
+    };
     let explore_title = clean_text(&raw.explore_title, 48);
     let home_tagline = clean_text(&raw.home_tagline, 160);
     let explore_tagline = clean_text(&raw.explore_tagline, 160);
@@ -2353,6 +2431,7 @@ fn sanitize_experience(
         edition_title,
         model: model.to_string(),
         home_greeting,
+        home_greetings,
         explore_title,
         home_tagline,
         explore_tagline,
@@ -3041,5 +3120,32 @@ mod tests {
             }
             other => panic!("expected Empty outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn peak_window_label_uses_broad_time_of_day_and_sanitizes_home_greetings() {
+        assert_eq!(peak_window_label(8), "Morning");
+        assert_eq!(peak_window_label(14), "Afternoon");
+        assert_eq!(peak_window_label(18), "Evening");
+        assert_eq!(peak_window_label(20), "Evening");
+        assert_eq!(peak_window_label(23), "Late Night");
+        assert_eq!(peak_window_label(2), "Late Night");
+
+        let raw: RawLlmResponse = serde_json::from_value(json!({
+            "editionTitle": "Evening Edition",
+            "homeGreeting": "Thursday frequency, cross",
+            "homeGreetings": {
+                "morning": "Morning frequency, cross",
+                "afternoon": "Afternoon drift, cross",
+                "evening": "Evening glow, cross",
+                "lateNight": "After-hours signal, cross"
+            }
+        }))
+        .unwrap();
+        let exp = sanitize_experience(raw, "Wednesday, Nov 25", 20000, 1700000000, "test");
+        assert_eq!(exp.home_greetings.morning, "Morning frequency, cross");
+        assert_eq!(exp.home_greetings.afternoon, "Afternoon drift, cross");
+        assert_eq!(exp.home_greetings.evening, "Evening glow, cross");
+        assert_eq!(exp.home_greetings.late_night, "After-hours signal, cross");
     }
 }

@@ -3005,6 +3005,7 @@ fn llm_meta_json(exp: Option<&crate::llm::DailyLlmExperience>) -> Value {
         "dateLabel": e.date_label,
         "generatedAt": e.generated_at,
         "homeGreeting": e.home_greeting,
+        "homeGreetings": e.home_greetings,
         "exploreTitle": e.explore_title,
         "homeTagline": e.home_tagline,
         "exploreTagline": e.explore_tagline,

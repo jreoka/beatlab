@@ -158,9 +158,15 @@ impl SourceRegistry {
                 .take(max_playlists.max(1))
                 .collect::<Vec<_>>()
         };
-        let mut chosen = pick(self.ytm.search_playlists(query, true, 20).await, 1);
+        let q_content_words = q_low
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty() && !matches!(*w, "mix" | "playlist" | "hits" | "songs" | "music" | "best" | "top" | "the" | "of" | "and" | "for"))
+            .count();
+        let featured_extra = if q_content_words >= 2 { 2 } else { 1 };
+        let community_extra = if q_content_words >= 2 { 2 } else { 0 };
+        let mut chosen = pick(self.ytm.search_playlists(query, true, 20).await, featured_extra);
         if chosen.is_empty() {
-            chosen = pick(self.ytm.search_playlists(query, false, 20).await, 0);
+            chosen = pick(self.ytm.search_playlists(query, false, 20).await, community_extra);
         }
         if chosen.is_empty() {
             return vec![];
@@ -607,27 +613,31 @@ pub fn dedup_and_rank_search(tracks: Vec<Track>, query: &str) -> Vec<Track> {
 /// "dance party" also returns "The Turkish Hits: 80s", "Egyptian '80s", or "Malayalam Dance Party".
 /// Reject playlists scoped to a regional or language scene the query did not ask for.
 pub(crate) fn has_unrequested_scene_qualifier(title: &str, query_low: &str) -> bool {
-    const SCENES: &[&str] = &[
-        "arabic", "khaleeji", "egyptian", "turkish", "persian", "kurdish", "bollywood",
-        "tollywood", "kollywood", "mollywood", "sandalwood", "hindi", "punjabi", "tamil",
-        "telugu", "malayalam", "marathi", "kannada", "bengali", "gujarati", "assamese",
+    let t = title.to_lowercase();
+    for fam in crate::taste::SCENE_FAMILIES {
+        let title_has_trigger = fam
+            .title_triggers
+            .iter()
+            .any(|s| crate::taste::contains_term(&t, s));
+        if title_has_trigger {
+            let query_asks_family = fam
+                .query_cues
+                .iter()
+                .any(|c| crate::taste::contains_term(query_low, c));
+            if !query_asks_family {
+                return true;
+            }
+        }
+    }
+    const STANDALONE_SCENES: &[&str] = &[
+        "khaleeji", "kurdish", "tollywood", "kollywood", "mollywood", "sandalwood", "punjabi",
+        "tamil", "telugu", "malayalam", "marathi", "kannada", "bengali", "gujarati", "assamese",
         "odia", "bhojpuri", "haryanvi", "desi", "bhangra", "garba", "dandiya", "kuthu",
         "dappankuthu", "filmi", "qawwali", "carnatic", "hindustani", "malayali", "mallu",
-        "kerala", "maharashtra", "indonesian", "malaysian", "thai", "vietnamese", "filipino",
-        "opm", "mandopop", "cantopop", "chinese", "korean", "japanese", "nigeria", "nigerian",
-        "ghanaian", "naija", "argentinian", "mexican", "brazilian", "colombian", "latin",
-        "latino", "spanish", "español", "éxitos", "sertanejo", "forró", "forro", "pagode",
-        "brega", "corridos", "banda", "norteño", "norteno", "ranchera", "vallenato", "dembow",
-        "champeta", "french", "german", "schlager", "volksmusik", "italian", "flamenco",
-        "polish", "russian", "ukrainian", "greek", "dutch", "swedish", "chalga", "turbofolk",
-        "dabke", "shaabi", "mahraganat", "canrock", "canadian", "australian", "japan", "korea",
-        "china", "taiwan", "india", "pakistan", "turkey", "egypt", "iran", "indonesia",
-        "malaysia", "thailand", "vietnam", "philippines", "africa", "african", "ghana",
-        "kenya", "brazil", "brasil", "mexico", "argentina", "colombia", "france", "germany",
-        "italy", "spain", "poland", "russia", "ukraine", "greece", "sweden",
+        "kerala", "maharashtra", "schlager", "volksmusik", "flamenco", "dutch", "chalga",
+        "turbofolk", "dabke", "shaabi", "mahraganat", "australian", "pakistan", "kenya",
     ];
-    let t = title.to_lowercase();
-    SCENES.iter().any(|s| {
+    STANDALONE_SCENES.iter().any(|s| {
         crate::taste::contains_term(&t, s) && !crate::taste::contains_term(query_low, s)
     })
 }

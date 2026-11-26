@@ -3149,10 +3149,19 @@ impl TasteEngine {
             }
         }
         let queries = vec![spec.query.clone()];
+        let context_text = format!(
+            "{} {} {} {}",
+            spec.label,
+            spec.subtitle,
+            spec.query,
+            spec.genres.join(" ")
+        );
         let empty_excl = HashSet::new();
         let tracks = self
             .curate_llm_mix_tracks(
                 user_id,
+                LlmMixKind::Thematic,
+                &context_text,
                 &queries,
                 &spec.seed_artists,
                 &spec.genres,
@@ -3188,10 +3197,20 @@ impl TasteEngine {
             }
         }
         let queries = vec![spec.query.clone()];
+        let context_text = format!(
+            "{} {} {} {} {}",
+            spec.kicker,
+            spec.title,
+            spec.subtitle,
+            spec.query,
+            spec.genres.join(" ")
+        );
         let empty_excl = HashSet::new();
         let tracks = self
             .curate_llm_mix_tracks(
                 user_id,
+                LlmMixKind::Thematic,
+                &context_text,
                 &queries,
                 &spec.seed_artists,
                 &spec.genres,
@@ -3243,9 +3262,18 @@ impl TasteEngine {
                 } else {
                     used_keys.clone()
                 };
+                let context_text = format!(
+                    "{} {} {} {}",
+                    spec.title,
+                    spec.subtitle,
+                    spec.seed_queries.join(" "),
+                    spec.genres.join(" ")
+                );
                 let tracks = self
                     .curate_llm_mix_tracks(
                         user_id,
+                        LlmMixKind::DailyMix,
+                        &context_text,
                         &spec.seed_queries,
                         &spec.seed_artists,
                         &spec.genres,
@@ -3301,6 +3329,7 @@ impl TasteEngine {
         //    with bounded concurrency so every card has real cover collages and instant playback.
         struct PoolJob {
             pool_key: String,
+            context_text: String,
             query: String,
             seed_artists: Vec<String>,
             genres: Vec<String>,
@@ -3311,6 +3340,13 @@ impl TasteEngine {
         for cm in &exp.custom_moods {
             jobs.push(PoolJob {
                 pool_key: crate::llm::llm_mood_pool_key(user_id, &cm.slug),
+                context_text: format!(
+                    "{} {} {} {}",
+                    cm.label,
+                    cm.subtitle,
+                    cm.query,
+                    cm.genres.join(" ")
+                ),
                 query: cm.query.clone(),
                 seed_artists: cm.seed_artists.clone(),
                 genres: cm.genres.clone(),
@@ -3322,6 +3358,14 @@ impl TasteEngine {
             for mix in &cat.mixes {
                 jobs.push(PoolJob {
                     pool_key: crate::llm::llm_explore_pool_key(user_id, &mix.key),
+                    context_text: format!(
+                        "{} {} {} {} {}",
+                        mix.kicker,
+                        mix.title,
+                        mix.subtitle,
+                        mix.query,
+                        mix.genres.join(" ")
+                    ),
                     query: mix.query.clone(),
                     seed_artists: mix.seed_artists.clone(),
                     genres: mix.genres.clone(),
@@ -3333,6 +3377,14 @@ impl TasteEngine {
         for era in &exp.era_mixes {
             jobs.push(PoolJob {
                 pool_key: crate::llm::llm_explore_pool_key(user_id, &era.key),
+                context_text: format!(
+                    "{} {} {} {} {}",
+                    era.kicker,
+                    era.title,
+                    era.subtitle,
+                    era.query,
+                    era.genres.join(" ")
+                ),
                 query: era.query.clone(),
                 seed_artists: era.seed_artists.clone(),
                 genres: era.genres.clone(),
@@ -3354,6 +3406,8 @@ impl TasteEngine {
                 let tracks = engine
                     .curate_llm_mix_tracks(
                         user_id,
+                        LlmMixKind::Thematic,
+                        &job.context_text,
                         &queries,
                         &job.seed_artists,
                         &job.genres,
@@ -3377,6 +3431,8 @@ impl TasteEngine {
     async fn curate_llm_mix_tracks(
         &self,
         user_id: i64,
+        kind: LlmMixKind,
+        context_text: &str,
         seed_queries: &[String],
         seed_artists: &[String],
         genres: &[String],
@@ -3386,8 +3442,19 @@ impl TasteEngine {
         exclude_song_keys: &HashSet<String>,
         limit: usize,
     ) -> Vec<Track> {
+        use crate::sources::MusicSource;
+
+        let ctx_low = context_text.to_lowercase();
+        let req_topic = strict_topic_for_text(&ctx_low);
+        let allow_christmas = req_topic == Some("christmas");
+        let allow_halloween = req_topic == Some("halloween");
+        let required_scenes = requested_scene_families(&ctx_low);
+
         let mut raw_candidates: Vec<Track> = Vec::new();
-        let mut curated_source_ids: HashSet<String> = HashSet::new();
+        let mut curated_playlist_rank: HashMap<String, usize> = HashMap::new();
+        let mut query_search_ids: HashSet<String> = HashSet::new();
+        let mut seed_artist_source_ids: HashSet<String> = HashSet::new();
+        let mut seed_radio_ids: HashSet<String> = HashSet::new();
 
         // 1. Fetch curated playlists & search tracks for LLM seed queries (bounded timeouts).
         for q in seed_queries.iter().take(2) {
@@ -3395,9 +3462,21 @@ impl TasteEngine {
             if trimmed.is_empty() {
                 continue;
             }
+            // If the mix metadata explicitly specifies a regional/language scene (e.g.
+            // kicker "J-JAZZ" / subtitle "Japanese jazz-fusion") that the raw query omitted,
+            // prepend the scene qualifier so remote playlists stay on-region.
+            let q_low = trimmed.to_lowercase();
+            let effective_query = if let Some(missing_fam) = required_scenes
+                .iter()
+                .find(|fam| !fam.query_cues.iter().any(|c| contains_term(&q_low, c)))
+            {
+                format!("{} {}", missing_fam.key, trimmed)
+            } else {
+                trimmed.to_string()
+            };
             let batches = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.sources.fetch_curated_mix_tracks(trimmed, 2, 20),
+                std::time::Duration::from_secs(6),
+                self.sources.fetch_curated_mix_tracks(&effective_query, 2, 25),
             )
             .await
             .unwrap_or_default();
@@ -3405,46 +3484,145 @@ impl TasteEngine {
             for (_, batch) in batches {
                 if !batch.is_empty() {
                     got_batch = true;
-                    for t in batch {
-                        curated_source_ids.insert(t.id.clone());
+                    for (rank_idx, t) in batch.into_iter().enumerate() {
+                        curated_playlist_rank.entry(t.id.clone()).or_insert(rank_idx);
                         raw_candidates.push(t);
                     }
                 }
             }
             if !got_batch {
-                let dz = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    self.sources.deezer.search_tracks(trimmed, 16),
-                )
-                .await
-                .unwrap_or_default();
-                for t in dz {
-                    curated_source_ids.insert(t.id.clone());
+                let mut search_hits: Vec<Track> = Vec::new();
+                if !self.sources.deezer.is_blocked() {
+                    let dz = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        self.sources.deezer.search_tracks(&effective_query, 16),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    search_hits.extend(dz);
+                }
+                if search_hits.len() < 6 {
+                    let ytm = tokio::time::timeout(
+                        std::time::Duration::from_secs(4),
+                        self.sources.ytm.search(&effective_query, 16),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    search_hits.extend(ytm);
+                }
+                for t in search_hits {
+                    query_search_ids.insert(t.id.clone());
                     raw_candidates.push(t);
                 }
             }
-            if let Ok(local_hits) = self.store.search_tracks(trimmed, 16, 0) {
-                raw_candidates.extend(local_hits);
+            if let Ok(local_hits) = self.store.search_tracks(&effective_query, 16, 0) {
+                for t in local_hits {
+                    if !required_scenes.is_empty()
+                        && !required_scenes
+                            .iter()
+                            .all(|fam| track_matches_scene_family(&t, "", fam))
+                    {
+                        continue;
+                    }
+                    query_search_ids.insert(t.id.clone());
+                    raw_candidates.push(t);
+                }
             }
         }
 
-        // 2. Pull tracks for LLM seed artists from SQLite + Deezer.
-        for artist in seed_artists.iter().take(4) {
+        // 2. Pull verified tracks for LLM seed artists from SQLite, Deezer, and YouTube Music.
+        for artist in seed_artists.iter().take(5) {
             let clean = artist.trim();
             if clean.is_empty() {
                 continue;
             }
-            let local_artist_tracks = self.store.search_tracks(clean, 10, 0).unwrap_or_default();
-            let local_cnt = local_artist_tracks.len();
-            raw_candidates.extend(local_artist_tracks);
-            if local_cnt < 4 {
+            let clean_low = primary_artist(clean).to_lowercase();
+            let mut artist_hits: Vec<Track> = self
+                .store
+                .search_tracks(clean, 12, 0)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| track_matches_seed_artist(t, &clean_low))
+                .collect();
+            if artist_hits.len() < 5 && !self.sources.deezer.is_blocked() {
                 let remote = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    self.sources.deezer.search_tracks(clean, 8),
+                    self.sources.deezer.search_tracks(clean, 10),
                 )
                 .await
                 .unwrap_or_default();
-                raw_candidates.extend(remote);
+                artist_hits.extend(
+                    remote
+                        .into_iter()
+                        .filter(|t| track_matches_seed_artist(t, &clean_low)),
+                );
+            }
+            if artist_hits.len() < 4 {
+                let ytm_remote = tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    self.sources.ytm.search(clean, 10),
+                )
+                .await
+                .unwrap_or_default();
+                artist_hits.extend(
+                    ytm_remote
+                        .into_iter()
+                        .filter(|t| track_matches_seed_artist(t, &clean_low)),
+                );
+            }
+            for t in artist_hits {
+                seed_artist_source_ids.insert(t.id.clone());
+                raw_candidates.push(t);
+            }
+        }
+
+        // 2b. When curated playlists + direct seed tracks are still below the mix size,
+        //     expand via YouTube Music track radio / Deezer artist radio from the verified
+        //     seed artists so niche scenes (e.g. Japanese jazz-fusion) stay authentically on-scene.
+        if raw_candidates.len() < limit && !seed_artist_source_ids.is_empty() {
+            let mut expanded_artists: HashSet<String> = HashSet::new();
+            let mut radio_seeds: Vec<Track> = Vec::new();
+            for t in &raw_candidates {
+                if !seed_artist_source_ids.contains(&t.id) {
+                    continue;
+                }
+                let pa = slug(&primary_artist(&t.artist));
+                if pa.is_empty() || !expanded_artists.insert(pa) {
+                    continue;
+                }
+                if t.id.starts_with("ytm:") || t.deezer_artist_id().is_some() {
+                    radio_seeds.push(t.clone());
+                    if radio_seeds.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+            for seed in radio_seeds {
+                let radio_tracks = if seed.id.starts_with("ytm:") {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(4),
+                        self.sources.ytm.fetch_radio_tracks(&seed.id, 18),
+                    )
+                    .await
+                    .unwrap_or_default()
+                } else if let Some(dz_aid) = seed.deezer_artist_id() {
+                    if !self.sources.deezer.is_blocked() {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(4),
+                            self.sources.deezer.fetch_artist_radio(&dz_aid),
+                        )
+                        .await
+                        .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                for rt in radio_tracks {
+                    seed_radio_ids.insert(rt.id.clone());
+                    raw_candidates.push(rt);
+                }
             }
         }
 
@@ -3452,22 +3630,39 @@ impl TasteEngine {
             let _ = self.store.upsert_tracks(&raw_candidates);
         }
 
-        // 3. Also pull matching tracks from the listener's own catalog & mood/genre pools.
+        // 3. Only pull from the generic global mood pool for pure mood-only mixes that do not
+        //    specify artists, genres, regional scenes, or an era.
         let mood_opt = mood_slug.and_then(Mood::from_slug);
+        let genre_lows: Vec<String> = genres
+            .iter()
+            .map(|g| g.trim().to_lowercase())
+            .filter(|g| !g.is_empty())
+            .collect();
         if let Some(m) = mood_opt {
-            let mood_ids = self.load_curated_pool_ids(&mood_cache_key(m), 24 * 3600);
-            if !mood_ids.is_empty() {
-                raw_candidates.extend(
-                    self.store
-                        .get_tracks_by_ids(&mood_ids[..mood_ids.len().min(30)])
-                        .unwrap_or_default(),
-                );
+            if seed_artists.is_empty()
+                && genre_lows.is_empty()
+                && required_scenes.is_empty()
+                && year_range.is_none()
+            {
+                let mood_ids = self.load_curated_pool_ids(&mood_cache_key(m), 24 * 3600);
+                if !mood_ids.is_empty() {
+                    raw_candidates.extend(
+                        self.store
+                            .get_tracks_by_ids(&mood_ids[..mood_ids.len().min(30)])
+                            .unwrap_or_default(),
+                    );
+                }
             }
         }
 
         let user_cands = self
             .store
             .candidate_tracks_for_user(user_id, 600)
+            .unwrap_or_default();
+        let user_cand_artists: Vec<String> = user_cands.iter().map(|t| t.artist.clone()).collect();
+        let user_artist_genres = self
+            .store
+            .known_artist_genres_for(&user_cand_artists)
             .unwrap_or_default();
 
         let sctx = self.build_scoring_context(user_id);
@@ -3476,69 +3671,93 @@ impl TasteEngine {
             .map(|a| primary_artist(a).to_lowercase())
             .filter(|a| !a.is_empty())
             .collect();
-        let genre_lows: Vec<String> = genres
-            .iter()
-            .map(|g| g.trim().to_lowercase())
-            .filter(|g| !g.is_empty())
-            .collect();
 
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut seen_keys: HashSet<String> = HashSet::new();
         let mut pool: Vec<Track> = Vec::new();
 
-        let mut admit = |t: Track, require_match: bool| {
-            if is_hidden_track(&t, &sctx.prof)
-                || is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
-                || is_mood_clutter_track(&t)
-            {
-                return;
-            }
-            if require_match {
-                let pa = primary_artist(&t.artist).to_lowercase();
-                let artist_hit = seed_artist_lows
-                    .iter()
-                    .any(|sa| !pa.is_empty() && (pa == *sa || pa.contains(sa.as_str())));
-                let g_low = t.genre.to_lowercase();
-                let genre_hit = !genre_lows.is_empty()
-                    && genre_lows.iter().any(|want| {
-                        genre_variants(want)
-                            .iter()
-                            .any(|alias| contains_term(&g_low, alias))
-                    });
-                let mood_hit = mood_opt.map_or(false, |m| {
-                    t.mood_list().contains(&m)
-                        || classify_moods(&t.title, &t.album, &t.genre, "").contains(&m)
-                });
-                let year_hit = year_range
-                    .map_or(false, |(lo, hi)| t.year >= lo && t.year <= hi);
-                if !(artist_hit || genre_hit || mood_hit || year_hit) {
-                    return;
-                }
+        let is_disallowed = |t: &Track| -> bool {
+            is_hidden_track(t, &sctx.prof)
+                || is_strongly_disliked(t, &sctx.prof, &sctx.stats)
+                || is_mood_clutter_track(t)
+                || (!allow_christmas && track_matches_topic(t, "christmas"))
+                || (!allow_halloween && track_matches_topic(t, "halloween"))
+        };
+
+        for t in raw_candidates {
+            if is_disallowed(&t) {
+                continue;
             }
             if seen_ids.insert(t.id.clone()) && seen_keys.insert(t.song_key()) {
                 pool.push(t);
             }
-        };
-
-        for t in raw_candidates {
-            admit(t, false);
         }
+
         for t in user_cands {
-            admit(t, true);
-        }
-        drop(admit);
+            if is_disallowed(&t) {
+                continue;
+            }
+            let ag = user_artist_genres
+                .get(&primary_artist(&t.artist).to_lowercase())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let g_low = format!("{} {}", t.genre, ag).to_lowercase();
+            let artist_hit = seed_artist_lows
+                .iter()
+                .any(|sa| track_matches_seed_artist(&t, sa));
+            let genre_hit = !genre_lows.is_empty()
+                && genre_lows
+                    .iter()
+                    .any(|want| genre_matches_text(&g_low, want));
+            let scene_hit = !required_scenes.is_empty()
+                && required_scenes
+                    .iter()
+                    .all(|fam| track_matches_scene_family(&t, ag, fam));
+            let conflicting_scene = has_conflicting_scene_genre(&g_low, genres, &ctx_low);
+            let mood_hit = mood_opt.map_or(false, |m| {
+                t.mood_list().contains(&m)
+                    || has_mood_meta_match(&g_low, m)
+                    || classify_moods(&t.title, &t.album, &t.genre, ag).contains(&m)
+            });
+            let mood_compat = mood_opt.map_or(true, |m| is_track_compatible_with_mood(&t, ag, m));
+            let year_hit = year_range.map_or(true, |(lo, hi)| t.year >= lo && t.year <= hi);
 
-        // Graceful fallback when sources are offline or the catalog is very small.
-        if pool.len() < 12 {
+            let admitted = if artist_hit {
+                match kind {
+                    LlmMixKind::Thematic => {
+                        year_range.map_or(true, |(lo, hi)| t.year == 0 || (t.year >= lo && t.year <= hi))
+                    }
+                    LlmMixKind::DailyMix => true,
+                }
+            } else if conflicting_scene {
+                false
+            } else if !required_scenes.is_empty() {
+                scene_hit && (genre_lows.is_empty() || genre_hit) && year_hit
+            } else if !genre_lows.is_empty() {
+                genre_hit && year_hit && mood_compat
+            } else if year_range.is_some() {
+                year_hit && (mood_opt.is_none() || mood_hit)
+            } else if mood_opt.is_some() {
+                mood_hit && mood_compat
+            } else {
+                false
+            };
+
+            if admitted && seen_ids.insert(t.id.clone()) && seen_keys.insert(t.song_key()) {
+                pool.push(t);
+            }
+        }
+
+        // Graceful fallback for personal Daily Mixes when sources are offline or the catalog
+        // is very small. Never pollute Thematic Explore/Mood/Era mixes with unrelated For You tracks.
+        if kind == LlmMixKind::DailyMix && pool.len() < 12 {
             let fallback = if familiarity == "discovery" {
                 self.discover_weekly(user_id, limit)
             } else {
                 self.for_you_tracks(user_id, limit)
             };
             for t in fallback {
-                if !is_hidden_track(&t, &sctx.prof)
-                    && !is_strongly_disliked(&t, &sctx.prof, &sctx.stats)
-                    && !is_mood_clutter_track(&t)
+                if !is_disallowed(&t)
                     && seen_ids.insert(t.id.clone())
                     && seen_keys.insert(t.song_key())
                 {
@@ -3550,13 +3769,23 @@ impl TasteEngine {
             return Vec::new();
         }
 
-        let score_mode = match familiarity {
-            "discovery" => ScoreMode::Discover,
+        let pool_artists: Vec<String> = pool.iter().map(|t| t.artist.clone()).collect();
+        let pool_artist_genres = self
+            .store
+            .known_artist_genres_for(&pool_artists)
+            .unwrap_or_default();
+
+        let score_mode = match (kind, familiarity) {
+            (LlmMixKind::Thematic, _) | (_, "discovery") => ScoreMode::Discover,
             _ => ScoreMode::Supermix,
         };
         let mood_cues: Vec<Mood> = mood_opt.into_iter().collect();
         let primary_q = seed_queries.first().map(String::as_str);
-        let n_w = self.neural_blend_weight(0.65, &sctx);
+        let neural_cap = match kind {
+            LlmMixKind::Thematic => 0.30,
+            LlmMixKind::DailyMix => 0.65,
+        };
+        let n_w = self.neural_blend_weight(neural_cap, &sctx);
         let n_scores = if n_w > 0.0 {
             self.neural_scores(user_id, &[], primary_q, &mood_cues, genres, &pool)
         } else {
@@ -3567,57 +3796,115 @@ impl TasteEngine {
             .into_iter()
             .enumerate()
             .map(|(idx, t)| {
-                let mut s = score_track_core(&t, &sctx.prof, &sctx.stats, score_mode);
+                let raw_taste = score_track_core(&t, &sctx.prof, &sctx.stats, score_mode);
+                let mut s = match kind {
+                    LlmMixKind::Thematic => {
+                        (raw_taste * 0.20).clamp(-0.8, 2.2)
+                            + user_realm_score(&t, &sctx.prof, &sctx.stats) * 0.30
+                    }
+                    LlmMixKind::DailyMix => raw_taste,
+                };
                 if let Some(&ns) = n_scores.get(idx) {
                     s += ns * n_w;
                 }
-                let pa = primary_artist(&t.artist).to_lowercase();
-                if seed_artist_lows
+                let ag = pool_artist_genres
+                    .get(&primary_artist(&t.artist).to_lowercase())
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let g_low = format!("{} {}", t.genre, ag).to_lowercase();
+
+                let artist_hit = seed_artist_lows
                     .iter()
-                    .any(|sa| !pa.is_empty() && (pa == *sa || pa.contains(sa.as_str())))
-                {
-                    s += 3.2;
-                }
-                let g_low = t.genre.to_lowercase();
-                if genre_lows.iter().any(|want| {
-                    genre_variants(want)
+                    .any(|sa| track_matches_seed_artist(&t, sa));
+                let genre_hit = !genre_lows.is_empty()
+                    && genre_lows
                         .iter()
-                        .any(|alias| contains_term(&g_low, alias))
-                }) {
-                    s += 1.6;
+                        .any(|want| genre_matches_text(&g_low, want));
+                let scene_hit = !required_scenes.is_empty()
+                    && required_scenes
+                        .iter()
+                        .all(|fam| track_matches_scene_family(&t, ag, fam));
+
+                if artist_hit {
+                    s += match kind {
+                        LlmMixKind::Thematic => 6.0,
+                        LlmMixKind::DailyMix => 4.2,
+                    };
+                }
+                if let Some(&ci) = curated_playlist_rank.get(&t.id) {
+                    let rank_bonus = (20usize.saturating_sub(ci) as f64) * 0.06;
+                    s += match kind {
+                        LlmMixKind::Thematic => 5.0 + rank_bonus,
+                        LlmMixKind::DailyMix => 2.2 + rank_bonus * 0.5,
+                    };
+                } else if seed_radio_ids.contains(&t.id) {
+                    s += match kind {
+                        LlmMixKind::Thematic => 4.0,
+                        LlmMixKind::DailyMix => 1.6,
+                    };
+                } else if query_search_ids.contains(&t.id) {
+                    s += match kind {
+                        LlmMixKind::Thematic => 3.2,
+                        LlmMixKind::DailyMix => 1.2,
+                    };
+                }
+                if genre_hit {
+                    s += match kind {
+                        LlmMixKind::Thematic => 2.5,
+                        LlmMixKind::DailyMix => 2.0,
+                    };
+                }
+                if scene_hit {
+                    s += match kind {
+                        LlmMixKind::Thematic => 2.5,
+                        LlmMixKind::DailyMix => 1.8,
+                    };
                 }
                 if let Some(m) = mood_opt {
                     if t.mood_list().contains(&m)
-                        || classify_moods(&t.title, &t.album, &t.genre, "").contains(&m)
+                        || has_mood_meta_match(&g_low, m)
+                        || classify_moods(&t.title, &t.album, &t.genre, ag).contains(&m)
                     {
-                        s += 1.2;
+                        s += 1.0;
                     }
                 }
                 if let Some((lo, hi)) = year_range {
                     if t.year >= lo && t.year <= hi {
-                        s += 1.8;
+                        s += 2.0;
                     } else if t.year > 0 {
-                        s -= 1.2;
+                        s -= match kind {
+                            LlmMixKind::Thematic => 3.5,
+                            LlmMixKind::DailyMix => 1.5,
+                        };
                     }
                 }
-                if curated_source_ids.contains(&t.id) {
-                    s += 0.9;
-                }
                 let familiar = is_familiar_track(&t, &sctx.prof, &sctx.stats);
-                match familiarity {
-                    "familiar" => {
+                match (kind, familiarity) {
+                    (LlmMixKind::Thematic, "discovery") => {
+                        if familiar {
+                            s -= 0.8;
+                        } else {
+                            s += 0.6;
+                        }
+                    }
+                    (LlmMixKind::Thematic, _) => {
+                        if familiar {
+                            s += 0.4;
+                        }
+                    }
+                    (LlmMixKind::DailyMix, "familiar") => {
                         if familiar {
                             s += 2.4;
                         }
                     }
-                    "discovery" => {
+                    (LlmMixKind::DailyMix, "discovery") => {
                         if familiar {
                             s -= 2.2;
                         } else {
                             s += 1.4;
                         }
                     }
-                    _ => {
+                    (LlmMixKind::DailyMix, _) => {
                         if familiar {
                             s += 0.6;
                         }
@@ -3684,12 +3971,10 @@ impl TasteEngine {
                             || (!g_low.trim().is_empty() && t.mood_list().contains(&m)))
                 });
                 let genre_ok = intent.genres.is_empty()
-                    || intent.genres.iter().any(|want| {
-                        let wl = want.to_lowercase();
-                        genre_variants(&wl)
-                            .iter()
-                            .any(|alias| contains_term(&g_low, alias))
-                    });
+                    || intent
+                        .genres
+                        .iter()
+                        .any(|want| genre_matches_text(&g_low, want));
                 let year_ok = intent
                     .year_range
                     .map_or(true, |(min_y, max_y)| t.year >= min_y && t.year <= max_y);
@@ -3782,8 +4067,7 @@ impl TasteEngine {
                     }
                 } else {
                     for want in &intent.genres {
-                        let wl = want.to_lowercase();
-                        if genre_variants(&wl).iter().any(|alias| contains_term(&g_low, alias)) {
+                        if genre_matches_text(&g_low, want) {
                             evidence += 1.8;
                             break;
                         }
@@ -9258,6 +9542,266 @@ fn is_mix_clutter_track(t: &Track, query_low: &str) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmMixKind {
+    DailyMix,
+    Thematic,
+}
+
+pub(crate) struct SceneFamily {
+    pub key: &'static str,
+    pub title_triggers: &'static [&'static str],
+    pub query_cues: &'static [&'static str],
+    pub match_cues: &'static [&'static str],
+    script: Option<ScriptFamily>,
+}
+
+pub(crate) const SCENE_FAMILIES: &[SceneFamily] = &[
+    SceneFamily {
+        key: "japanese",
+        title_triggers: &["japanese", "japan"],
+        query_cues: &[
+            "japanese", "japan", "j-pop", "jpop", "j pop", "j-rock", "jrock", "j rock",
+            "j-jazz", "jjazz", "j jazz", "city pop", "city-pop", "citypop", "shibuya-kei",
+            "shibuya kei", "kayokyoku", "enka", "anime",
+        ],
+        match_cues: &[
+            "japanese", "japan", "j-pop", "jpop", "j pop", "j-rock", "jrock", "j rock",
+            "j-jazz", "jjazz", "j jazz", "city pop", "city-pop", "citypop", "shibuya-kei",
+            "shibuya kei", "shibuya", "tokyo", "kissaten", "kayokyoku", "enka", "anime",
+            "nihon", "nippon",
+        ],
+        script: Some(ScriptFamily::Japanese),
+    },
+    SceneFamily {
+        key: "korean",
+        title_triggers: &["korean", "korea"],
+        query_cues: &[
+            "korean", "korea", "k-pop", "kpop", "k pop", "k-rock", "krock", "k-indie",
+            "k-r&b", "k-hip-hop",
+        ],
+        match_cues: &[
+            "korean", "korea", "k-pop", "kpop", "k pop", "k-rock", "krock", "k-indie",
+            "k-r&b", "k-hip-hop", "seoul",
+        ],
+        script: Some(ScriptFamily::Korean),
+    },
+    SceneFamily {
+        key: "chinese",
+        title_triggers: &["chinese", "china", "taiwan", "mandopop", "cantopop"],
+        query_cues: &[
+            "chinese", "china", "taiwan", "taiwanese", "c-pop", "cpop", "c pop", "mandopop",
+            "cantopop",
+        ],
+        match_cues: &[
+            "chinese", "china", "taiwan", "taiwanese", "c-pop", "cpop", "c pop", "mandopop",
+            "cantopop", "hong kong",
+        ],
+        script: Some(ScriptFamily::Cjk),
+    },
+    SceneFamily {
+        key: "brazilian",
+        title_triggers: &["brazilian", "brazil", "brasil", "sertanejo", "forró", "forro", "pagode", "brega"],
+        query_cues: &["brazilian", "brazil", "brasil", "bossa nova", "bossa", "mpb", "samba", "sertanejo", "forró", "forro", "pagode", "brega"],
+        match_cues: &["brazilian", "brazil", "brasil", "bossa nova", "bossa", "mpb", "samba", "sertanejo", "forró", "forro", "pagode", "brega"],
+        script: None,
+    },
+    SceneFamily {
+        key: "french",
+        title_triggers: &["french", "france"],
+        query_cues: &["french", "france", "chanson", "french house", "french touch", "yé-yé", "ye-ye"],
+        match_cues: &["french", "france", "chanson", "french house", "french touch", "paris", "yé-yé", "ye-ye"],
+        script: None,
+    },
+    SceneFamily {
+        key: "latin",
+        title_triggers: &[
+            "latin", "latino", "spanish", "español", "éxitos", "spain", "mexican", "mexico",
+            "argentinian", "argentina", "colombian", "colombia", "corridos", "banda",
+            "norteño", "norteno", "ranchera", "vallenato", "dembow", "champeta",
+        ],
+        query_cues: &[
+            "latin", "latino", "spanish", "español", "éxitos", "spain", "mexican", "mexico",
+            "argentinian", "argentina", "colombian", "colombia", "reggaeton", "salsa",
+            "bachata", "cumbia", "corridos", "banda", "norteño", "norteno", "ranchera",
+            "vallenato", "dembow", "champeta",
+        ],
+        match_cues: &[
+            "latin", "latino", "spanish", "español", "éxitos", "spain", "mexican", "mexico",
+            "argentinian", "argentina", "colombian", "colombia", "reggaeton", "salsa",
+            "bachata", "cumbia", "corridos", "banda", "norteño", "norteno", "ranchera",
+            "vallenato", "dembow", "champeta",
+        ],
+        script: None,
+    },
+    SceneFamily {
+        key: "indian",
+        title_triggers: &["indian", "india", "bollywood", "hindi"],
+        query_cues: &["indian", "india", "bollywood", "hindi", "bhangra", "punjabi", "tamil", "telugu"],
+        match_cues: &["indian", "india", "bollywood", "hindi", "bhangra", "punjabi", "tamil", "telugu"],
+        script: Some(ScriptFamily::Indic),
+    },
+    SceneFamily {
+        key: "arabic",
+        title_triggers: &["arabic", "egyptian", "egypt"],
+        query_cues: &["arabic", "egyptian", "egypt", "habibi", "dabke", "khaleeji"],
+        match_cues: &["arabic", "egyptian", "egypt", "habibi", "dabke", "khaleeji"],
+        script: Some(ScriptFamily::Arabic),
+    },
+    SceneFamily {
+        key: "turkish",
+        title_triggers: &["turkish", "turkey"],
+        query_cues: &["turkish", "turkey", "anatolian"],
+        match_cues: &["turkish", "turkey", "anatolian", "istanbul"],
+        script: None,
+    },
+    SceneFamily {
+        key: "persian",
+        title_triggers: &["persian", "iran"],
+        query_cues: &["persian", "iran", "iranian"],
+        match_cues: &["persian", "iran", "iranian"],
+        script: None,
+    },
+    SceneFamily {
+        key: "african",
+        title_triggers: &["african", "africa", "nigeria", "nigerian", "naija", "ghana", "ghanaian"],
+        query_cues: &["african", "africa", "afrobeat", "afrobeats", "afropop", "amapiano", "highlife", "nigeria", "nigerian", "naija", "ghana", "ghanaian"],
+        match_cues: &["african", "africa", "afrobeat", "afrobeats", "afropop", "amapiano", "highlife", "nigeria", "nigerian", "naija", "ghana", "ghanaian"],
+        script: None,
+    },
+    SceneFamily {
+        key: "german",
+        title_triggers: &["german", "germany"],
+        query_cues: &["german", "germany", "krautrock", "neue deutsche welle"],
+        match_cues: &["german", "germany", "krautrock", "berlin"],
+        script: None,
+    },
+    SceneFamily {
+        key: "italian",
+        title_triggers: &["italian", "italy"],
+        query_cues: &["italian", "italy", "italo disco", "italo-disco", "italo"],
+        match_cues: &["italian", "italy", "italo disco", "italo-disco", "italo"],
+        script: None,
+    },
+    SceneFamily {
+        key: "russian",
+        title_triggers: &["russian", "russia", "ukrainian", "ukraine"],
+        query_cues: &["russian", "russia", "ukrainian", "ukraine", "sovietwave"],
+        match_cues: &["russian", "russia", "ukrainian", "ukraine", "sovietwave"],
+        script: Some(ScriptFamily::Cyrillic),
+    },
+    SceneFamily {
+        key: "swedish",
+        title_triggers: &["swedish", "sweden"],
+        query_cues: &["swedish", "sweden", "nordic", "scandinavian"],
+        match_cues: &["swedish", "sweden", "nordic", "scandinavian"],
+        script: None,
+    },
+    SceneFamily {
+        key: "polish",
+        title_triggers: &["polish", "poland"],
+        query_cues: &["polish", "poland"],
+        match_cues: &["polish", "poland"],
+        script: None,
+    },
+    SceneFamily {
+        key: "greek",
+        title_triggers: &["greek", "greece"],
+        query_cues: &["greek", "greece"],
+        match_cues: &["greek", "greece"],
+        script: Some(ScriptFamily::Greek),
+    },
+    SceneFamily {
+        key: "indonesian",
+        title_triggers: &["indonesian", "indonesia"],
+        query_cues: &["indonesian", "indonesia"],
+        match_cues: &["indonesian", "indonesia"],
+        script: None,
+    },
+    SceneFamily {
+        key: "malaysian",
+        title_triggers: &["malaysian", "malaysia"],
+        query_cues: &["malaysian", "malaysia"],
+        match_cues: &["malaysian", "malaysia"],
+        script: None,
+    },
+    SceneFamily {
+        key: "thai",
+        title_triggers: &["thai", "thailand"],
+        query_cues: &["thai", "thailand"],
+        match_cues: &["thai", "thailand"],
+        script: Some(ScriptFamily::Thai),
+    },
+    SceneFamily {
+        key: "vietnamese",
+        title_triggers: &["vietnamese", "vietnam"],
+        query_cues: &["vietnamese", "vietnam", "v-pop", "vpop"],
+        match_cues: &["vietnamese", "vietnam", "v-pop", "vpop"],
+        script: None,
+    },
+    SceneFamily {
+        key: "filipino",
+        title_triggers: &["filipino", "philippines", "opm"],
+        query_cues: &["filipino", "philippines", "opm", "p-pop"],
+        match_cues: &["filipino", "philippines", "opm", "p-pop"],
+        script: None,
+    },
+    SceneFamily {
+        key: "canadian",
+        title_triggers: &["canadian", "canrock"],
+        query_cues: &["canadian", "canrock"],
+        match_cues: &["canadian", "canrock"],
+        script: None,
+    },
+];
+
+pub(crate) fn requested_scene_families(text_low: &str) -> Vec<&'static SceneFamily> {
+    SCENE_FAMILIES
+        .iter()
+        .filter(|fam| fam.query_cues.iter().any(|c| contains_term(text_low, c)))
+        .collect()
+}
+
+pub(crate) fn scene_family_matches_text(fam: &SceneFamily, hay_low: &str) -> bool {
+    fam.match_cues.iter().any(|c| contains_term(hay_low, c))
+}
+
+fn track_matches_scene_family(t: &Track, artist_genres: &str, fam: &SceneFamily) -> bool {
+    let hay = format!("{} {} {} {}", t.genre, artist_genres, t.title, t.album).to_lowercase();
+    if scene_family_matches_text(fam, &hay) {
+        return true;
+    }
+    if let Some(sf) = fam.script {
+        if non_latin_scripts_in_str(&t.title).contains(&sf)
+            || non_latin_scripts_in_str(&t.artist).contains(&sf)
+            || non_latin_scripts_in_str(&t.album).contains(&sf)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn track_matches_seed_artist(t: &Track, seed_artist_low: &str) -> bool {
+    if seed_artist_low.is_empty() {
+        return false;
+    }
+    let pa = primary_artist(&t.artist).to_lowercase();
+    let full = t.artist.to_lowercase();
+    if pa == seed_artist_low || full == seed_artist_low {
+        return true;
+    }
+    let seed_slug = slug(seed_artist_low);
+    if !seed_slug.is_empty() && slug(&pa) == seed_slug {
+        return true;
+    }
+    if seed_artist_low.len() >= 4 {
+        contains_term(&pa, seed_artist_low) || contains_term(&full, seed_artist_low)
+    } else {
+        false
+    }
+}
+
 fn genre_variants(term_low: &str) -> &'static [&'static str] {
     match term_low {
         "classic rock" | "classicrock" => &["classic rock", "classicrock"],
@@ -9267,6 +9811,16 @@ fn genre_variants(term_low: &str) -> &'static [&'static str] {
         "j-rock" | "jrock" | "j rock" | "japanese rock" => {
             &["jrock", "j-rock", "j rock", "japanese rock"]
         }
+        "j-jazz" | "jjazz" | "j jazz" | "japanese jazz" | "japanese jazz fusion" => &[
+            "j-jazz",
+            "jjazz",
+            "j jazz",
+            "japanese jazz",
+            "japanese jazz fusion",
+            "japan jazz",
+        ],
+        "jazz fusion" => &["jazz fusion", "fusion"],
+        "shibuya-kei" | "shibuya kei" => &["shibuya-kei", "shibuya kei"],
         "k-pop" | "kpop" | "k pop" | "korean pop" => {
             &["kpop", "k-pop", "k pop", "korean pop"]
         }
@@ -9319,6 +9873,14 @@ pub(crate) fn playlist_token_matches(pl_norm: &str, tok: &str) -> bool {
             .iter()
             .any(|s| contains_term(pl_norm, s)),
         _ => {
+            if let Some(fam) = SCENE_FAMILIES
+                .iter()
+                .find(|f| f.query_cues.contains(&tok))
+            {
+                if scene_family_matches_text(fam, pl_norm) {
+                    return true;
+                }
+            }
             let variants = genre_variants(tok);
             if !variants.is_empty() {
                 variants.iter().any(|s| contains_term(pl_norm, s))
@@ -15479,6 +16041,143 @@ mod tests {
                 .iter()
                 .map(|t| (&t.id, &t.title, &t.artist))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn thematic_japanese_jazz_mix_excludes_christmas_western_jazz_and_jpop_favorites() {
+        let store = Store::open_memory().unwrap();
+        let (u, _) = store.authenticate_or_create_user("cross", "pw").unwrap();
+        let sources = SourceRegistry::new(
+            crate::sources::deezer::DeezerSource::new(),
+            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::archive::ArchiveSource::new(),
+            Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
+            crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
+        );
+        let taste = TasteEngine::new(store.clone(), sources);
+
+        let mk = |id: &str, title: &str, artist: &str, album: &str, genre: &str, moods: &str, year: i32| Track {
+            id: id.into(),
+            source: "local".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: album.into(),
+            genre: genre.into(),
+            moods: moods.into(),
+            year,
+            duration: 240,
+            bitrate: 900,
+            format: "flac".into(),
+            ..Default::default()
+        };
+
+        let mut catalog = vec![
+            // Listener's heavily played & starred tracks that must NOT leak into a J-Jazz mix:
+            mk("loc:xmas1", "Holly Jolly Christmas", "Michael Bublé", "Christmas", "Jazz, Pop", "chill,upbeat", 2011),
+            mk("loc:xmas2", "O Little Town Of Bethlehem", "Nat King Cole", "The Christmas Song", "Jazz", "chill", 2009),
+            mk("loc:xmas3", "Jingle Bells", "Frank Sinatra", "Christmas", "Jazz", "chill,upbeat", 2015),
+            mk("loc:xmas4", "O Holy Night", "Nat King Cole", "The Christmas Song", "Jazz", "chill", 2009),
+            mk("loc:jpop1", "The Everlasting Guilty Crown", "EGOIST", "The Everlasting Guilty Crown", "J-Pop, Anime", "chill,energy", 2012),
+            mk("loc:jpop2", "Fallen", "EGOIST", "Fallen", "J-Pop, Anime", "chill,late_night", 2014),
+            mk("loc:jpop3", "ブルーバード - Blue Bird", "Ikimonogakari", "My song Your song", "J-Pop", "upbeat,chill", 2008),
+            mk("loc:wjazz", "So What", "Miles Davis", "Kind of Blue", "Jazz", "chill,late_night", 1959),
+            // Authentic Japanese jazz-fusion track NOT in seed_artists (discovered via user catalog):
+            mk("loc:jjazz_extra", "Flying Beagle", "Himiko Kikuchi", "Flying Beagle", "Japanese Jazz, Jazz Fusion", "groove,chill", 1987),
+        ];
+        // 5 local tracks per seed artist so the test runs completely offline without network hits.
+        for i in 1..=5 {
+            catalog.push(mk(
+                &format!("loc:casiopea_{i}"),
+                &format!("Asayake {i}"),
+                "Casiopea",
+                "Mint Jams",
+                "Japanese Jazz, Jazz Fusion",
+                "groove,chill",
+                1982,
+            ));
+            catalog.push(mk(
+                &format!("loc:fukui_{i}"),
+                &format!("Early Summer {i}"),
+                "Ryo Fukui",
+                "Scenery",
+                "Japanese Jazz, Jazz",
+                "chill,late_night",
+                1976,
+            ));
+        }
+        store.upsert_tracks(&catalog).unwrap();
+
+        // Heavily star and play all the non-J-Jazz tracks to simulate strong personal affinity.
+        for id in [
+            "loc:xmas1",
+            "loc:xmas2",
+            "loc:xmas3",
+            "loc:xmas4",
+            "loc:jpop1",
+            "loc:jpop2",
+            "loc:jpop3",
+            "loc:wjazz",
+        ] {
+            store.star_track(u.id, id).unwrap();
+            for _ in 0..8 {
+                store.record_event(u.id, id, "play", 1.0).unwrap();
+                store.record_event(u.id, id, "complete", 1.0).unwrap();
+            }
+        }
+
+        let seed_artists = vec!["Casiopea".to_string(), "Ryo Fukui".to_string()];
+        let genres = vec!["Jazz".to_string(), "Jazz Fusion".to_string()];
+        let excl = HashSet::new();
+        let tracks = taste
+            .curate_llm_mix_tracks(
+                u.id,
+                LlmMixKind::Thematic,
+                "J-JAZZ Kissaten Sunday Japanese jazz-fusion instrumentals for a quiet afternoon table",
+                &[],
+                &seed_artists,
+                &genres,
+                Some("chill"),
+                None,
+                "balanced",
+                &excl,
+                30,
+            )
+            .await;
+
+        assert!(
+            !tracks.is_empty(),
+            "expected Japanese jazz-fusion tracks in mix"
+        );
+        let ids: Vec<&str> = tracks.iter().map(|t| t.id.as_str()).collect();
+        for forbidden in [
+            "loc:xmas1",
+            "loc:xmas2",
+            "loc:xmas3",
+            "loc:xmas4",
+            "loc:jpop1",
+            "loc:jpop2",
+            "loc:jpop3",
+            "loc:wjazz",
+        ] {
+            assert!(
+                !ids.contains(&forbidden),
+                "unrelated favorite {forbidden} leaked into J-Jazz mix: {:?}",
+                ids
+            );
+        }
+        assert!(
+            ids.contains(&"loc:jjazz_extra"),
+            "authentic Japanese jazz-fusion track should be admitted: {:?}",
+            ids
+        );
+        assert!(
+            tracks.iter().all(|t| matches!(
+                t.artist.as_str(),
+                "Casiopea" | "Ryo Fukui" | "Himiko Kikuchi"
+            )),
+            "expected only Japanese jazz-fusion artists, got: {:?}",
+            tracks.iter().map(|t| (&t.title, &t.artist)).collect::<Vec<_>>()
         );
     }
 }
