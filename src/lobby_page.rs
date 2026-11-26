@@ -1294,12 +1294,12 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (offsetSec > 0.5) u += `&t=${offsetSec.toFixed(2)}`;
       return u;
     }
-    const NORM_TARGET_LUFS = -14.0;
-    const NORM_CEILING_LIN = Math.pow(10, -0.5 / 20);
-    const NORM_DEFAULT_GAIN = Math.pow(10, -3.0 / 20);
+    const NORM_TARGET_LUFS = -10.5;
+    const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
+    const NORM_DEFAULT_GAIN = 0.9;
     const NORM = {
-      ctx: null, source: null, gainNode: null, ready: false, failed: false, connecting: false,
-      trackId: '', loudness: null, reqToken: 0, retryTimer: null, cache: new Map(),
+      ctx: null, source: null, gainNode: null, limiterNode: null, ready: false, failed: false, connecting: false,
+      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0, cache: new Map(),
     };
     function computeNormGain(vol, muted, loudness) {
       if (muted || vol <= 0) return 0;
@@ -1308,9 +1308,9 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         const trackGain = Math.pow(10, gainDb / 20);
         const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
         const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
-        return Math.min(vol * trackGain, NORM_CEILING_LIN / tpLin);
+        return Math.min(vol * trackGain, NORM_MAX_CEILING_LIN / tpLin);
       }
-      return Math.min(vol * NORM_DEFAULT_GAIN, NORM_CEILING_LIN);
+      return Math.min(vol * NORM_DEFAULT_GAIN, 1.0);
     }
     function ensureNormGraph() {
       if (NORM.ready) {
@@ -1329,7 +1329,19 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
           NORM.source = ctx.createMediaElementSource(audio);
           NORM.gainNode = ctx.createGain();
           NORM.source.connect(NORM.gainNode);
-          NORM.gainNode.connect(ctx.destination);
+          if (typeof ctx.createDynamicsCompressor === 'function') {
+            const lim = ctx.createDynamicsCompressor();
+            lim.threshold.value = -1.0;
+            lim.knee.value = 1.0;
+            lim.ratio.value = 20.0;
+            lim.attack.value = 0.001;
+            lim.release.value = 0.05;
+            NORM.gainNode.connect(lim);
+            lim.connect(ctx.destination);
+            NORM.limiterNode = lim;
+          } else {
+            NORM.gainNode.connect(ctx.destination);
+          }
           NORM.ready = true;
           NORM.connecting = false;
           ctx.addEventListener('statechange', () => {
@@ -1348,6 +1360,8 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         else NORM.connecting = false;
       }).catch(() => { NORM.connecting = false; });
     }
+    document.addEventListener('pointerdown', ensureNormGraph, { capture: true, once: true });
+    document.addEventListener('keydown', ensureNormGraph, { capture: true, once: true });
     function applyVolume(rampSec = 0) {
       const muted = S.muted || S.volume === 0;
       const target = computeNormGain(S.volume, muted, NORM.loudness);
@@ -1358,10 +1372,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         const now = NORM.ctx.currentTime;
         try {
           p.cancelScheduledValues(now);
-          if (rampSec > 0.05) {
-            p.setValueAtTime(p.value, now);
-            p.linearRampToValueAtTime(target, now + rampSec);
-          } else if (rampSec > 0) {
+          if (rampSec > 0) {
             p.setTargetAtTime(target, now, 0.012);
           } else {
             p.setValueAtTime(target, now);
@@ -1373,37 +1384,37 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       $('vol-icon').innerHTML = audio.muted ? ICON.volOff : ICON.volOn;
       $('vol').value = String(S.volume);
     }
+    function canApplyPrePlayLobbyGain() {
+      return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.25;
+    }
+    function fetchLobbyLoudnessPrePlay(t) {
+      if (!t || !t.id || NORM.trackId !== t.id || NORM.loudness) return;
+      const tok = NORM.reqToken;
+      fetch(`/api/lobby/${encodeURIComponent(CODE)}/loudness/${encodeURIComponent(t.id)}?lid=${encodeURIComponent(lid)}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (!d || tok !== NORM.reqToken || NORM.trackId !== t.id) return;
+          if (Number.isFinite(Number(d.lufs))) {
+            const norm = { lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 };
+            NORM.cache.set(t.id, norm);
+            if (canApplyPrePlayLobbyGain()) {
+              NORM.loudness = norm;
+              applyVolume(0);
+            }
+          }
+        })
+        .catch(() => {});
+    }
     function syncLobbyLoudness(t) {
-      if (NORM.retryTimer) { clearTimeout(NORM.retryTimer); NORM.retryTimer = null; }
-      const tok = ++NORM.reqToken;
+      NORM.reqToken++;
+      NORM.metaRetryDoneFor = '';
       if (!t || !t.id) { NORM.trackId = ''; NORM.loudness = null; applyVolume(0); return; }
       NORM.trackId = t.id;
       const cached = NORM.cache.get(t.id);
       if (cached) { NORM.loudness = cached; applyVolume(0); return; }
       NORM.loudness = null;
       applyVolume(0);
-      const delays = [2500, 4000, 6000];
-      let attempt = 0;
-      const poll = () => {
-        if (tok !== NORM.reqToken || NORM.trackId !== t.id) return;
-        fetch(`/api/lobby/${encodeURIComponent(CODE)}/loudness/${encodeURIComponent(t.id)}?lid=${encodeURIComponent(lid)}`)
-          .then((r) => (r.ok ? r.json() : null))
-          .then((d) => {
-            if (!d || tok !== NORM.reqToken || NORM.trackId !== t.id) return;
-            if (Number.isFinite(Number(d.lufs))) {
-              const norm = { lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 };
-              NORM.cache.set(t.id, norm);
-              NORM.loudness = norm;
-              applyVolume(!audio.paused && audio.currentTime > 0.25 ? 1.2 : 0);
-              if (d.ready) return;
-            }
-            if (d.pending && attempt < delays.length) {
-              NORM.retryTimer = setTimeout(() => { NORM.retryTimer = null; poll(); }, delays[attempt++]);
-            }
-          })
-          .catch(() => {});
-      };
-      poll();
+      fetchLobbyLoudnessPrePlay(t);
     }
     function unlockAudio() {
       // iOS/Safari only let audio start inside a tap; play a blip of silence now
@@ -1552,6 +1563,10 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     audio.addEventListener('loadedmetadata', () => {
       if (!S.loadedId) return;
       const t = curTrack();
+      if (t && t.id === NORM.trackId && !NORM.loudness && NORM.metaRetryDoneFor !== t.id && canApplyPrePlayLobbyGain()) {
+        NORM.metaRetryDoneFor = t.id;
+        fetchLobbyLoudnessPrePlay(t);
+      }
       if (S.checkOffset && t && t.duration > 0 && Number.isFinite(audio.duration)) {
         S.checkOffset = false;
         // The server ignored ?t= (no transcoder available): we got the whole file.

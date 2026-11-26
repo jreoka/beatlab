@@ -105,7 +105,7 @@ pub struct StreamEngine {
     in_flight_resolutions: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     in_flight_downloads: Arc<StdMutex<HashSet<String>>>,
     in_flight_warms: Arc<StdMutex<HashSet<String>>>,
-    in_flight_loudness: Arc<StdMutex<HashSet<String>>>,
+    in_flight_loudness: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     in_flight_embeds: Arc<StdMutex<HashMap<String, Arc<Notify>>>>,
     warm_sem: Arc<Semaphore>,
     light_warm_sem: Arc<Semaphore>,
@@ -190,7 +190,7 @@ impl StreamEngine {
             in_flight_resolutions: Arc::new(StdMutex::new(HashMap::new())),
             in_flight_downloads: Arc::new(StdMutex::new(HashSet::new())),
             in_flight_warms: Arc::new(StdMutex::new(HashSet::new())),
-            in_flight_loudness: Arc::new(StdMutex::new(HashSet::new())),
+            in_flight_loudness: Arc::new(StdMutex::new(HashMap::new())),
             in_flight_embeds: Arc::new(StdMutex::new(HashMap::new())),
             warm_sem: Arc::new(Semaphore::new(2)),
             light_warm_sem: Arc::new(Semaphore::new(1)),
@@ -553,21 +553,25 @@ impl StreamEngine {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        {
-            let mut set = self
+        let notify = {
+            let mut map = self
                 .in_flight_loudness
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if !set.insert(track_id.to_string()) {
+            if map.contains_key(track_id) {
                 return;
             }
-        }
+            let n = Arc::new(Notify::new());
+            map.insert(track_id.to_string(), Arc::clone(&n));
+            n
+        };
         let this = self.clone();
         let tid = track_id.to_string();
         handle.spawn(async move {
-            let _guard = InFlightSetGuard {
-                set: Arc::clone(&this.in_flight_loudness),
+            let _guard = NotifyLeaderGuard {
+                map: Arc::clone(&this.in_flight_loudness),
                 key: tid.clone(),
+                notify,
             };
             let Ok(Ok(_permit)) = tokio::time::timeout(
                 Duration::from_secs(120),
@@ -593,12 +597,71 @@ impl StreamEngine {
         });
     }
 
+    /// Ensures loudness is measured once for an on-disk file, coordinating with any
+    /// in-flight scan so duplicate ffmpeg processes are never spawned.
+    async fn ensure_local_file_loudness(
+        &self,
+        track_id: &str,
+        owner_id: &str,
+        path: &Path,
+        timeout: Duration,
+    ) -> Option<TrackLoudness> {
+        if let Ok(Some(m)) = self.store.get_track_loudness(track_id) {
+            if m.exact {
+                return Some(m);
+            }
+        }
+        let (notify, is_leader) = {
+            let mut map = self
+                .in_flight_loudness
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = map.get(track_id) {
+                (Arc::clone(existing), false)
+            } else {
+                let n = Arc::new(Notify::new());
+                map.insert(track_id.to_string(), Arc::clone(&n));
+                (n, true)
+            }
+        };
+        if !is_leader {
+            let _ = tokio::time::timeout(timeout, notify.notified()).await;
+            return self.store.get_track_loudness(track_id).ok().flatten();
+        }
+        let _guard = NotifyLeaderGuard {
+            map: Arc::clone(&self.in_flight_loudness),
+            key: track_id.to_string(),
+            notify,
+        };
+        if let Ok(Some(m)) = self.store.get_track_loudness(track_id) {
+            if m.exact {
+                return Some(m);
+            }
+        }
+        let Ok(Ok(_permit)) =
+            tokio::time::timeout(timeout, self.loudness_sem.clone().acquire_owned()).await
+        else {
+            return self.store.get_track_loudness(track_id).ok().flatten();
+        };
+        if let Ok(Some((m, src))) =
+            tokio::time::timeout(timeout, measure_file_loudness(path, self.ffmpeg_available)).await
+        {
+            let _ = self.store.upsert_track_loudness(track_id, m, src);
+            if owner_id != track_id {
+                let _ = self.store.upsert_track_loudness(owner_id, m, src);
+            }
+            return Some(m);
+        }
+        self.store.get_track_loudness(track_id).ok().flatten()
+    }
+
     /// Resolves a track's loudness on demand. Returns `(loudness, pending)`:
     /// - Already measured in DB -> returns immediately.
     /// - Present on local disk (local library, hot cache, or local/cached sibling) ->
-    ///   measures directly (fast, ~0.3-0.8s) and persists for all future plays.
-    /// - Remote track still downloading to hot cache -> returns `(None, true)` so the
-    ///   client can re-check once caching completes.
+    ///   measures directly (fast, ~0.3-0.6s) and persists for all future plays.
+    /// - Known YouTube video ID or active stream resolution -> reads YouTube's
+    ///   pre-computed BS.1770 LKFS (~120ms) or awaits the active resolution so
+    ///   playback starts at exact normalized loudness from 0:00.
     pub async fn ensure_track_loudness(&self, track: &Track) -> (Option<TrackLoudness>, bool) {
         if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
             if m.exact {
@@ -632,52 +695,69 @@ impl StreamEngine {
         };
 
         if let Some((owner_id, path)) = disk_path {
-            if let Ok(Ok(_permit)) = tokio::time::timeout(
-                Duration::from_secs(12),
-                self.loudness_sem.clone().acquire_owned(),
-            )
-            .await
-            {
-                if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
-                    if m.exact {
-                        return (Some(m), false);
-                    }
-                }
-                if let Some((m, src)) = measure_file_loudness(&path, self.ffmpeg_available).await {
-                    let _ = self.store.upsert_track_loudness(&track.id, m, src);
-                    if owner_id != track.id {
-                        let _ = self.store.upsert_track_loudness(&owner_id, m, src);
-                    }
+            let m = self
+                .ensure_local_file_loudness(&track.id, &owner_id, &path, Duration::from_secs(12))
+                .await;
+            return (m, false);
+        }
+
+        // Known YouTube video ID -> fetch YouTube's pre-computed BS.1770 LKFS directly (~120ms).
+        let known_vid = track
+            .stream_url
+            .strip_prefix("ytm:")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.store
+                    .kv_get(&format!("ytmvid:{}", track.id))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+        if let Some(vid) = known_vid {
+            if let Some(m) = self.sources.ytm.fetch_video_loudness(&vid).await {
+                let _ = self.store.upsert_track_loudness(&track.id, m, "ytm_lkfs");
+                return (Some(m), false);
+            }
+        }
+
+        // If stream resolution is currently running (e.g. cold `resolve:ytm:` track),
+        // wait briefly for it so we pick up the `ytm_lkfs` written during resolution
+        // before audio begins playing.
+        let res_notify = {
+            self.in_flight_resolutions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&track.id)
+                .cloned()
+        };
+        if let Some(n) = res_notify {
+            let _ = tokio::time::timeout(Duration::from_secs(6), n.notified()).await;
+            if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
+                if m.exact {
                     return (Some(m), false);
                 }
             }
-            return (self.store.get_track_loudness(&track.id).ok().flatten(), false);
         }
 
-        let in_flight = self
-            .in_flight_downloads
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&track.id)
-            || self
-                .in_flight_loudness
+        // Same for any in-flight loudness measurement started by another request.
+        let loud_notify = {
+            self.in_flight_loudness
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .contains(&track.id)
-            || self
-                .in_flight_warms
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&track.id);
-        let cacheable_remote = track.source != "radio"
-            && !track.stream_url.contains("/preview/")
-            && (track.stream_url.starts_with("resolve:")
-                || track.stream_url.starts_with("ytm:")
-                || track.stream_url.starts_with("slsk://")
-                || track.stream_url.starts_with("http://")
-                || track.stream_url.starts_with("https://"));
+                .get(&track.id)
+                .cloned()
+        };
+        if let Some(n) = loud_notify {
+            let _ = tokio::time::timeout(Duration::from_secs(6), n.notified()).await;
+            if let Ok(Some(m)) = self.store.get_track_loudness(&track.id) {
+                if m.exact {
+                    return (Some(m), false);
+                }
+            }
+        }
+
         let stored = self.store.get_track_loudness(&track.id).ok().flatten();
-        (stored, in_flight || (self.ffmpeg_available && cacheable_remote))
+        (stored, false)
     }
 
     fn existing_local_audio_path(&self, track: &Track) -> Option<PathBuf> {
@@ -779,6 +859,32 @@ impl StreamEngine {
         }
     }
 
+    async fn resolve_ytm_stream_with_loudness(
+        &self,
+        track: &Track,
+        video_id: &str,
+    ) -> AppResult<crate::sources::ytm::ResolvedStream> {
+        let already_known = self
+            .store
+            .get_track_loudness(&track.id)
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.exact);
+        if already_known {
+            return self.sources.ytm.resolve_stream(video_id).await;
+        }
+        // Fetch YouTube's pre-computed BS.1770 LKFS (~120ms) concurrently with yt-dlp
+        // stream resolution so loudness is persisted before the first audio byte streams.
+        let (stream_res, loud_opt) = tokio::join!(
+            self.sources.ytm.resolve_stream(video_id),
+            self.sources.ytm.fetch_video_loudness(video_id)
+        );
+        if let Some(m) = loud_opt {
+            let _ = self.store.upsert_track_loudness(&track.id, m, "ytm_lkfs");
+        }
+        stream_res
+    }
+
     async fn perform_ytm_resolve(&self, track: &Track) -> AppResult<CachedResolved> {
         let direct = track.stream_url.starts_with("ytm:");
         let vid_key = format!("ytmvid:{}", track.id);
@@ -786,7 +892,7 @@ impl StreamEngine {
         // restarts instead of re-searching YouTube Music on every first play.
         if !direct {
             if let Some(vid) = self.store.kv_get(&vid_key).filter(|v| !v.trim().is_empty()) {
-                match self.sources.ytm.resolve_stream(&vid).await {
+                match self.resolve_ytm_stream_with_loudness(track, &vid).await {
                     Ok(resolved) => return Ok(self.cache_resolved(track, resolved).await),
                     Err(e) => {
                         // Video removed or region-blocked: forget it and search again.
@@ -824,7 +930,7 @@ impl StreamEngine {
                 })?
         };
 
-        let resolved = self.sources.ytm.resolve_stream(&video_id).await?;
+        let resolved = self.resolve_ytm_stream_with_loudness(track, &video_id).await?;
         if !direct {
             self.store.kv_set(&vid_key, &video_id);
         }
@@ -964,6 +1070,28 @@ impl StreamEngine {
                 return (StatusCode::BAD_GATEWAY, format!("Stream error: {}", e)).into_response();
             }
         };
+
+        // For an on-disk file that has never been measured yet, complete its fast
+        // one-time EBU R128 scan (~250ms) before streaming the first audio bytes so
+        // playback always starts at exact normalized loudness with zero mid-song shift.
+        if let PlayTarget::LocalFile { ref path, .. } = resolved {
+            if self
+                .store
+                .get_track_loudness(&track.id)
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                let _ = self
+                    .ensure_local_file_loudness(
+                        &track.id,
+                        &track.id,
+                        path,
+                        Duration::from_millis(1500),
+                    )
+                    .await;
+            }
+        }
 
         let resolved_ext = play_target_ext(&resolved, track);
         let is_alac = is_alac_m4a(&resolved_ext, track);

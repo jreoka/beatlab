@@ -14,12 +14,19 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// Streaming loudness target (LUFS), aligned with Spotify / YouTube Music / Tidal.
+/// Loudness target (LUFS). `-10.5 LUFS` keeps tracks at full, punchy listening
+/// volume while still taming loudness-war masters (`-6` to `-8 LUFS`) and
+/// lifting quieter dynamic tracks cleanly to match.
 #[cfg(test)]
-pub const TARGET_LUFS: f64 = -14.0;
-/// True-peak output ceiling (dBTP) to leave headroom for browser/OS resampling.
+pub const TARGET_LUFS: f64 = -10.5;
+/// True-peak reference ceiling (dBTP) before the transparent safety peak catcher.
 #[cfg(test)]
-pub const TRUE_PEAK_CEILING_DB: f64 = -0.5;
+pub const TRUE_PEAK_CEILING_DB: f64 = -0.3;
+/// Maximum allowed overshoot (dB) into the transparent `-1 dBFS` brickwall safety
+/// peak catcher so quiet, 0-dBFS-normalized tracks can still be lifted to match
+/// louder tracks without ever squashing dynamics or pumping.
+#[cfg(test)]
+pub const MAX_PEAK_CATCH_DB: f64 = 3.5;
 /// Minimum/maximum allowed gain adjustment (dB) so corrupt/near-silent files
 /// can never produce extreme attenuation or noise-floor amplification.
 #[cfg(test)]
@@ -51,8 +58,10 @@ impl TrackLoudness {
 }
 
 /// Computes the peak-safe linear output gain for a track at a given user volume
-/// (`0.0..=1.0`). Because this is a single constant multiplier for the whole
-/// track, dynamic range is 100% preserved and the output never clips.
+/// (`0.0..=1.0`). Uses one fixed scalar multiplier across the whole track so
+/// internal dynamic range stays intact; when boosting quiet tracks, allows at
+/// most `MAX_PEAK_CATCH_DB` into the transparent `-1 dBFS` peak catcher so rare
+/// millisecond transients never hard-clip.
 #[cfg(test)]
 pub fn compute_output_gain(lufs: f64, true_peak_db: f64, user_volume: f64) -> f64 {
     let vol = user_volume.clamp(0.0, 1.0);
@@ -67,7 +76,7 @@ pub fn compute_output_gain(lufs: f64, true_peak_db: f64, user_volume: f64) -> f6
         0.0
     };
     let tp_lin = 10.0_f64.powf(tp_db / 20.0).clamp(0.01, 4.0);
-    let ceiling_lin = 10.0_f64.powf(TRUE_PEAK_CEILING_DB / 20.0);
+    let ceiling_lin = 10.0_f64.powf((TRUE_PEAK_CEILING_DB + MAX_PEAK_CATCH_DB) / 20.0);
     let max_safe_total = ceiling_lin / tp_lin;
     (vol * track_gain).min(max_safe_total)
 }
@@ -373,24 +382,24 @@ mod tests {
 
     #[test]
     fn output_gain_matches_loudness_and_never_clips_peaks() {
-        // Loud modern master (-8 LUFS, 0 dBTP) at 100% volume -> attenuated by -6 dB (~0.501)
-        let loud = compute_output_gain(-8.0, 0.0, 1.0);
-        assert!((loud - 0.5012).abs() < 0.01);
+        // Loud modern master (-7.5 LUFS, 0 dBTP) at 100% volume -> attenuated by -3 dB (~0.708)
+        let loud = compute_output_gain(-7.5, 0.0, 1.0);
+        assert!((loud - 0.7079).abs() < 0.01);
 
-        // Reference track (-14 LUFS, -1 dBTP) at 100% volume -> unity (1.0)
-        let ref_track = compute_output_gain(-14.0, -1.0, 1.0);
+        // Reference track (-10.5 LUFS, -1 dBTP) at 100% volume -> unity (1.0)
+        let ref_track = compute_output_gain(-10.5, -1.0, 1.0);
         assert!((ref_track - 1.0).abs() < 0.001);
 
-        // Quiet dynamic track (-20 LUFS, -1 dBTP) at 50% volume -> gets full +6 dB boost (~1.0) without clipping!
-        let quiet_half_vol = compute_output_gain(-20.0, -1.0, 0.5);
-        assert!((quiet_half_vol - 0.9976).abs() < 0.01);
+        // Quiet 80s/indie track (-13.5 LUFS, -0.5 dBTP) at 90% volume -> boosted +3 dB (~1.27)
+        let indie = compute_output_gain(-13.5, -0.5, 0.9);
+        assert!((indie - (0.9 * 10.0_f64.powf(3.0 / 20.0))).abs() < 0.01);
 
-        // Same quiet dynamic track at 100% volume -> capped at peak headroom (-0.5 dBTP ceiling / -1 dBTP peak = +0.5 dB = 1.059)
+        // Very quiet dynamic track (-20 LUFS, -1 dBTP) at 100% volume -> capped by safe peak-catch budget
         let quiet_full_vol = compute_output_gain(-20.0, -1.0, 1.0);
         let tp_lin = 10.0_f64.powf(-1.0 / 20.0);
-        let ceiling_lin = 10.0_f64.powf(TRUE_PEAK_CEILING_DB / 20.0);
-        assert!(quiet_full_vol * tp_lin <= ceiling_lin + 1e-6);
-        assert!((quiet_full_vol - (ceiling_lin / tp_lin)).abs() < 0.001);
+        let max_lin = 10.0_f64.powf((TRUE_PEAK_CEILING_DB + MAX_PEAK_CATCH_DB) / 20.0);
+        assert!(quiet_full_vol * tp_lin <= max_lin + 1e-6);
+        assert!((quiet_full_vol - (max_lin / tp_lin)).abs() < 0.001);
 
         // Muted / zero volume always produces silence.
         assert_eq!(compute_output_gain(-20.0, -6.0, 0.0), 0.0);

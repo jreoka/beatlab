@@ -858,25 +858,28 @@
   // ---------------------------------------------------------------------------
   // Playback output & always-on EBU R128 loudness normalization
   // ---------------------------------------------------------------------------
-  // Single constant scalar gain per track (ITU-R BS.1770-4 -> -14 LUFS) capped
-  // by true-peak headroom (-0.5 dBTP). Never compresses or pumps dynamic range.
-  const NORM_TARGET_LUFS = -14.0;
-  const NORM_CEILING_LIN = Math.pow(10, -0.5 / 20);
+  // Single constant scalar gain per track (ITU-R BS.1770-4 -> -10.5 LUFS) with
+  // a transparent -1 dBFS brickwall peak catcher so loud tracks play untouched
+  // (0 dB limiting) and quiet tracks lift cleanly to match without clipping or
+  // mid-song volume shifts.
+  const NORM_TARGET_LUFS = -10.5;
+  const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
   const NORM_MIN_GAIN_DB = -18.0;
   const NORM_MAX_GAIN_DB = 12.0;
-  const NORM_DEFAULT_UNMEASURED_GAIN = Math.pow(10, -3.0 / 20);
+  const NORM_DEFAULT_UNMEASURED_GAIN = 0.9;
 
   const audioNorm = {
     ctx: null,
     source: null,
     gainNode: null,
+    limiterNode: null,
     ready: false,
     failed: false,
     connecting: false,
     currentTrackId: '',
     currentLoudness: null,
+    metaRetryDoneFor: '',
     reqToken: 0,
-    retryTimer: null,
     abortController: null,
   };
 
@@ -906,10 +909,10 @@
       const trackGain = Math.pow(10, gainDb / 20);
       const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
       const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
-      const maxSafeTotal = NORM_CEILING_LIN / tpLin;
+      const maxSafeTotal = NORM_MAX_CEILING_LIN / tpLin;
       return Math.min(userVol * trackGain, maxSafeTotal);
     }
-    return Math.min(userVol * NORM_DEFAULT_UNMEASURED_GAIN, NORM_CEILING_LIN);
+    return Math.min(userVol * NORM_DEFAULT_UNMEASURED_GAIN, 1.0);
   }
 
   function ensureAudioNormGraph() {
@@ -943,9 +946,22 @@
         const source = ctx.createMediaElementSource(audio);
         const gainNode = ctx.createGain();
         source.connect(gainNode);
-        gainNode.connect(ctx.destination);
+        let limiterNode = null;
+        if (typeof ctx.createDynamicsCompressor === 'function') {
+          limiterNode = ctx.createDynamicsCompressor();
+          limiterNode.threshold.value = -1.0;
+          limiterNode.knee.value = 1.0;
+          limiterNode.ratio.value = 20.0;
+          limiterNode.attack.value = 0.001;
+          limiterNode.release.value = 0.05;
+          gainNode.connect(limiterNode);
+          limiterNode.connect(ctx.destination);
+        } else {
+          gainNode.connect(ctx.destination);
+        }
         audioNorm.source = source;
         audioNorm.gainNode = gainNode;
+        audioNorm.limiterNode = limiterNode;
         audioNorm.ready = true;
         audioNorm.connecting = false;
         ctx.addEventListener('statechange', () => {
@@ -978,6 +994,20 @@
       });
   }
 
+  // Unlock and wire the AudioContext on the very first pointer/key interaction
+  // (before `click` triggers play) so the first song never switches audio paths.
+  if (typeof document !== 'undefined') {
+    const prewarmAudioGraph = () => {
+      ensureAudioNormGraph();
+      if (audioNorm.ready || audioNorm.failed) {
+        document.removeEventListener('pointerdown', prewarmAudioGraph, true);
+        document.removeEventListener('keydown', prewarmAudioGraph, true);
+      }
+    };
+    document.addEventListener('pointerdown', prewarmAudioGraph, true);
+    document.addEventListener('keydown', prewarmAudioGraph, true);
+  }
+
   function applyOutputVolume(rampSec = 0) {
     const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
     const target = computeNormalizedOutputGain(effectiveVol, state.muted, audioNorm.currentLoudness);
@@ -988,10 +1018,7 @@
       const now = audioNorm.ctx.currentTime;
       try {
         param.cancelScheduledValues(now);
-        if (rampSec > 0.05) {
-          param.setValueAtTime(param.value, now);
-          param.linearRampToValueAtTime(target, now + rampSec);
-        } else if (rampSec > 0) {
+        if (rampSec > 0) {
           param.setTargetAtTime(target, now, 0.012);
         } else {
           param.setValueAtTime(target, now);
@@ -1005,10 +1032,6 @@
   }
 
   function cancelLoudnessSync() {
-    if (audioNorm.retryTimer) {
-      clearTimeout(audioNorm.retryTimer);
-      audioNorm.retryTimer = null;
-    }
     if (audioNorm.abortController) {
       try {
         audioNorm.abortController.abort();
@@ -1029,16 +1052,46 @@
     return norm;
   }
 
+  function canStillApplyPrePlayGain() {
+    return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.25;
+  }
+
+  function fetchTrackLoudnessPrePlay(trackId) {
+    if (!trackId || !state.token) return;
+    if (audioNorm.currentTrackId !== trackId || audioNorm.currentLoudness) return;
+    const reqToken = audioNorm.reqToken;
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    audioNorm.abortController = ctrl;
+    api(`/api/web/loudness/${encodeURIComponent(trackId)}`, {
+      signal: ctrl ? ctrl.signal : undefined,
+    })
+      .then((res) => {
+        if (reqToken !== audioNorm.reqToken || audioNorm.currentTrackId !== trackId) return;
+        if (res && isValidLoudness(res)) {
+          const norm = storeTrackLoudness(trackId, res);
+          // Only apply BEFORE audible playback is underway so a song NEVER
+          // shifts volume a few seconds into playback.
+          if (norm && canStillApplyPrePlayGain()) {
+            audioNorm.currentLoudness = norm;
+            applyOutputVolume(0);
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
   function syncLoudnessForTrack(track) {
     cancelLoudnessSync();
     if (!track || !track.id) {
       audioNorm.currentTrackId = '';
       audioNorm.currentLoudness = null;
+      audioNorm.metaRetryDoneFor = '';
       applyOutputVolume(0);
       return;
     }
     const trackId = track.id;
     audioNorm.currentTrackId = trackId;
+    audioNorm.metaRetryDoneFor = '';
     const known = normalizeLoudnessObj(track.loudness || state.trackMap.get(trackId)?.loudness);
     if (known) {
       audioNorm.currentLoudness = known;
@@ -1047,42 +1100,7 @@
     }
     audioNorm.currentLoudness = null;
     applyOutputVolume(0);
-
-    const reqToken = audioNorm.reqToken;
-    const retryDelays = [2500, 4000, 6000];
-    let attempt = 0;
-
-    const pollOnce = () => {
-      if (reqToken !== audioNorm.reqToken || audioNorm.currentTrackId !== trackId) return;
-      if (!state.token) return;
-      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      audioNorm.abortController = ctrl;
-      api(`/api/web/loudness/${encodeURIComponent(trackId)}`, {
-        signal: ctrl ? ctrl.signal : undefined,
-      })
-        .then((res) => {
-          if (reqToken !== audioNorm.reqToken || audioNorm.currentTrackId !== trackId) return;
-          if (res && isValidLoudness(res)) {
-            const norm = storeTrackLoudness(trackId, res);
-            if (norm) {
-              audioNorm.currentLoudness = norm;
-              const smooth = !audio.paused && audio.currentTime > 0.25 ? 1.2 : 0;
-              applyOutputVolume(smooth);
-            }
-            if (res.ready) return;
-          }
-          if (res && res.pending && attempt < retryDelays.length) {
-            const delay = retryDelays[attempt++];
-            audioNorm.retryTimer = setTimeout(() => {
-              audioNorm.retryTimer = null;
-              pollOnce();
-            }, delay);
-          }
-        })
-        .catch(() => {});
-    };
-
-    pollOnce();
+    fetchTrackLoudnessPrePlay(trackId);
   }
 
   function setMediaPlaybackState(value) {
@@ -7598,6 +7616,17 @@
       if (state.queue.length) saveServerQueue();
     });
     audio.addEventListener('loadedmetadata', () => {
+      const cur = currentTrack();
+      if (
+        cur &&
+        cur.id === audioNorm.currentTrackId &&
+        !audioNorm.currentLoudness &&
+        audioNorm.metaRetryDoneFor !== cur.id &&
+        canStillApplyPrePlayGain()
+      ) {
+        audioNorm.metaRetryDoneFor = cur.id;
+        fetchTrackLoudnessPrePlay(cur.id);
+      }
       if (state.pendingSeekSec > 0) {
         const target = state.pendingSeekSec;
         state.pendingSeekSec = 0;

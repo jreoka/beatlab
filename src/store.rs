@@ -5556,7 +5556,7 @@ impl Store {
                     Ok(TrackLoudness {
                         lufs,
                         true_peak_db,
-                        exact: source == "ebur128" || source == "tag",
+                        exact: matches!(source.as_str(), "ebur128" | "tag" | "ytm_lkfs"),
                     })
                 },
             )
@@ -5605,7 +5605,7 @@ impl Store {
                     TrackLoudness {
                         lufs,
                         true_peak_db,
-                        exact: source == "ebur128" || source == "tag",
+                        exact: matches!(source.as_str(), "ebur128" | "tag" | "ytm_lkfs"),
                     },
                 ))
             })?;

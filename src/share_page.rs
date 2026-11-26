@@ -1150,12 +1150,12 @@ pub fn render_share_html(
     }};
 
     let masterVolume = 0.9;
-    const NORM_TARGET_LUFS = -14.0;
-    const NORM_CEILING_LIN = Math.pow(10, -0.5 / 20);
-    const NORM_DEFAULT_GAIN = Math.pow(10, -3.0 / 20);
+    const NORM_TARGET_LUFS = -10.5;
+    const NORM_MAX_CEILING_LIN = Math.pow(10, (-0.3 + 3.5) / 20);
+    const NORM_DEFAULT_GAIN = 0.9;
     const normState = {{
-      ctx: null, source: null, gainNode: null, ready: false, failed: false, connecting: false,
-      trackId: '', loudness: null, reqToken: 0, retryTimer: null,
+      ctx: null, source: null, gainNode: null, limiterNode: null, ready: false, failed: false, connecting: false,
+      trackId: '', loudness: null, metaRetryDoneFor: '', reqToken: 0,
     }};
 
     function computeNormGain(vol, loudness) {{
@@ -1165,9 +1165,9 @@ pub fn render_share_html(
         const trackGain = Math.pow(10, gainDb / 20);
         const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
         const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
-        return Math.min(vol * trackGain, NORM_CEILING_LIN / tpLin);
+        return Math.min(vol * trackGain, NORM_MAX_CEILING_LIN / tpLin);
       }}
-      return Math.min(vol * NORM_DEFAULT_GAIN, NORM_CEILING_LIN);
+      return Math.min(vol * NORM_DEFAULT_GAIN, 1.0);
     }}
 
     function ensureNormGraph() {{
@@ -1187,7 +1187,19 @@ pub fn render_share_html(
           normState.source = ctx.createMediaElementSource(audio);
           normState.gainNode = ctx.createGain();
           normState.source.connect(normState.gainNode);
-          normState.gainNode.connect(ctx.destination);
+          if (typeof ctx.createDynamicsCompressor === 'function') {{
+            const lim = ctx.createDynamicsCompressor();
+            lim.threshold.value = -1.0;
+            lim.knee.value = 1.0;
+            lim.ratio.value = 20.0;
+            lim.attack.value = 0.001;
+            lim.release.value = 0.05;
+            normState.gainNode.connect(lim);
+            lim.connect(ctx.destination);
+            normState.limiterNode = lim;
+          }} else {{
+            normState.gainNode.connect(ctx.destination);
+          }}
           normState.ready = true;
           normState.connecting = false;
           ctx.addEventListener('statechange', () => {{
@@ -1207,6 +1219,9 @@ pub fn render_share_html(
       }}).catch(() => {{ normState.connecting = false; }});
     }}
 
+    document.addEventListener('pointerdown', ensureNormGraph, {{ capture: true, once: true }});
+    document.addEventListener('keydown', ensureNormGraph, {{ capture: true, once: true }});
+
     function applyOutputVolume(rampSec = 0) {{
       const v = Math.max(0, Math.min(1, Number(masterVolume) || 0));
       const target = computeNormGain(v, normState.loudness);
@@ -1217,10 +1232,7 @@ pub fn render_share_html(
         const now = normState.ctx.currentTime;
         try {{
           p.cancelScheduledValues(now);
-          if (rampSec > 0.05) {{
-            p.setValueAtTime(p.value, now);
-            p.linearRampToValueAtTime(target, now + rampSec);
-          }} else if (rampSec > 0) {{
+          if (rampSec > 0) {{
             p.setTargetAtTime(target, now, 0.012);
           }} else {{
             p.setValueAtTime(target, now);
@@ -1231,9 +1243,31 @@ pub fn render_share_html(
       }}
     }}
 
+    function canApplyPrePlayShareGain() {{
+      return audio.paused || audio.readyState < 3 || (audio.currentTime || 0) < 0.25;
+    }}
+
+    function fetchShareLoudnessPrePlay(t) {{
+      if (!t || !t.id || normState.trackId !== t.id || normState.loudness) return;
+      const tok = normState.reqToken;
+      fetch(`/api/public/share/${{encodeURIComponent(DATA.id)}}/loudness/${{encodeURIComponent(t.id)}}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {{
+          if (!d || tok !== normState.reqToken || normState.trackId !== t.id) return;
+          if (Number.isFinite(Number(d.lufs))) {{
+            t.loudness = {{ lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 }};
+            if (canApplyPrePlayShareGain()) {{
+              normState.loudness = t.loudness;
+              applyOutputVolume(0);
+            }}
+          }}
+        }})
+        .catch(() => {{}});
+    }}
+
     function syncShareLoudness(t) {{
-      if (normState.retryTimer) {{ clearTimeout(normState.retryTimer); normState.retryTimer = null; }}
-      const tok = ++normState.reqToken;
+      normState.reqToken++;
+      normState.metaRetryDoneFor = '';
       if (!t || !t.id) {{ normState.trackId = ''; normState.loudness = null; applyOutputVolume(0); return; }}
       normState.trackId = t.id;
       if (t.loudness && Number.isFinite(t.loudness.lufs)) {{
@@ -1243,27 +1277,7 @@ pub fn render_share_html(
       }}
       normState.loudness = null;
       applyOutputVolume(0);
-      const delays = [2500, 4000, 6000];
-      let attempt = 0;
-      const poll = () => {{
-        if (tok !== normState.reqToken || normState.trackId !== t.id) return;
-        fetch(`/api/public/share/${{encodeURIComponent(DATA.id)}}/loudness/${{encodeURIComponent(t.id)}}`)
-          .then((r) => (r.ok ? r.json() : null))
-          .then((d) => {{
-            if (!d || tok !== normState.reqToken || normState.trackId !== t.id) return;
-            if (Number.isFinite(Number(d.lufs))) {{
-              t.loudness = {{ lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 }};
-              normState.loudness = t.loudness;
-              applyOutputVolume(!audio.paused && audio.currentTime > 0.25 ? 1.2 : 0);
-              if (d.ready) return;
-            }}
-            if (d.pending && attempt < delays.length) {{
-              normState.retryTimer = setTimeout(() => {{ normState.retryTimer = null; poll(); }}, delays[attempt++]);
-            }}
-          }})
-          .catch(() => {{}});
-      }};
-      poll();
+      fetchShareLoudnessPrePlay(t);
     }}
 
     function esc(s) {{
@@ -1566,6 +1580,13 @@ pub fn render_share_html(
     }}
 
     applyOutputVolume();
+    audio.addEventListener('loadedmetadata', () => {{
+      const t = tracks[state.idx];
+      if (t && t.id === normState.trackId && !normState.loudness && normState.metaRetryDoneFor !== t.id && canApplyPrePlayShareGain()) {{
+        normState.metaRetryDoneFor = t.id;
+        fetchShareLoudnessPrePlay(t);
+      }}
+    }});
     audio.addEventListener('play', () => {{ ensureNormGraph(); updatePlayBtn(true); }});
     audio.addEventListener('pause', () => updatePlayBtn(false));
     audio.addEventListener('ended', () => {{

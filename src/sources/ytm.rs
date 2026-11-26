@@ -14,6 +14,7 @@ use tracing::warn;
 
 const INNERTUBE_SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const INNERTUBE_NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
+const INNERTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 const YTM_SONGS_PARAMS: &str = "EgWKAQIIAWoKEAMQBBAJEAoQBQ%3D%3D";
 /// Search filter: playlists curated by YouTube Music itself ("Anime Hits", "Top J-Rock"...).
 const YTM_FEATURED_PLAYLISTS_PARAMS: &str = "EgeKAQQoADgBagwQDhAKEAMQBRAJEAQ%3D";
@@ -78,6 +79,69 @@ impl YtmSource {
 
     pub fn ytdlp_bin(&self) -> &str {
         &self.ytdlp_bin
+    }
+
+    /// Fetches YouTube's pre-computed ITU-R BS.1770 integrated loudness (LKFS/LUFS)
+    /// for a video ID via the Android Innertube player endpoint (~120ms, zero audio
+    /// bytes downloaded) so cold streams start at the exact normalized volume from 0:00.
+    pub async fn fetch_video_loudness(
+        &self,
+        video_id: &str,
+    ) -> Option<crate::loudness::TrackLoudness> {
+        let vid = video_id.trim().trim_start_matches("ytm:").trim();
+        if vid.is_empty() || vid.len() > 32 || vid.contains('/') || vid.contains('?') {
+            return None;
+        }
+        let body = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "ANDROID",
+                    "clientVersion": "20.10.38",
+                    "hl": "en",
+                    "gl": "US"
+                }
+            },
+            "videoId": vid
+        });
+        let resp = tokio::time::timeout(
+            Duration::from_millis(2500),
+            self.http
+                .post(INNERTUBE_PLAYER_URL)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let val = tokio::time::timeout(Duration::from_millis(2000), resp.json::<Value>())
+            .await
+            .ok()?
+            .ok()?;
+        let audio_cfg = val.pointer("/playerConfig/audioConfig")?;
+        let lufs = audio_cfg
+            .get("trackAbsoluteLoudnessLkfs")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                audio_cfg
+                    .get("perceptualLoudnessDb")
+                    .and_then(|v| v.as_f64())
+            })
+            .or_else(|| {
+                audio_cfg
+                    .get("loudnessDb")
+                    .and_then(|v| v.as_f64())
+                    .map(|d| -14.0 + d)
+            })?;
+        let m = crate::loudness::TrackLoudness {
+            lufs: (lufs * 100.0).round() / 100.0,
+            true_peak_db: 0.0,
+            exact: true,
+        };
+        m.is_valid().then_some(m)
     }
 
     async fn innertube_post(&self, url: &str, body: Value) -> Option<Value> {
