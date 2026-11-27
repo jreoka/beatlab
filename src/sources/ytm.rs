@@ -496,9 +496,9 @@ impl YtmSource {
         // Chrome on Android pauses `<audio>` elements on screen lock whenever the
         // demuxed container reports a video track (`HasVideo() == true`).
         let clients = [
+            "",
             "youtube:player_client=android",
             "youtube:player_client=ios",
-            "",
         ];
         let audio_only_fmt = "bestaudio[vcodec=none][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[protocol!=m3u8][protocol!=m3u8_native]";
         let fallback_fmt = "bestaudio[protocol!=m3u8][protocol!=m3u8_native]/best[protocol!=m3u8][protocol!=m3u8_native]/best";
