@@ -49,10 +49,76 @@ pub struct YtmCandidate {
     pub cover_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YtdlpProxyConfig {
+    pub base_url: String,
+    pub token: String,
+}
+
+impl YtdlpProxyConfig {
+    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Option<Self> {
+        let raw = base_url.into();
+        let trimmed = raw.trim().trim_end_matches('/');
+        if trimmed.is_empty()
+            || (!trimmed.starts_with("http://") && !trimmed.starts_with("https://"))
+        {
+            return None;
+        }
+        Some(Self {
+            base_url: trimmed.to_string(),
+            token: token.into().trim().to_string(),
+        })
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let raw_url = std::env::var("BEATLAB_YTDLP_PROXY_URL").ok()?;
+        let token = std::env::var("BEATLAB_YTDLP_PROXY_TOKEN").unwrap_or_default();
+        let cfg = Self::new(raw_url, token)?;
+        if cfg.token.is_empty() {
+            warn!(
+                proxy = %cfg.safe_url_label(),
+                "BEATLAB_YTDLP_PROXY_URL is set without BEATLAB_YTDLP_PROXY_TOKEN"
+            );
+        }
+        Some(cfg)
+    }
+
+    pub fn auth_header_value(&self) -> Option<String> {
+        if self.token.is_empty() {
+            None
+        } else {
+            Some(format!("Bearer {}", self.token))
+        }
+    }
+
+    pub fn endpoint(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            format!("{}{}", self.base_url, path)
+        } else {
+            format!("{}/{}", self.base_url, path)
+        }
+    }
+
+    pub fn safe_url_label(&self) -> String {
+        match url::Url::parse(&self.base_url) {
+            Ok(mut u) => {
+                let _ = u.set_username("");
+                let _ = u.set_password(None);
+                u.set_query(None);
+                u.set_fragment(None);
+                u.to_string().trim_end_matches('/').to_string()
+            }
+            Err(_) => self.base_url.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct YtmSource {
     http: reqwest::Client,
+    proxy_http: reqwest::Client,
     ytdlp_bin: String,
+    proxy: Option<YtdlpProxyConfig>,
     ytdlp_sem: Arc<Semaphore>,
     /// Index into the yt-dlp client attempts that last succeeded. When YouTube
     /// breaks one player client, every play used to wait for it to fail first.
@@ -61,9 +127,21 @@ pub struct YtmSource {
 
 impl YtmSource {
     pub fn new(ytdlp_override: Option<String>) -> Self {
+        Self::with_proxy(ytdlp_override, None)
+    }
+
+    pub fn with_proxy(
+        ytdlp_override: Option<String>,
+        proxy: Option<YtdlpProxyConfig>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(12))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_default();
+        let proxy_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(12))
+            .timeout(Duration::from_secs(35))
             .build()
             .unwrap_or_default();
         let ytdlp_bin = ytdlp_override
@@ -71,7 +149,9 @@ impl YtmSource {
             .unwrap_or_else(detect_ytdlp_bin);
         Self {
             http,
+            proxy_http,
             ytdlp_bin,
+            proxy,
             ytdlp_sem: Arc::new(Semaphore::new(4)),
             preferred_client: Arc::new(AtomicUsize::new(0)),
         }
@@ -79,6 +159,10 @@ impl YtmSource {
 
     pub fn ytdlp_bin(&self) -> &str {
         &self.ytdlp_bin
+    }
+
+    pub fn proxy_config(&self) -> Option<&YtdlpProxyConfig> {
+        self.proxy.as_ref()
     }
 
     /// Fetches YouTube's pre-computed ITU-R BS.1770 integrated loudness (LKFS/LUFS)
@@ -313,11 +397,16 @@ impl YtmSource {
         title: &str,
         target_duration: i32,
     ) -> Option<String> {
+        let search_arg = format!("ytsearch4:{} audio", query);
+        if let Some(ref proxy) = self.proxy {
+            return self
+                .ytdlp_flat_search_via_proxy(proxy, &search_arg, artist, title, target_duration)
+                .await;
+        }
         let _permit = tokio::time::timeout(Duration::from_secs(10), self.ytdlp_sem.acquire())
             .await
             .ok()?
             .ok()?;
-        let search_arg = format!("ytsearch4:{} audio", query);
         let mut cmd = Command::new(&self.ytdlp_bin);
         cmd.kill_on_drop(true);
         cmd.args([
@@ -338,34 +427,52 @@ impl YtmSource {
         let mut cands = Vec::new();
         for line in stdout.lines() {
             if let Ok(v) = serde_json::from_str::<Value>(line) {
-                let vid = v.get("id").and_then(|s| s.as_str()).unwrap_or("");
-                if vid.is_empty() {
-                    continue;
+                if let Some(c) = parse_ytdlp_search_entry(&v) {
+                    cands.push(c);
                 }
-                cands.push(YtmCandidate {
-                    video_id: vid.to_string(),
-                    title: v
-                        .get("title")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    artist: v
-                        .get("uploader")
-                        .or_else(|| v.get("channel"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    artist_id: v
-                        .get("channel_id")
-                        .or_else(|| v.get("uploader_id"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    album: String::new(),
-                    year: 0,
-                    duration: v.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0) as i32,
-                    cover_url: String::new(),
-                });
+            }
+        }
+        cands.sort_by_key(|c| std::cmp::Reverse(score_ytm_candidate(c, artist, title, target_duration)));
+        cands.into_iter().next().map(|c| c.video_id)
+    }
+
+    async fn ytdlp_flat_search_via_proxy(
+        &self,
+        proxy: &YtdlpProxyConfig,
+        search_arg: &str,
+        artist: &str,
+        title: &str,
+        target_duration: i32,
+    ) -> Option<String> {
+        let _permit = tokio::time::timeout(Duration::from_secs(10), self.ytdlp_sem.acquire())
+            .await
+            .ok()?
+            .ok()?;
+        let mut req = self
+            .proxy_http
+            .post(proxy.endpoint("/ytdlp/search"))
+            .json(&serde_json::json!({ "query": search_arg }));
+        if let Some(auth) = proxy.auth_header_value() {
+            req = req.header("Authorization", auth);
+        }
+        let resp = tokio::time::timeout(Duration::from_secs(18), req.send())
+            .await
+            .ok()?
+            .ok()?;
+        if !resp.status().is_success() {
+            warn!(status = %resp.status(), "yt-dlp proxy search non-success");
+            return None;
+        }
+        let body: Value = tokio::time::timeout(Duration::from_secs(5), resp.json())
+            .await
+            .ok()?
+            .ok()?;
+        let mut cands = Vec::new();
+        if let Some(entries) = body.get("entries").and_then(|e| e.as_array()) {
+            for v in entries {
+                if let Some(c) = parse_ytdlp_search_entry(v) {
+                    cands.push(c);
+                }
             }
         }
         cands.sort_by_key(|c| std::cmp::Reverse(score_ytm_candidate(c, artist, title, target_duration)));
@@ -451,6 +558,11 @@ impl YtmSource {
         extractor_args: &str,
         format_sel: &str,
     ) -> AppResult<ResolvedStream> {
+        if let Some(ref proxy) = self.proxy {
+            return self
+                .run_ytdlp_json_via_proxy(proxy, watch_url, extractor_args, format_sel)
+                .await;
+        }
         let _permit = tokio::time::timeout(Duration::from_secs(12), self.ytdlp_sem.acquire())
             .await
             .map_err(|_| err_msg("Timed out waiting for yt-dlp concurrency slot"))?
@@ -517,6 +629,153 @@ impl YtmSource {
             has_video,
         })
     }
+
+    async fn run_ytdlp_json_via_proxy(
+        &self,
+        proxy: &YtdlpProxyConfig,
+        watch_url: &str,
+        extractor_args: &str,
+        format_sel: &str,
+    ) -> AppResult<ResolvedStream> {
+        let _permit = tokio::time::timeout(Duration::from_secs(12), self.ytdlp_sem.acquire())
+            .await
+            .map_err(|_| err_msg("Timed out waiting for yt-dlp concurrency slot"))?
+            .map_err(|_| err_msg("yt-dlp semaphore closed"))?;
+
+        let mut req = self
+            .proxy_http
+            .post(proxy.endpoint("/ytdlp/resolve"))
+            .json(&serde_json::json!({
+                "url": watch_url,
+                "extractor_args": extractor_args,
+                "format": format_sel,
+            }));
+        if let Some(auth) = proxy.auth_header_value() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = tokio::time::timeout(Duration::from_secs(30), req.send())
+            .await
+            .map_err(|_| err_msg("yt-dlp proxy request timed out"))?
+            .map_err(|e| err_msg(format!("yt-dlp proxy request error: {}", e)))?;
+
+        let status = resp.status();
+        let body_text = tokio::time::timeout(Duration::from_secs(10), resp.text())
+            .await
+            .map_err(|_| err_msg("yt-dlp proxy response read timed out"))?
+            .map_err(|e| err_msg(format!("yt-dlp proxy response read error: {}", e)))?;
+
+        if !status.is_success() {
+            let detail = serde_json::from_str::<Value>(&body_text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| body_text.trim().to_string());
+            return Err(err_msg(format!(
+                "yt-dlp proxy HTTP {}: {}",
+                status.as_u16(),
+                if detail.is_empty() { "upstream error" } else { detail.as_str() }
+            )));
+        }
+
+        let v: Value = serde_json::from_str(&body_text)
+            .map_err(|e| err_msg(format!("yt-dlp proxy returned invalid JSON: {}", e)))?;
+
+        // Prefer the proxy's `/ytdlp/stream/<id>` URL so audio bytes are fetched from
+        // the same egress IP that signed the YouTube URL, authenticated with the token.
+        let (url, headers) = if let Some(stream_path) = v
+            .get("stream_path")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| s.starts_with('/'))
+        {
+            let mut hdrs = Vec::new();
+            if let Some(auth) = proxy.auth_header_value() {
+                hdrs.push(("Authorization".to_string(), auth));
+            }
+            (proxy.endpoint(stream_path), hdrs)
+        } else {
+            let direct_url = v
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if direct_url.is_empty()
+                || (!direct_url.starts_with("http://") && !direct_url.starts_with("https://"))
+            {
+                return Err(err_msg("yt-dlp proxy returned non-HTTP stream URL"));
+            }
+            let mut hdrs = Vec::new();
+            if let Some(arr) = v.get("headers").and_then(|h| h.as_array()) {
+                for pair in arr {
+                    if let Some(items) = pair.as_array() {
+                        if let (Some(k), Some(val)) = (
+                            items.first().and_then(|x| x.as_str()),
+                            items.get(1).and_then(|x| x.as_str()),
+                        ) {
+                            hdrs.push((k.to_string(), val.to_string()));
+                        }
+                    }
+                }
+            } else if let Some(obj) = v.get("http_headers").and_then(|h| h.as_object()) {
+                for (k, val) in obj {
+                    if let Some(s) = val.as_str() {
+                        hdrs.push((k.clone(), s.to_string()));
+                    }
+                }
+            }
+            (direct_url, hdrs)
+        };
+
+        let ext = v
+            .get("ext")
+            .and_then(|s| s.as_str())
+            .unwrap_or("m4a")
+            .to_lowercase();
+        let has_video = v
+            .get("has_video")
+            .and_then(|b| b.as_bool())
+            .unwrap_or_else(|| parse_ytdlp_has_video(&v));
+
+        Ok(ResolvedStream {
+            url,
+            headers,
+            ext,
+            source_webpage_url: watch_url.to_string(),
+            has_video,
+        })
+    }
+}
+
+fn parse_ytdlp_search_entry(v: &Value) -> Option<YtmCandidate> {
+    let vid = v.get("id").and_then(|s| s.as_str()).unwrap_or("");
+    if vid.is_empty() {
+        return None;
+    }
+    Some(YtmCandidate {
+        video_id: vid.to_string(),
+        title: v
+            .get("title")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        artist: v
+            .get("uploader")
+            .or_else(|| v.get("channel"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        artist_id: v
+            .get("channel_id")
+            .or_else(|| v.get("uploader_id"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        album: String::new(),
+        year: 0,
+        duration: v.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0) as i32,
+        cover_url: String::new(),
+    })
 }
 
 fn parse_ytdlp_has_video(v: &Value) -> bool {
@@ -537,7 +796,14 @@ impl MusicSource for YtmSource {
     }
 
     fn status(&self) -> String {
-        format!("youtube music — fast innertube search + {}", self.ytdlp_bin)
+        if let Some(ref proxy) = self.proxy {
+            format!(
+                "youtube music — fast innertube search + yt-dlp proxy ({})",
+                proxy.safe_url_label()
+            )
+        } else {
+            format!("youtube music — fast innertube search + {}", self.ytdlp_bin)
+        }
     }
 
     async fn search(&self, query: &str, limit: usize) -> Vec<Track> {
@@ -1417,5 +1683,132 @@ mod tests {
         assert!(!parse_ytdlp_has_video(&serde_json::json!({ "acodec": "opus" })));
         assert!(parse_ytdlp_has_video(&serde_json::json!({ "vcodec": "avc1.42001E", "acodec": "mp4a.40.2" })));
         assert!(parse_ytdlp_has_video(&serde_json::json!({ "vcodec": "vp9", "acodec": "opus" })));
+    }
+
+    #[test]
+    fn ytdlp_proxy_config_normalizes_and_sanitizes_urls() {
+        assert!(YtdlpProxyConfig::new("", "tok").is_none());
+        assert!(YtdlpProxyConfig::new("ftp://example.com", "tok").is_none());
+
+        let cfg = YtdlpProxyConfig::new("  https://user:secret@proxy.fly.dev/  ", "  my-token  ")
+            .expect("valid proxy config");
+        assert_eq!(cfg.base_url, "https://user:secret@proxy.fly.dev");
+        assert_eq!(cfg.token, "my-token");
+        assert_eq!(cfg.auth_header_value().as_deref(), Some("Bearer my-token"));
+        assert_eq!(cfg.safe_url_label(), "https://proxy.fly.dev");
+        assert_eq!(
+            cfg.endpoint("/ytdlp/resolve"),
+            "https://user:secret@proxy.fly.dev/ytdlp/resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn ytm_source_resolves_and_searches_through_token_protected_proxy() {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let expected_token = "super-secret-proxy-token-123456";
+
+        async fn check_auth(headers: &HeaderMap, expected: &str) -> bool {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v == format!("Bearer {}", expected))
+        }
+
+        let app = Router::new()
+            .route(
+                "/ytdlp/resolve",
+                post(
+                    |State(tok): State<String>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                        if !check_auth(&headers, &tok).await {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(serde_json::json!({ "error": "Unauthorized" })),
+                            );
+                        }
+                        let url = body.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                        assert!(url.contains("watch?v=dQw4w9WgXcQ"));
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "stream_path": "/ytdlp/stream/abc123?expire=1900000000",
+                                "ext": "m4a",
+                                "has_video": false,
+                                "expires_at": 1900000000
+                            })),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/ytdlp/search",
+                post(
+                    |State(tok): State<String>, headers: HeaderMap, Json(_body): Json<Value>| async move {
+                        if !check_auth(&headers, &tok).await {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(serde_json::json!({ "error": "Unauthorized" })),
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "entries": [
+                                    {
+                                        "id": "FGBhQbmPwH8",
+                                        "title": "One More Time",
+                                        "uploader": "Daft Punk",
+                                        "duration": 320.0
+                                    }
+                                ]
+                            })),
+                        )
+                    },
+                ),
+            )
+            .with_state(expected_token.to_string());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base = format!("http://{}", addr);
+
+        // Wrong token must be rejected
+        let bad_ytm = YtmSource::with_proxy(
+            None,
+            YtdlpProxyConfig::new(&base, "wrong-token"),
+        );
+        let err = bad_ytm.resolve_stream("dQw4w9WgXcQ").await.unwrap_err();
+        assert!(err.to_string().contains("401"), "unexpected error: {err}");
+
+        // Valid token succeeds and returns proxied stream URL with Bearer auth header
+        let ok_ytm = YtmSource::with_proxy(
+            None,
+            YtdlpProxyConfig::new(&base, expected_token),
+        );
+        let resolved = ok_ytm.resolve_stream("ytm:dQw4w9WgXcQ").await.unwrap();
+        assert_eq!(
+            resolved.url,
+            format!("{}/ytdlp/stream/abc123?expire=1900000000", base)
+        );
+        assert_eq!(resolved.ext, "m4a");
+        assert!(!resolved.has_video);
+        assert!(resolved
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == &format!("Bearer {}", expected_token)));
+
+        let found = ok_ytm
+            .ytdlp_flat_search("Daft Punk One More Time", "Daft Punk", "One More Time", 320)
+            .await;
+        assert_eq!(found.as_deref(), Some("FGBhQbmPwH8"));
+
+        server.abort();
     }
 }

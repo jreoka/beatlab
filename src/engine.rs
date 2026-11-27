@@ -1420,6 +1420,45 @@ impl StreamEngine {
             Ok(p) => p,
             Err(r) => return r,
         };
+        if let Some(proxy) = self.sources.ytm.proxy_config() {
+            let pipe_url = proxy.endpoint(&format!(
+                "/ytdlp/pipe?url={}",
+                urlencoding::encode(watch_url)
+            ));
+            let mut req = self.stream_http.get(&pipe_url);
+            if let Some(auth) = proxy.auth_header_value() {
+                req = req.header(header::AUTHORIZATION, auth);
+            }
+            return match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let ct = resp
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("audio/mp4")
+                        .to_string();
+                    let body_stream = resp.bytes_stream().map(move |res| {
+                        let _keep = &permit;
+                        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, ct)
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .body(Body::from_stream(body_stream))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
+                Ok(resp) => {
+                    warn!(status = %resp.status(), "yt-dlp proxy pipe returned non-success");
+                    (StatusCode::BAD_GATEWAY, "Failed to pipe audio via yt-dlp proxy")
+                        .into_response()
+                }
+                Err(e) => {
+                    warn!(error = %e, "yt-dlp proxy pipe request failed");
+                    (StatusCode::BAD_GATEWAY, "Failed to connect to yt-dlp proxy").into_response()
+                }
+            };
+        }
         let mut cmd = Command::new(self.sources.ytm.ytdlp_bin());
         cmd.args([
             "--no-playlist",
