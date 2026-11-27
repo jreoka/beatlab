@@ -126,6 +126,7 @@ pub struct YtmSource {
 }
 
 impl YtmSource {
+    #[cfg(test)]
     pub fn new(ytdlp_override: Option<String>) -> Self {
         Self::with_proxy(ytdlp_override, None)
     }
