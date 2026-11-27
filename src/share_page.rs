@@ -1171,7 +1171,7 @@ pub fn render_share_html(
 
     function computeNormGain(vol, loudness) {{
       if (vol <= 0) return 0;
-      if (loudness && Number.isFinite(loudness.lufs)) {{
+      if (loudness && Number.isFinite(loudness.lufs) && loudness.lufs > -60 && loudness.lufs <= -1) {{
         const gainDb = Math.max(-18, Math.min(16, NORM_TARGET_LUFS - loudness.lufs));
         const trackGain = Math.pow(10, gainDb / 20);
         const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
@@ -1186,13 +1186,13 @@ pub fn render_share_html(
       if (!lim) return;
       const tpDb = loudness && Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
       const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
-      const engage = targetGain * tpLin > 1.12;
+      const engage = targetGain * tpLin > 1.25;
       try {{
-        lim.threshold.setValueAtTime(engage ? -0.6 : 0.0, now);
-        lim.knee.setValueAtTime(engage ? 1.5 : 0.0, now);
+        lim.threshold.setValueAtTime(engage ? -0.3 : 0.0, now);
+        lim.knee.setValueAtTime(0.0, now);
         lim.ratio.setValueAtTime(engage ? 20.0 : 1.0, now);
         lim.attack.setValueAtTime(0.001, now);
-        lim.release.setValueAtTime(0.08, now);
+        lim.release.setValueAtTime(0.025, now);
       }} catch {{}}
     }}
 
@@ -1205,7 +1205,7 @@ pub fn render_share_html(
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) {{ normState.failed = true; return; }}
       if (navigator.audioSession) {{ try {{ navigator.audioSession.type = 'playback'; }} catch {{}} }}
-      try {{ if (!normState.ctx) normState.ctx = new AC(); }} catch {{ normState.failed = true; return; }}
+      try {{ if (!normState.ctx) {{ try {{ normState.ctx = new AC({{ latencyHint: 'playback' }}); }} catch {{ normState.ctx = new AC(); }} }} }} catch {{ normState.failed = true; return; }}
       const ctx = normState.ctx;
       const wire = () => {{
         if (normState.ready) return;
@@ -1220,7 +1220,7 @@ pub fn render_share_html(
             lim.knee.value = 0.0;
             lim.ratio.value = 1.0;
             lim.attack.value = 0.001;
-            lim.release.value = 0.08;
+            lim.release.value = 0.025;
             tail.connect(lim);
             tail = lim;
             normState.limiterNode = lim;
@@ -1294,7 +1294,7 @@ pub fn render_share_html(
         .then((d) => {{
           if (tok === normState.reqToken) normState.inFlight = false;
           if (!d || tok !== normState.reqToken || normState.trackId !== t.id) return;
-          if (Number.isFinite(Number(d.lufs))) {{
+          if (Number.isFinite(Number(d.lufs)) && Number(d.lufs) > -60 && Number(d.lufs) <= -1) {{
             t.loudness = {{ lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 }};
             normState.loudness = t.loudness;
             applyOutputVolume(canApplyPrePlayShareGain() ? 0 : 0.6);
@@ -1320,7 +1320,7 @@ pub fn render_share_html(
       normState.metaRetryDoneFor = '';
       if (!t || !t.id) {{ normState.trackId = ''; normState.loudness = null; applyOutputVolume(0); return; }}
       normState.trackId = t.id;
-      if (t.loudness && Number.isFinite(t.loudness.lufs)) {{
+      if (t.loudness && Number.isFinite(t.loudness.lufs) && t.loudness.lufs > -60 && t.loudness.lufs <= -1) {{
         normState.loudness = t.loudness;
         applyOutputVolume(0);
         return;

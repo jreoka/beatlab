@@ -912,8 +912,8 @@
       !!l &&
       typeof l === 'object' &&
       Number.isFinite(Number(l.lufs)) &&
-      Number(l.lufs) > -70 &&
-      Number(l.lufs) <= 6
+      Number(l.lufs) > -60 &&
+      Number(l.lufs) <= -1
     );
   }
 
@@ -922,13 +922,13 @@
     const tp = Number(l.truePeakDb);
     return {
       lufs: Number(l.lufs),
-      truePeakDb: Number.isFinite(tp) && tp > -70 && tp <= 12 ? tp : 0,
+      truePeakDb: Number.isFinite(tp) && tp > -60 && tp <= 12 ? tp : 0,
     };
   }
 
   function computeNormalizedOutputGain(userVol, muted, loudness) {
     if (muted || userVol <= 0) return 0;
-    if (loudness && Number.isFinite(loudness.lufs)) {
+    if (loudness && isValidLoudness(loudness)) {
       const gainDb = Math.max(NORM_MIN_GAIN_DB, Math.min(NORM_MAX_GAIN_DB, NORM_TARGET_LUFS - loudness.lufs));
       const trackGain = Math.pow(10, gainDb / 20);
       const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
@@ -944,16 +944,17 @@
     if (!lim) return;
     const tpDb = loudness && Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
     const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
-    // Only engage lookahead peak limiting when boosting peaks past ~+1 dBFS;
+    // Only engage lookahead peak limiting when boosting peaks past ~+2 dBFS;
     // keep 1:1 bypass on modern/attenuated tracks so DynamicsCompressor never
-    // subtly ducks bright mixes.
-    const engage = targetGain * tpLin > 1.12;
+    // ducks bright mixes, and use fast 25ms release so boosted older tracks
+    // keep their full loudness between drum hits.
+    const engage = targetGain * tpLin > 1.25;
     try {
-      lim.threshold.setValueAtTime(engage ? -0.6 : 0.0, now);
-      lim.knee.setValueAtTime(engage ? 1.5 : 0.0, now);
+      lim.threshold.setValueAtTime(engage ? -0.3 : 0.0, now);
+      lim.knee.setValueAtTime(0.0, now);
       lim.ratio.setValueAtTime(engage ? 20.0 : 1.0, now);
       lim.attack.setValueAtTime(0.001, now);
-      lim.release.setValueAtTime(0.08, now);
+      lim.release.setValueAtTime(0.025, now);
     } catch {}
   }
 
@@ -976,7 +977,13 @@
       } catch {}
     }
     try {
-      if (!audioNorm.ctx) audioNorm.ctx = new AC();
+      if (!audioNorm.ctx) {
+        try {
+          audioNorm.ctx = new AC({ latencyHint: 'playback' });
+        } catch {
+          audioNorm.ctx = new AC();
+        }
+      }
     } catch {
       audioNorm.failed = true;
       return;
@@ -996,7 +1003,7 @@
           limiterNode.knee.value = 0.0;
           limiterNode.ratio.value = 1.0;
           limiterNode.attack.value = 0.001;
-          limiterNode.release.value = 0.08;
+          limiterNode.release.value = 0.025;
           tail.connect(limiterNode);
           tail = limiterNode;
         }
@@ -1060,7 +1067,10 @@
   }
 
   function applyOutputVolume(rampSec = 0) {
-    const effectiveVol = state.muted ? 0 : Math.max(0, Math.min(1, Number(state.volume) || 0));
+    // On mobile viewports the in-app volume slider is hidden and hardware volume
+    // buttons control loudness, so always drive unity (1.0) unless muted.
+    const sliderVol = isMobileViewport() ? 1 : Math.max(0, Math.min(1, Number(state.volume) || 0));
+    const effectiveVol = state.muted ? 0 : sliderVol;
     const target = computeNormalizedOutputGain(effectiveVol, state.muted, audioNorm.currentLoudness);
     audio.muted = state.muted;
     if (audioNorm.ready && audioNorm.gainNode && audioNorm.ctx) {

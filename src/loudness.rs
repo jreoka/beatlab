@@ -49,11 +49,15 @@ pub struct TrackLoudness {
 
 impl TrackLoudness {
     pub fn is_valid(&self) -> bool {
+        // Real musical audio always has strictly negative integrated loudness
+        // (even a full-scale 0 dBFS sine wave is -3.01 LUFS); rejecting >= -1.0
+        // prevents bogus 0.0 LUFS readings from failed/empty analyzer runs from
+        // ever poisoning the DB and attenuating playback by 7+ dB.
         self.lufs.is_finite()
-            && self.lufs > -70.0
-            && self.lufs <= 6.0
+            && self.lufs > -60.0
+            && self.lufs <= -1.0
             && self.true_peak_db.is_finite()
-            && self.true_peak_db > -70.0
+            && self.true_peak_db > -60.0
             && self.true_peak_db <= 12.0
     }
 }
@@ -106,6 +110,19 @@ pub async fn measure_file_loudness(
 }
 
 async fn measure_with_ffmpeg(path: &Path) -> Option<TrackLoudness> {
+    // ITU-R BS.1770-4 is defined at 48 kHz. Resampling explicitly before ebur128
+    // avoids FFmpeg 5.1 (Debian Bookworm) filter-graph failures on 88.2/96/192 kHz
+    // Hi-Res FLACs and speeds up Hi-Res loudness scanning by 2-4x.
+    if let Some(m) =
+        run_ffmpeg_ebur128(path, "aresample=48000,ebur128=peak=true:framelog=quiet").await
+    {
+        return Some(m);
+    }
+    // Fallback to sample-peak mode if swresample 4x true-peak oversampling fails.
+    run_ffmpeg_ebur128(path, "aresample=48000,ebur128=peak=sample:framelog=quiet").await
+}
+
+async fn run_ffmpeg_ebur128(path: &Path, filter: &str) -> Option<TrackLoudness> {
     let mut cmd = Command::new("ffmpeg");
     cmd.kill_on_drop(true)
         .args([
@@ -117,7 +134,7 @@ async fn measure_with_ffmpeg(path: &Path) -> Option<TrackLoudness> {
             "-sn",
             "-dn",
             "-af",
-            "ebur128=peak=true:framelog=quiet",
+            filter,
             "-f",
             "null",
             "-",
@@ -129,6 +146,9 @@ async fn measure_with_ffmpeg(path: &Path) -> Option<TrackLoudness> {
         .await
         .ok()?
         .ok()?;
+    if !output.status.success() {
+        return None;
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
     parse_ebur128_summary(&stderr)
 }
@@ -174,7 +194,7 @@ pub fn parse_ebur128_summary(stderr: &str) -> Option<TrackLoudness> {
     }
 
     let lufs = integrated_lufs?;
-    let peak = true_peak_db.unwrap_or(0.0);
+    let peak = true_peak_db?;
     let m = TrackLoudness {
         lufs: (lufs * 100.0).round() / 100.0,
         true_peak_db: (peak * 100.0).round() / 100.0,
@@ -372,6 +392,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_lufs_and_inf_peak_summary() {
+        let bogus_zero = r#"
+[Parsed_ebur128_0 @ 0x55] Summary:
+  Integrated loudness:
+    I:          0.0 LUFS
+  True peak:
+    Peak:      -inf dBFS
+"#;
+        assert!(parse_ebur128_summary(bogus_zero).is_none());
+        let zero_with_peak = r#"
+[Parsed_ebur128_0 @ 0x55] Summary:
+  Integrated loudness:
+    I:          0.0 LUFS
+  True peak:
+    Peak:       0.0 dBFS
+"#;
+        assert!(parse_ebur128_summary(zero_with_peak).is_none());
+        assert!(!TrackLoudness {
+            lufs: 0.0,
+            true_peak_db: 0.0,
+            exact: true,
+        }
+        .is_valid());
+    }
+
+    #[test]
     fn parses_itunnorm_sound_check() {
         // 00000FA0 = 4000 -> -10*log10(4) = -6.02 dB gain -> lufs = -16 - (-6.02) = -9.98 LUFS
         // Peak 00007FFF = 32767 -> ~0.0 dBFS
@@ -462,6 +508,39 @@ mod tests {
             diff,
             m_loud.lufs,
             m_quiet.lufs
+        );
+
+        let hires_flac = dir.join("hires96k.flac");
+        let ok_hires = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=2:sample_rate=96000,volume=-6dB",
+                "-sample_fmt",
+                "s32",
+                "-c:a",
+                "flac",
+                &hires_flac.to_string_lossy(),
+            ])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok_hires, "ffmpeg failed generating 96kHz test flac");
+        let (m_hires, src_hires) = measure_file_loudness(&hires_flac, true)
+            .await
+            .expect("96kHz hires flac should measure");
+        assert_eq!(src_hires, "ebur128");
+        assert!(
+            (m_hires.lufs - m_loud.lufs).abs() < 0.6,
+            "96kHz FLAC loudness should match 48kHz WAV (hires={}, wav={})",
+            m_hires.lufs,
+            m_loud.lufs
         );
 
         let _ = std::fs::remove_dir_all(&dir);

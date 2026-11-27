@@ -538,6 +538,14 @@ impl Store {
         ensure_column(&conn, "sessions", "mfa_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "deleted_at", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "users", "restore_hash", "TEXT NOT NULL DEFAULT ''")?;
+        // Purge any poisoned loudness rows (e.g. 0.0 LUFS from older FFmpeg
+        // Hi-Res 96kHz ebur128 init failures) so they are re-measured cleanly.
+        let _ = conn.execute(
+            "DELETE FROM track_loudness
+             WHERE integrated_lufs >= -1.0 OR integrated_lufs <= -60.0
+                OR true_peak_db <= -60.0 OR true_peak_db > 12.0",
+            [],
+        );
         // Allow user_id to be NULL in auth_challenges for usernameless
         // (discoverable) passkey sign-in ceremonies.
         let auth_challenges_notnull: bool = {
@@ -5567,7 +5575,13 @@ impl Store {
     pub fn has_ebur128_loudness(&self, track_id: &str) -> bool {
         let conn = self.lock();
         conn.query_row(
-            "SELECT 1 FROM track_loudness WHERE track_id = ?1 AND source = 'ebur128'",
+            "SELECT 1 FROM track_loudness
+             WHERE track_id = ?1
+               AND source = 'ebur128'
+               AND integrated_lufs > -60.0
+               AND integrated_lufs <= -1.0
+               AND true_peak_db > -60.0
+               AND true_peak_db <= 12.0",
             params![track_id],
             |_| Ok(()),
         )
@@ -5632,7 +5646,11 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT c.track_id, c.path
                  FROM cache_entries c
-                 LEFT JOIN track_loudness l ON l.track_id = c.track_id AND l.source = 'ebur128'
+                 LEFT JOIN track_loudness l
+                   ON l.track_id = c.track_id
+                  AND l.source = 'ebur128'
+                  AND l.integrated_lufs > -60.0
+                  AND l.integrated_lufs <= -1.0
                  WHERE l.track_id IS NULL
                  ORDER BY c.last_accessed DESC
                  LIMIT ?1",
@@ -5652,7 +5670,11 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT t.id, substr(t.stream_url, 6)
                  FROM tracks t
-                 LEFT JOIN track_loudness l ON l.track_id = t.id AND l.source = 'ebur128'
+                 LEFT JOIN track_loudness l
+                   ON l.track_id = t.id
+                  AND l.source = 'ebur128'
+                  AND l.integrated_lufs > -60.0
+                  AND l.integrated_lufs <= -1.0
                  WHERE t.stream_url LIKE 'file:%' AND l.track_id IS NULL
                  ORDER BY t.created DESC
                  LIMIT ?1",

@@ -1313,7 +1313,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
     }
     function computeNormGain(vol, muted, loudness) {
       if (muted || vol <= 0) return 0;
-      if (loudness && Number.isFinite(loudness.lufs)) {
+      if (loudness && Number.isFinite(loudness.lufs) && loudness.lufs > -60 && loudness.lufs <= -1) {
         const gainDb = Math.max(-18, Math.min(16, NORM_TARGET_LUFS - loudness.lufs));
         const trackGain = Math.pow(10, gainDb / 20);
         const tpDb = Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
@@ -1327,13 +1327,13 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       if (!lim) return;
       const tpDb = loudness && Number.isFinite(loudness.truePeakDb) ? loudness.truePeakDb : 0;
       const tpLin = Math.max(0.01, Math.min(4.0, Math.pow(10, tpDb / 20)));
-      const engage = targetGain * tpLin > 1.12;
+      const engage = targetGain * tpLin > 1.25;
       try {
-        lim.threshold.setValueAtTime(engage ? -0.6 : 0.0, now);
-        lim.knee.setValueAtTime(engage ? 1.5 : 0.0, now);
+        lim.threshold.setValueAtTime(engage ? -0.3 : 0.0, now);
+        lim.knee.setValueAtTime(0.0, now);
         lim.ratio.setValueAtTime(engage ? 20.0 : 1.0, now);
         lim.attack.setValueAtTime(0.001, now);
-        lim.release.setValueAtTime(0.08, now);
+        lim.release.setValueAtTime(0.025, now);
       } catch {}
     }
     function ensureNormGraph() {
@@ -1345,7 +1345,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) { NORM.failed = true; return; }
       if (navigator.audioSession) { try { navigator.audioSession.type = 'playback'; } catch {} }
-      try { if (!NORM.ctx) NORM.ctx = new AC(); } catch { NORM.failed = true; return; }
+      try { if (!NORM.ctx) { try { NORM.ctx = new AC({ latencyHint: 'playback' }); } catch { NORM.ctx = new AC(); } } } catch { NORM.failed = true; return; }
       const ctx = NORM.ctx;
       const wire = () => {
         if (NORM.ready) return;
@@ -1360,7 +1360,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
             lim.knee.value = 0.0;
             lim.ratio.value = 1.0;
             lim.attack.value = 0.001;
-            lim.release.value = 0.08;
+            lim.release.value = 0.025;
             tail.connect(lim);
             tail = lim;
             NORM.limiterNode = lim;
@@ -1432,7 +1432,7 @@ const TEMPLATE: &str = r##"<!DOCTYPE html>
         .then((d) => {
           if (tok === NORM.reqToken) NORM.inFlight = false;
           if (!d || tok !== NORM.reqToken || NORM.trackId !== t.id) return;
-          if (Number.isFinite(Number(d.lufs))) {
+          if (Number.isFinite(Number(d.lufs)) && Number(d.lufs) > -60 && Number(d.lufs) <= -1) {
             const norm = { lufs: Number(d.lufs), truePeakDb: Number.isFinite(Number(d.truePeakDb)) ? Number(d.truePeakDb) : 0 };
             NORM.cache.set(t.id, norm);
             NORM.loudness = norm;
