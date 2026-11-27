@@ -210,6 +210,12 @@ async fn main() -> models::AppResult<()> {
         lobbies: Default::default(),
     };
 
+    if let Ok(orphaned) = store.fail_orphaned_instant_mixes() {
+        if orphaned > 0 {
+            info!(count = orphaned, "marked interrupted instant mixes as failed");
+        }
+    }
+
     tokio::spawn(webapp::prewarm_charts(state.clone()));
     lobby::spawn_sweeper(state.lobbies.clone(), store.clone());
 
@@ -315,6 +321,20 @@ async fn main() -> models::AppResult<()> {
         .route("/api/web/genre/{name}", get(webapp::genre_detail))
         .route("/api/web/search", get(webapp::search))
         .route("/api/web/instant-mix", get(webapp::instant_mix))
+        .route(
+            "/api/web/instant-mixes",
+            get(webapp::list_instant_mixes).post(webapp::create_instant_mix),
+        )
+        .route(
+            "/api/web/instant-mixes/{id}",
+            get(webapp::get_instant_mix)
+                .patch(webapp::update_instant_mix)
+                .delete(webapp::delete_instant_mix),
+        )
+        .route(
+            "/api/web/instant-mixes/{id}/retry",
+            post(webapp::retry_instant_mix),
+        )
         .route("/api/web/album/{id}", get(webapp::album_detail))
         .route("/api/web/artist/{id}", get(webapp::artist_detail))
         .route("/api/web/library", get(webapp::library))

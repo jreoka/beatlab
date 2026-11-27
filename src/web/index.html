@@ -176,11 +176,12 @@
             </span>
             <span>Listening History</span>
           </button>
-          <button class="lib-row" onclick="App.promptInstantMix()">
+          <button class="lib-row" id="sidebar-instant-mixes-btn" data-route="mix" onclick="App.navigate('mix')">
             <span class="lib-badge mix-bg">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 1.9 5.2L19 10l-5.1 1.8L12 17l-1.9-5.2L5 10l5.1-1.8L12 3z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16z"/></svg>
             </span>
-            <span>Instant Mix</span>
+            <span class="lib-row-label">Instant Mixes</span>
+            <span id="sidebar-mix-badge" class="sidebar-mix-badge hidden" aria-live="polite"></span>
           </button>
         </div>
 
@@ -224,6 +225,10 @@
         </div>
 
         <div class="topbar-right">
+          <button id="topbar-mix-pill" class="topbar-mix-pill hidden" onclick="App.navigate('mix')" title="Instant Mixes">
+            <span id="topbar-mix-icon" class="topbar-mix-icon" aria-hidden="true"></span>
+            <span id="topbar-mix-label">Mixes</span>
+          </button>
           <button id="lobby-live-pill" class="lobby-live-pill hidden" onclick="App.openLobby()" title="Listen Together">
             <span class="live-dot" aria-hidden="true"></span>
             <span id="lobby-live-label">LIVE</span>
@@ -515,6 +520,9 @@
 
   <!-- Toast Notification -->
   <div id="toast" class="toast hidden"></div>
+
+  <!-- Instant Mix Ready Notifications -->
+  <div id="mix-notif-stack" class="mix-notif-stack" aria-live="polite" aria-atomic="false"></div>
 
   <!-- Stats Chart Tooltip -->
   <div id="stats-tooltip" class="stats-tooltip hidden" role="tooltip"></div>

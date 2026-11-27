@@ -8746,3 +8746,978 @@ html[data-theme="light"] .lobby-hero-art-empty { box-shadow: 0 12px 32px rgba(15
   .lobby-orb-ring { animation: none; }
   .lobby-orb-ring { display: none; }
 }
+
+/* ============================================================================
+   Instant Mixes Hub, Background Curation, Ready Notifications & Playlist View
+   ============================================================================ */
+
+/* Sidebar & Topbar Live Curation Indicators */
+.lib-row {
+  position: relative;
+}
+.lib-row.active {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}
+.lib-row-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sidebar-mix-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.sidebar-mix-badge.creating {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.sidebar-mix-badge.ready {
+  background: var(--accent);
+  color: #06120b;
+}
+
+.topbar-mix-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-bright);
+  transition: background 0.15s, border-color 0.15s, transform 0.12s;
+  white-space: nowrap;
+}
+.topbar-mix-pill:hover {
+  background: var(--surface-2);
+  border-color: var(--accent);
+}
+.topbar-mix-pill.creating {
+  background: var(--accent-soft);
+  border-color: rgba(30, 215, 96, 0.35);
+  color: var(--accent);
+}
+.topbar-mix-pill.ready {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06120b;
+}
+.topbar-mix-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.imix-mini-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(30, 215, 96, 0.25);
+  border-top-color: currentColor;
+  display: inline-block;
+  animation: beatlab-spin 0.72s linear infinite;
+  flex-shrink: 0;
+}
+.imix-mini-spinner.inline {
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.imix-ready-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+}
+
+/* Instant Mixes Page Layout */
+.imix-page {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  padding-bottom: 24px;
+}
+
+.imix-composer-card {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 92% -10%, rgba(30, 215, 96, 0.16), transparent 52%),
+    radial-gradient(circle at 6% 110%, rgba(56, 189, 248, 0.09), transparent 45%),
+    var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.imix-composer-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.imix-composer-heading {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+.imix-composer-badge {
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent), #10b981);
+  color: #05130b;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 8px 22px rgba(30, 215, 96, 0.24);
+}
+.imix-composer-badge svg {
+  width: 24px;
+  height: 24px;
+}
+.imix-page-title {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+.imix-page-sub {
+  font-size: 13.5px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+.imix-live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid rgba(30, 215, 96, 0.28);
+  white-space: nowrap;
+}
+
+.imix-composer-form {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+.imix-input-wrap {
+  flex: 1 1 280px;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.imix-input-icon {
+  position: absolute;
+  left: 14px;
+  color: var(--text-dim);
+  display: inline-flex;
+  pointer-events: none;
+}
+.imix-input-icon svg {
+  width: 17px;
+  height: 17px;
+}
+.imix-input-wrap input {
+  width: 100%;
+  height: 46px;
+  padding: 0 16px 0 42px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-bright);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14.5px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.imix-input-wrap input::placeholder {
+  color: var(--text-dim);
+}
+.imix-input-wrap input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(30, 215, 96, 0.15);
+}
+.imix-submit-btn {
+  height: 46px;
+  padding: 0 20px;
+  border-radius: var(--radius-lg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.imix-submit-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.imix-chips-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.imix-chips-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+/* Your Instant Mixes List & Grid */
+.imix-library-section {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.imix-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.imix-list-head-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.imix-list-head h2 {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.imix-filter-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.imix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(216px, 1fr));
+  gap: 16px;
+}
+
+.imix-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 12px;
+  cursor: pointer;
+  transition: background 0.16s, border-color 0.16s, transform 0.16s, box-shadow 0.16s;
+  min-width: 0;
+}
+.imix-card:hover {
+  background: var(--surface-2);
+  border-color: var(--border-bright);
+  transform: translateY(-2px);
+}
+.imix-card.creating {
+  border-color: rgba(30, 215, 96, 0.34);
+  background: linear-gradient(180deg, rgba(30, 215, 96, 0.06), var(--surface) 45%);
+}
+.imix-card.unseen {
+  border-color: rgba(30, 215, 96, 0.55);
+  box-shadow: 0 0 0 1px rgba(30, 215, 96, 0.2);
+}
+.imix-card.failed {
+  border-color: rgba(244, 63, 94, 0.3);
+}
+
+.imix-card-art {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface-2);
+  margin-bottom: 12px;
+}
+.imix-mosaic {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+.imix-mosaic img,
+.imix-single-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.imix-placeholder-art {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, rgba(30, 215, 96, 0.2), rgba(56, 189, 248, 0.15));
+  color: var(--accent);
+}
+.imix-placeholder-art svg {
+  width: 44px;
+  height: 44px;
+}
+
+/* Curating Artwork Shimmer + Spinner */
+.imix-card-art.creating-art,
+.imix-hero-creating-art {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 30% 25%, rgba(30, 215, 96, 0.24), transparent 60%),
+    radial-gradient(circle at 80% 80%, rgba(56, 189, 248, 0.18), transparent 55%),
+    var(--surface-2);
+}
+.imix-hero-creating-art {
+  width: 184px;
+  height: 184px;
+  border-radius: var(--radius);
+  flex-shrink: 0;
+}
+.imix-art-shimmer {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    115deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.08) 48%,
+    transparent 76%
+  );
+  transform: translateX(-100%);
+  animation: imixShimmer 1.85s ease-in-out infinite;
+}
+@keyframes imixShimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+.imix-art-spinner-wrap {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+}
+.imix-art-spinner {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 3px solid rgba(30, 215, 96, 0.22);
+  border-top-color: var(--accent);
+  box-shadow: 0 0 24px rgba(30, 215, 96, 0.22);
+  animation: beatlab-spin 0.85s linear infinite;
+}
+.imix-art-spinner.lg {
+  width: 56px;
+  height: 56px;
+  border-width: 3.5px;
+}
+
+.imix-card-art.failed-art,
+.imix-hero-failed-art {
+  display: grid;
+  place-items: center;
+  background: rgba(244, 63, 94, 0.08);
+  color: var(--danger);
+}
+.imix-hero-failed-art {
+  width: 184px;
+  height: 184px;
+  border-radius: var(--radius);
+  flex-shrink: 0;
+}
+.imix-failed-icon svg,
+.imix-hero-failed-art svg {
+  width: 44px;
+  height: 44px;
+}
+
+.imix-status-pill {
+  position: absolute;
+  top: 9px;
+  left: 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  backdrop-filter: blur(8px);
+}
+.imix-status-pill.creating {
+  background: rgba(12, 18, 15, 0.78);
+  color: var(--accent);
+  border: 1px solid rgba(30, 215, 96, 0.35);
+}
+.imix-status-pill.failed {
+  background: rgba(24, 12, 16, 0.8);
+  color: #fda4af;
+  border: 1px solid rgba(244, 63, 94, 0.35);
+}
+
+.imix-card-badges {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.imix-badge {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 999px;
+  backdrop-filter: blur(8px);
+}
+.imix-badge.ai {
+  background: rgba(10, 14, 18, 0.78);
+  color: var(--accent);
+  border: 1px solid rgba(30, 215, 96, 0.4);
+}
+.imix-badge.saved {
+  background: rgba(10, 14, 18, 0.78);
+  color: #f4f4f5;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.imix-card-top-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 5px;
+  opacity: 0;
+  transition: opacity 0.14s;
+}
+.imix-card:hover .imix-card-top-actions,
+.imix-card:focus-within .imix-card-top-actions {
+  opacity: 1;
+}
+.imix-card-icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: rgba(10, 10, 14, 0.74);
+  color: #f4f4f5;
+  backdrop-filter: blur(8px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.14s, transform 0.12s, color 0.14s;
+}
+.imix-card-icon-btn:hover {
+  background: rgba(10, 10, 14, 0.92);
+  transform: scale(1.06);
+}
+.imix-card-icon-btn.top-right {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+}
+.imix-card-icon-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.imix-card:hover .card-play-fab {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.imix-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.imix-card-title {
+  font-size: 14.5px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.imix-card-sub {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.imix-card-sub.creating-text {
+  color: var(--accent);
+  font-weight: 600;
+}
+.imix-card-meta {
+  margin-top: auto;
+  padding-top: 6px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.imix-card-failed-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.imix-card-failed-actions .mini-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.imix-card-failed-actions .mini-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.danger-text {
+  color: #fda4af !important;
+}
+html[data-theme="light"] .danger-text {
+  color: #e11d48 !important;
+}
+
+/* Empty State */
+.imix-empty-state {
+  text-align: center;
+  padding: 44px 20px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  border: 1px dashed var(--border-bright);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.imix-empty-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: grid;
+  place-items: center;
+}
+.imix-empty-icon svg {
+  width: 26px;
+  height: 26px;
+}
+.imix-empty-state h3 {
+  font-size: 17px;
+  font-weight: 700;
+}
+.imix-empty-state p {
+  max-width: 420px;
+  font-size: 13.5px;
+  color: var(--text-muted);
+}
+
+/* Full Instant Mix Playlist Detail View */
+.imix-detail-nav {
+  margin-bottom: 12px;
+}
+.imix-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 6px 8px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.14s, color 0.14s;
+}
+.imix-back-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.imix-back-btn svg {
+  width: 16px;
+  height: 16px;
+}
+.imix-detail-hero .btn-secondary svg,
+.imix-detail-hero .btn-primary svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+.imix-prompt-pill {
+  display: inline-block;
+  margin-bottom: 14px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.imix-related-section {
+  margin-top: 28px;
+}
+.imix-related-section .refine-query-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.imix-related-section .refine-query-pill svg {
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+}
+
+/* Curating Skeleton Track List */
+.imix-skeleton-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+.imix-skel-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.imix-skel-box {
+  display: block;
+  border-radius: 6px;
+  background: var(--surface-2);
+  animation: imixPulse 1.4s ease-in-out infinite;
+}
+.imix-skel-box.num { width: 18px; height: 14px; }
+.imix-skel-box.thumb { width: 40px; height: 40px; flex-shrink: 0; }
+.imix-skel-lines { flex: 1; display: flex; flex-direction: column; gap: 7px; }
+.imix-skel-box.title { width: 42%; height: 13px; }
+.imix-skel-box.sub { width: 26%; height: 11px; }
+.imix-skel-box.dur { width: 34px; height: 12px; }
+@keyframes imixPulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 0.9; }
+}
+
+/* Rich Instant Mix Ready Notifications */
+.mix-notif-stack {
+  position: fixed;
+  right: 20px;
+  bottom: calc(var(--player-h) + 18px);
+  z-index: 160;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(370px, calc(100vw - 24px));
+  pointer-events: none;
+}
+.mix-notif {
+  pointer-events: auto;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 12px 14px;
+  border-radius: var(--radius-lg);
+  background: var(--elevated);
+  border: 1px solid var(--border-bright);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.48);
+  cursor: pointer;
+  animation: mixNotifIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  transition: transform 0.16s, border-color 0.16s, opacity 0.2s;
+}
+.mix-notif:hover {
+  border-color: var(--accent);
+}
+.mix-notif.failed {
+  border-color: rgba(244, 63, 94, 0.45);
+}
+.mix-notif.leaving {
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+}
+@keyframes mixNotifIn {
+  from {
+    opacity: 0;
+    transform: translateY(16px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.mix-notif-art {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border-radius: var(--radius);
+  overflow: hidden;
+  flex-shrink: 0;
+  background: var(--surface-2);
+}
+.mix-notif-art.failed-art {
+  display: grid;
+  place-items: center;
+  background: rgba(244, 63, 94, 0.14);
+  color: var(--danger);
+}
+.mix-notif-art.failed-art svg {
+  width: 24px;
+  height: 24px;
+}
+.mix-notif-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.mix-notif-mosaic {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+.mix-notif-mosaic img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.mix-notif-check {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #05130b;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+.mix-notif-check svg {
+  width: 11px;
+  height: 11px;
+}
+.mix-notif-body {
+  flex: 1;
+  min-width: 0;
+}
+.mix-notif-kicker {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.mix-notif.failed .mix-notif-kicker {
+  color: var(--danger);
+}
+.mix-notif-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mix-notif-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mix-notif-actions {
+  display: flex;
+  gap: 7px;
+  margin-top: 8px;
+}
+.mix-notif-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--surface-2);
+  color: var(--text);
+  transition: background 0.14s, transform 0.12s;
+}
+.mix-notif-btn:hover {
+  background: var(--surface-3);
+}
+.mix-notif-btn.primary {
+  background: var(--accent);
+  color: #05130b;
+}
+.mix-notif-btn.primary:hover {
+  background: var(--accent-hover);
+}
+.mix-notif-btn svg {
+  width: 12px;
+  height: 12px;
+}
+.mix-notif-close {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+.mix-notif-close:hover {
+  color: var(--text);
+}
+.mix-notif-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2.5px;
+  background: var(--accent);
+  transform-origin: left center;
+  animation: mixNotifBar 7.5s linear forwards;
+}
+.mix-notif.paused .mix-notif-bar {
+  animation-play-state: paused;
+}
+@keyframes mixNotifBar {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+/* Light theme polish */
+html[data-theme="light"] .imix-composer-card {
+  background:
+    radial-gradient(circle at 92% -10%, rgba(16, 185, 129, 0.14), transparent 52%),
+    radial-gradient(circle at 6% 110%, rgba(14, 165, 233, 0.08), transparent 45%),
+    var(--surface);
+}
+html[data-theme="light"] .imix-input-wrap input {
+  background: #ffffff;
+}
+html[data-theme="light"] .mix-notif {
+  box-shadow: 0 14px 36px rgba(15, 20, 28, 0.16);
+}
+html[data-theme="light"] .imix-art-shimmer {
+  background: linear-gradient(
+    115deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.45) 48%,
+    transparent 76%
+  );
+}
+
+/* Touch & Mobile Responsiveness */
+@media (hover: none) {
+  .imix-card-top-actions {
+    opacity: 1;
+  }
+}
+@media (max-width: 780px) {
+  .imix-composer-card {
+    padding: 18px 16px;
+  }
+  .imix-page-title {
+    font-size: 22px;
+  }
+  .imix-composer-form {
+    flex-direction: column;
+  }
+  .imix-input-wrap {
+    flex: none;
+  }
+  .imix-submit-btn {
+    width: 100%;
+  }
+  .imix-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .imix-card {
+    padding: 9px;
+  }
+  .imix-hero-creating-art,
+  .imix-hero-failed-art {
+    width: 152px;
+    height: 152px;
+  }
+  .mix-notif-stack {
+    right: 12px;
+    left: 12px;
+    width: auto;
+    bottom: auto;
+    top: calc(var(--topbar-h) + 10px);
+  }
+  .topbar-mix-pill {
+    height: 30px;
+    padding: 0 10px;
+    font-size: 11px;
+  }
+}
+@media (max-width: 420px) {
+  .imix-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .imix-art-shimmer,
+  .imix-skel-box,
+  .mix-notif-bar {
+    animation: none;
+  }
+}

@@ -8,7 +8,7 @@ use crate::models::{
     UserProfile, UserTrackStats, ERR_RESTORE_REQUIRED, slug,
 };
 use crate::state::{client_ip, rate_limit_ip, user_agent, AppState};
-use crate::store::SessionMeta;
+use crate::store::{SessionMeta, StoredInstantMix};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -868,6 +868,23 @@ pub struct SearchQuery {
     pub q: Option<String>,
     pub mode: Option<String>,
     pub phase: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct InstantMixCreateReq {
+    pub query: String,
+    #[serde(default)]
+    pub mode: String,
+}
+
+#[derive(Deserialize)]
+pub struct InstantMixUpdateReq {
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    #[serde(default, rename = "savedPlaylistId")]
+    pub saved_playlist_id: Option<String>,
+    #[serde(default, rename = "removeTrackId")]
+    pub remove_track_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3857,37 +3874,418 @@ pub async fn search(
     .await
 }
 
-pub async fn instant_mix(
+struct BuiltInstantMix {
+    title: String,
+    subtitle: String,
+    query: String,
+    is_theme_mix: bool,
+    prominent: bool,
+    ai_interpreted: bool,
+    total_duration: i64,
+    tracks: Vec<Track>,
+    taste_match_ids: HashSet<String>,
+}
+
+const MAX_CONCURRENT_INSTANT_MIXES: usize = 6;
+const MAX_LISTED_INSTANT_MIXES: usize = 60;
+
+fn instant_mix_tasks() -> &'static std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>> {
+    static TASKS: OnceLock<std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>> =
+        OnceLock::new();
+    TASKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+struct InstantMixTaskGuard {
+    id: String,
+}
+
+impl Drop for InstantMixTaskGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = instant_mix_tasks().lock() {
+            map.remove(&self.id);
+        }
+    }
+}
+
+fn cancel_instant_mix_task(id: &str) {
+    if let Ok(mut map) = instant_mix_tasks().lock() {
+        if let Some(handle) = map.remove(id) {
+            handle.abort();
+        }
+    }
+}
+
+fn spawn_instant_mix_job(
+    state: AppState,
+    mix_id: String,
+    uid: i64,
+    query: String,
+    mode: String,
+) {
+    cancel_instant_mix_task(&mix_id);
+    let task_id = mix_id.clone();
+    let handle = tokio::spawn(async move {
+        let _guard = InstantMixTaskGuard {
+            id: task_id.clone(),
+        };
+        let mode_opt = if mode.trim().is_empty() {
+            None
+        } else {
+            Some(mode.as_str())
+        };
+        let (built, refinements) = compute_instant_mix(&state, uid, &query, mode_opt).await;
+        match built {
+            Some(mix) if !mix.tracks.is_empty() => {
+                let _ = state.store.upsert_tracks(&mix.tracks);
+                let mut seen = HashSet::new();
+                let track_ids: Vec<String> = mix
+                    .tracks
+                    .iter()
+                    .filter(|t| seen.insert(t.id.clone()))
+                    .map(|t| t.id.clone())
+                    .collect();
+                let refinements_json = serde_json::to_string(&refinements).unwrap_or_else(|_| "null".to_string());
+                let _ = state.store.complete_instant_mix(
+                    &task_id,
+                    &mix.title,
+                    &mix.subtitle,
+                    mix.is_theme_mix,
+                    mix.prominent,
+                    mix.ai_interpreted,
+                    mix.total_duration,
+                    &track_ids,
+                    &refinements_json,
+                );
+            }
+            _ => {
+                let msg = format!(
+                    "Couldn't find enough matching tracks for \"{}\". Try another artist, genre, era, or vibe.",
+                    query
+                );
+                let _ = state.store.fail_instant_mix(&task_id, &msg);
+            }
+        }
+    });
+    if let Ok(mut map) = instant_mix_tasks().lock() {
+        map.insert(mix_id, handle.abort_handle());
+    }
+}
+
+fn instant_mix_cover_urls(state: &AppState, track_ids: &[String]) -> Vec<String> {
+    if track_ids.is_empty() {
+        return Vec::new();
+    }
+    let sample_ids: Vec<String> = track_ids.iter().take(16).cloned().collect();
+    let tracks = state.store.get_tracks_by_ids(&sample_ids).unwrap_or_default();
+    let by_id: HashMap<&str, &Track> = tracks.iter().map(|t| (t.id.as_str(), t)).collect();
+    let mut covers = Vec::with_capacity(4);
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    for tid in &sample_ids {
+        let Some(t) = by_id.get(tid.as_str()) else {
+            continue;
+        };
+        let dedup_key = if !t.cover_url.trim().is_empty() {
+            t.cover_url.trim().to_string()
+        } else if !t.album.trim().is_empty() {
+            format!("{}|{}", t.artist.to_lowercase(), t.album.to_lowercase())
+        } else {
+            t.id.clone()
+        };
+        if seen_keys.insert(dedup_key) {
+            covers.push(cover_api_url(&t.id));
+            if covers.len() == 4 {
+                break;
+            }
+        }
+    }
+    covers
+}
+
+fn instant_mix_summary_json(state: &AppState, m: &StoredInstantMix) -> Value {
+    let covers = instant_mix_cover_urls(state, &m.track_ids);
+    let cover_url = covers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "/api/web/cover/default".to_string());
+    json!({
+        "id": m.id,
+        "query": m.query,
+        "mode": m.mode,
+        "status": m.status,
+        "title": m.title,
+        "subtitle": m.subtitle,
+        "isThemeMix": m.is_theme_mix,
+        "prominent": m.prominent,
+        "aiInterpreted": m.ai_interpreted,
+        "totalDuration": m.total_duration,
+        "trackCount": m.track_ids.len(),
+        "covers": covers,
+        "coverUrl": cover_url,
+        "savedPlaylistId": if m.saved_playlist_id.is_empty() { Value::Null } else { Value::String(m.saved_playlist_id.clone()) },
+        "error": m.error,
+        "created": m.created,
+        "changed": m.changed,
+    })
+}
+
+fn instant_mix_detail_json(state: &AppState, uid: i64, m: &StoredInstantMix) -> Value {
+    let raw_tracks = if m.track_ids.is_empty() {
+        Vec::new()
+    } else {
+        state.store.get_tracks_by_ids(&m.track_ids).unwrap_or_default()
+    };
+    let (hidden_ids, hidden_keys) = state.store.hidden_track_sets(uid).unwrap_or_default();
+    let by_id: HashMap<String, Track> = raw_tracks.into_iter().map(|t| (t.id.clone(), t)).collect();
+    let mut ordered: Vec<Track> = Vec::with_capacity(m.track_ids.len());
+    for tid in &m.track_ids {
+        if let Some(t) = by_id.get(tid) {
+            if !hidden_ids.contains(&t.id)
+                && (hidden_keys.is_empty() || !hidden_keys.contains(&t.song_key()))
+            {
+                ordered.push(t.clone());
+            }
+        }
+    }
+    let total_duration: i64 = ordered.iter().map(|t| t.duration.max(0) as i64).sum();
+    let taste_match_ids = personal_match_ids(state, uid);
+    let web_tracks = to_web_tracks_with_taste(state, uid, &ordered, &taste_match_ids);
+    let mut covers = Vec::with_capacity(4);
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    for (t, wt) in ordered.iter().zip(web_tracks.iter()) {
+        let dedup_key = if !t.cover_url.trim().is_empty() {
+            t.cover_url.trim().to_string()
+        } else {
+            wt.cover_url.clone()
+        };
+        if seen_keys.insert(dedup_key) {
+            covers.push(wt.cover_url.clone());
+            if covers.len() == 4 {
+                break;
+            }
+        }
+    }
+    let cover_url = covers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "/api/web/cover/default".to_string());
+    let refinements: Value =
+        serde_json::from_str(&m.refinements_json).unwrap_or(Value::Null);
+    json!({
+        "id": m.id,
+        "query": m.query,
+        "mode": m.mode,
+        "status": m.status,
+        "title": m.title,
+        "subtitle": m.subtitle,
+        "isThemeMix": m.is_theme_mix,
+        "prominent": m.prominent,
+        "aiInterpreted": m.ai_interpreted,
+        "totalDuration": total_duration,
+        "trackCount": web_tracks.len(),
+        "covers": covers,
+        "coverUrl": cover_url,
+        "savedPlaylistId": if m.saved_playlist_id.is_empty() { Value::Null } else { Value::String(m.saved_playlist_id.clone()) },
+        "error": m.error,
+        "created": m.created,
+        "changed": m.changed,
+        "refinements": refinements,
+        "tracks": web_tracks,
+    })
+}
+
+pub async fn list_instant_mixes(
     State(state): State<AppState>,
-    Query(q): Query<SearchQuery>,
     headers: HeaderMap,
 ) -> Response {
     let user = match require_web_user(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let query = q.q.unwrap_or_default().trim().to_string();
+    let mixes = state
+        .store
+        .list_instant_mixes(user.id, MAX_LISTED_INSTANT_MIXES)
+        .unwrap_or_default();
+    let creating_count = mixes.iter().filter(|m| m.status == "creating").count();
+    let items: Vec<Value> = mixes
+        .iter()
+        .map(|m| instant_mix_summary_json(&state, m))
+        .collect();
+    json_res(json!({
+        "mixes": items,
+        "creatingCount": creating_count,
+    }))
+}
+
+pub async fn create_instant_mix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<InstantMixCreateReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let query = req.query.trim().to_string();
+    if query.is_empty() {
+        return err_res(StatusCode::BAD_REQUEST, "Enter a vibe, artist, song, or genre");
+    }
+    let query: String = query.chars().take(240).collect();
+    let creating_now = state
+        .store
+        .count_creating_instant_mixes(user.id)
+        .unwrap_or(0);
+    if creating_now >= MAX_CONCURRENT_INSTANT_MIXES {
+        return err_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Several mixes are already curating. Please wait a moment for one to finish.",
+        );
+    }
+    let mode = req.mode.trim().to_string();
+    let created = match state.store.create_instant_mix(user.id, &query, &mode) {
+        Ok(m) => m,
+        Err(e) => return err_res(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let summary = instant_mix_summary_json(&state, &created);
+    spawn_instant_mix_job(state, created.id, user.id, query, mode);
+    json_res(json!({ "mix": summary }))
+}
+
+pub async fn get_instant_mix(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(m) = state.store.get_instant_mix(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Instant mix not found");
+    };
+    if m.user_id != user.id {
+        return err_res(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    json_res(json!({
+        "mix": instant_mix_detail_json(&state, user.id, &m),
+    }))
+}
+
+pub async fn update_instant_mix(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<InstantMixUpdateReq>,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(existing) = state.store.get_instant_mix(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Instant mix not found");
+    };
+    if existing.user_id != user.id {
+        return err_res(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    match state.store.update_instant_mix(
+        &id,
+        user.id,
+        req.title.as_deref(),
+        req.subtitle.as_deref(),
+        req.saved_playlist_id.as_deref(),
+        req.remove_track_id.as_deref(),
+    ) {
+        Ok(Some(updated)) => json_res(json!({
+            "mix": instant_mix_detail_json(&state, user.id, &updated),
+        })),
+        Ok(None) => err_res(StatusCode::NOT_FOUND, "Instant mix not found"),
+        Err(e) => err_res(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+pub async fn delete_instant_mix(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(existing) = state.store.get_instant_mix(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Instant mix not found");
+    };
+    if existing.user_id != user.id {
+        return err_res(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    cancel_instant_mix_task(&id);
+    let _ = state.store.delete_instant_mix(&id, user.id);
+    json_res(json!({ "ok": true }))
+}
+
+pub async fn retry_instant_mix(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(existing) = state.store.get_instant_mix(&id).ok().flatten() else {
+        return err_res(StatusCode::NOT_FOUND, "Instant mix not found");
+    };
+    if existing.user_id != user.id {
+        return err_res(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let creating_now = state
+        .store
+        .count_creating_instant_mixes(user.id)
+        .unwrap_or(0);
+    if existing.status != "creating" && creating_now >= MAX_CONCURRENT_INSTANT_MIXES {
+        return err_res(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Several mixes are already curating. Please wait a moment for one to finish.",
+        );
+    }
+    let Some(reset) = state
+        .store
+        .reset_instant_mix_creating(&id, user.id)
+        .ok()
+        .flatten()
+    else {
+        return err_res(StatusCode::NOT_FOUND, "Instant mix not found");
+    };
+    let summary = instant_mix_summary_json(&state, &reset);
+    spawn_instant_mix_job(state, reset.id, user.id, reset.query, reset.mode);
+    json_res(json!({ "mix": summary }))
+}
+
+async fn compute_instant_mix(
+    state: &AppState,
+    uid: i64,
+    query: &str,
+    mode_raw: Option<&str>,
+) -> (Option<BuiltInstantMix>, Option<crate::taste::SearchRefinements>) {
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return (None, None);
+    }
     let explicit_standard = matches!(
-        q.mode.as_deref().map(str::trim).map(str::to_lowercase).as_deref(),
+        mode_raw.map(str::trim).map(str::to_lowercase).as_deref(),
         Some("standard") | Some("classic") | Some("noai")
     );
-    let mode_override = match q.mode.as_deref().map(str::trim).map(str::to_lowercase).as_deref() {
+    let mode_override = match mode_raw.map(str::trim).map(str::to_lowercase).as_deref() {
         Some("topic") | Some("genre") | Some("vibe") => Some("topic".to_string()),
         Some("entity") | Some("artist") | Some("song") => Some("entity".to_string()),
         _ => None,
     };
-    if query.is_empty() {
-        return json_res(json!({
-            "query": "",
-            "instantMix": Value::Null,
-            "refinements": Value::Null,
-        }));
-    }
 
     if !explicit_standard {
         if let Some(ref curator) = state.llm {
-            if let Some(resp) = try_build_llm_instant_mix(&state, curator, user.id, &query).await {
-                return resp;
+            if let Some((built, refinements)) =
+                try_build_llm_instant_mix_data(state, curator, uid, &query).await
+            {
+                return (Some(built), Some(refinements));
             }
         }
     }
@@ -3906,7 +4304,6 @@ pub async fn instant_mix(
             return (Vec::new(), Vec::new());
         }
         if !intent.is_theme_mix && !force_topic {
-            // Fetch curated playlists in parallel for evidence-based topic vs entity routing.
             let curated = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 state.sources.fetch_curated_mix_tracks(&base_query, 2, 24),
@@ -3915,7 +4312,7 @@ pub async fn instant_mix(
             .unwrap_or_default();
             return (curated, Vec::new());
         }
-        fetch_topic_mix_inputs(&state, &intent, &base_query).await
+        fetch_topic_mix_inputs(state, &intent, &base_query).await
     };
 
     let raw_radio_fut = async {
@@ -3964,17 +4361,12 @@ pub async fn instant_mix(
         }
     }
 
-    // Remote (Deezer) search & playlist tracks carry no genre metadata. Without it the
-    // genre-clash checks cannot tell an actual J-Rock track from a rap track that happened
-    // to live in a playlists whose title matched "jrock". Resolve album genres before any
-    // candidate ranking so the mixer can validate tracks, not just playlist titles.
     if intent.is_theme_mix && !intent.genres.is_empty() {
         let dz = &state.sources.deezer;
         dz.enrich_track_genres(&mut combined).await;
         for (_, batch) in curated_batches.iter_mut() {
             dz.enrich_track_genres(batch).await;
         }
-        // Persist the resolved genres so artist/genre indexes are useful on later requests.
         let mut enriched: Vec<Track> = combined.clone();
         for (_, batch) in &curated_batches {
             enriched.extend(batch.iter().cloned());
@@ -3992,10 +4384,6 @@ pub async fn instant_mix(
             || combined.iter().any(|t| {
                 crate::models::slug(&crate::models::primary_artist(&t.artist)) == base_slug
             }));
-    // A query can collide with an obscure artist's name (e.g. "anime" is also a hardcore DJ
-    // called "Anime"). Playlists titled with the query tell us which meaning people intend:
-    // "100% Queen" is full of Queen tracks, "Anime Essentials" contains no tracks by "Anime".
-    // When the matching artist is nearly absent from those playlists, treat it as a topic.
     let artist_absent_from_curated = {
         let curated: Vec<&Track> = curated_batches.iter().flat_map(|(_, b)| b.iter()).collect();
         let by_artist = curated
@@ -4012,7 +4400,7 @@ pub async fn instant_mix(
 
     let mut mix_ctx = if !use_topic_path {
         let ctx =
-            expand_entity_mix_context(&state, user.id, &query, &combined, &dz_artists, &ytm_hints)
+            expand_entity_mix_context(state, uid, &query, &combined, &dz_artists, &ytm_hints)
                 .await;
         if ctx.anchor_artist.is_none() && curated_batches.is_empty() {
             use crate::sources::MusicSource;
@@ -4049,7 +4437,7 @@ pub async fn instant_mix(
         }
         ctx
     } else if curated_batches.is_empty() {
-        let ytm_radio = fetch_topic_ytm_radio_fallback(&state, &intent, &combined, &ytm_hints).await;
+        let ytm_radio = fetch_topic_ytm_radio_fallback(state, &intent, &combined, &ytm_hints).await;
         crate::taste::SearchMixContext {
             ytm_radio,
             ..Default::default()
@@ -4065,16 +4453,16 @@ pub async fn instant_mix(
         None
     };
 
-    let combined_len = combined.len();
-    let curated_len = curated_batches.len();
-    let radio_len = mix_ctx.ytm_radio.len()
+    let mut combined_len = combined.len();
+    let mut curated_len = curated_batches.len();
+    let mut radio_len = mix_ctx.ytm_radio.len()
         + mix_ctx.dz_artist_top.len()
         + mix_ctx.dz_artist_radio.len()
         + mix_ctx.dz_related_tracks.len();
     let expand_inputs = (combined.clone(), curated_batches.clone(), mix_ctx.clone());
     let mut refined = run_instant_mix_refine(
-        &state,
-        user.id,
+        state,
+        uid,
         &query,
         combined,
         curated_batches,
@@ -4082,11 +4470,11 @@ pub async fn instant_mix(
     )
     .await;
 
+    let mut did_fallback = false;
     if refined.instant_mix.is_none() {
         if let Some((mut fb_combined, mut fb_curated, mut fb_ctx)) = fallback_inputs {
-            // Auto mode failed on its initial pass; retry with the full Genre & Vibe (topic) pipeline.
             let (topic_curated, topic_extra) =
-                fetch_topic_mix_inputs(&state, &intent, &base_query).await;
+                fetch_topic_mix_inputs(state, &intent, &base_query).await;
             let mut topic_upsert = topic_extra.clone();
             for (_, batch) in &topic_curated {
                 topic_upsert.extend(batch.iter().cloned());
@@ -4103,18 +4491,18 @@ pub async fn instant_mix(
             fb_curated.extend(topic_curated);
             if fb_curated.is_empty() && fb_ctx.ytm_radio.is_empty() {
                 fb_ctx.ytm_radio =
-                    fetch_topic_ytm_radio_fallback(&state, &intent, &fb_combined, &ytm_hints).await;
+                    fetch_topic_ytm_radio_fallback(state, &intent, &fb_combined, &ytm_hints).await;
             }
             fb_ctx.mode_override = Some("topic".to_string());
-            let fb_combined_len = fb_combined.len();
-            let fb_curated_len = fb_curated.len();
-            let fb_radio_len = fb_ctx.ytm_radio.len()
+            combined_len = fb_combined.len();
+            curated_len = fb_curated.len();
+            radio_len = fb_ctx.ytm_radio.len()
                 + fb_ctx.dz_artist_top.len()
                 + fb_ctx.dz_artist_radio.len()
                 + fb_ctx.dz_related_tracks.len();
             refined = run_instant_mix_refine(
-                &state,
-                user.id,
+                state,
+                uid,
                 &query,
                 fb_combined.clone(),
                 fb_curated.clone(),
@@ -4122,8 +4510,8 @@ pub async fn instant_mix(
             )
             .await;
             refined = expand_sparse_theme_mix(
-                &state,
-                user.id,
+                state,
+                uid,
                 &query,
                 &intent,
                 refined,
@@ -4131,46 +4519,102 @@ pub async fn instant_mix(
                 &ytm_hints,
             )
             .await;
-            return format_instant_mix_response(
-                &state,
-                user.id,
-                &query,
-                fb_combined_len,
-                fb_curated_len,
-                fb_radio_len,
-                refined,
-            );
+            did_fallback = true;
         }
     }
 
-    let refined = expand_sparse_theme_mix(
-        &state,
-        user.id,
-        &query,
-        &intent,
-        refined,
-        expand_inputs,
-        &ytm_hints,
-    )
-    .await;
+    if !did_fallback {
+        refined = expand_sparse_theme_mix(
+            state,
+            uid,
+            &query,
+            &intent,
+            refined,
+            expand_inputs,
+            &ytm_hints,
+        )
+        .await;
+    }
 
-    format_instant_mix_response(
-        &state,
-        user.id,
-        &query,
-        combined_len,
-        curated_len,
-        radio_len,
-        refined,
-    )
+    if let Some(ref mix) = refined.instant_mix {
+        if mix.is_theme_mix && curated_len > 0 && mix.tracks.len() >= 8 {
+            state
+                .taste
+                .save_curated_query_tracks(&query.trim().to_lowercase(), &mix.tracks);
+        }
+    } else {
+        tracing::warn!(
+            query = %query,
+            combined_len,
+            curated_len,
+            radio_len,
+            ranked_len = refined.tracks.len(),
+            "instant mix returned empty"
+        );
+    }
+
+    let taste_match_ids = refined.taste_match_ids;
+    let refinements = Some(refined.refinements);
+    let built = refined.instant_mix.map(|mix| BuiltInstantMix {
+        title: mix.title,
+        subtitle: mix.subtitle,
+        query: mix.query,
+        is_theme_mix: mix.is_theme_mix,
+        prominent: mix.prominent,
+        ai_interpreted: false,
+        total_duration: mix.total_duration as i64,
+        tracks: mix.tracks,
+        taste_match_ids,
+    });
+    (built, refinements)
 }
 
-async fn try_build_llm_instant_mix(
+pub async fn instant_mix(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let user = match require_web_user(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let query = q.q.unwrap_or_default().trim().to_string();
+    if query.is_empty() {
+        return json_res(json!({
+            "query": "",
+            "instantMix": Value::Null,
+            "refinements": Value::Null,
+        }));
+    }
+
+    let (built, refinements) =
+        compute_instant_mix(&state, user.id, &query, q.mode.as_deref()).await;
+    let instant_mix_json = built.as_ref().map(|mix| {
+        json!({
+            "title": mix.title,
+            "subtitle": mix.subtitle,
+            "query": mix.query,
+            "isThemeMix": mix.is_theme_mix,
+            "prominent": mix.prominent,
+            "aiInterpreted": mix.ai_interpreted,
+            "totalDuration": mix.total_duration,
+            "tracks": to_web_tracks_with_taste(&state, user.id, &mix.tracks, &mix.taste_match_ids),
+        })
+    });
+
+    json_res(json!({
+        "query": query,
+        "instantMix": instant_mix_json,
+        "refinements": refinements,
+    }))
+}
+
+async fn try_build_llm_instant_mix_data(
     state: &AppState,
     curator: &crate::llm::LlmCurator,
     uid: i64,
     query: &str,
-) -> Option<Response> {
+) -> Option<(BuiltInstantMix, crate::taste::SearchRefinements)> {
     let spec = match curator
         .interpret_instant_mix_prompt(&state.store, uid, query)
         .await
@@ -4204,20 +4648,20 @@ async fn try_build_llm_instant_mix(
         filter_chips: Vec::new(),
         query_suggestions: suggestions,
     };
-    Some(json_res(json!({
-        "query": query,
-        "instantMix": {
-            "title": mix.title,
-            "subtitle": mix.subtitle,
-            "query": mix.query,
-            "isThemeMix": mix.is_theme_mix,
-            "prominent": mix.prominent,
-            "aiInterpreted": true,
-            "totalDuration": mix.total_duration,
-            "tracks": to_web_tracks_with_taste(state, uid, &mix.tracks, &taste_match_ids),
+    Some((
+        BuiltInstantMix {
+            title: mix.title,
+            subtitle: mix.subtitle,
+            query: mix.query,
+            is_theme_mix: mix.is_theme_mix,
+            prominent: mix.prominent,
+            ai_interpreted: true,
+            total_duration: mix.total_duration as i64,
+            tracks: mix.tracks,
+            taste_match_ids,
         },
-        "refinements": refinements,
-    })))
+        refinements,
+    ))
 }
 
 /// Minimum size a theme mix should reach before we try to grow it.
@@ -4775,6 +5219,7 @@ async fn run_instant_mix_refine(
     .unwrap_or_else(|_| state.taste.search_and_refine(uid, &q_fallback, vec![], vec![]))
 }
 
+#[cfg(test)]
 fn format_instant_mix_response(
     state: &AppState,
     uid: i64,

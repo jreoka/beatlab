@@ -22,6 +22,11 @@
     globe: '<svg class="vis-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z"/></svg>',
     pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>',
     playlistAdd: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M11 12H3"/><path d="M16 6H3"/><path d="M16 18H3"/><path d="M18 9v6"/><path d="M21 12h-6"/></svg>',
+    sparkle: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 1.9 5.2L19 10l-5.1 1.8L12 17l-1.9-5.2L5 10l5.1-1.8L12 3z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16z"/></svg>',
+    edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>',
+    refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>',
+    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+    alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12.5"/><circle cx="12" cy="16.2" r="0.8" fill="currentColor" stroke="none"/></svg>',
   };
 
   function pinnedPlaylistsStorageKey() {
@@ -225,6 +230,14 @@
     currentShareUrl: '',
     searchState: null,
     activeInstantMix: null,
+    instantMixes: [],
+    instantMixesLoaded: false,
+    instantMixesFilter: 'all',
+    instantMixPollTimer: null,
+    instantMixPollingInFlight: false,
+    instantMixUnseenReady: new Set(),
+    instantMixPrevStatus: new Map(),
+    instantMixSaveTargetId: null,
     social: {
       profileData: null,
       profileTab: 'radio',
@@ -1957,6 +1970,17 @@
     state.lyrics = { synced: false, plain: '', lines: [] };
     state.activeLyricIdx = -1;
     state.searchState = null;
+    state.activeInstantMix = null;
+    stopInstantMixPoller();
+    state.instantMixes = [];
+    state.instantMixesLoaded = false;
+    state.instantMixesFilter = 'all';
+    state.instantMixUnseenReady.clear();
+    state.instantMixPrevStatus.clear();
+    state.instantMixSaveTargetId = null;
+    updateInstantMixIndicators();
+    const mixNotifStack = $('mix-notif-stack');
+    if (mixNotifStack) mixNotifStack.innerHTML = '';
     state.statsData = null;
     state.currentMoodShare = null;
     state.currentGenreShare = null;
@@ -2812,7 +2836,11 @@
     showAppShell();
     $('user-name').textContent = state.user.username;
     $('user-avatar').innerHTML = avatarInner(selfAvatarUser());
-    await Promise.all([refreshSidebarPlaylists(), restoreServerQueue()]);
+    await Promise.all([
+      refreshSidebarPlaylists(),
+      restoreServerQueue(),
+      refreshInstantMixes({ silent: true, initial: true }),
+    ]);
     renderCurrentHash();
     refreshLobby();
   }
@@ -3066,6 +3094,13 @@
         (r === 'library' && (hash === 'liked' || hash === 'history'));
       el.classList.toggle('active', match);
     });
+    const sidebarMixBtn = $('sidebar-instant-mixes-btn');
+    if (sidebarMixBtn) {
+      sidebarMixBtn.classList.toggle(
+        'active',
+        hash === 'mix' || hash.startsWith('mix?') || hash.startsWith('mix/')
+      );
+    }
 
     if (hash === 'home') return renderHome();
     if (hash === 'explore') return renderExplore();
@@ -3076,11 +3111,21 @@
       return renderProfileView(reference, tab);
     }
     if (hash.startsWith('explore-mix/')) return renderExploreMix(safeDecodeUri(hash.slice(12)));
+    if (hash.startsWith('mix/')) {
+      return renderInstantMixDetail(safeDecodeUri(hash.slice(4)));
+    }
     if (hash === 'mix' || hash.startsWith('mix?')) {
       const qIdx = hash.indexOf('?');
       const params = qIdx >= 0 ? new URLSearchParams(hash.slice(qIdx + 1)) : null;
-      const mixQ = params ? params.get('q') || '' : '';
-      return renderInstantMixPage(mixQ);
+      const mixQ = params ? (params.get('q') || '').trim() : '';
+      const mixMode = params ? (params.get('mode') || '').trim() : '';
+      if (mixQ) {
+        try {
+          history.replaceState(null, '', '#mix');
+        } catch {}
+        return renderInstantMixMenu({ submitQuery: mixQ, submitMode: mixMode });
+      }
+      return renderInstantMixMenu();
     }
     if (isSearchHash(hash)) {
       const q = extractSearchQueryFromHash(hash);
@@ -3832,50 +3877,597 @@
     }
   }
 
-  async function renderInstantMixPage(query) {
-    const cleanQ = String(query || '').trim();
-    const llmOn = Boolean(state.user?.llmEnabled);
-    state.searchState = null;
-    const placeholder = llmOn
-      ? 'Describe a vibe, scene, artist, or era (e.g. rainy 2am Tokyo drive with warm synths, Daft Punk)...'
-      : 'Enter an artist, song, genre, era, or mood (e.g. 80s hits, Daft Punk, chill)...';
-    const builderHeader = (val) => `
-      <div class="section-head" style="margin-bottom:14px">
-        <h1 class="page-greeting" style="margin-bottom:0">Instant Mix</h1>
+  function stopInstantMixPoller() {
+    if (state.instantMixPollTimer) {
+      clearTimeout(state.instantMixPollTimer);
+      state.instantMixPollTimer = null;
+    }
+    state.instantMixPollingInFlight = false;
+  }
+
+  function syncInstantMixPoller() {
+    const hasCreating = state.token && state.instantMixes.some((m) => m.status === 'creating');
+    if (!hasCreating) {
+      stopInstantMixPoller();
+      return;
+    }
+    if (state.instantMixPollTimer) return;
+    state.instantMixPollTimer = setTimeout(async () => {
+      state.instantMixPollTimer = null;
+      await refreshInstantMixes({ silent: true });
+    }, 1600);
+  }
+
+  function currentHashValue() {
+    return location.hash.replace(/^#/, '') || 'home';
+  }
+
+  function relativeMixTime(ts) {
+    if (!ts) return '';
+    const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(ts));
+    if (diff < 45) return 'Just now';
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 172800) return 'Yesterday';
+    if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+    try {
+      return new Date(Number(ts) * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    } catch {
+      return '';
+    }
+  }
+
+  function updateInstantMixIndicators() {
+    const creatingCount = state.instantMixes.filter((m) => m.status === 'creating').length;
+    const unseenCount = state.instantMixUnseenReady.size;
+
+    const sideBadge = $('sidebar-mix-badge');
+    if (sideBadge) {
+      if (creatingCount > 0) {
+        sideBadge.className = 'sidebar-mix-badge creating';
+        sideBadge.innerHTML = `<span class="imix-mini-spinner" aria-hidden="true"></span><span>${creatingCount}</span>`;
+      } else if (unseenCount > 0) {
+        sideBadge.className = 'sidebar-mix-badge ready';
+        sideBadge.innerHTML = `<span class="imix-ready-dot" aria-hidden="true"></span><span>${unseenCount}</span>`;
+      } else {
+        sideBadge.className = 'sidebar-mix-badge hidden';
+        sideBadge.innerHTML = '';
+      }
+    }
+
+    const topPill = $('topbar-mix-pill');
+    const topIcon = $('topbar-mix-icon');
+    const topLabel = $('topbar-mix-label');
+    if (topPill && topIcon && topLabel) {
+      if (creatingCount > 0) {
+        topPill.className = 'topbar-mix-pill creating';
+        topIcon.innerHTML = '<span class="imix-mini-spinner"></span>';
+        topLabel.textContent = creatingCount === 1 ? 'Curating mix' : `Curating (${creatingCount})`;
+      } else if (unseenCount > 0) {
+        topPill.className = 'topbar-mix-pill ready';
+        topIcon.innerHTML = '<span class="imix-ready-dot"></span>';
+        topLabel.textContent = unseenCount === 1 ? 'Mix ready' : `${unseenCount} mixes ready`;
+      } else {
+        topPill.className = 'topbar-mix-pill hidden';
+      }
+    }
+  }
+
+  function dismissMixNotification(el) {
+    if (!el || !el.parentNode) return;
+    clearTimeout(el._timer);
+    el.classList.add('leaving');
+    setTimeout(() => {
+      if (el.parentNode) el.parentNode.removeChild(el);
+    }, 220);
+  }
+
+  function showMixReadyNotification(mix) {
+    const stack = $('mix-notif-stack');
+    if (!stack || !mix) return;
+    while (stack.children.length >= 3) {
+      stack.removeChild(stack.firstElementChild);
+    }
+    const covers = Array.isArray(mix.covers) ? mix.covers.filter(Boolean).slice(0, 4) : [];
+    const thumbHtml =
+      covers.length >= 4
+        ? `<div class="mix-notif-mosaic">${covers.map((c) => `<img src="${esc(c)}" alt="" />`).join('')}</div>`
+        : `<img class="mix-notif-thumb" src="${esc(covers[0] || mix.coverUrl || '/api/web/cover/default')}" alt="" />`;
+    const metaParts = [];
+    if (mix.trackCount) metaParts.push(`${mix.trackCount} tracks`);
+    if (mix.totalDuration) metaParts.push(fmtTotalDur(mix.totalDuration));
+
+    const card = document.createElement('div');
+    card.className = 'mix-notif ready';
+    card.setAttribute('role', 'status');
+    card.innerHTML = `
+      <div class="mix-notif-art">
+        ${thumbHtml}
+        <span class="mix-notif-check" aria-hidden="true">${ICONS.check}</span>
       </div>
-      <form class="instant-mix-builder-form" onsubmit="App.submitInstantMixForm(event)">
-        <input id="instant-mix-term-input" type="text" value="${esc(val)}" placeholder="${esc(placeholder)}" autocomplete="off" />
-        <button type="submit" class="btn-primary">Create Instant Mix</button>
-      </form>
+      <div class="mix-notif-body">
+        <div class="mix-notif-kicker">Instant Mix Ready</div>
+        <div class="mix-notif-title">${esc(mix.title || mix.query)}</div>
+        ${metaParts.length ? `<div class="mix-notif-meta">${esc(metaParts.join(' · '))}</div>` : ''}
+        <div class="mix-notif-actions">
+          <button type="button" class="mix-notif-btn primary" data-action="view">View Mix</button>
+          <button type="button" class="mix-notif-btn" data-action="play">${ICONS.play} Play</button>
+        </div>
+      </div>
+      <button type="button" class="icon-btn mix-notif-close" title="Dismiss" aria-label="Dismiss notification">${ICONS.close}</button>
+      <div class="mix-notif-bar" aria-hidden="true"></div>
     `;
+
+    card.querySelector('[data-action="view"]').onclick = (e) => {
+      e.stopPropagation();
+      dismissMixNotification(card);
+      navigate(`mix/${encodeURIComponent(mix.id)}`);
+    };
+    card.querySelector('[data-action="play"]').onclick = (e) => {
+      e.stopPropagation();
+      dismissMixNotification(card);
+      playInstantMixById(mix.id);
+    };
+    card.querySelector('.mix-notif-close').onclick = (e) => {
+      e.stopPropagation();
+      dismissMixNotification(card);
+    };
+    card.onclick = () => {
+      dismissMixNotification(card);
+      navigate(`mix/${encodeURIComponent(mix.id)}`);
+    };
+
+    const scheduleDismiss = () => {
+      clearTimeout(card._timer);
+      card._timer = setTimeout(() => dismissMixNotification(card), 7500);
+    };
+    card.addEventListener('mouseenter', () => {
+      clearTimeout(card._timer);
+      card.classList.add('paused');
+    });
+    card.addEventListener('mouseleave', () => {
+      card.classList.remove('paused');
+      scheduleDismiss();
+    });
+    stack.appendChild(card);
+    scheduleDismiss();
+  }
+
+  function showMixFailedNotification(mix) {
+    const stack = $('mix-notif-stack');
+    if (!stack || !mix) return;
+    while (stack.children.length >= 3) {
+      stack.removeChild(stack.firstElementChild);
+    }
+    const card = document.createElement('div');
+    card.className = 'mix-notif failed';
+    card.setAttribute('role', 'status');
+    card.innerHTML = `
+      <div class="mix-notif-art failed-art">${ICONS.alert}</div>
+      <div class="mix-notif-body">
+        <div class="mix-notif-kicker">Instant Mix Couldn&apos;t Curate</div>
+        <div class="mix-notif-title">${esc(mix.title || mix.query)}</div>
+        <div class="mix-notif-meta">${esc(mix.error || 'Try another artist, genre, or vibe.')}</div>
+        <div class="mix-notif-actions">
+          <button type="button" class="mix-notif-btn" data-action="retry">${ICONS.refresh} Retry</button>
+          <button type="button" class="mix-notif-btn" data-action="open">Open Menu</button>
+        </div>
+      </div>
+      <button type="button" class="icon-btn mix-notif-close" title="Dismiss" aria-label="Dismiss notification">${ICONS.close}</button>
+    `;
+    card.querySelector('[data-action="retry"]').onclick = (e) => {
+      e.stopPropagation();
+      dismissMixNotification(card);
+      retryInstantMix(mix.id);
+    };
+    card.querySelector('[data-action="open"]').onclick = (e) => {
+      e.stopPropagation();
+      dismissMixNotification(card);
+      navigate('mix');
+    };
+    card.querySelector('.mix-notif-close').onclick = (e) => {
+      e.stopPropagation();
+      dismissMixNotification(card);
+    };
+    stack.appendChild(card);
+    card._timer = setTimeout(() => dismissMixNotification(card), 7000);
+  }
+
+  async function refreshInstantMixes({ silent = false, initial = false } = {}) {
+    if (!state.token || state.instantMixPollingInFlight) return state.instantMixes;
+    state.instantMixPollingInFlight = true;
+    try {
+      const d = await api('/api/web/instant-mixes');
+      const mixes = Array.isArray(d.mixes) ? d.mixes : [];
+      const hash = currentHashValue();
+      const viewingMixId = hash.startsWith('mix/') ? safeDecodeUri(hash.slice(4)) : '';
+      let activeDetailTransitioned = false;
+
+      if (!initial) {
+        for (const m of mixes) {
+          const prev = state.instantMixPrevStatus.get(m.id);
+          if (prev === 'creating' && m.status === 'ready') {
+            haptic('success');
+            if (hash !== 'mix' && viewingMixId !== m.id) {
+              state.instantMixUnseenReady.add(m.id);
+            }
+            showMixReadyNotification(m);
+            if (viewingMixId === m.id) activeDetailTransitioned = true;
+          } else if (prev === 'creating' && m.status === 'failed') {
+            showMixFailedNotification(m);
+            if (viewingMixId === m.id) activeDetailTransitioned = true;
+          }
+        }
+      }
+
+      const nextStatusMap = new Map();
+      for (const m of mixes) {
+        nextStatusMap.set(m.id, m.status);
+      }
+      state.instantMixPrevStatus = nextStatusMap;
+      state.instantMixes = mixes;
+      state.instantMixesLoaded = true;
+      updateInstantMixIndicators();
+
+      if (hash === 'mix' && $('imix-list-region')) {
+        renderInstantMixesListDom();
+      } else if (activeDetailTransitioned && viewingMixId) {
+        renderInstantMixDetail(viewingMixId, { silent: true });
+      }
+      return mixes;
+    } catch (e) {
+      if (!silent) showToast(e.message || 'Could not load instant mixes');
+      return state.instantMixes;
+    } finally {
+      state.instantMixPollingInFlight = false;
+      syncInstantMixPoller();
+    }
+  }
+
+  async function submitBackgroundInstantMix(query, mode = '') {
+    const cleanQ = String(query || '').trim();
     if (!cleanQ) {
-      state.activeInstantMix = null;
-      const dailyPrompts = Array.isArray(state.llmSearchPrompts) && state.llmSearchPrompts.length
+      showToast('Describe a vibe, artist, song, or genre');
+      return null;
+    }
+    try {
+      const d = await api('/api/web/instant-mixes', {
+        method: 'POST',
+        body: JSON.stringify({ query: cleanQ, mode: String(mode || '').trim() }),
+      });
+      const mix = d && d.mix;
+      if (!mix) return null;
+      haptic('tap');
+      state.instantMixes = [mix, ...state.instantMixes.filter((x) => x.id !== mix.id)];
+      state.instantMixesLoaded = true;
+      state.instantMixPrevStatus.set(mix.id, mix.status || 'creating');
+      if (state.instantMixesFilter === 'ready') {
+        state.instantMixesFilter = 'all';
+      }
+      updateInstantMixIndicators();
+      syncInstantMixPoller();
+      if (currentHashValue() === 'mix' && $('imix-list-region')) {
+        renderInstantMixesListDom();
+      }
+      showToast(`Curating "${mix.title}" in the background…`);
+      return mix;
+    } catch (e) {
+      showToast(e.message || 'Could not start instant mix');
+      return null;
+    }
+  }
+
+  function instantMixVibeChips() {
+    const llmOn = Boolean(state.user?.llmEnabled);
+    const dailyPrompts =
+      Array.isArray(state.llmSearchPrompts) && state.llmSearchPrompts.length
         ? state.llmSearchPrompts.map((p) => ({
             label: p.label || p.query,
             query: p.query || p.label,
           }))
         : [];
-      const fallbackPrompts = llmOn
-        ? [
-            { label: 'Rainy 2am Tokyo drive, warm synths', query: 'rainy 2am Tokyo drive with warm analog synths' },
-            { label: 'Cozy Sunday morning acoustic coffee', query: 'cozy sunday morning acoustic songs for coffee' },
-            { label: 'Upbeat indie rock for cleaning', query: 'upbeat indie rock like early strokes for cleaning' },
-            { label: '80s hits', query: '80s hits' },
-            { label: 'Late night chill', query: 'Late night chill' },
-          ]
-        : ['80s hits', '90s rock', 'Late night chill', 'Workout energy', 'Indie synthpop'].map((sg) => ({
-            label: sg,
-            query: sg,
-          }));
-      const chips = dailyPrompts.length ? dailyPrompts : fallbackPrompts;
+    if (dailyPrompts.length) return dailyPrompts.slice(0, 8);
+    return llmOn
+      ? [
+          { label: 'Rainy 2am Tokyo drive, warm synths', query: 'rainy 2am Tokyo drive with warm analog synths' },
+          { label: 'Cozy Sunday morning acoustic coffee', query: 'cozy sunday morning acoustic songs for coffee' },
+          { label: 'Upbeat indie rock for cleaning', query: 'upbeat indie rock like early strokes for cleaning' },
+          { label: 'Golden hour coastal chill', query: 'golden hour coastal chill dream pop and surf indie' },
+          { label: '80s synthwave classics', query: '80s synthwave classics' },
+          { label: 'High-energy workout beats', query: 'high energy workout beats' },
+        ]
+      : [
+          '80s hits',
+          '90s rock',
+          'Late night chill',
+          'Workout energy',
+          'Indie synthpop',
+          'Acoustic coffeehouse',
+        ].map((sg) => ({ label: sg, query: sg }));
+  }
+
+  function renderMixArtContent(covers, fallbackCover) {
+    const list = Array.isArray(covers) ? covers.filter(Boolean).slice(0, 4) : [];
+    if (list.length >= 4) {
+      return `<div class="imix-mosaic">${list.map((c) => `<img src="${esc(c)}" loading="lazy" alt="" />`).join('')}</div>`;
+    }
+    if (list.length >= 1) {
+      return `<img class="imix-single-img" src="${esc(list[0])}" loading="lazy" alt="" />`;
+    }
+    if (fallbackCover && !fallbackCover.endsWith('/default')) {
+      return `<img class="imix-single-img" src="${esc(fallbackCover)}" loading="lazy" alt="" />`;
+    }
+    return `<div class="imix-placeholder-art">${ICONS.sparkle}</div>`;
+  }
+
+  function renderInstantMixMenuCard(m) {
+    const idArg = esc(JSON.stringify(m.id));
+    const isCreating = m.status === 'creating';
+    const isFailed = m.status === 'failed';
+    const isReady = m.status === 'ready';
+    const isUnseen = state.instantMixUnseenReady.has(m.id);
+    const ago = relativeMixTime(m.changed || m.created);
+
+    if (isCreating) {
+      return `<article class="imix-card creating" onclick="App.navigate('mix/${encodeURIComponent(m.id)}')">
+        <div class="imix-card-art creating-art">
+          <div class="imix-art-shimmer" aria-hidden="true"></div>
+          <div class="imix-art-spinner-wrap" aria-hidden="true">
+            <div class="imix-art-spinner"></div>
+          </div>
+          <span class="imix-status-pill creating"><span class="imix-mini-spinner"></span>Curating</span>
+          <button type="button" class="imix-card-icon-btn top-right" title="Cancel mix" aria-label="Cancel mix" onclick="event.stopPropagation();App.deleteInstantMix(${idArg})">${ICONS.close}</button>
+        </div>
+        <div class="imix-card-body">
+          <div class="imix-card-title">${esc(m.title || m.query)}</div>
+          <div class="imix-card-sub creating-text">Curating tracks in the background…</div>
+          <div class="imix-card-meta">
+            <span>Started ${esc(ago || 'just now')}</span>
+          </div>
+        </div>
+      </article>`;
+    }
+
+    if (isFailed) {
+      return `<article class="imix-card failed" onclick="App.navigate('mix/${encodeURIComponent(m.id)}')">
+        <div class="imix-card-art failed-art">
+          <div class="imix-failed-icon">${ICONS.alert}</div>
+          <span class="imix-status-pill failed">Couldn&apos;t curate</span>
+          <button type="button" class="imix-card-icon-btn top-right" title="Remove" aria-label="Remove mix" onclick="event.stopPropagation();App.deleteInstantMix(${idArg})">${ICONS.trash}</button>
+        </div>
+        <div class="imix-card-body">
+          <div class="imix-card-title">${esc(m.title || m.query)}</div>
+          <div class="imix-card-sub">${esc(m.error || 'No matching tracks found.')}</div>
+          <div class="imix-card-failed-actions">
+            <button type="button" class="mini-btn" onclick="event.stopPropagation();App.retryInstantMix(${idArg})">${ICONS.refresh} Retry</button>
+            <button type="button" class="mini-btn danger-text" onclick="event.stopPropagation();App.deleteInstantMix(${idArg})">Remove</button>
+          </div>
+        </div>
+      </article>`;
+    }
+
+    const metaBits = [];
+    if (m.trackCount) metaBits.push(`${m.trackCount} tracks`);
+    if (m.totalDuration) metaBits.push(fmtTotalDur(m.totalDuration));
+    if (ago) metaBits.push(ago);
+
+    return `<article class="imix-card ready${isUnseen ? ' unseen' : ''}" data-share-kind="mix" data-share-id="${esc(m.id)}" data-share-title="${esc(m.title)}" data-share-sub="${esc(m.subtitle || '')}" data-share-cover="${esc(m.coverUrl || '')}" onclick="App.navigate('mix/${encodeURIComponent(m.id)}')">
+      <div class="imix-card-art">
+        ${renderMixArtContent(m.covers, m.coverUrl)}
+        <div class="imix-card-badges">
+          ${m.aiInterpreted ? '<span class="imix-badge ai">AI</span>' : ''}
+          ${m.savedPlaylistId ? '<span class="imix-badge saved">Saved ✓</span>' : ''}
+        </div>
+        <div class="imix-card-top-actions">
+          <button type="button" class="imix-card-icon-btn" title="Rename mix" aria-label="Rename ${esc(m.title)}" onclick="event.stopPropagation();App.promptRenameInstantMix(${idArg})">${ICONS.edit}</button>
+          <button type="button" class="imix-card-icon-btn" title="More options" aria-label="Options for ${esc(m.title)}" onclick="event.stopPropagation();App.openInstantMixCardMenu(event, ${idArg})">${ICONS.more}</button>
+        </div>
+        ${
+          isReady && m.trackCount > 0
+            ? `<button type="button" class="card-play-fab" title="Play ${esc(m.title)}" aria-label="Play ${esc(m.title)}" onclick="event.stopPropagation();App.playInstantMixById(${idArg}, this)">${ICONS.play}</button>`
+            : ''
+        }
+      </div>
+      <div class="imix-card-body">
+        <div class="imix-card-title">${esc(m.title || m.query)}</div>
+        <div class="imix-card-sub">${esc(m.subtitle || m.query)}</div>
+        <div class="imix-card-meta">${esc(metaBits.join(' · '))}</div>
+      </div>
+    </article>`;
+  }
+
+  function renderInstantMixesListDom() {
+    const region = $('imix-list-region');
+    if (!region) return;
+    const all = state.instantMixes || [];
+    const creatingCount = all.filter((m) => m.status === 'creating').length;
+    const readyCount = all.filter((m) => m.status === 'ready').length;
+    const failedCount = all.filter((m) => m.status === 'failed').length;
+    const filter = state.instantMixesFilter || 'all';
+
+    const headerPill = $('imix-composer-live-pill');
+    if (headerPill) {
+      if (creatingCount > 0) {
+        headerPill.className = 'imix-live-pill';
+        headerPill.innerHTML = `<span class="imix-mini-spinner"></span><span>${creatingCount} curating in background</span>`;
+      } else {
+        headerPill.className = 'imix-live-pill hidden';
+        headerPill.innerHTML = '';
+      }
+    }
+
+    const filtered = all.filter((m) => {
+      if (filter === 'creating') return m.status === 'creating';
+      if (filter === 'ready') return m.status === 'ready';
+      return true;
+    });
+
+    if (!state.instantMixesLoaded && !all.length) {
+      region.innerHTML = `
+        <div class="main-loading-state" style="min-height:160px">
+          <div class="loading-spinner" aria-hidden="true"></div>
+          <p class="loading-label">Loading your instant mixes…</p>
+        </div>`;
+      return;
+    }
+
+    if (!all.length) {
+      region.innerHTML = `
+        <div class="imix-empty-state">
+          <div class="imix-empty-icon">${ICONS.sparkle}</div>
+          <h3>No instant mixes yet</h3>
+          <p>Submit any vibe, artist, song, or era above. Mixes curate automatically in the background and notify you as soon as they&apos;re ready to play.</p>
+        </div>`;
+      return;
+    }
+
+    region.innerHTML = `
+      <div class="imix-list-head">
+        <div class="imix-list-head-left">
+          <h2>Your Instant Mixes</h2>
+          <div class="imix-filter-tabs" role="tablist" aria-label="Filter instant mixes">
+            <button type="button" class="tab-chip ${filter === 'all' ? 'active' : ''}" onclick="App.setInstantMixFilter('all')">All (${all.length})</button>
+            ${
+              creatingCount > 0
+                ? `<button type="button" class="tab-chip ${filter === 'creating' ? 'active' : ''}" onclick="App.setInstantMixFilter('creating')"><span class="imix-mini-spinner inline"></span>Curating (${creatingCount})</button>`
+                : ''
+            }
+            <button type="button" class="tab-chip ${filter === 'ready' ? 'active' : ''}" onclick="App.setInstantMixFilter('ready')">Ready (${readyCount})</button>
+          </div>
+        </div>
+        ${
+          failedCount > 0
+            ? `<button type="button" class="mini-btn danger-text" onclick="App.clearFailedInstantMixes()">Clear failed (${failedCount})</button>`
+            : ''
+        }
+      </div>
+      ${
+        filtered.length
+          ? `<div class="imix-grid">${filtered.map(renderInstantMixMenuCard).join('')}</div>`
+          : `<p class="muted-center" style="padding:28px 0">No mixes in this filter right now.</p>`
+      }
+    `;
+  }
+
+  async function renderInstantMixMenu({ submitQuery = '', submitMode = '', focusInput = false } = {}) {
+    const { reqToken, signal } = beginViewRequest();
+    state.searchState = null;
+    state.activeInstantMix = null;
+    if (state.instantMixUnseenReady.size > 0) {
+      state.instantMixUnseenReady.clear();
+      updateInstantMixIndicators();
+    }
+
+    const llmOn = Boolean(state.user?.llmEnabled);
+    const placeholder = llmOn
+      ? 'Describe a vibe, scene, artist, genre, or era (e.g. rainy 2am Tokyo drive with warm synths)...'
+      : 'Enter an artist, song, genre, era, or mood (e.g. 80s hits, Daft Punk, late night chill)...';
+    const chips = instantMixVibeChips();
+
+    $('main-view').innerHTML = `
+      <div class="imix-page">
+        <section class="imix-composer-card">
+          <div class="imix-composer-top">
+            <div class="imix-composer-heading">
+              <span class="imix-composer-badge" aria-hidden="true">${ICONS.sparkle}</span>
+              <div>
+                <h1 class="imix-page-title">Instant Mixes</h1>
+                <p class="imix-page-sub">Submit as many mixes as you like — they curate in the background and notify you when ready.</p>
+              </div>
+            </div>
+            <div id="imix-composer-live-pill" class="imix-live-pill hidden"></div>
+          </div>
+
+          <form class="imix-composer-form" onsubmit="App.submitInstantMixForm(event)" autocomplete="off">
+            <div class="imix-input-wrap">
+              <span class="imix-input-icon" aria-hidden="true">${ICONS.sparkle}</span>
+              <input
+                id="instant-mix-composer-input"
+                type="text"
+                name="beatlab-mix-vibe"
+                value=""
+                placeholder="${esc(placeholder)}"
+                maxlength="240"
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
+                data-form-type="other"
+              />
+            </div>
+            <button type="submit" class="btn-primary imix-submit-btn">${ICONS.sparkle} Create Mix</button>
+          </form>
+
+          <div class="imix-chips-row">
+            <span class="imix-chips-label">Quick vibes:</span>
+            <div class="instant-mix-suggestions">
+              ${chips
+                .map(
+                  (sg) =>
+                    `<button type="button" class="refine-query-pill" onclick="App.queueInstantMixPrompt(${esc(JSON.stringify(sg.query))})">${esc(sg.label)}</button>`
+                )
+                .join('')}
+            </div>
+          </div>
+        </section>
+
+        <section id="imix-list-region" class="imix-library-section"></section>
+      </div>
+    `;
+    $('main-view').scrollTop = 0;
+    renderInstantMixesListDom();
+
+    if (focusInput) {
+      const inp = $('instant-mix-composer-input');
+      if (inp) {
+        inp.value = '';
+        inp.focus();
+      }
+    }
+
+    if (submitQuery) {
+      await submitBackgroundInstantMix(submitQuery, submitMode);
+    }
+    if (!isViewRequestCurrent(reqToken, signal)) return;
+    await refreshInstantMixes({ silent: true });
+  }
+
+  function renderInstantMixDetailDom(mix) {
+    const idArg = esc(JSON.stringify(mix.id));
+    const backBar = `
+      <div class="imix-detail-nav">
+        <button type="button" class="imix-back-btn" onclick="App.navigate('mix')">${ICONS.back}<span>All Instant Mixes</span></button>
+      </div>
+    `;
+
+    if (mix.status === 'creating') {
       $('main-view').innerHTML = `
-        ${builderHeader('')}
-        <div class="instant-mix-suggestions">
-          ${chips
+        ${backBar}
+        <div class="hero-header imix-detail-hero creating">
+          <div class="imix-hero-creating-art">
+            <div class="imix-art-shimmer" aria-hidden="true"></div>
+            <div class="imix-art-spinner-wrap" aria-hidden="true"><div class="imix-art-spinner lg"></div></div>
+          </div>
+          <div class="hero-info">
+            <div class="hero-kicker"><span class="imix-mini-spinner inline"></span> CURATING IN BACKGROUND</div>
+            <h1 class="hero-title">${esc(mix.title || mix.query)}</h1>
+            <div class="hero-sub">Finding the best matching tracks for &ldquo;${esc(mix.query)}&rdquo;. Feel free to keep browsing — we&apos;ll notify you as soon as it&apos;s ready.</div>
+            <div class="hero-actions">
+              <button type="button" class="btn-secondary" onclick="App.navigate('mix')">Back to Instant Mixes</button>
+              <button type="button" class="btn-secondary danger-text" onclick="App.deleteInstantMix(${idArg})">Cancel Mix</button>
+            </div>
+          </div>
+        </div>
+        <div class="imix-skeleton-list" aria-hidden="true">
+          ${Array.from({ length: 6 })
             .map(
-              (sg) =>
-                `<button class="refine-query-pill" onclick="App.navigate('mix?q=${encodeURIComponent(sg.query)}')">${esc(sg.label)}</button>`
+              () => `<div class="imix-skel-row">
+                <span class="imix-skel-box num"></span>
+                <span class="imix-skel-box thumb"></span>
+                <div class="imix-skel-lines"><span class="imix-skel-box title"></span><span class="imix-skel-box sub"></span></div>
+                <span class="imix-skel-box dur"></span>
+              </div>`
             )
             .join('')}
         </div>
@@ -3883,56 +4475,408 @@
       return;
     }
 
+    if (mix.status === 'failed') {
+      $('main-view').innerHTML = `
+        ${backBar}
+        <div class="hero-header imix-detail-hero failed">
+          <div class="imix-hero-failed-art">${ICONS.alert}</div>
+          <div class="hero-info">
+            <div class="hero-kicker" style="color:var(--danger)">INSTANT MIX · FAILED</div>
+            <h1 class="hero-title">${esc(mix.title || mix.query)}</h1>
+            <div class="hero-sub">${esc(mix.error || 'Could not curate tracks for this prompt.')}</div>
+            <div class="hero-actions">
+              <button type="button" class="btn-primary" onclick="App.retryInstantMix(${idArg})">${ICONS.refresh} Retry Curation</button>
+              <button type="button" class="btn-secondary danger-text" onclick="App.deleteInstantMix(${idArg})">Delete Mix</button>
+            </div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    const tracks = Array.isArray(mix.tracks) ? mix.tracks : [];
+    const covers = [];
+    for (const c of Array.isArray(mix.covers) ? mix.covers : []) {
+      if (c && !covers.includes(c)) covers.push(c);
+      if (covers.length === 4) break;
+    }
+    if (covers.length < 4) {
+      for (const t of tracks) {
+        if (t.coverUrl && !covers.includes(t.coverUrl)) {
+          covers.push(t.coverUrl);
+          if (covers.length === 4) break;
+        }
+      }
+    }
+    const artHtml =
+      covers.length >= 4
+        ? `<div class="hero-collage">${covers.map((c) => `<img src="${esc(c)}" alt="" />`).join('')}</div>`
+        : covers.length >= 1
+          ? `<img class="hero-art" src="${esc(covers[0])}" alt="${esc(mix.title)}" />`
+          : `<div class="hero-art imix-placeholder-art">${ICONS.sparkle}</div>`;
+
+    const kickerParts = ['INSTANT MIX'];
+    if (mix.aiInterpreted) kickerParts.push('AI CURATED');
+    else if (mix.refinements?.detectedIntent) kickerParts.push(String(mix.refinements.detectedIntent).toUpperCase());
+
+    const subParts = [];
+    if (mix.subtitle) subParts.push(mix.subtitle);
+    subParts.push(`${tracks.length} song${tracks.length === 1 ? '' : 's'}`);
+    subParts.push(fmtTotalDur(mix.totalDuration));
+
+    const suggestions = Array.isArray(mix.refinements?.querySuggestions)
+      ? mix.refinements.querySuggestions.filter(Boolean)
+      : [];
+
+    $('main-view').innerHTML = `
+      ${backBar}
+      <div class="hero-header imix-detail-hero" data-share-kind="mix" data-share-id="${esc(mix.id)}" data-share-title="${esc(mix.title)}" data-share-sub="${esc(mix.subtitle || '')}" data-share-cover="${esc(covers[0] || '')}">
+        ${artHtml}
+        <div class="hero-info">
+          <div class="hero-kicker">${esc(kickerParts.join(' · '))}</div>
+          <h1 class="hero-title">${esc(mix.title)}</h1>
+          <div class="hero-sub">${esc(subParts.join(' · '))}</div>
+          ${
+            mix.query && mix.query.toLowerCase() !== (mix.title || '').toLowerCase()
+              ? `<div class="imix-prompt-pill">Prompt: &ldquo;${esc(mix.query)}&rdquo;</div>`
+              : ''
+          }
+          <div class="hero-actions">
+            ${tracks.length ? `<button type="button" class="btn-primary" onclick="App.playInstantMix(false, 0)">${ICONS.play} Play</button>` : ''}
+            ${tracks.length > 1 ? `<button type="button" class="btn-secondary" onclick="App.playInstantMix(true, 0)">Shuffle</button>` : ''}
+            ${tracks.length ? `<button type="button" class="btn-secondary" onclick="App.queueInstantMix()">Add to Queue</button>` : ''}
+            ${
+              mix.savedPlaylistId
+                ? `<button type="button" class="btn-secondary" onclick="App.navigate('playlist/${encodeURIComponent(mix.savedPlaylistId)}')">${ICONS.check} Saved Playlist</button>`
+                : tracks.length
+                  ? `<button type="button" class="btn-secondary" onclick="App.promptSaveInstantMix(${idArg})">+ Save to Playlists</button>`
+                  : ''
+            }
+            ${tracks.length ? `<button type="button" class="btn-secondary" onclick="App.shareCurrentInstantMix()">${ICONS.share} Share</button>` : ''}
+            <button type="button" class="btn-secondary" onclick="App.promptRenameInstantMix(${idArg})">${ICONS.edit} Rename</button>
+            <button type="button" class="btn-secondary" onclick="App.retryInstantMix(${idArg})">${ICONS.refresh} Regenerate</button>
+            <button type="button" class="btn-secondary danger-text" onclick="App.deleteInstantMix(${idArg})">${ICONS.trash} Delete</button>
+          </div>
+        </div>
+      </div>
+      ${
+        tracks.length
+          ? `<div class="track-table">${renderTrackRows(tracks, tracks, mix.id, false, mix.query, false, true)}</div>`
+          : `<p class="muted-center">No tracks left in this mix. Click Regenerate to build a fresh set of tracks.</p>`
+      }
+      ${
+        suggestions.length
+          ? `<section class="section imix-related-section">
+              <div class="section-head"><h2>Spin up a related instant mix</h2></div>
+              <div class="instant-mix-suggestions">
+                ${suggestions
+                  .map(
+                    (sg) =>
+                      `<button type="button" class="refine-query-pill" onclick="App.queueInstantMixPrompt(${esc(JSON.stringify(sg))}, true)">${ICONS.sparkle} ${esc(sg)}</button>`
+                  )
+                  .join('')}
+              </div>
+            </section>`
+          : ''
+      }
+    `;
+  }
+
+  async function renderInstantMixDetail(id, { silent = false } = {}) {
+    const cleanId = String(id || '').trim();
+    if (!cleanId) return renderInstantMixMenu();
     const { reqToken, signal } = beginViewRequest();
-    setMainLoading(`Creating instant mix for "${cleanQ}"...`);
+    state.searchState = null;
+    if (state.instantMixUnseenReady.delete(cleanId)) {
+      updateInstantMixIndicators();
+    }
+    if (!silent) {
+      setMainLoading('Loading instant mix...');
+    }
     try {
-      const d = await api(`/api/web/instant-mix?q=${encodeURIComponent(cleanQ)}`, { signal });
+      const d = await api(`/api/web/instant-mixes/${encodeURIComponent(cleanId)}`, { signal });
       if (!isViewRequestCurrent(reqToken, signal)) return;
-      if (!d.instantMix || !Array.isArray(d.instantMix.tracks) || !d.instantMix.tracks.length) {
-        state.activeInstantMix = null;
-        $('main-view').innerHTML = `
-          ${builderHeader(cleanQ)}
-          <p class="muted-center">Couldn't build an instant mix for "${esc(cleanQ)}". Try another artist, song, era, or vibe.</p>
-        `;
+      const mix = d && d.mix;
+      if (!mix) {
+        $('main-view').innerHTML = `<p class="muted-center">Instant mix not found. <button class="mini-btn" onclick="App.navigate('mix')">Back to Instant Mixes</button></p>`;
         return;
       }
-      const mix = {
-        ...d.instantMix,
-        tracks: cacheTracks(d.instantMix.tracks || []),
-      };
+      mix.tracks = cacheTracks(mix.tracks || []);
       state.activeInstantMix = {
+        id: mix.id,
         mix,
-        query: cleanQ,
-        refinements: d.refinements || null,
+        query: mix.query,
+        refinements: mix.refinements || null,
         expanded: true,
       };
-      $('main-view').innerHTML = `
-        ${builderHeader(cleanQ)}
-        ${renderInstantMixCard(mix, d.refinements || null, cleanQ, true)}
-      `;
-      $('main-view').scrollTop = 0;
+      // Keep local summary list in sync.
+      const idx = state.instantMixes.findIndex((x) => x.id === mix.id);
+      const summaryPatch = {
+        id: mix.id,
+        query: mix.query,
+        mode: mix.mode,
+        status: mix.status,
+        title: mix.title,
+        subtitle: mix.subtitle,
+        isThemeMix: mix.isThemeMix,
+        prominent: mix.prominent,
+        aiInterpreted: mix.aiInterpreted,
+        totalDuration: mix.totalDuration,
+        trackCount: mix.tracks.length,
+        covers: mix.covers,
+        coverUrl: mix.coverUrl,
+        savedPlaylistId: mix.savedPlaylistId,
+        error: mix.error,
+        created: mix.created,
+        changed: mix.changed,
+      };
+      if (idx >= 0) state.instantMixes[idx] = summaryPatch;
+      else state.instantMixes.unshift(summaryPatch);
+      state.instantMixPrevStatus.set(mix.id, mix.status);
+      updateInstantMixIndicators();
+      syncInstantMixPoller();
+
+      renderInstantMixDetailDom(mix);
+      if (!silent) $('main-view').scrollTop = 0;
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
     }
   }
 
-  function promptInstantMix(initialQuery = '') {
-    const defaultVal = String(initialQuery || (state.searchState ? state.searchState.query : '') || '').trim();
-    const llmOn = Boolean(state.user?.llmEnabled);
-    const hint = llmOn
-      ? 'Describe any mood, scene, activity, artist, song, genre, or era.'
-      : 'Generate an on-demand mix from any artist, song, genre, era, or mood.';
-    const placeholder = llmOn
-      ? 'e.g. rainy 2am Tokyo drive with warm synths, Daft Punk, 80s hits...'
-      : 'e.g. 80s hits, Daft Punk, late night chill...';
+  async function playInstantMixById(id, btn = null, shuffled = false) {
+    const cleanId = String(id || '').trim();
+    if (!cleanId) return;
+    if (state.activeInstantMix?.id === cleanId && state.activeInstantMix.mix?.tracks?.length) {
+      playInstantMix(shuffled, 0);
+      return;
+    }
+    if (btn && btn.classList.contains('fab-loading')) return;
+    setFabLoading(btn);
+    const { token, signal } = beginQueueFetch();
+    try {
+      const d = await api(`/api/web/instant-mixes/${encodeURIComponent(cleanId)}`, { signal });
+      if (token !== state.queueActionToken) return;
+      const tracks = cacheTracks(d?.mix?.tracks || []);
+      if (!tracks.length) {
+        showToast('No playable tracks in this mix yet');
+        return;
+      }
+      const ids = tracks.map((t) => t.id);
+      sendTrackEvent(ids[0], 'mix_play', 1);
+      if (shuffled) playShuffledIds(ids);
+      else playListByIds(ids, 0);
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      showToast(e.message || 'Could not play instant mix');
+    } finally {
+      clearFabLoading(btn);
+    }
+  }
+
+  function openInstantMixCardMenu(event, id) {
+    if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+    const mix = state.instantMixes.find((m) => m.id === id);
+    if (!mix) return;
+    closeTrackMenu();
+    const menu = $('context-menu');
+    const backdrop = $('ctx-backdrop');
+    const idArg = esc(JSON.stringify(mix.id));
+    menu.innerHTML = `
+      <div class="ctx-sheet-head">
+        <img src="${esc(mix.coverUrl || '/api/web/cover/default')}" alt="" />
+        <div class="ctx-sheet-meta">
+          <div class="ctx-sheet-title">${esc(mix.title || mix.query)}</div>
+          <div class="ctx-sheet-sub">${esc(`${mix.trackCount || 0} tracks · Instant Mix`)}</div>
+        </div>
+        <button class="icon-btn" title="Close" onclick="App.closeTrackMenu()">${ICONS.close}</button>
+      </div>
+      <button class="ctx-item" onclick="App.closeTrackMenu();App.navigate('mix/${encodeURIComponent(mix.id)}')">Open Full Playlist</button>
+      <button class="ctx-item" onclick="App.closeTrackMenu();App.playInstantMixById(${idArg}, null, false)">Play Mix</button>
+      <button class="ctx-item" onclick="App.closeTrackMenu();App.playInstantMixById(${idArg}, null, true)">Shuffle Mix</button>
+      <hr class="ctx-sep">
+      ${
+        mix.savedPlaylistId
+          ? `<button class="ctx-item" onclick="App.closeTrackMenu();App.navigate('playlist/${encodeURIComponent(mix.savedPlaylistId)}')">Open Saved Playlist ✓</button>`
+          : `<button class="ctx-item" onclick="App.closeTrackMenu();App.promptSaveInstantMix(${idArg})">Save to Playlists</button>`
+      }
+      <button class="ctx-item" onclick="App.closeTrackMenu();App.promptRenameInstantMix(${idArg})">Rename Mix</button>
+      <button class="ctx-item" onclick="App.closeTrackMenu();App.retryInstantMix(${idArg})">Regenerate Mix</button>
+      <hr class="ctx-sep">
+      <button class="ctx-item danger" onclick="App.closeTrackMenu();App.deleteInstantMix(${idArg})">Delete Mix</button>
+    `;
+    positionContextMenu(menu, backdrop, event);
+  }
+
+  function promptRenameInstantMix(id) {
+    const mix =
+      (state.activeInstantMix?.id === id ? state.activeInstantMix.mix : null) ||
+      state.instantMixes.find((m) => m.id === id);
+    if (!mix) return;
+    const idArg = esc(JSON.stringify(mix.id));
     openModal(`
-      <div class="modal-head"><h3>Create Instant Mix</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
-      <form onsubmit="App.submitInstantMixModal(event)" style="display:flex;flex-direction:column;gap:12px">
-        <p style="font-size:13px;color:var(--text-muted)">${esc(hint)}</p>
-        <input id="instant-mix-modal-input" type="text" value="${esc(defaultVal)}" placeholder="${esc(placeholder)}" required autofocus />
-        <button type="submit" class="btn-primary">Create Instant Mix</button>
+      <div class="modal-head"><h3>Rename Instant Mix</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
+      <form onsubmit="App.submitRenameInstantMix(event, ${idArg})" style="display:flex;flex-direction:column;gap:12px" autocomplete="off">
+        <input id="rename-mix-title" type="text" value="${esc(mix.title || '')}" placeholder="Mix title" maxlength="120" autocomplete="off" required autofocus />
+        <input id="rename-mix-sub" type="text" value="${esc(mix.subtitle || '')}" placeholder="Subtitle (optional)" maxlength="240" autocomplete="off" />
+        <button type="submit" class="btn-primary">Save Changes</button>
       </form>
     `);
+  }
+
+  async function submitRenameInstantMix(e, id) {
+    e.preventDefault();
+    const title = ($('rename-mix-title')?.value || '').trim();
+    const subtitle = ($('rename-mix-sub')?.value || '').trim();
+    if (!title) {
+      showToast('Please enter a mix name');
+      return;
+    }
+    try {
+      const d = await api(`/api/web/instant-mixes/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title, subtitle }),
+      });
+      closeModal();
+      const updated = d && d.mix;
+      if (updated) {
+        updated.tracks = cacheTracks(updated.tracks || []);
+        const idx = state.instantMixes.findIndex((m) => m.id === id);
+        if (idx >= 0) {
+          state.instantMixes[idx] = { ...state.instantMixes[idx], title: updated.title, subtitle: updated.subtitle };
+        }
+        if (state.activeInstantMix?.id === id) {
+          state.activeInstantMix.mix = updated;
+          if (currentHashValue() === `mix/${id}`) {
+            renderInstantMixDetailDom(updated);
+          }
+        }
+        if (currentHashValue() === 'mix') {
+          renderInstantMixesListDom();
+        }
+      }
+      showToast('Instant mix updated');
+    } catch (err) {
+      showToast(err.message || 'Could not rename mix');
+    }
+  }
+
+  async function retryInstantMix(id) {
+    try {
+      const d = await api(`/api/web/instant-mixes/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+      const mix = d && d.mix;
+      if (mix) {
+        const idx = state.instantMixes.findIndex((m) => m.id === id);
+        if (idx >= 0) state.instantMixes[idx] = mix;
+        else state.instantMixes.unshift(mix);
+        state.instantMixPrevStatus.set(id, 'creating');
+        updateInstantMixIndicators();
+        syncInstantMixPoller();
+        if (currentHashValue() === 'mix') {
+          renderInstantMixesListDom();
+        } else if (currentHashValue() === `mix/${id}`) {
+          state.activeInstantMix = { id, mix, query: mix.query, refinements: null, expanded: true };
+          renderInstantMixDetailDom(mix);
+        }
+        showToast(`Regenerating "${mix.title}" in the background…`);
+      }
+    } catch (err) {
+      showToast(err.message || 'Could not regenerate mix');
+    }
+  }
+
+  async function deleteInstantMix(id) {
+    try {
+      await api(`/api/web/instant-mixes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.instantMixes = state.instantMixes.filter((m) => m.id !== id);
+      state.instantMixPrevStatus.delete(id);
+      state.instantMixUnseenReady.delete(id);
+      updateInstantMixIndicators();
+      syncInstantMixPoller();
+      if (state.activeInstantMix?.id === id) {
+        state.activeInstantMix = null;
+      }
+      if (currentHashValue() === `mix/${id}`) {
+        navigate('mix');
+      } else if (currentHashValue() === 'mix') {
+        renderInstantMixesListDom();
+      }
+      showToast('Instant mix removed');
+    } catch (err) {
+      showToast(err.message || 'Could not delete instant mix');
+    }
+  }
+
+  async function clearFailedInstantMixes() {
+    const failed = state.instantMixes.filter((m) => m.status === 'failed');
+    if (!failed.length) return;
+    await Promise.all(
+      failed.map((m) =>
+        api(`/api/web/instant-mixes/${encodeURIComponent(m.id)}`, { method: 'DELETE' }).catch(() => {})
+      )
+    );
+    const failedIds = new Set(failed.map((m) => m.id));
+    state.instantMixes = state.instantMixes.filter((m) => !failedIds.has(m.id));
+    for (const fid of failedIds) state.instantMixPrevStatus.delete(fid);
+    updateInstantMixIndicators();
+    if (currentHashValue() === 'mix') renderInstantMixesListDom();
+    showToast(`Cleared ${failed.length} failed mix${failed.length === 1 ? '' : 'es'}`);
+  }
+
+  async function removeTrackFromInstantMix(mixId, trackId) {
+    try {
+      const d = await api(`/api/web/instant-mixes/${encodeURIComponent(mixId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ removeTrackId: trackId }),
+      });
+      const updated = d && d.mix;
+      if (updated) {
+        updated.tracks = cacheTracks(updated.tracks || []);
+        const idx = state.instantMixes.findIndex((m) => m.id === mixId);
+        if (idx >= 0) {
+          state.instantMixes[idx] = {
+            ...state.instantMixes[idx],
+            trackCount: updated.tracks.length,
+            totalDuration: updated.totalDuration,
+            covers: updated.covers,
+            coverUrl: updated.coverUrl,
+          };
+        }
+        if (state.activeInstantMix?.id === mixId) {
+          state.activeInstantMix.mix = updated;
+          if (currentHashValue() === `mix/${mixId}`) {
+            renderInstantMixDetailDom(updated);
+          }
+        }
+      }
+      showToast('Removed track from mix');
+    } catch (err) {
+      showToast(err.message || 'Could not remove track');
+    }
+  }
+
+  function promptInstantMix(initialQuery = '') {
+    const explicitQ = typeof initialQuery === 'string' ? initialQuery.trim() : '';
+    if (explicitQ) {
+      navigate('mix');
+      submitBackgroundInstantMix(explicitQ);
+      return;
+    }
+    if (currentHashValue() === 'mix') {
+      const inp = $('instant-mix-composer-input');
+      if (inp) {
+        inp.value = '';
+        inp.focus();
+      }
+      return;
+    }
+    location.hash = '#mix';
+    setTimeout(() => {
+      const inp = $('instant-mix-composer-input');
+      if (inp) {
+        inp.value = '';
+        inp.focus();
+      }
+    }, 40);
   }
 
   function renderSearchView() {
@@ -6067,8 +7011,10 @@
             </button>
             ${
               editablePlaylistId
-                ? `<button class="icon-btn tr-edit-btn" title="Move Up" onclick="App.movePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${i}, ${Math.max(0, i - 1)})">${ICONS.arrowUp}</button>
-                   <button class="icon-btn tr-edit-btn" title="Remove" onclick="App.removePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${i})">${ICONS.close}</button>`
+                ? String(editablePlaylistId).startsWith('imix-')
+                  ? `<button class="icon-btn tr-edit-btn" title="Remove from mix" onclick="App.removeTrackFromInstantMix(${esc(JSON.stringify(editablePlaylistId))}, ${esc(JSON.stringify(t.id))})">${ICONS.close}</button>`
+                  : `<button class="icon-btn tr-edit-btn" title="Move Up" onclick="App.movePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${i}, ${Math.max(0, i - 1)})">${ICONS.arrowUp}</button>
+                     <button class="icon-btn tr-edit-btn" title="Remove" onclick="App.removePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${i})">${ICONS.close}</button>`
                 : ''
             }
             <button class="icon-btn" title="More options" onclick="App.openTrackMenu(event, ${esc(JSON.stringify(t.id))}${editArgs})">${ICONS.more}</button>
@@ -7357,6 +8303,14 @@
   }
 
   function refreshActiveInstantMixCard() {
+    if (state.activeInstantMix?.id && currentHashValue() === `mix/${state.activeInstantMix.id}`) {
+      renderInstantMixDetailDom(state.activeInstantMix.mix);
+      return;
+    }
+    if (currentHashValue() === 'mix') {
+      renderInstantMixesListDom();
+      return;
+    }
     const card = document.querySelector('#main-view .instant-mix-card');
     if (!card) return;
     if (state.searchState && state.searchState.instantMix) {
@@ -8659,13 +9613,16 @@
       : '';
     const plActions =
       editablePlaylistId != null && playlistPos >= 0
-        ? `${
-            playlistPos > 0
-              ? `<button class="ctx-item" onclick="App.closeTrackMenu();App.movePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${playlistPos}, ${playlistPos - 1})">Move Up in Playlist</button>`
-              : ''
-          }
-          <button class="ctx-item danger" onclick="App.closeTrackMenu();App.removePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${playlistPos})">Remove from Playlist</button>
-          <hr class="ctx-sep">`
+        ? String(editablePlaylistId).startsWith('imix-')
+          ? `<button class="ctx-item danger" onclick="App.closeTrackMenu();App.removeTrackFromInstantMix(${esc(JSON.stringify(editablePlaylistId))}, ${tidArg})">Remove from Instant Mix</button>
+             <hr class="ctx-sep">`
+          : `${
+              playlistPos > 0
+                ? `<button class="ctx-item" onclick="App.closeTrackMenu();App.movePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${playlistPos}, ${playlistPos - 1})">Move Up in Playlist</button>`
+                : ''
+            }
+            <button class="ctx-item danger" onclick="App.closeTrackMenu();App.removePlaylistItem(${esc(JSON.stringify(editablePlaylistId))}, ${playlistPos})">Remove from Playlist</button>
+            <hr class="ctx-sep">`
         : '';
 
     menu.innerHTML = `
@@ -9032,14 +9989,28 @@
           );
         }
         renderSearchView();
-      } else if (state.activeInstantMix && state.activeInstantMix.mix && document.querySelector('#main-view .instant-mix-card')) {
+      } else if (state.activeInstantMix && state.activeInstantMix.mix) {
         state.activeInstantMix.mix.tracks = (state.activeInstantMix.mix.tracks || []).filter(
           (t) => t.id !== trackId
         );
-        const { mix, query, refinements, expanded } = state.activeInstantMix;
-        const card = document.querySelector('#main-view .instant-mix-card');
-        if (card) {
-          card.outerHTML = renderInstantMixCard(mix, refinements, query, expanded);
+        if (state.activeInstantMix.id) {
+          api(`/api/web/instant-mixes/${encodeURIComponent(state.activeInstantMix.id)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ removeTrackId: trackId }),
+          }).catch(() => {});
+          const idx = state.instantMixes.findIndex((m) => m.id === state.activeInstantMix.id);
+          if (idx >= 0) {
+            state.instantMixes[idx].trackCount = state.activeInstantMix.mix.tracks.length;
+          }
+          if (currentHashValue() === `mix/${state.activeInstantMix.id}`) {
+            renderInstantMixDetailDom(state.activeInstantMix.mix);
+          }
+        } else if (document.querySelector('#main-view .instant-mix-card')) {
+          const { mix, query, refinements, expanded } = state.activeInstantMix;
+          const card = document.querySelector('#main-view .instant-mix-card');
+          if (card) {
+            card.outerHTML = renderInstantMixCard(mix, refinements, query, expanded);
+          }
         }
       }
       document.querySelectorAll('#main-view [data-tid]').forEach((el) => {
@@ -12432,47 +13403,78 @@
     playSearchTrack,
     createInstantMixForSearch,
     promptInstantMix,
-    submitInstantMixModal: (e) => {
-      e.preventDefault();
-      const val = ($('instant-mix-modal-input')?.value || '').trim();
-      if (!val) return;
-      closeModal();
-      navigate(`mix?q=${encodeURIComponent(val)}`);
-    },
     submitInstantMixForm: (e) => {
       e.preventDefault();
-      const val = ($('instant-mix-term-input')?.value || '').trim();
+      const input = $('instant-mix-composer-input');
+      const val = (input?.value || '').trim();
       if (!val) return;
-      navigate(`mix?q=${encodeURIComponent(val)}`);
+      if (input) input.value = '';
+      submitBackgroundInstantMix(val);
+    },
+    queueInstantMixPrompt: (query, goToMenu = false) => {
+      const val = String(query || '').trim();
+      if (!val) return;
+      if (goToMenu && currentHashValue() !== 'mix') {
+        navigate('mix');
+      }
+      submitBackgroundInstantMix(val);
+    },
+    setInstantMixFilter: (filter) => {
+      state.instantMixesFilter = filter || 'all';
+      renderInstantMixesListDom();
     },
     playInstantMix,
     playInstantMixAt,
+    playInstantMixById,
     queueInstantMix,
+    openInstantMixCardMenu,
+    promptRenameInstantMix,
+    submitRenameInstantMix,
+    retryInstantMix,
+    deleteInstantMix,
+    clearFailedInstantMixes,
+    removeTrackFromInstantMix,
     promptSaveUpcoming,
     setSaveQueueIncludeCurrent,
     setSaveQueueMode,
     submitSaveQueueNew,
     submitSaveQueueToExisting,
-    promptSaveInstantMix: () => {
-      const active = getActiveInstantMix();
-      if (!active || !active.mix || !Array.isArray(active.mix.tracks) || !active.mix.tracks.length) {
+    promptSaveInstantMix: async (mixId = null) => {
+      let targetMix = null;
+      let targetId = mixId || state.activeInstantMix?.id || null;
+      if (mixId && state.activeInstantMix?.id !== mixId) {
+        try {
+          const d = await api(`/api/web/instant-mixes/${encodeURIComponent(mixId)}`);
+          targetMix = d && d.mix;
+          if (targetMix) targetMix.tracks = cacheTracks(targetMix.tracks || []);
+        } catch (err) {
+          showToast(err.message || 'Could not load mix to save');
+          return;
+        }
+      } else {
+        const active = getActiveInstantMix();
+        targetMix = active && active.mix;
+      }
+      if (!targetMix || !Array.isArray(targetMix.tracks) || !targetMix.tracks.length) {
         showToast('No instant mix tracks to save');
         return;
       }
-      const mix = active.mix;
+      state.instantMixSaveTargetId = targetId;
+      state._pendingSaveMixObj = targetMix;
       openModal(`
         <div class="modal-head"><h3>Save Instant Mix to Playlists</h3><button class="icon-btn" title="Close" onclick="App.closeModal()">${ICONS.close}</button></div>
-        <form onsubmit="App.submitSaveInstantMix(event)" style="display:flex;flex-direction:column;gap:12px">
-          <input id="save-mix-name" type="text" value="${esc(mix.title || active.query || 'Instant Mix')}" placeholder="Playlist name" required autofocus />
-          <input id="save-mix-desc" type="text" value="${esc(mix.subtitle || '')}" placeholder="Description (optional)" />
-          <button type="submit" class="btn-primary">Save Playlist (${mix.tracks.length} tracks)</button>
+        <form onsubmit="App.submitSaveInstantMix(event)" style="display:flex;flex-direction:column;gap:12px" autocomplete="off">
+          <input id="save-mix-name" type="text" value="${esc(targetMix.title || targetMix.query || 'Instant Mix')}" placeholder="Playlist name" autocomplete="off" required autofocus />
+          <input id="save-mix-desc" type="text" value="${esc(targetMix.subtitle || '')}" placeholder="Description (optional)" autocomplete="off" />
+          <button type="submit" class="btn-primary">Save Playlist (${targetMix.tracks.length} tracks)</button>
         </form>
       `);
     },
     submitSaveInstantMix: async (e) => {
       e.preventDefault();
-      const active = getActiveInstantMix();
-      if (!active || !active.mix || !Array.isArray(active.mix.tracks) || !active.mix.tracks.length) {
+      const targetMix = state._pendingSaveMixObj || getActiveInstantMix()?.mix;
+      const targetId = state.instantMixSaveTargetId || state.activeInstantMix?.id || null;
+      if (!targetMix || !Array.isArray(targetMix.tracks) || !targetMix.tracks.length) {
         closeModal();
         showToast('No instant mix tracks to save');
         return;
@@ -12483,13 +13485,27 @@
         return;
       }
       const comment = ($('save-mix-desc')?.value || '').trim();
-      const trackIds = [...new Set(active.mix.tracks.map((t) => t.id).filter(Boolean))];
+      const trackIds = [...new Set(targetMix.tracks.map((t) => t.id).filter(Boolean))];
       try {
         const res = await api('/api/web/playlists', {
           method: 'POST',
           body: JSON.stringify({ name, comment, trackIds }),
         });
-        active.mix.savedPlaylistId = res.playlist.id;
+        const newPlId = res.playlist.id;
+        targetMix.savedPlaylistId = newPlId;
+        if (targetId) {
+          await api(`/api/web/instant-mixes/${encodeURIComponent(targetId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ savedPlaylistId: newPlId }),
+          }).catch(() => {});
+          const idx = state.instantMixes.findIndex((m) => m.id === targetId);
+          if (idx >= 0) state.instantMixes[idx].savedPlaylistId = newPlId;
+          if (state.activeInstantMix?.id === targetId && state.activeInstantMix.mix) {
+            state.activeInstantMix.mix.savedPlaylistId = newPlId;
+          }
+        }
+        state._pendingSaveMixObj = null;
+        state.instantMixSaveTargetId = null;
         haptic('success');
         closeModal();
         await refreshSidebarPlaylists();
@@ -12605,7 +13621,10 @@
             if (el.dataset.shareId === pid) el.remove();
           });
         if (state.activeInstantMix?.mix?.savedPlaylistId === pid) {
-          delete state.activeInstantMix.mix.savedPlaylistId;
+          state.activeInstantMix.mix.savedPlaylistId = null;
+        }
+        for (const m of state.instantMixes || []) {
+          if (m.savedPlaylistId === pid) m.savedPlaylistId = null;
         }
         if (state.searchState?.instantMix?.savedPlaylistId === pid) {
           delete state.searchState.instantMix.savedPlaylistId;

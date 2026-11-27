@@ -51,6 +51,27 @@ pub struct NeuralTrainingCorpus {
     pub tracks: HashMap<String, Track>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredInstantMix {
+    pub id: String,
+    pub user_id: i64,
+    pub query: String,
+    pub mode: String,
+    pub status: String,
+    pub title: String,
+    pub subtitle: String,
+    pub is_theme_mix: bool,
+    pub prominent: bool,
+    pub ai_interpreted: bool,
+    pub total_duration: i64,
+    pub track_ids: Vec<String>,
+    pub refinements_json: String,
+    pub saved_playlist_id: String,
+    pub error: String,
+    pub created: i64,
+    pub changed: i64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -510,6 +531,28 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_lobbies_user_active
                 ON lobbies(user_id, ended);
+
+            CREATE TABLE IF NOT EXISTS instant_mixes (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'creating',
+                title TEXT NOT NULL DEFAULT '',
+                subtitle TEXT NOT NULL DEFAULT '',
+                is_theme_mix INTEGER NOT NULL DEFAULT 0,
+                prominent INTEGER NOT NULL DEFAULT 0,
+                ai_interpreted INTEGER NOT NULL DEFAULT 0,
+                total_duration INTEGER NOT NULL DEFAULT 0,
+                track_ids TEXT NOT NULL DEFAULT '[]',
+                refinements TEXT NOT NULL DEFAULT 'null',
+                saved_playlist_id TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created INTEGER NOT NULL,
+                changed INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_instant_mixes_user
+                ON instant_mixes(user_id, created DESC);
             ",
         )?;
 
@@ -1424,6 +1467,7 @@ impl Store {
         )?;
         for table in [
             "playlists",
+            "instant_mixes",
             "user_track_stats",
             "events",
             "stars",
@@ -5167,8 +5211,269 @@ impl Store {
             params![id],
         )?;
         tx.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE instant_mixes SET saved_playlist_id = '' WHERE saved_playlist_id = ?1",
+            params![id],
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Background-curated Instant Mixes
+    // -------------------------------------------------------------------------
+
+    pub fn create_instant_mix(
+        &self,
+        user_id: i64,
+        query: &str,
+        mode: &str,
+    ) -> AppResult<StoredInstantMix> {
+        let now = Utc::now().timestamp();
+        let id = format!("imix-{}", Uuid::new_v4().simple());
+        let clean_q = query.trim();
+        let initial_title: String = clean_q.chars().take(80).collect();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO instant_mixes(
+                id, user_id, query, mode, status, title, subtitle,
+                is_theme_mix, prominent, ai_interpreted, total_duration,
+                track_ids, refinements, saved_playlist_id, error, created, changed
+             ) VALUES (?1, ?2, ?3, ?4, 'creating', ?5, 'Curating your mix...', 0, 0, 0, 0, '[]', 'null', '', '', ?6, ?6)",
+            params![id, user_id, clean_q, mode.trim(), initial_title, now],
+        )?;
+        Ok(StoredInstantMix {
+            id,
+            user_id,
+            query: clean_q.to_string(),
+            mode: mode.trim().to_string(),
+            status: "creating".to_string(),
+            title: initial_title,
+            subtitle: "Curating your mix...".to_string(),
+            is_theme_mix: false,
+            prominent: false,
+            ai_interpreted: false,
+            total_duration: 0,
+            track_ids: Vec::new(),
+            refinements_json: "null".to_string(),
+            saved_playlist_id: String::new(),
+            error: String::new(),
+            created: now,
+            changed: now,
+        })
+    }
+
+    pub fn count_creating_instant_mixes(&self, user_id: i64) -> AppResult<usize> {
+        let conn = self.lock();
+        let cnt: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM instant_mixes WHERE user_id = ?1 AND status = 'creating'",
+            params![user_id],
+            |r| r.get(0),
+        )?;
+        Ok(cnt.max(0) as usize)
+    }
+
+    pub fn list_instant_mixes(&self, user_id: i64, limit: usize) -> AppResult<Vec<StoredInstantMix>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, query, mode, status, title, subtitle,
+                    is_theme_mix, prominent, ai_interpreted, total_duration,
+                    track_ids, refinements, saved_playlist_id, error, created, changed
+             FROM instant_mixes
+             WHERE user_id = ?1
+             ORDER BY created DESC, rowid DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id, limit as i64], row_to_stored_instant_mix)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_instant_mix(&self, id: &str) -> AppResult<Option<StoredInstantMix>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, user_id, query, mode, status, title, subtitle,
+                        is_theme_mix, prominent, ai_interpreted, total_duration,
+                        track_ids, refinements, saved_playlist_id, error, created, changed
+                 FROM instant_mixes
+                 WHERE id = ?1",
+                params![id],
+                row_to_stored_instant_mix,
+            )
+            .optional()?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_instant_mix(
+        &self,
+        id: &str,
+        title: &str,
+        subtitle: &str,
+        is_theme_mix: bool,
+        prominent: bool,
+        ai_interpreted: bool,
+        total_duration: i64,
+        track_ids: &[String],
+        refinements_json: &str,
+    ) -> AppResult<bool> {
+        let now = Utc::now().timestamp();
+        let ids_json = serde_json::to_string(track_ids)?;
+        let conn = self.lock();
+        let updated = conn.execute(
+            "UPDATE instant_mixes
+             SET status = 'ready',
+                 title = ?1,
+                 subtitle = ?2,
+                 is_theme_mix = ?3,
+                 prominent = ?4,
+                 ai_interpreted = ?5,
+                 total_duration = ?6,
+                 track_ids = ?7,
+                 refinements = ?8,
+                 error = '',
+                 changed = ?9
+             WHERE id = ?10",
+            params![
+                title,
+                subtitle,
+                is_theme_mix as i64,
+                prominent as i64,
+                ai_interpreted as i64,
+                total_duration,
+                ids_json,
+                refinements_json,
+                now,
+                id,
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn fail_instant_mix(&self, id: &str, error: &str) -> AppResult<bool> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        let updated = conn.execute(
+            "UPDATE instant_mixes
+             SET status = 'failed',
+                 error = ?1,
+                 changed = ?2
+             WHERE id = ?3",
+            params![error, now, id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn reset_instant_mix_creating(
+        &self,
+        id: &str,
+        user_id: i64,
+    ) -> AppResult<Option<StoredInstantMix>> {
+        let now = Utc::now().timestamp();
+        {
+            let conn = self.lock();
+            let updated = conn.execute(
+                "UPDATE instant_mixes
+                 SET status = 'creating',
+                     subtitle = 'Curating your mix...',
+                     error = '',
+                     changed = ?1
+                 WHERE id = ?2 AND user_id = ?3",
+                params![now, id, user_id],
+            )?;
+            if updated == 0 {
+                return Ok(None);
+            }
+        }
+        self.get_instant_mix(id)
+    }
+
+    pub fn update_instant_mix(
+        &self,
+        id: &str,
+        user_id: i64,
+        title: Option<&str>,
+        subtitle: Option<&str>,
+        saved_playlist_id: Option<&str>,
+        remove_track_id: Option<&str>,
+    ) -> AppResult<Option<StoredInstantMix>> {
+        let Some(mut cur) = self.get_instant_mix(id)? else {
+            return Ok(None);
+        };
+        if cur.user_id != user_id {
+            return Ok(None);
+        }
+        if let Some(t) = title {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                cur.title = trimmed.chars().take(120).collect();
+            }
+        }
+        if let Some(s) = subtitle {
+            cur.subtitle = s.trim().chars().take(240).collect();
+        }
+        if let Some(pid) = saved_playlist_id {
+            cur.saved_playlist_id = pid.trim().to_string();
+        }
+        if let Some(rm) = remove_track_id {
+            let before = cur.track_ids.len();
+            cur.track_ids.retain(|tid| tid != rm);
+            if cur.track_ids.len() != before {
+                let remaining = self.get_tracks_by_ids(&cur.track_ids).unwrap_or_default();
+                cur.total_duration = remaining.iter().map(|t| t.duration.max(0) as i64).sum();
+            }
+        }
+        let now = Utc::now().timestamp();
+        cur.changed = now;
+        let ids_json = serde_json::to_string(&cur.track_ids)?;
+        {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE instant_mixes
+                 SET title = ?1,
+                     subtitle = ?2,
+                     saved_playlist_id = ?3,
+                     track_ids = ?4,
+                     total_duration = ?5,
+                     changed = ?6
+                 WHERE id = ?7 AND user_id = ?8",
+                params![
+                    cur.title,
+                    cur.subtitle,
+                    cur.saved_playlist_id,
+                    ids_json,
+                    cur.total_duration,
+                    now,
+                    id,
+                    user_id,
+                ],
+            )?;
+        }
+        Ok(Some(cur))
+    }
+
+    pub fn delete_instant_mix(&self, id: &str, user_id: i64) -> AppResult<bool> {
+        let conn = self.lock();
+        let deleted = conn.execute(
+            "DELETE FROM instant_mixes WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    pub fn fail_orphaned_instant_mixes(&self) -> AppResult<usize> {
+        let now = Utc::now().timestamp();
+        let conn = self.lock();
+        let updated = conn.execute(
+            "UPDATE instant_mixes
+             SET status = 'failed',
+                 error = 'Interrupted while curating — click Retry to regenerate.',
+                 changed = ?1
+             WHERE status = 'creating'",
+            params![now],
+        )?;
+        Ok(updated)
     }
 
     pub fn save_play_queue(&self, user_id: i64, state: &PlayQueueState) -> AppResult<()> {
@@ -6083,6 +6388,33 @@ fn row_to_track_at(row: &Row, offset: usize) -> rusqlite::Result<Track> {
         meta: row.get(offset + 18)?,
         deezer_id: row.get(offset + 19)?,
         created: row.get(offset + 20)?,
+    })
+}
+
+fn row_to_stored_instant_mix(row: &Row) -> rusqlite::Result<StoredInstantMix> {
+    let is_theme_int: i64 = row.get(7)?;
+    let prom_int: i64 = row.get(8)?;
+    let ai_int: i64 = row.get(9)?;
+    let ids_json: String = row.get(11)?;
+    let track_ids: Vec<String> = serde_json::from_str(&ids_json).unwrap_or_default();
+    Ok(StoredInstantMix {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        query: row.get(2)?,
+        mode: row.get(3)?,
+        status: row.get(4)?,
+        title: row.get(5)?,
+        subtitle: row.get(6)?,
+        is_theme_mix: is_theme_int != 0,
+        prominent: prom_int != 0,
+        ai_interpreted: ai_int != 0,
+        total_duration: row.get(10)?,
+        track_ids,
+        refinements_json: row.get(12)?,
+        saved_playlist_id: row.get(13)?,
+        error: row.get(14)?,
+        created: row.get(15)?,
+        changed: row.get(16)?,
     })
 }
 
@@ -9092,5 +9424,81 @@ mod tests {
         let missing_after = store.tracks_missing_loudness(10).unwrap();
         assert_eq!(missing_after.len(), 1);
         assert_eq!(missing_after[0].0, "ytm:2");
+    }
+
+    #[test]
+    fn instant_mixes_lifecycle_update_unlink_and_orphan_cleanup() {
+        let store = Store::open_memory().unwrap();
+        let user = store.create_user("mixer", "StrongPass123!").unwrap();
+
+        let mut t1 = sample_track("t1", "Night Drive", "Synth Artist", "Midnight");
+        t1.duration = 210;
+        let mut t2 = sample_track("t2", "Neon Rain", "Synth Artist", "Midnight");
+        t2.duration = 190;
+        store.upsert_tracks(&[t1, t2]).unwrap();
+
+        let created = store
+            .create_instant_mix(user.id, "rainy 2am synthwave", "")
+            .unwrap();
+        assert_eq!(created.status, "creating");
+        assert_eq!(store.count_creating_instant_mixes(user.id).unwrap(), 1);
+
+        let completed = store
+            .complete_instant_mix(
+                &created.id,
+                "Rainy 2am Synthwave",
+                "Warm nocturnal synths",
+                true,
+                true,
+                true,
+                400,
+                &["t1".into(), "t2".into()],
+                r#"{"detectedIntent":"AI Curated Mix","filterChips":[],"querySuggestions":["lofi night"]}"#,
+            )
+            .unwrap();
+        assert!(completed);
+        assert_eq!(store.count_creating_instant_mixes(user.id).unwrap(), 0);
+
+        // Save as playlist, link it, rename & remove a track.
+        let pl = store
+            .create_playlist(user.id, "Saved Synth", "", false, &["t1".into(), "t2".into()])
+            .unwrap();
+        let updated = store
+            .update_instant_mix(
+                &created.id,
+                user.id,
+                Some("My 2am Drive"),
+                Some("Custom sub"),
+                Some(&pl.id),
+                Some("t1"),
+            )
+            .unwrap()
+            .expect("updated mix");
+        assert_eq!(updated.title, "My 2am Drive");
+        assert_eq!(updated.subtitle, "Custom sub");
+        assert_eq!(updated.saved_playlist_id, pl.id);
+        assert_eq!(updated.track_ids, vec!["t2".to_string()]);
+        assert_eq!(updated.total_duration, 190);
+
+        // Deleting the linked playlist clears saved_playlist_id on the instant mix.
+        store.delete_playlist(&pl.id).unwrap();
+        let after_pl_del = store.get_instant_mix(&created.id).unwrap().unwrap();
+        assert!(after_pl_del.saved_playlist_id.is_empty());
+
+        // Retry resets to creating; orphan cleanup marks creating mixes as failed.
+        let retried = store
+            .reset_instant_mix_creating(&created.id, user.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "creating");
+        let orphaned = store.fail_orphaned_instant_mixes().unwrap();
+        assert_eq!(orphaned, 1);
+        let after_orphan = store.get_instant_mix(&created.id).unwrap().unwrap();
+        assert_eq!(after_orphan.status, "failed");
+        assert!(!after_orphan.error.is_empty());
+
+        // Delete removes the mix.
+        assert!(store.delete_instant_mix(&created.id, user.id).unwrap());
+        assert!(store.get_instant_mix(&created.id).unwrap().is_none());
     }
 }
