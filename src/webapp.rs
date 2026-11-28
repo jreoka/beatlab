@@ -858,6 +858,8 @@ pub struct PasswordChangeReq {
     pub current_password: String,
     #[serde(rename = "newPassword")]
     pub new_password: String,
+    #[serde(rename = "confirmPassword")]
+    pub confirm_password: String,
     /// Required when two-factor authentication is enabled.
     #[serde(default)]
     pub code: Option<String>,
@@ -1206,6 +1208,9 @@ pub async fn change_password(
         Ok(value) => value,
         Err(r) => return r,
     };
+    if req.new_password != req.confirm_password {
+        return err_res(StatusCode::BAD_REQUEST, "New passwords do not match");
+    }
     if let Err(r) = check_current_password(&user, &req.current_password, "Current password is incorrect").await {
         return r;
     }
@@ -8369,6 +8374,7 @@ mod tests {
             Json(PasswordChangeReq {
                 current_password: "wrong-pass".into(),
                 new_password: "new-pass".into(),
+                confirm_password: "new-pass".into(),
                 code: Some(codes[0].clone()),
             }),
         )
@@ -8382,6 +8388,21 @@ mod tests {
             Json(PasswordChangeReq {
                 current_password: "real-pass".into(),
                 new_password: "new-pass".into(),
+                confirm_password: "different-pass".into(),
+                code: Some(codes[0].clone()),
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.store.recovery_code_stats(u.id).unwrap(), (2, 0));
+
+        let res = change_password(
+            State(state.clone()),
+            bearer(&tok),
+            Json(PasswordChangeReq {
+                current_password: "real-pass".into(),
+                new_password: "new-pass".into(),
+                confirm_password: "new-pass".into(),
                 code: Some(codes[0].clone()),
             }),
         )
@@ -8404,6 +8425,7 @@ mod tests {
             Json(PasswordChangeReq {
                 current_password: "old-pass".into(),
                 new_password: "new-pass".into(),
+                confirm_password: "new-pass".into(),
                 code: None,
             }),
         )

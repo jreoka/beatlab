@@ -10520,6 +10520,7 @@
               ? `<form onsubmit="App.submitPasswordChange(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
                   <input id="pw-cur" type="password" autocomplete="current-password" placeholder="Current password" required />
                   <input id="pw-new" type="password" autocomplete="new-password" placeholder="New password" required />
+                  <input id="pw-confirm" type="password" autocomplete="new-password" placeholder="Confirm new password" required />
                   ${sec.twoFactorEnabled ? '<input id="pw-code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA or recovery code" required />' : ''}
                   <div class="settings-confirm-actions" style="justify-content:flex-start;margin-top:6px">
                     <button type="submit" class="btn-secondary">Update password</button>
@@ -13707,12 +13708,20 @@
     },
     submitPasswordChange: async (e) => {
       e.preventDefault();
+      const newPassword = $('pw-new').value;
+      const confirmPassword = $('pw-confirm').value;
+      if (newPassword !== confirmPassword) {
+        showToast('New passwords do not match');
+        $('pw-confirm').focus();
+        return;
+      }
       try {
         const res = await api('/api/web/account/password', {
           method: 'POST',
           body: JSON.stringify({
             currentPassword: $('pw-cur').value,
-            newPassword: $('pw-new').value,
+            newPassword,
+            confirmPassword,
             code: $('pw-code') ? $('pw-code').value : undefined,
           }),
         });
