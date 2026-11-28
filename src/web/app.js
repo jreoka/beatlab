@@ -1,6 +1,7 @@
 (() => {
   'use strict';
 
+  const $ = (id) => document.getElementById(id);
   const audio = document.getElementById('audio-el');
 
   const ICONS = {
@@ -712,8 +713,6 @@
       showToast('Use your browser menu to install Beatlab');
     }
   }
-
-  const $ = (id) => document.getElementById(id);
 
   function esc(str) {
     return String(str ?? '')
