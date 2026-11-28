@@ -151,7 +151,10 @@ impl StreamEngine {
 
         // Streaming/caching client: cap connect & per-read idle stalls without aborting valid
         // multi-minute lossless FLAC downloads at a 30s total transfer ceiling.
+        // Force IPv4 so upstream YouTube googlevideo fetches match the IPv4 egress address
+        // used by `YtmSource` during Innertube `/player` resolution.
         let stream_http = reqwest::Client::builder()
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
             .connect_timeout(Duration::from_secs(15))
             .read_timeout(Duration::from_secs(45))
             .tcp_nodelay(true)

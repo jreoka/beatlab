@@ -4,10 +4,11 @@ use crate::taste::classify_moods_str;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const INNERTUBE_SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const INNERTUBE_NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
@@ -61,17 +62,8 @@ struct InnertubePlayerClient {
 }
 
 const INNERTUBE_PLAYER_CLIENTS: &[InnertubePlayerClient] = &[
-    InnertubePlayerClient {
-        name: "IOS",
-        version: "20.10.4",
-        client_id: "5",
-        user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-        device_make: Some("Apple"),
-        device_model: Some("iPhone16,2"),
-        os_name: "iPhone",
-        os_version: "18.3.2.22D82",
-        android_sdk_version: None,
-    },
+    // ANDROID returns both adaptive audio-only formats (Opus 251 / M4A 140) and
+    // progressive fallback `itag=18` in a single `/player` response.
     InnertubePlayerClient {
         name: "ANDROID",
         version: "20.10.38",
@@ -82,6 +74,17 @@ const INNERTUBE_PLAYER_CLIENTS: &[InnertubePlayerClient] = &[
         os_name: "Android",
         os_version: "14",
         android_sdk_version: Some(34),
+    },
+    InnertubePlayerClient {
+        name: "IOS",
+        version: "20.10.4",
+        client_id: "5",
+        user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        device_make: Some("Apple"),
+        device_model: Some("iPhone16,2"),
+        os_name: "iPhone",
+        os_version: "18.3.2.22D82",
+        android_sdk_version: None,
     },
     InnertubePlayerClient {
         name: "ANDROID_VR",
@@ -130,6 +133,10 @@ pub struct YtmSource {
     /// Index into `INNERTUBE_PLAYER_CLIENTS` that last succeeded. When YouTube
     /// breaks one player client, subsequent plays start with the working one.
     preferred_client: Arc<AtomicUsize>,
+    /// Epoch seconds until which adaptive audio-only URLs are skipped because
+    /// YouTube's CDN returned 403 past the init segment (PO-token gating on
+    /// datacenter IPs). Re-checked automatically after the cooldown expires.
+    adaptive_blocked_until: Arc<AtomicI64>,
 }
 
 impl Default for YtmSource {
@@ -144,7 +151,10 @@ impl YtmSource {
     }
 
     fn with_player_endpoint(player_endpoint: String) -> Self {
+        // Force IPv4 so `/youtubei/v1/player` and `StreamEngine::stream_http`
+        // always share the same egress IP (YouTube googlevideo URLs are IP-bound).
         let http = reqwest::Client::builder()
+            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .timeout(Duration::from_secs(12))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .build()
@@ -153,6 +163,7 @@ impl YtmSource {
             http,
             player_endpoint,
             preferred_client: Arc::new(AtomicUsize::new(0)),
+            adaptive_blocked_until: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -481,21 +492,75 @@ impl YtmSource {
         }
 
         let loudness = parse_innertube_audio_config_loudness(&val);
-        let selected = select_best_innertube_format(&val).ok_or_else(|| {
-            err_msg(format!(
+        let candidates = select_innertube_format_candidates(&val);
+        if candidates.is_empty() {
+            return Err(err_msg(format!(
                 "{} returned no direct playable audio stream",
                 client.name
-            ))
-        })?;
+            )));
+        }
 
-        Ok(ResolvedStream {
-            url: selected.url,
-            headers: vec![("User-Agent".to_string(), client.user_agent.to_string())],
-            ext: selected.ext,
-            source_webpage_url: watch_url.to_string(),
-            has_video: selected.has_video,
-            loudness,
-        })
+        let now = Utc::now().timestamp();
+        let skip_adaptive = self.adaptive_blocked_until.load(Ordering::Relaxed) > now;
+        let mut last_probe_err = "stream URL rejected by upstream CDN";
+        for cand in candidates {
+            if !cand.has_video && skip_adaptive {
+                continue;
+            }
+            match self.probe_stream_playable(&cand.url, client.user_agent).await {
+                Ok(()) => {
+                    return Ok(ResolvedStream {
+                        url: cand.url,
+                        headers: vec![("User-Agent".to_string(), client.user_agent.to_string())],
+                        ext: cand.ext,
+                        source_webpage_url: watch_url.to_string(),
+                        has_video: cand.has_video,
+                        loudness,
+                    });
+                }
+                Err(status) => {
+                    debug!(
+                        client = client.name,
+                        has_video = cand.has_video,
+                        status,
+                        "innertube stream candidate failed playability probe"
+                    );
+                    if !cand.has_video && status == 403 {
+                        // Datacenter IPs often get 403 past the init segment on
+                        // adaptive streams (PO-token gating); skip adaptive for
+                        // 10 minutes and fall straight through to progressive.
+                        self.adaptive_blocked_until
+                            .store(now + 600, Ordering::Relaxed);
+                        last_probe_err = "adaptive stream returned HTTP 403 (PO-token gated)";
+                    }
+                }
+            }
+        }
+
+        Err(err_msg(format!("{} {}", client.name, last_probe_err)))
+    }
+
+    /// Probes 1 KB past the initial ~64 KB container header (`bytes=262144-263167`)
+    /// so PO-token-gated adaptive URLs (which allow the init segment then return
+    /// 403 on real media bytes) are caught before playback starts.
+    async fn probe_stream_playable(&self, url: &str, user_agent: &str) -> Result<(), u16> {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(6),
+            self.http
+                .get(url)
+                .header("User-Agent", user_agent)
+                .header("Range", "bytes=262144-263167")
+                .send(),
+        )
+        .await
+        .map_err(|_| 504u16)?
+        .map_err(|_| 502u16)?;
+        let code = resp.status().as_u16();
+        if resp.status().is_success() || code == 206 || code == 416 {
+            Ok(())
+        } else {
+            Err(code)
+        }
     }
 }
 
@@ -571,13 +636,16 @@ fn is_direct_non_hls_url(url: &str) -> bool {
     !low.contains(".m3u8") && !low.contains("/manifest/hls")
 }
 
-/// Picks the best direct playable stream from an Innertube `/player` JSON payload:
-/// 1) Highest-bitrate pure audio-only format from `streamingData.adaptiveFormats`
-///    (preferring the original/default audio track when multi-language dubs exist).
-/// 2) Muxed fallback from `streamingData.formats` (`has_video = true`) if no direct
-///    audio-only stream is available.
-fn select_best_innertube_format(root: &Value) -> Option<SelectedInnertubeFormat> {
-    let streaming = root.get("streamingData")?;
+/// Returns ordered playable stream candidates from an Innertube `/player` payload:
+/// 1) Best pure audio-only format from `streamingData.adaptiveFormats` (preferring
+///    the original/default audio track when multi-language dubs exist).
+/// 2) Best muxed fallback from `streamingData.formats` (`has_video = true`), used
+///    when adaptive streams are absent or PO-token gated (HTTP 403) on datacenter IPs.
+fn select_innertube_format_candidates(root: &Value) -> Vec<SelectedInnertubeFormat> {
+    let Some(streaming) = root.get("streamingData") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
 
     if let Some(adaptive) = streaming.get("adaptiveFormats").and_then(|v| v.as_array()) {
         let mut best: Option<(i64, SelectedInnertubeFormat)> = None;
@@ -617,7 +685,7 @@ fn select_best_innertube_format(root: &Value) -> Option<SelectedInnertubeFormat>
             }
         }
         if let Some((_, fmt)) = best {
-            return Some(fmt);
+            out.push(fmt);
         }
     }
 
@@ -647,11 +715,16 @@ fn select_best_innertube_format(root: &Value) -> Option<SelectedInnertubeFormat>
             }
         }
         if let Some((_, fmt)) = best {
-            return Some(fmt);
+            out.push(fmt);
         }
     }
 
-    None
+    out
+}
+
+#[cfg(test)]
+fn select_best_innertube_format(root: &Value) -> Option<SelectedInnertubeFormat> {
+    select_innertube_format_candidates(root).into_iter().next()
 }
 
 #[async_trait]
@@ -1622,23 +1695,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ytm_source_resolves_via_direct_innertube_player_with_client_fallback() {
+    async fn ytm_source_resolves_via_direct_innertube_player_with_client_and_403_fallback() {
+        use axum::extract::State;
         use axum::http::StatusCode;
-        use axum::routing::post;
+        use axum::routing::{get, post};
         use axum::{Json, Router};
 
-        let app = Router::new().route(
-            "/youtubei/v1/player",
-            post(|Json(body): Json<Value>| async move {
-                let client_name = body
-                    .pointer("/context/client/clientName")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                let video_id = body.get("videoId").and_then(|v| v.as_str()).unwrap_or("");
-                assert_eq!(video_id, "FGBhQbmPwH8");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
 
-                if client_name == "IOS" {
-                    return (
+        let app = Router::new()
+            .route(
+                "/youtubei/v1/player",
+                post(|State(base_url): State<String>, Json(body): Json<Value>| async move {
+                    let client_name = body
+                        .pointer("/context/client/clientName")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let video_id = body.get("videoId").and_then(|v| v.as_str()).unwrap_or("");
+                    assert_eq!(video_id, "FGBhQbmPwH8");
+
+                    if client_name == "ANDROID" {
+                        // Simulate datacenter PO-token 403 on adaptive stream,
+                        // with playable progressive itag=18 fallback.
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "playabilityStatus": { "status": "OK" },
+                                "playerConfig": {
+                                    "audioConfig": {
+                                        "loudnessDb": 2.5,
+                                        "loudnessTargetLkfs": -14.0
+                                    }
+                                },
+                                "streamingData": {
+                                    "adaptiveFormats": [
+                                        {
+                                            "itag": 251,
+                                            "url": format!("{}/stream/blocked?expire=1900000000", base_url),
+                                            "mimeType": "audio/webm; codecs=\"opus\"",
+                                            "bitrate": 155000
+                                        }
+                                    ],
+                                    "formats": [
+                                        {
+                                            "itag": 18,
+                                            "url": format!("{}/stream/muxed?expire=1900000000", base_url),
+                                            "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+                                            "bitrate": 500000
+                                        }
+                                    ]
+                                }
+                            })),
+                        );
+                    }
+
+                    (
                         StatusCode::OK,
                         Json(serde_json::json!({
                             "playabilityStatus": {
@@ -1646,48 +1759,22 @@ mod tests {
                                 "reason": "Sign in to confirm you're not a bot"
                             }
                         })),
-                    );
-                }
+                    )
+                }),
+            )
+            .route("/stream/blocked", get(|| async { StatusCode::FORBIDDEN }))
+            .route("/stream/muxed", get(|| async { (StatusCode::PARTIAL_CONTENT, "ok") }))
+            .with_state(base.clone());
 
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "playabilityStatus": { "status": "OK" },
-                        "playerConfig": {
-                            "audioConfig": {
-                                "loudnessDb": 2.5,
-                                "loudnessTargetLkfs": -14.0
-                            }
-                        },
-                        "streamingData": {
-                            "adaptiveFormats": [
-                                {
-                                    "itag": 140,
-                                    "url": "https://rr1.googlevideo.com/videoplayback?itag=140&expire=1900000000",
-                                    "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
-                                    "bitrate": 130000
-                                }
-                            ]
-                        }
-                    })),
-                )
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        let ytm = YtmSource::with_player_endpoint(format!("http://{}/youtubei/v1/player", addr));
+        let ytm = YtmSource::with_player_endpoint(format!("{}/youtubei/v1/player", base));
         let resolved = ytm.resolve_stream("ytm:FGBhQbmPwH8").await.unwrap();
-        assert_eq!(
-            resolved.url,
-            "https://rr1.googlevideo.com/videoplayback?itag=140&expire=1900000000"
-        );
-        assert_eq!(resolved.ext, "m4a");
-        assert!(!resolved.has_video);
+        assert_eq!(resolved.url, format!("{}/stream/muxed?expire=1900000000", base));
+        assert_eq!(resolved.ext, "mp4");
+        assert!(resolved.has_video);
         assert_eq!(
             resolved.source_webpage_url,
             "https://www.youtube.com/watch?v=FGBhQbmPwH8"
@@ -1695,7 +1782,7 @@ mod tests {
         assert!(resolved.headers.iter().any(|(k, v)| k == "User-Agent" && v.contains("Android")));
         let loudness = resolved.loudness.expect("loudness extracted from player payload");
         assert!((loudness.lufs - (-11.5)).abs() < 0.01);
-        assert_eq!(ytm.preferred_client.load(Ordering::Relaxed), 1);
+        assert!(ytm.adaptive_blocked_until.load(Ordering::Relaxed) > Utc::now().timestamp());
 
         server.abort();
     }
