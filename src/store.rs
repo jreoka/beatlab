@@ -5880,12 +5880,6 @@ impl Store {
         )?)
     }
 
-    /// Backwards-compatible wrapper that prunes straight to `max_bytes`.
-    pub fn prune_cache(&self, max_bytes: i64) -> AppResult<()> {
-        let _ = self.prune_cache_watermarks(max_bytes, max_bytes)?;
-        Ok(())
-    }
-
     /// Smart hot-cache eviction with high/low-water hysteresis.
     /// Triggers once total bytes exceed `high_water_bytes` and evicts lowest-scoring
     /// tracks (combining recency decay, hit frequency, cool-tier backup status, and
