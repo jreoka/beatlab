@@ -5442,7 +5442,7 @@ pub async fn library(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .collect();
     let frequent: Vec<Track> = state
         .store
-        .user_all_frequent_tracks(uid)
+        .user_frequent_tracks(uid, 50, 0)
         .unwrap_or_default()
         .into_iter()
         .map(|(t, _)| t)
