@@ -9941,8 +9941,21 @@
   }
 
   let trackMenuCloser = null;
+  let trackMenuArmCleanup = null;
+
+  function disarmTrackMenuPointerGuard() {
+    if (trackMenuArmCleanup) {
+      trackMenuArmCleanup();
+      trackMenuArmCleanup = null;
+    }
+    const menu = $('context-menu');
+    const backdrop = $('ctx-backdrop');
+    if (menu) menu.classList.remove('ctx-arming');
+    if (backdrop) backdrop.classList.remove('ctx-arming');
+  }
 
   function closeTrackMenu() {
+    disarmTrackMenuPointerGuard();
     const menu = $('context-menu');
     const backdrop = $('ctx-backdrop');
     if (menu) menu.classList.add('hidden');
@@ -9955,6 +9968,35 @@
 
   function positionContextMenu(menu, backdrop, event) {
     haptic('select');
+    disarmTrackMenuPointerGuard();
+    if (event && event.fromLongPress) {
+      menu.classList.add('ctx-arming');
+      if (backdrop) backdrop.classList.add('ctx-arming');
+      let releaseTimer = null;
+      const onLift = () => {
+        if (releaseTimer) return;
+        releaseTimer = setTimeout(() => {
+          disarmTrackMenuPointerGuard();
+        }, 60);
+      };
+      const onTouchLift = (te) => {
+        if (!te.touches || te.touches.length === 0) onLift();
+      };
+      window.addEventListener('pointerup', onLift, { capture: true, passive: true });
+      window.addEventListener('pointercancel', onLift, { capture: true, passive: true });
+      window.addEventListener('touchend', onTouchLift, { capture: true, passive: true });
+      window.addEventListener('touchcancel', onTouchLift, { capture: true, passive: true });
+      trackMenuArmCleanup = () => {
+        if (releaseTimer) {
+          clearTimeout(releaseTimer);
+          releaseTimer = null;
+        }
+        window.removeEventListener('pointerup', onLift, true);
+        window.removeEventListener('pointercancel', onLift, true);
+        window.removeEventListener('touchend', onTouchLift, true);
+        window.removeEventListener('touchcancel', onTouchLift, true);
+      };
+    }
     menu.classList.remove('hidden');
     if (window.innerWidth <= 780) {
       menu.style.left = '';
@@ -10257,7 +10299,7 @@
         longPressFiredAt = Date.now();
         suppressNextClick = true;
         haptic('medium');
-        openTargetMenu({ clientX: startX, clientY: startY }, info);
+        openTargetMenu({ clientX: startX, clientY: startY, fromLongPress: true }, info);
       }, 480);
     });
 
@@ -10277,7 +10319,7 @@
       (e) => {
         if (suppressNextClick) {
           suppressNextClick = false;
-          if (Date.now() - longPressFiredAt < 1200) {
+          if (Date.now() - longPressFiredAt < 1200 && !e.target.closest('#context-menu')) {
             e.preventDefault();
             e.stopPropagation();
             return;

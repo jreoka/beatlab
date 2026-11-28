@@ -2683,6 +2683,10 @@ a {
   border-radius: var(--radius);
   padding: 6px;
 }
+.context-menu.ctx-arming,
+.ctx-backdrop.ctx-arming {
+  pointer-events: none !important;
+}
 .ctx-sheet-head {
   display: none;
 }
@@ -2718,8 +2722,10 @@ a {
   color: var(--accent);
   font-weight: 600;
 }
-.ctx-item:hover {
-  background: var(--surface-3);
+@media (hover: hover) and (pointer: fine) {
+  .ctx-item:hover {
+    background: var(--surface-3);
+  }
 }
 
 /* Share Modal */
@@ -6474,9 +6480,11 @@ html, body {
 .user-menu-item {
   border-radius: var(--radius-sm);
 }
-.ctx-item:hover,
-.user-menu-item:hover {
-  background: var(--surface-2);
+@media (hover: hover) and (pointer: fine) {
+  .ctx-item:hover,
+  .user-menu-item:hover {
+    background: var(--surface-2);
+  }
 }
 .ctx-sep {
   border-color: var(--border) !important;
