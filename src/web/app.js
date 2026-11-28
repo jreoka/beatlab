@@ -9967,7 +9967,9 @@
   }
 
   function positionContextMenu(menu, backdrop, event) {
-    haptic('select');
+    if (!(event && event.fromLongPress)) {
+      haptic('select');
+    }
     disarmTrackMenuPointerGuard();
     if (event && event.fromLongPress) {
       menu.classList.add('ctx-arming');
@@ -10217,12 +10219,14 @@
 
   function wireTrackGestures() {
     let holdTimer = null;
+    let activeTouchHold = false;
     let startX = 0;
     let startY = 0;
     let longPressFiredAt = 0;
     let suppressNextClick = false;
 
     const clearHold = () => {
+      activeTouchHold = false;
       if (holdTimer) {
         clearTimeout(holdTimer);
         holdTimer = null;
@@ -10282,8 +10286,16 @@
       const info = getTargetArgs(e.target);
       if (!info) return;
       e.preventDefault();
+      const isTouch = activeTouchHold || e.pointerType === 'touch' || e.pointerType === 'pen';
+      clearHold();
       if (Date.now() - longPressFiredAt < 700) return;
-      openTargetMenu(e, info);
+      if (isTouch) {
+        longPressFiredAt = Date.now();
+        suppressNextClick = true;
+        openTargetMenu({ clientX: e.clientX, clientY: e.clientY, fromLongPress: true }, info);
+      } else {
+        openTargetMenu(e, info);
+      }
     });
 
     document.addEventListener('pointerdown', (e) => {
@@ -10292,10 +10304,12 @@
       const info = getTargetArgs(e.target);
       if (!info) return;
       clearHold();
+      activeTouchHold = true;
       startX = e.clientX;
       startY = e.clientY;
       holdTimer = setTimeout(() => {
         holdTimer = null;
+        activeTouchHold = false;
         longPressFiredAt = Date.now();
         suppressNextClick = true;
         haptic('medium');
@@ -10310,8 +10324,14 @@
       }
     });
 
-    document.addEventListener('pointerup', clearHold);
-    document.addEventListener('pointercancel', clearHold);
+    const onPointerEnd = () => {
+      clearHold();
+      if (suppressNextClick) {
+        longPressFiredAt = Date.now();
+      }
+    };
+    document.addEventListener('pointerup', onPointerEnd);
+    document.addEventListener('pointercancel', onPointerEnd);
     document.addEventListener('scroll', clearHold, true);
 
     document.addEventListener(
