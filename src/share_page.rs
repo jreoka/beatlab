@@ -1465,14 +1465,14 @@ pub fn render_share_html(
       }}
     }}
 
-    function advanceShareTrack(step) {{
-      if (tracks.length <= 1) return;
+    function advanceShareTrack(step, fromAutoSkip = false) {{
+      if (tracks.length <= 1) return false;
       if (state.order.length !== tracks.length) rebuildPlayOrder(state.idx);
       const nextPos = state.orderPos + step;
       if (nextPos >= 0 && nextPos < state.order.length) {{
         state.orderPos = nextPos;
-        loadTrack(state.order[nextPos], true);
-        return;
+        loadTrack(state.order[nextPos], true, fromAutoSkip);
+        return true;
       }}
       if (state.repeat === 'all') {{
         if (step > 0) {{
@@ -1485,12 +1485,32 @@ pub fn render_share_html(
             state.order = reshuffled;
           }}
           state.orderPos = 0;
-          loadTrack(state.order[0], true);
+          loadTrack(state.order[0], true, fromAutoSkip);
+          return true;
         }} else {{
           state.orderPos = state.order.length - 1;
-          loadTrack(state.order[state.orderPos], true);
+          loadTrack(state.order[state.orderPos], true, fromAutoSkip);
+          return true;
         }}
       }}
+      return false;
+    }}
+
+    function handleSharePlaybackFailure(errToken, t) {{
+      if (!t || errToken !== state.activeAudioToken || tracks[state.idx]?.id !== t.id) return;
+      if (state.autoSkipAttemptedToken === errToken) return;
+      state.autoSkipAttemptedToken = errToken;
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      state.consecutiveFailures = (state.consecutiveFailures || 0) + 1;
+      const maxSkips = Math.min(5, Math.max(0, tracks.length - 1));
+      if (!isOffline && tracks.length > 1 && state.consecutiveFailures <= maxSkips) {{
+        if (advanceShareTrack(1, true)) {{
+          toast(`Couldn't play "${{t.title}}" — skipping to next`);
+          return;
+        }}
+      }}
+      updatePlayBtn(false);
+      toast(`Unable to play "${{t.title}}" right now`);
     }}
 
     function commitShareTrack(token, t, autoplay) {{
@@ -1505,13 +1525,20 @@ pub fn render_share_html(
       if (autoplay) {{
         audio.play().catch((e) => {{
           if (token !== state.activeAudioToken || (e && e.name === 'AbortError')) return;
+          if (e && e.name !== 'NotAllowedError') {{
+            handleSharePlaybackFailure(token, t);
+            return;
+          }}
           updatePlayBtn(false);
         }});
       }}
     }}
 
-    function loadTrack(idx, autoplay = false) {{
+    function loadTrack(idx, autoplay = false, fromAutoSkip = false) {{
       if (!tracks.length) return;
+      if (!fromAutoSkip) {{
+        state.consecutiveFailures = 0;
+      }}
       if (state.loadCommitTimer) {{
         clearTimeout(state.loadCommitTimer);
         state.loadCommitTimer = null;
@@ -1521,7 +1548,7 @@ pub fn render_share_html(
         state.lyricsAbortController = null;
       }}
       const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
-      const isBurst = autoplay && state.lastSwitchAt > 0 && now - state.lastSwitchAt < 280;
+      const isBurst = !fromAutoSkip && autoplay && state.lastSwitchAt > 0 && now - state.lastSwitchAt < 280;
       if (autoplay) state.lastSwitchAt = now;
       const token = ++state.activeAudioToken;
       state.idx = ((idx % tracks.length) + tracks.length) % tracks.length;
@@ -1638,6 +1665,7 @@ pub fn render_share_html(
       }}
     }});
     audio.addEventListener('play', () => {{ ensureNormGraph(); updatePlayBtn(true); }});
+    audio.addEventListener('playing', () => {{ state.consecutiveFailures = 0; }});
     audio.addEventListener('pause', () => updatePlayBtn(false));
     audio.addEventListener('ended', () => {{
       if (state.loadCommitTimer) return;
@@ -1654,13 +1682,21 @@ pub fn render_share_html(
       if (state.loadCommitTimer || !audio.getAttribute('src')) return;
       const errToken = state.activeAudioToken;
       const t = tracks[state.idx];
-      if (!t || state.compatAttemptedId === t.id) return;
-      state.compatAttemptedId = t.id;
-      audio.src = buildUrl(t, true);
-      audio.play().catch((e) => {{
-        if (errToken !== state.activeAudioToken || (e && e.name === 'AbortError')) return;
-        updatePlayBtn(false);
-      }});
+      if (!t) return;
+      if (state.compatAttemptedId !== t.id && !audio.src.includes('compat=1')) {{
+        state.compatAttemptedId = t.id;
+        audio.src = buildUrl(t, true);
+        audio.play().catch((e) => {{
+          if (errToken !== state.activeAudioToken || (e && e.name === 'AbortError')) return;
+          if (e && e.name !== 'NotAllowedError') {{
+            handleSharePlaybackFailure(errToken, t);
+            return;
+          }}
+          updatePlayBtn(false);
+        }});
+        return;
+      }}
+      handleSharePlaybackFailure(errToken, t);
     }});
     audio.addEventListener('timeupdate', () => {{
       if (state.seeking) return;

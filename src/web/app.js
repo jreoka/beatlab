@@ -189,6 +189,8 @@
     networkRetryTimer: null,
     networkRetryCount: 0,
     pendingNetworkResume: null,
+    consecutivePlayFailures: 0,
+    autoSkipAttemptedToken: 0,
     stallTimer: null,
     lastPositionStateAt: 0,
     volume: parseFloat(localStorage.getItem('beatlab_vol') || '0.9'),
@@ -7357,7 +7359,9 @@
     state.pendingNetworkResume = null;
   }
 
-  function scheduleNetworkRetry(errToken, track, resumePos = 0, fromStall = false) {
+  const MAX_CONSECUTIVE_PLAY_FAILURES = 5;
+
+  function scheduleNetworkRetry(errToken, track, resumePos = 0, fromStall = false, maxRetries = 3) {
     if (!track || errToken !== state.activeAudioToken) return false;
     const cur = currentTrack();
     if (!cur || cur.id !== track.id) return false;
@@ -7368,7 +7372,7 @@
       return true;
     }
 
-    if (state.networkRetryCount >= 3) {
+    if (state.networkRetryCount >= maxRetries) {
       state.pendingNetworkResume = { trackId: track.id, pos: safePos, token: errToken };
       return false;
     }
@@ -7399,7 +7403,12 @@
           if (errToken !== state.activeAudioToken) return;
           if (e && e.name === 'AbortError') return;
           if (e && e.name !== 'NotAllowedError') {
-            scheduleNetworkRetry(errToken, nowCur, safePos, false);
+            handlePlaybackFailure(errToken, nowCur, {
+              allowRetry: true,
+              maxRetries,
+              resumePos: safePos,
+              fromStall: false,
+            });
           } else {
             updatePlayButton(false);
           }
@@ -7409,6 +7418,72 @@
       }
     }, delayMs);
     return true;
+  }
+
+  async function handlePlaybackFailure(
+    errToken,
+    track,
+    { allowRetry = true, maxRetries = 3, resumePos = 0, fromStall = false } = {}
+  ) {
+    if (!track || errToken !== state.activeAudioToken) return;
+    const cur = currentTrack();
+    if (!cur || cur.id !== track.id) return;
+    if (state.autoSkipAttemptedToken === errToken) return;
+
+    const safePos = Number.isFinite(resumePos) && resumePos > 0.5 ? resumePos : 0;
+    const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    if (isOffline) {
+      scheduleNetworkRetry(errToken, cur, safePos, fromStall, maxRetries);
+      checkServerHealth();
+      return;
+    }
+
+    if (allowRetry && scheduleNetworkRetry(errToken, cur, safePos, fromStall, maxRetries)) {
+      checkServerHealth();
+      return;
+    }
+
+    state.autoSkipAttemptedToken = errToken;
+    clearPlaybackRecovery();
+
+    // Confirm the Beatlab server itself is reachable before skipping so a server
+    // outage pauses and resumes cleanly instead of burning through the queue.
+    const serverUp = await checkServerHealth();
+    if (errToken !== state.activeAudioToken) return;
+    const latestCur = currentTrack();
+    if (!latestCur || latestCur.id !== track.id) return;
+
+    if (!serverUp) {
+      state.pendingNetworkResume = { trackId: latestCur.id, pos: safePos, token: errToken };
+      updatePlayButton(false);
+      clearNowPlaying(false);
+      showToast(`Unable to play "${latestCur.title}" right now`);
+      return;
+    }
+
+    state.consecutivePlayFailures = (state.consecutivePlayFailures || 0) + 1;
+
+    const hasNextInQueue = state.queueIndex + 1 < state.queue.length;
+    const canWrapToAnother = state.repeat === 'all' && state.queue.length > 1;
+    const canAutoplayAnother = !!state.autoplay && state.queue.length > 0;
+    const canSkip =
+      state.consecutivePlayFailures <= MAX_CONSECUTIVE_PLAY_FAILURES &&
+      (hasNextInQueue || canWrapToAnother || canAutoplayAnother);
+
+    if (canSkip) {
+      showToast(`Couldn't play "${latestCur.title}" — skipping to next`);
+      await nextTrack(false, { fromAutoSkip: true });
+      return;
+    }
+
+    updatePlayButton(false);
+    setMediaPlaybackState('none');
+    clearNowPlaying(false);
+    if (state.consecutivePlayFailures > MAX_CONSECUTIVE_PLAY_FAILURES) {
+      showToast('Playback stopped — multiple tracks failed to play');
+    } else {
+      showToast(`Unable to play "${latestCur.title}" right now`);
+    }
   }
 
   function resumePendingNetworkPlayback() {
@@ -7438,6 +7513,10 @@
       audio.play().catch((e) => {
         if (pending.token !== state.activeAudioToken) return;
         if (e && e.name === 'AbortError') return;
+        if (e && e.name !== 'NotAllowedError') {
+          handlePlaybackFailure(pending.token, cur, { allowRetry: true, resumePos: pending.pos, fromStall: false });
+          return;
+        }
         updatePlayButton(false);
       });
     } finally {
@@ -7741,7 +7820,8 @@
         if (loadToken !== state.activeAudioToken) return;
         if (e && e.name === 'AbortError') return;
         if (e && e.name !== 'NotAllowedError') {
-          if (scheduleNetworkRetry(loadToken, track, 0, false)) return;
+          handlePlaybackFailure(loadToken, track, { allowRetry: true, resumePos: 0, fromStall: false });
+          return;
         }
         updatePlayButton(false);
         clearNowPlaying(false);
@@ -7884,8 +7964,11 @@
     });
   }
 
-  async function playQueueAt(index, { allowAutoRadio = true } = {}) {
+  async function playQueueAt(index, { allowAutoRadio = true, fromAutoSkip = false } = {}) {
     if (index < 0 || index >= state.queue.length) return;
+    if (!fromAutoSkip) {
+      state.consecutivePlayFailures = 0;
+    }
     const prevTrackObj = currentTrack();
     const track = state.queue[index];
     if (prevTrackObj && prevTrackObj.id !== track.id) {
@@ -7895,6 +7978,7 @@
     const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
     // Never defer audio commitment into a throttled setTimeout while backgrounded/locked.
     const isBurst =
+      !fromAutoSkip &&
       document.visibilityState === 'visible' &&
       state.lastPlaySwitchAt > 0 &&
       now - state.lastPlaySwitchAt < 280;
@@ -8992,6 +9076,8 @@
     const cur = currentTrack();
     if (!cur) return;
     clearPlaybackRecovery();
+    state.consecutivePlayFailures = 0;
+    state.autoSkipAttemptedToken = 0;
     state.intentionalPause = false;
     state.hiddenResumeAttempted = false;
     syncMediaSession(cur, true);
@@ -9022,7 +9108,8 @@
         if (playToken !== state.activeAudioToken) return;
         if (e && e.name === 'AbortError') return;
         if (e && e.name !== 'NotAllowedError') {
-          if (scheduleNetworkRetry(playToken, cur, resumePos, false)) return;
+          handlePlaybackFailure(playToken, cur, { allowRetry: true, resumePos, fromStall: false });
+          return;
         }
         updatePlayButton(false);
         clearNowPlaying(false);
@@ -9063,7 +9150,7 @@
     playQueueAt(prev);
   }
 
-  async function nextTrack(manual = false) {
+  async function nextTrack(manual = false, { fromAutoSkip = false } = {}) {
     if (manual) haptic('medium');
     const cur = currentTrack();
     if (
@@ -9088,7 +9175,7 @@
       if (state.autoplay && !state.radioLoading && state.queue.length - next <= 2 && cur) {
         appendRadioTracks(cur.id);
       }
-      return playQueueAt(next);
+      return playQueueAt(next, { fromAutoSkip });
     }
     if (state.repeat === 'all') {
       if (state.shuffle && state.queue.length > 1) {
@@ -9099,7 +9186,7 @@
         }
         state.queue = reshuffled;
       }
-      return playQueueAt(0);
+      return playQueueAt(0, { fromAutoSkip });
     }
     if (state.autoplay && cur) {
       const idxBefore = state.queueIndex;
@@ -9110,7 +9197,7 @@
         await appendRadioTracks(cur.id);
       }
       if (state.queueIndex === idxBefore && state.queueIndex + 1 < state.queue.length) {
-        return playQueueAt(state.queueIndex + 1);
+        return playQueueAt(state.queueIndex + 1, { fromAutoSkip });
       }
       updatePlayButton(false);
       setMediaPlaybackState('none');
@@ -9144,7 +9231,12 @@
         const nowPos = audio.currentTime || 0;
         // Only intervene if playback genuinely hasn't progressed for 15s.
         if (Math.abs(nowPos - watchPos) < 0.25 && audio.readyState < 3) {
-          scheduleNetworkRetry(watchToken, cur, nowPos, true);
+          handlePlaybackFailure(watchToken, cur, {
+            allowRetry: true,
+            maxRetries: 2,
+            resumePos: nowPos,
+            fromStall: true,
+          });
         }
       }, 15000);
     };
@@ -9166,6 +9258,7 @@
       state.hiddenResumeAttempted = false;
       state.networkRetryCount = 0;
       state.pendingNetworkResume = null;
+      state.consecutivePlayFailures = 0;
       updatePlayButton(true);
       const cur = currentTrack();
       if (cur) {
@@ -9267,8 +9360,13 @@
         state.switchGuardUntil = Date.now() + 800;
         try {
           audio.src = buildStreamUrl(cur, true, pos);
-          audio.play().catch(() => {
+          audio.play().catch((e) => {
             if (errToken !== state.activeAudioToken) return;
+            if (e && e.name === 'AbortError') return;
+            if (e && e.name !== 'NotAllowedError') {
+              handlePlaybackFailure(errToken, cur, { allowRetry: false, resumePos: pos, fromStall: false });
+              return;
+            }
             updatePlayButton(false);
             clearNowPlaying(false);
           });
@@ -9277,16 +9375,16 @@
         }
         return;
       }
-      if (code === 2 || isOffline || code === 4) {
-        if (scheduleNetworkRetry(errToken, cur, pos, false)) {
-          checkServerHealth();
-          return;
-        }
+      if (code === 2 || isOffline) {
+        handlePlaybackFailure(errToken, cur, { allowRetry: true, maxRetries: 3, resumePos: pos, fromStall: false });
+        return;
       }
-      updatePlayButton(false);
-      clearNowPlaying(false);
-      checkServerHealth();
-      showToast(`Unable to play "${cur.title}" right now`);
+      if (code === 4) {
+        const allowRetry = state.compatAttemptedId !== cur.id;
+        handlePlaybackFailure(errToken, cur, { allowRetry, maxRetries: 1, resumePos: pos, fromStall: false });
+        return;
+      }
+      handlePlaybackFailure(errToken, cur, { allowRetry: false, resumePos: pos, fromStall: false });
     });
     audio.addEventListener('ended', () => {
       clearStallWatch();
