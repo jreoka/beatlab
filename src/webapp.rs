@@ -5435,29 +5435,41 @@ pub async fn library(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .collect();
     let recent: Vec<Track> = state
         .store
-        .user_recent_tracks(uid, 40, 0)
+        .user_all_recent_tracks(uid)
         .unwrap_or_default()
         .into_iter()
         .map(|(t, _)| t)
         .collect();
     let frequent: Vec<Track> = state
         .store
-        .user_frequent_tracks(uid, 40, 0)
+        .user_all_frequent_tracks(uid)
         .unwrap_or_default()
         .into_iter()
         .map(|(t, _)| t)
         .collect();
+
+    let starred = state.store.starred_ids(uid).unwrap_or_default();
+    let stats = state.store.track_stats_map(uid).unwrap_or_default();
+    let ratings = state.store.user_ratings(uid).unwrap_or_default();
+    let mut all_ids_seen = HashSet::new();
+    let mut all_ids = Vec::new();
+    for t in starred_tracks.iter().chain(recent.iter()).chain(frequent.iter()) {
+        if all_ids_seen.insert(t.id.as_str()) {
+            all_ids.push(t.id.clone());
+        }
+    }
+    let loudness = state.store.loudness_map_for_ids(&all_ids).unwrap_or_default();
 
     json_res(json!({
         "playlists": playlists
             .iter()
             .map(|p| playlist_summary_for_user_json(&state, uid, p))
             .collect::<Vec<_>>(),
-        "likedTracks": to_web_tracks(&state, uid, &starred_tracks),
+        "likedTracks": to_web_tracks_from_maps(&starred_tracks, &starred, &stats, &ratings, &loudness),
         "savedAlbums": saved_albums,
         "followedArtists": followed_artists,
-        "recentTracks": to_web_tracks(&state, uid, &recent),
-        "frequentTracks": to_web_tracks(&state, uid, &frequent),
+        "recentTracks": to_web_tracks_from_maps(&recent, &starred, &stats, &ratings, &loudness),
+        "frequentTracks": to_web_tracks_from_maps(&frequent, &starred, &stats, &ratings, &loudness),
     }))
 }
 

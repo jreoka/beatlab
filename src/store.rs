@@ -3504,6 +3504,62 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn user_all_recent_tracks(
+        &self,
+        user_id: i64,
+    ) -> AppResult<Vec<(Track, UserTrackStats)>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, uts.play_count, uts.skip_count, uts.last_played
+             FROM user_track_stats uts
+             JOIN tracks t ON t.id = uts.track_id
+             WHERE uts.user_id = ?1 AND uts.play_count > 0
+             ORDER BY uts.last_played DESC",
+            prefixed_track_cols("t")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                let t = row_to_track(r)?;
+                let st = UserTrackStats {
+                    play_count: r.get(21)?,
+                    skip_count: r.get(22)?,
+                    last_played: r.get(23)?,
+                };
+                Ok((t, st))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn user_all_frequent_tracks(
+        &self,
+        user_id: i64,
+    ) -> AppResult<Vec<(Track, UserTrackStats)>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {}, uts.play_count, uts.skip_count, uts.last_played
+             FROM user_track_stats uts
+             JOIN tracks t ON t.id = uts.track_id
+             WHERE uts.user_id = ?1 AND uts.play_count > 0
+             ORDER BY uts.play_count DESC, uts.last_played DESC",
+            prefixed_track_cols("t")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                let t = row_to_track(r)?;
+                let st = UserTrackStats {
+                    play_count: r.get(21)?,
+                    skip_count: r.get(22)?,
+                    last_played: r.get(23)?,
+                };
+                Ok((t, st))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn user_recent_events(&self, user_id: i64, limit: usize) -> AppResult<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(

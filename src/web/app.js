@@ -222,6 +222,8 @@
     viewAbortController: null,
     homeCache: null,
     libTab: 'playlists',
+    libTrackLists: {},
+    virtualListCleanup: null,
     statsRange: 'all',
     statsMetric: 'streams',
     statsData: null,
@@ -3022,7 +3024,17 @@
     return new URLSearchParams(hash.slice(qIdx + 1)).get('q') || '';
   }
 
+  function cleanupVirtualList() {
+    if (typeof state.virtualListCleanup === 'function') {
+      try {
+        state.virtualListCleanup();
+      } catch {}
+      state.virtualListCleanup = null;
+    }
+  }
+
   function abortActiveViewRequest() {
+    cleanupVirtualList();
     state.viewReqToken += 1;
     if (state.viewAbortController) {
       state.viewAbortController.abort();
@@ -5444,6 +5456,188 @@
     return hash === 'library' || hash === 'liked' || hash === 'history';
   }
 
+  function renderLibraryTrackRow(track, idx, { singleRadio = false, libraryListKey = '' } = {}) {
+    const t = (track && track.id && state.trackMap.get(track.id)) || track;
+    const cur = currentTrack();
+    const isCur = cur && cur.id === t.id;
+    const playClick = singleRadio
+      ? `App.playSingle(${esc(JSON.stringify(t.id))})`
+      : `App.playLibraryList(${esc(JSON.stringify(libraryListKey))}, ${idx})`;
+    return `<div class="track-row ${isCur ? 'playing' : ''}" data-tid="${esc(t.id)}">
+      <div class="tr-idx" onclick="${playClick}">
+        <span class="tr-num">${idx + 1}</span>
+        <span class="tr-playing-icon">${ICONS.nowPlaying}</span>
+      </div>
+      <div class="tr-main" onclick="${playClick}">
+        <img class="tr-thumb" src="${esc(t.coverUrl)}" loading="lazy" alt="" />
+        <div class="tr-text">
+          <div class="tr-title-row">
+            <div class="tr-title">${esc(t.title)}</div>
+          </div>
+          <div class="tr-sub">
+            <span class="clickable" onclick="event.stopPropagation();App.navigate('artist/${encodeURIComponent(t.artistId)}')">${esc(t.artist)}</span>
+            ${t.album ? ` · <span class="clickable" onclick="event.stopPropagation();App.navigate('album/${encodeURIComponent(t.albumId)}')">${esc(t.album)}</span>` : ''}
+            ${yearTag(t.year)}
+          </div>
+        </div>
+      </div>
+      <span class="quality-badge ${t.isLossless ? 'lossless' : ''}">${esc(t.qualityBadge)}</span>
+      <div class="tr-dur">${fmtTime(t.duration)}</div>
+      <div class="tr-actions">
+        <button class="icon-btn tr-like-btn ${t.isStarred ? 'active' : ''}" title="Like" onclick="App.toggleTrackLike(${esc(JSON.stringify(t.id))}, this)">
+          ${ICONS.heart}
+        </button>
+        <button class="icon-btn" title="More options" onclick="App.openTrackMenu(event, ${esc(JSON.stringify(t.id))})">${ICONS.more}</button>
+      </div>
+    </div>`;
+  }
+
+  function mountVirtualList({
+    container,
+    scrollEl,
+    items,
+    renderItem,
+    mode = 'list',
+    threshold = 50,
+    estimatedRowHeight = 58,
+    overscanRows = 8,
+  }) {
+    cleanupVirtualList();
+    if (!container || !scrollEl || !Array.isArray(items) || !items.length) return;
+
+    if (items.length <= threshold) {
+      container.style.paddingTop = '';
+      container.style.paddingBottom = '';
+      container.innerHTML = items.map((item, idx) => renderItem(item, idx)).join('');
+      return;
+    }
+
+    let rowStride = estimatedRowHeight;
+    let cols = 1;
+    let measured = false;
+    let lastStart = -1;
+    let lastEnd = -1;
+    let lastTopPad = -1;
+    let lastBottomPad = -1;
+    let rafId = 0;
+    let disposed = false;
+
+    function measureGridCols() {
+      if (mode !== 'grid') return 1;
+      const cs = getComputedStyle(container);
+      const tmpl = cs.gridTemplateColumns || '';
+      const count = tmpl.split(/\s+/).filter((tok) => tok && tok !== 'none').length;
+      return Math.max(1, count);
+    }
+
+    function measureRowStride() {
+      const first = container.firstElementChild;
+      if (!first) return rowStride;
+      const rect = first.getBoundingClientRect();
+      if (!rect || rect.height <= 0) return rowStride;
+      const cs = getComputedStyle(container);
+      const gap = parseFloat(cs.rowGap || cs.gap || '0') || 0;
+      return Math.max(24, rect.height + gap);
+    }
+
+    function computeAndRender(force = false) {
+      if (disposed || !container.isConnected) return;
+      cols = measureGridCols();
+      const totalRows = Math.ceil(items.length / cols);
+      const scrollRect = scrollEl.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      const viewportH = Math.max(240, scrollRect.height || window.innerHeight || 720);
+      const relTop = containerRect.top - scrollRect.top;
+      const visibleTop = Math.max(0, -relTop);
+      const visibleBottom = Math.max(0, viewportH - relTop);
+
+      const startRow = Math.max(0, Math.floor(visibleTop / rowStride) - overscanRows);
+      const endRow = Math.min(totalRows, Math.ceil(visibleBottom / rowStride) + overscanRows);
+      const startIdx = Math.min(items.length, startRow * cols);
+      const endIdx = Math.min(items.length, endRow * cols);
+      const topPad = Math.round(startRow * rowStride);
+      const bottomPad = Math.round(Math.max(0, totalRows - endRow) * rowStride);
+
+      if (
+        !force &&
+        startIdx === lastStart &&
+        endIdx === lastEnd &&
+        topPad === lastTopPad &&
+        bottomPad === lastBottomPad
+      ) {
+        return;
+      }
+
+      lastStart = startIdx;
+      lastEnd = endIdx;
+      lastTopPad = topPad;
+      lastBottomPad = bottomPad;
+
+      container.style.paddingTop = topPad > 0 ? `${topPad}px` : '';
+      container.style.paddingBottom = bottomPad > 0 ? `${bottomPad}px` : '';
+
+      let out = '';
+      for (let i = startIdx; i < endIdx; i++) {
+        out += renderItem(items[i], i);
+      }
+      container.innerHTML = out;
+
+      if (!measured && container.firstElementChild) {
+        const nextStride = measureRowStride();
+        measured = true;
+        if (Math.abs(nextStride - rowStride) > 1) {
+          rowStride = nextStride;
+          computeAndRender(true);
+        }
+      }
+    }
+
+    function scheduleUpdate(remeasure = false) {
+      if (disposed) return;
+      if (remeasure) measured = false;
+      if (rafId) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        computeAndRender(remeasure);
+      });
+    }
+
+    const onScroll = () => scheduleUpdate(false);
+    const onResize = () => scheduleUpdate(true);
+
+    scrollEl.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onResize, { passive: true });
+
+    let resizeObserver = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      let lastWidth = container.clientWidth;
+      resizeObserver = new ResizeObserver(() => {
+        const w = container.clientWidth;
+        if (w > 0 && w !== lastWidth) {
+          lastWidth = w;
+          scheduleUpdate(true);
+        }
+      });
+      resizeObserver.observe(container);
+    }
+
+    computeAndRender(true);
+
+    state.virtualListCleanup = () => {
+      disposed = true;
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+      scrollEl.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onResize);
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+        resizeObserver = null;
+      }
+    };
+  }
+
   async function renderLibrary(tab = 'playlists') {
     const { reqToken, signal } = beginViewRequest();
     state.libTab = tab;
@@ -5458,6 +5652,9 @@
       const frequent = cacheTracks(lib.frequentTracks || []);
       const albums = lib.savedAlbums || [];
       const artists = lib.followedArtists || [];
+      state.libTrackLists = {
+        liked: liked.map((t) => t.id),
+      };
 
       const tabs = [
         ['playlists', `Playlists (${state.playlists.length})`],
@@ -5465,7 +5662,7 @@
         ['albums', `Albums (${albums.length})`],
         ['artists', `Artists (${artists.length})`],
         ['history', `History (${recent.length})`],
-        ['frequent', `Most Played`],
+        ['frequent', `Most Played (${frequent.length})`],
       ];
 
       let html = `<div class="section-head"><h1>Your Library</h1><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn-secondary" onclick="App.navigate('stats')">Listening Stats</button><button class="btn-primary" onclick="App.promptCreatePlaylist()">+ New Playlist</button></div></div>`;
@@ -5478,31 +5675,102 @@
 
       if (tab === 'playlists') {
         html += state.playlists.length
-          ? `<div class="card-grid">${state.playlists.map(renderPlaylistCard).join('')}</div>`
+          ? `<div class="card-grid" id="lib-virtual-grid"></div>`
           : `<p class="muted-center">No playlists yet. Create one or save an Instant Mix!</p>`;
       } else if (tab === 'liked') {
         html += liked.length
-          ? `<div style="margin-bottom:14px"><button class="btn-primary" onclick="App.playListByIds(${esc(JSON.stringify(liked.map((t) => t.id)))}, 0)">${ICONS.play} Play Liked Songs</button></div><div class="track-table">${renderTrackRows(liked)}</div>`
+          ? `<div style="margin-bottom:14px"><button class="btn-primary" onclick="App.playLibraryList('liked', 0)">${ICONS.play} Play Liked Songs</button></div><div class="track-table" id="lib-virtual-list"></div>`
           : `<p class="muted-center">No liked songs yet. Tap the heart icon on any track!</p>`;
       } else if (tab === 'albums') {
         html += albums.length
-          ? `<div class="card-grid">${albums.map(renderAlbumCard).join('')}</div>`
+          ? `<div class="card-grid" id="lib-virtual-grid"></div>`
           : `<p class="muted-center">No saved albums yet.</p>`;
       } else if (tab === 'artists') {
         html += artists.length
-          ? `<div class="card-grid">${artists.map(renderArtistCard).join('')}</div>`
+          ? `<div class="card-grid" id="lib-virtual-grid"></div>`
           : `<p class="muted-center">Not following any artists yet.</p>`;
       } else if (tab === 'history') {
         html += recent.length
-          ? `<div class="track-table">${renderTrackRows(recent, null, null, true)}</div>`
+          ? `<div class="track-table" id="lib-virtual-list"></div>`
           : `<p class="muted-center">Your listening history will appear here.</p>`;
       } else if (tab === 'frequent') {
         html += frequent.length
-          ? `<div class="track-table">${renderTrackRows(frequent, null, null, true)}</div>`
+          ? `<div class="track-table" id="lib-virtual-list"></div>`
           : `<p class="muted-center">Play tracks to see your most-spun favorites.</p>`;
       }
 
-      $('main-view').innerHTML = html;
+      const mainEl = $('main-view');
+      mainEl.innerHTML = html;
+      mainEl.scrollTop = 0;
+
+      if (tab === 'playlists' && state.playlists.length) {
+        mountVirtualList({
+          container: $('lib-virtual-grid'),
+          scrollEl: mainEl,
+          items: state.playlists,
+          renderItem: renderPlaylistCard,
+          mode: 'grid',
+          threshold: 48,
+          estimatedRowHeight: 260,
+          overscanRows: 3,
+        });
+      } else if (tab === 'liked' && liked.length) {
+        mountVirtualList({
+          container: $('lib-virtual-list'),
+          scrollEl: mainEl,
+          items: liked,
+          renderItem: (t, idx) =>
+            renderLibraryTrackRow(t, idx, { singleRadio: false, libraryListKey: 'liked' }),
+          mode: 'list',
+          threshold: 50,
+          estimatedRowHeight: 58,
+          overscanRows: 10,
+        });
+      } else if (tab === 'albums' && albums.length) {
+        mountVirtualList({
+          container: $('lib-virtual-grid'),
+          scrollEl: mainEl,
+          items: albums,
+          renderItem: renderAlbumCard,
+          mode: 'grid',
+          threshold: 48,
+          estimatedRowHeight: 260,
+          overscanRows: 3,
+        });
+      } else if (tab === 'artists' && artists.length) {
+        mountVirtualList({
+          container: $('lib-virtual-grid'),
+          scrollEl: mainEl,
+          items: artists,
+          renderItem: renderArtistCard,
+          mode: 'grid',
+          threshold: 48,
+          estimatedRowHeight: 250,
+          overscanRows: 3,
+        });
+      } else if (tab === 'history' && recent.length) {
+        mountVirtualList({
+          container: $('lib-virtual-list'),
+          scrollEl: mainEl,
+          items: recent,
+          renderItem: (t, idx) => renderLibraryTrackRow(t, idx, { singleRadio: true }),
+          mode: 'list',
+          threshold: 50,
+          estimatedRowHeight: 58,
+          overscanRows: 10,
+        });
+      } else if (tab === 'frequent' && frequent.length) {
+        mountVirtualList({
+          container: $('lib-virtual-list'),
+          scrollEl: mainEl,
+          items: frequent,
+          renderItem: (t, idx) => renderLibraryTrackRow(t, idx, { singleRadio: true }),
+          mode: 'list',
+          threshold: 50,
+          estimatedRowHeight: 58,
+          overscanRows: 10,
+        });
+      }
     } catch (e) {
       handleViewFetchError(e, reqToken, signal);
     }
@@ -12572,6 +12840,10 @@
         history.replaceState(null, '', nextHash);
       }
       return renderLibrary(tab);
+    },
+    playLibraryList: (key, startIndex = 0) => {
+      const ids = (state.libTrackLists && state.libTrackLists[key]) || [];
+      if (ids.length) playListByIds(ids, startIndex);
     },
     setStatsRange: (range) => {
       haptic('tap');
