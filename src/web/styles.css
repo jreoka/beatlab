@@ -9795,19 +9795,19 @@ html[data-theme="light"] .imix-art-shimmer {
     box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.08);
   }
 
-  /* ---- 4-tab Native Frosted Bottom Navigation ---- */
+  /* ---- 4-tab Native Solid Bottom Navigation ---- */
   .mobile-nav {
     grid-template-columns: repeat(4, 1fr);
     height: calc(var(--mobile-nav-h) + env(safe-area-inset-bottom));
     padding: 4px 10px env(safe-area-inset-bottom);
-    background: rgba(14, 14, 17, 0.86);
-    backdrop-filter: blur(24px) saturate(180%);
-    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    background: var(--bg);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
     border-top: 1px solid rgba(255, 255, 255, 0.07);
     z-index: 95;
   }
   html[data-theme="light"] .mobile-nav {
-    background: rgba(255, 255, 255, 0.88);
+    background: var(--bg);
     border-top: 1px solid rgba(0, 0, 0, 0.07);
   }
   .mobile-nav-btn,
