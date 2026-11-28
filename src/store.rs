@@ -169,7 +169,7 @@ impl Store {
         Ok(store)
     }
 
-    #[cfg(test)]
+        #[cfg(test)]
     pub fn open_memory() -> AppResult<Self> {
         let conn = Connection::open_in_memory()?;
         configure_conn(&conn)?;
@@ -395,7 +395,8 @@ impl Store {
                 track_id TEXT PRIMARY KEY,
                 path TEXT NOT NULL,
                 bytes INTEGER NOT NULL,
-                last_accessed INTEGER NOT NULL
+                last_accessed INTEGER NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 1
             );
 
             -- Per-track EBU R128 integrated loudness & true peak for always-on
@@ -420,7 +421,8 @@ impl Store {
                 object_key TEXT NOT NULL,
                 bytes INTEGER NOT NULL,
                 created INTEGER NOT NULL,
-                last_accessed INTEGER NOT NULL DEFAULT 0
+                last_accessed INTEGER NOT NULL DEFAULT 0,
+                hits INTEGER NOT NULL DEFAULT 1
             );
             -- The recency index is created after migrations add its columns.
             CREATE INDEX IF NOT EXISTS idx_remote_cache_created
@@ -621,6 +623,14 @@ impl Store {
                 ",
             )?;
         }
+        // Hot & cool caches: track hit counts alongside recency for smart
+        // frequency+recency+size-aware eviction.
+        ensure_column(
+            &conn,
+            "cache_entries",
+            "hits",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
         // Cool cache: namespace entries by asset type and track real usage so
         // eviction only happens once the bucket is nearly full.
         ensure_column(
@@ -634,6 +644,12 @@ impl Store {
             "remote_cache_entries",
             "last_accessed",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "remote_cache_entries",
+            "hits",
+            "INTEGER NOT NULL DEFAULT 1",
         )?;
         conn.execute(
             "UPDATE remote_cache_entries SET last_accessed = created WHERE last_accessed = 0",
@@ -735,7 +751,7 @@ impl Store {
 
     /// Test convenience helper: authenticate or create a user in one call.
     /// Production sign-in must use the strict `authenticate_user` instead.
-    #[cfg(test)]
+        #[cfg(test)]
     pub fn authenticate_or_create_user(
         &self,
         username: &str,
@@ -842,7 +858,7 @@ impl Store {
     }
 
     /// Convenience wrapper used by tests; production callers pass full metadata.
-    #[cfg(test)]
+        #[cfg(test)]
     pub fn create_session(&self, user_id: i64, kind: &str) -> AppResult<String> {
         self.create_session_with_meta(user_id, kind, &SessionMeta::default())
     }
@@ -5638,12 +5654,13 @@ impl Store {
         let conn = self.lock();
         let now = Utc::now().timestamp();
         conn.execute(
-            "INSERT INTO remote_cache_entries(track_id, kind, object_key, bytes, created, last_accessed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            "INSERT INTO remote_cache_entries(track_id, kind, object_key, bytes, created, last_accessed, hits)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)
              ON CONFLICT(track_id) DO UPDATE SET
                  kind = excluded.kind, object_key = excluded.object_key,
                  bytes = excluded.bytes, created = excluded.created,
-                 last_accessed = excluded.last_accessed",
+                 last_accessed = excluded.last_accessed,
+                 hits = remote_cache_entries.hits + 1",
             params![Self::cool_registry_id(kind, asset_id), kind, object_key, bytes, now],
         )?;
         Ok(())
@@ -5679,11 +5696,11 @@ impl Store {
         self.get_asset_cache_entry("audio", track_id)
     }
 
-    /// Refreshes the recency signal so frequently used assets survive eviction.
+    /// Refreshes the recency and frequency signals so popular assets survive eviction.
     pub fn touch_asset_cache_entry(&self, kind: &str, asset_id: &str) -> AppResult<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE remote_cache_entries SET last_accessed = ?1 WHERE kind = ?2 AND track_id = ?3",
+            "UPDATE remote_cache_entries SET last_accessed = ?1, hits = hits + 1 WHERE kind = ?2 AND track_id = ?3",
             params![
                 Utc::now().timestamp(),
                 kind,
@@ -5729,26 +5746,54 @@ impl Store {
         Ok(rows)
     }
 
-    /// Least-recently-used first, for cool-cache quota eviction. Returns
-    /// (kind, asset_id, object_key, bytes) so any asset kind can be evicted.
+    /// Smart eviction candidates for cool-cache quota enforcement.
+    /// Ranks entries by a recency-decayed frequency, asset-kind priority, and
+    /// gentle size-awareness score (lowest retention score evicted first).
+    /// Returns (kind, asset_id, object_key, bytes).
     pub fn remote_cache_eviction_candidates(
         &self,
         limit: usize,
     ) -> AppResult<Vec<(String, String, String, i64)>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT kind,
-                    CASE WHEN kind = 'audio' THEN track_id
-                         ELSE substr(track_id, length(kind) + 2) END AS asset_id,
-                    object_key, bytes
-             FROM remote_cache_entries ORDER BY last_accessed ASC LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = Utc::now().timestamp();
+        let pool_limit = limit.saturating_mul(8).max(4000) as i64;
+        let mut candidates: Vec<(String, String, String, i64, i64, f64)> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT kind,
+                        CASE WHEN kind = 'audio' THEN track_id
+                             ELSE substr(track_id, length(kind) + 2) END AS asset_id,
+                        object_key, bytes, last_accessed, hits
+                 FROM remote_cache_entries
+                 ORDER BY last_accessed ASC
+                 LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![pool_limit], |r| {
+                    let kind: String = r.get(0)?;
+                    let asset_id: String = r.get(1)?;
+                    let object_key: String = r.get(2)?;
+                    let bytes: i64 = r.get(3)?;
+                    let last_accessed: i64 = r.get(4)?;
+                    let hits: i64 = r.get(5)?;
+                    let score = cool_cache_retention_score(&kind, now - last_accessed, hits, bytes);
+                    Ok((kind, asset_id, object_key, bytes, last_accessed, score))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        candidates.sort_by(|a, b| {
+            a.5.total_cmp(&b.5)
+                .then_with(|| a.4.cmp(&b.4))
+                .then_with(|| b.3.cmp(&a.3))
+        });
+        candidates.truncate(limit);
+        Ok(candidates
+            .into_iter()
+            .map(|(kind, asset_id, key, bytes, _, _)| (kind, asset_id, key, bytes))
+            .collect())
     }
 
     pub fn delete_asset_cache_entry(&self, kind: &str, asset_id: &str) -> AppResult<()> {
@@ -5764,8 +5809,12 @@ impl Store {
         let now = Utc::now().timestamp();
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO cache_entries(track_id, path, bytes, last_accessed) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(track_id) DO UPDATE SET path = excluded.path, bytes = excluded.bytes, last_accessed = excluded.last_accessed",
+            "INSERT INTO cache_entries(track_id, path, bytes, last_accessed, hits) VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(track_id) DO UPDATE SET
+                 path = excluded.path,
+                 bytes = excluded.bytes,
+                 last_accessed = excluded.last_accessed,
+                 hits = cache_entries.hits + 1",
             params![track_id, path, bytes, now],
         )?;
         Ok(())
@@ -5798,7 +5847,7 @@ impl Store {
         let now = Utc::now().timestamp();
         let conn = self.lock();
         conn.execute(
-            "UPDATE cache_entries SET last_accessed = ?1 WHERE track_id = ?2",
+            "UPDATE cache_entries SET last_accessed = ?1, hits = hits + 1 WHERE track_id = ?2",
             params![now, track_id],
         )?;
         Ok(())
@@ -5831,30 +5880,70 @@ impl Store {
         )?)
     }
 
+    /// Backwards-compatible wrapper that prunes straight to `max_bytes`.
     pub fn prune_cache(&self, max_bytes: i64) -> AppResult<()> {
+        let _ = self.prune_cache_watermarks(max_bytes, max_bytes)?;
+        Ok(())
+    }
+
+    /// Smart hot-cache eviction with high/low-water hysteresis.
+    /// Triggers once total bytes exceed `high_water_bytes` and evicts lowest-scoring
+    /// tracks (combining recency decay, hit frequency, cool-tier backup status, and
+    /// gentle size awareness) down to `low_water_bytes`.
+    pub fn prune_cache_watermarks(
+        &self,
+        high_water_bytes: i64,
+        low_water_bytes: i64,
+    ) -> AppResult<usize> {
         let mut total = self.cache_total_bytes()?;
-        if total <= max_bytes {
-            return Ok(());
+        if total <= high_water_bytes {
+            return Ok(0);
         }
-        let entries: Vec<(String, String, i64)> = {
+        let target = low_water_bytes.min(high_water_bytes).max(0);
+        let now = Utc::now().timestamp();
+        let mut entries: Vec<(String, String, i64, i64, f64)> = {
             let conn = self.lock();
             let mut stmt = conn.prepare(
-                "SELECT track_id, path, bytes FROM cache_entries ORDER BY last_accessed ASC",
+                "SELECT c.track_id, c.path, c.bytes, c.last_accessed, c.hits,
+                        CASE WHEN r.track_id IS NOT NULL THEN 1 ELSE 0 END AS in_cool
+                 FROM cache_entries c
+                 LEFT JOIN remote_cache_entries r
+                   ON r.kind = 'audio' AND r.track_id = c.track_id",
             )?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .query_map([], |r| {
+                    let tid: String = r.get(0)?;
+                    let path: String = r.get(1)?;
+                    let bytes: i64 = r.get(2)?;
+                    let last_accessed: i64 = r.get(3)?;
+                    let hits: i64 = r.get(4)?;
+                    let in_cool: i64 = r.get(5)?;
+                    let score = hot_cache_retention_score(
+                        now - last_accessed,
+                        hits,
+                        bytes,
+                        in_cool != 0,
+                    );
+                    Ok((tid, path, bytes, last_accessed, score))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
+        entries.sort_by(|a, b| {
+            a.4.total_cmp(&b.4)
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| b.2.cmp(&a.2))
+        });
         let mut removed = Vec::new();
-        for (tid, path, bytes) in entries {
-            if total <= max_bytes {
+        for (tid, path, bytes, _, _) in entries {
+            if total <= target {
                 break;
             }
             let _ = std::fs::remove_file(&path);
             removed.push(tid);
             total -= bytes;
         }
+        let count = removed.len();
         if !removed.is_empty() {
             let mut conn = self.lock();
             let tx = conn.transaction()?;
@@ -5866,7 +5955,7 @@ impl Store {
             }
             tx.commit()?;
         }
-        Ok(())
+        Ok(count)
     }
 
     // -------------------------------------------------------------------------
@@ -7727,6 +7816,43 @@ fn migrate_artist_disambiguation_v3(conn: &mut Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// Retention score for hot (local disk) audio cache entries.
+/// Higher score = more valuable to keep; lowest scores are evicted first.
+/// Combines exponential recency decay (3-day half-life), logarithmic hit
+/// frequency, cool-tier backup awareness (tracks not yet mirrored to S3/R2
+/// get a 1.5x retention boost), and gentle size awareness.
+pub fn hot_cache_retention_score(age_secs: i64, hits: i64, bytes: i64, in_cool: bool) -> f64 {
+    const HALF_LIFE_SECS: f64 = 3.0 * 86_400.0;
+    let age = age_secs.max(0) as f64;
+    let recency = 0.5_f64.powf(age / HALF_LIFE_SECS);
+    let freq = 1.0 + (hits.max(1) as f64).ln();
+    let tier_weight = if in_cool { 1.0 } else { 1.5 };
+    let mb = (bytes.max(1) as f64) / (1024.0 * 1024.0);
+    let size_penalty = mb.max(1.0).powf(0.25);
+    (recency * freq * tier_weight) / size_penalty
+}
+
+/// Retention score for cool (S3/R2) cache entries across all asset kinds.
+/// Higher score = more valuable to keep; lowest scores are evicted first.
+/// Combines exponential recency decay (30-day half-life), logarithmic hit
+/// frequency, asset-kind priority (avatars/covers outrank bulky stale audio),
+/// and gentle size awareness.
+pub fn cool_cache_retention_score(kind: &str, age_secs: i64, hits: i64, bytes: i64) -> f64 {
+    const HALF_LIFE_SECS: f64 = 30.0 * 86_400.0;
+    let age = age_secs.max(0) as f64;
+    let recency = 0.5_f64.powf(age / HALF_LIFE_SECS);
+    let freq = 1.0 + (hits.max(1) as f64).ln();
+    let kind_weight = match kind {
+        "avatar" => 2.0,
+        "cover" => 1.5,
+        "embed" => 1.1,
+        _ => 1.0,
+    };
+    let mb = (bytes.max(1) as f64) / (1024.0 * 1024.0);
+    let size_penalty = mb.max(1.0).powf(0.20);
+    (recency * freq * kind_weight) / size_penalty
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9296,6 +9422,99 @@ mod tests {
         assert_eq!(candidates[0].1, "track:old");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn smart_hot_cache_eviction_uses_hysteresis_frequency_and_cool_awareness() {
+        let store = Store::open_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("beatlab_hot_smart_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let p_cool_cold = dir.join("cool_cold.m4a");
+        let p_local_only = dir.join("local_only.m4a");
+        let p_popular = dir.join("popular.m4a");
+        for p in [&p_cool_cold, &p_local_only, &p_popular] {
+            std::fs::write(p, vec![0u8; 1000]).unwrap();
+        }
+
+        store
+            .upsert_cache_entry("t:cool_cold", &p_cool_cold.to_string_lossy(), 1000)
+            .unwrap();
+        store
+            .upsert_cache_entry("t:local_only", &p_local_only.to_string_lossy(), 1000)
+            .unwrap();
+        store
+            .upsert_cache_entry("t:popular", &p_popular.to_string_lossy(), 1000)
+            .unwrap();
+
+        // Mark `t:cool_cold` and `t:popular` as safely backed up in cool storage,
+        // and give `t:popular` many plays.
+        store
+            .upsert_remote_cache_entry("t:cool_cold", "k/cool_cold", 1000)
+            .unwrap();
+        store
+            .upsert_remote_cache_entry("t:popular", "k/popular", 1000)
+            .unwrap();
+        for _ in 0..10 {
+            store.touch_cache_entry("t:popular").unwrap();
+        }
+
+        // Below high-water mark (3500): nothing is evicted.
+        assert_eq!(store.prune_cache_watermarks(3500, 1500).unwrap(), 0);
+
+        // Above high-water mark (2500), trim down to low-water (1500):
+        // should evict `t:cool_cold` first (in cool + 1 hit), then `t:local_only`
+        // (1 hit, not in cool), keeping `t:popular` (11 hits).
+        let removed = store.prune_cache_watermarks(2500, 1500).unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.get_cache_entry("t:cool_cold").unwrap().is_none());
+        assert!(store.get_cache_entry("t:local_only").unwrap().is_none());
+        assert!(store.get_cache_entry("t:popular").unwrap().is_some());
+        assert!(!p_cool_cold.exists());
+        assert!(p_popular.exists());
+
+        // Verify tier-awareness directly: with identical recency, hits, and size,
+        // an un-mirrored hot track outranks a cool-backed hot track.
+        assert!(
+            hot_cache_retention_score(3600, 1, 5_000_000, false)
+                > hot_cache_retention_score(3600, 1, 5_000_000, true)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn smart_cool_cache_eviction_prioritizes_popular_and_small_metadata_assets() {
+        let store = Store::open_memory().unwrap();
+
+        // Same timestamp, different kinds/sizes/hits.
+        store
+            .upsert_remote_cache_entry("t:big_stale", "k/big", 50 * 1024 * 1024)
+            .unwrap();
+        store
+            .upsert_remote_cache_entry("t:popular", "k/pop", 10 * 1024 * 1024)
+            .unwrap();
+        store
+            .upsert_asset_cache_entry("cover", "al:1", "k/cover", 80 * 1024)
+            .unwrap();
+        store
+            .upsert_asset_cache_entry("avatar", "u:1", "k/avatar", 40 * 1024)
+            .unwrap();
+
+        for _ in 0..8 {
+            store.touch_remote_cache_entry("t:popular").unwrap();
+        }
+
+        let candidates = store.remote_cache_eviction_candidates(4).unwrap();
+        assert_eq!(candidates.len(), 4);
+        // The bulky one-hit audio track must be evicted first.
+        assert_eq!(candidates[0].0, "audio");
+        assert_eq!(candidates[0].1, "t:big_stale");
+        // Popular audio and tiny avatar/cover should survive longest.
+        let last_ids: Vec<&str> = candidates[1..].iter().map(|c| c.1.as_str()).collect();
+        assert!(last_ids.contains(&"t:popular"));
+        assert!(last_ids.contains(&"u:1"));
+        assert!(last_ids.contains(&"al:1"));
     }
 
     #[test]

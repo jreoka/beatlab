@@ -95,6 +95,14 @@ pub struct StreamEngine {
     pub cover_dir: PathBuf,
     pub embed_dir: PathBuf,
     pub max_cache_bytes: i64,
+    /// Hot audio cache starts evicting here (default 95% of max_cache_bytes).
+    pub cache_high_water_bytes: i64,
+    /// Hot audio cache trims down to here (default 85% of max_cache_bytes).
+    pub cache_low_water_bytes: i64,
+    /// Local disk ceiling for cached cover art (`cache/covers`).
+    pub max_cover_cache_bytes: i64,
+    /// Local disk ceiling for pre-rendered share embeds (`cache/embeds`).
+    pub max_embed_cache_bytes: i64,
     /// Per-track disk cache ceiling. Large hi-res FLACs can exceed the old
     /// 250 MB limit, which made them re-fetch from the source on every play.
     pub max_track_bytes: i64,
@@ -171,6 +179,39 @@ impl StreamEngine {
             .map(|s| s.success())
             .unwrap_or(false);
 
+        let max_cache_bytes = ((max_cache_gb.max(0.5)) * 1024.0 * 1024.0 * 1024.0) as i64;
+        let cache_high_pct = std::env::var("BEATLAB_CACHE_HIGH_WATER_PCT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(95.0)
+            .clamp(1.0, 100.0);
+        let default_low_pct = (cache_high_pct - 10.0).max(50.0).min(cache_high_pct);
+        let cache_low_pct = std::env::var("BEATLAB_CACHE_LOW_WATER_PCT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(default_low_pct)
+            .clamp(1.0, cache_high_pct);
+        let cache_high_water_bytes = (max_cache_bytes as f64 * cache_high_pct / 100.0) as i64;
+        let cache_low_water_bytes = (max_cache_bytes as f64 * cache_low_pct / 100.0) as i64;
+        let max_cover_cache_bytes = (std::env::var("BEATLAB_COVER_CACHE_MB")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(256.0)
+            .max(16.0)
+            * 1024.0
+            * 1024.0) as i64;
+        let max_embed_cache_bytes = (std::env::var("BEATLAB_EMBED_CACHE_MB")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(512.0)
+            .max(32.0)
+            * 1024.0
+            * 1024.0) as i64;
+
         Self {
             store,
             sources,
@@ -179,7 +220,11 @@ impl StreamEngine {
             cache_dir,
             cover_dir,
             embed_dir,
-            max_cache_bytes: ((max_cache_gb.max(0.5)) * 1024.0 * 1024.0 * 1024.0) as i64,
+            max_cache_bytes,
+            cache_high_water_bytes,
+            cache_low_water_bytes,
+            max_cover_cache_bytes,
+            max_embed_cache_bytes,
             max_track_bytes: (std::env::var("BEATLAB_CACHE_MAX_TRACK_MB")
                 .ok()
                 .and_then(|s| s.parse::<f64>().ok())
@@ -202,6 +247,29 @@ impl StreamEngine {
             embed_sem: Arc::new(Semaphore::new(2)),
             loudness_sem: Arc::new(Semaphore::new(2)),
         }
+    }
+
+    /// Smart hot audio cache pruning using high/low-water hysteresis.
+    pub fn prune_hot_cache(&self) {
+        let _ = self
+            .store
+            .prune_cache_watermarks(self.cache_high_water_bytes, self.cache_low_water_bytes);
+    }
+
+    /// Prunes local `cache/covers` and `cache/embeds` directories down to 80%
+    /// of their caps whenever they exceed their ceiling. Returns (covers_removed, embeds_removed).
+    pub fn prune_aux_disk_caches(&self) -> (usize, usize) {
+        let covers = prune_dir_by_mtime(&self.cover_dir, self.max_cover_cache_bytes, true);
+        let embeds = prune_dir_by_mtime(&self.embed_dir, self.max_embed_cache_bytes, false);
+        (covers, embeds)
+    }
+
+    pub fn local_covers_bytes(&self) -> i64 {
+        dir_total_bytes(&self.cover_dir)
+    }
+
+    pub fn local_embeds_bytes(&self) -> i64 {
+        dir_total_bytes(&self.embed_dir)
     }
 
     /// Keeps the cool tier's "never pull from a source twice" promise for audio:
@@ -228,6 +296,7 @@ impl StreamEngine {
                             .map(|m| m.len() as i64)
                             .unwrap_or(0);
                         let _ = store.upsert_remote_cache_entry(&tid, &key, bytes);
+                        remote.maybe_enforce_quota_async(store);
                     }
                 });
             }
@@ -259,6 +328,7 @@ impl StreamEngine {
             match remote.upload_bytes(&key, bytes, &ext, &mime, &src).await {
                 Ok(()) => {
                     let _ = store.upsert_asset_cache_entry(kind, &id, &key, len);
+                    remote.maybe_enforce_quota_async(store);
                 }
                 Err(e) => {
                     debug!(asset_id = %id, error = %e.to_string(), "cool asset upload failed");
@@ -378,7 +448,7 @@ impl StreamEngine {
                                 &p.to_string_lossy(),
                                 f.size as i64,
                             );
-                            let _ = this.store.prune_cache(this.max_cache_bytes);
+                            this.prune_hot_cache();
                             this.note_audio_access(&tid, &p, &ext2);
                             this.spawn_analyze_loudness(&tid, p);
                         }
@@ -401,7 +471,7 @@ impl StreamEngine {
                             &local_path.to_string_lossy(),
                             bytes,
                         );
-                        let _ = self.store.prune_cache(self.max_cache_bytes);
+                        self.prune_hot_cache();
                         let ext = local_path
                             .extension()
                             .and_then(|e| e.to_str())
@@ -1747,7 +1817,7 @@ impl StreamEngine {
             .unwrap_or(total_written);
         self.store
             .upsert_cache_entry(track_id, &final_path.to_string_lossy(), final_bytes)?;
-        let _ = self.store.prune_cache(self.max_cache_bytes);
+        self.prune_hot_cache();
         self.spawn_analyze_loudness(track_id, final_path.clone());
 
         // Mirror the hot copy into the optional cool tier. A failure here is
@@ -1757,6 +1827,7 @@ impl StreamEngine {
             match remote.upload_from(&key, &final_path, final_ext).await {
                 Ok(()) => {
                     let _ = self.store.upsert_remote_cache_entry(track_id, &key, final_bytes);
+                    remote.maybe_enforce_quota_async(self.store.clone());
                     debug!(track_id = %track_id, "mirrored track to cool cache");
                 }
                 Err(e) => {
@@ -1801,6 +1872,7 @@ impl StreamEngine {
                         .await
                         .unwrap_or_else(|_| "image/jpeg".to_string());
                     if !is_low_res_cover(&bytes) {
+                        touch_file_mtime(&cache_file);
                         let _ = self.store.touch_asset_cache_entry("cover", lookup_id);
                         return image_response(bytes, &mime);
                     }
@@ -2033,6 +2105,7 @@ impl StreamEngine {
             .map(|m| m.len() > 4096)
             .unwrap_or(false)
         {
+            touch_file_mtime(&out_path);
             let _ = self.store.touch_asset_cache_entry("embed", &track.id);
             return Some(out_path);
         }
@@ -3074,9 +3147,114 @@ fn svg_cover_response(label: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+fn touch_file_mtime(path: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+fn dir_total_bytes(dir: &Path) -> i64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len() as i64)
+        .sum()
+}
+
+/// Prunes a local auxiliary cache directory (`covers` or `embeds`) by file
+/// modification time when it exceeds `max_bytes`, trimming down to 80% of
+/// `max_bytes`. When `remove_cover_sidecars` is true, removing `<hash>.img`
+/// also removes its companion `<hash>.mime` and `<hash>.src` files.
+fn prune_dir_by_mtime(dir: &Path, max_bytes: i64, remove_cover_sidecars: bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total: i64 = 0;
+    let mut files: Vec<(PathBuf, i64, std::time::SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let len = meta.len() as i64;
+        total += len;
+        // Skip in-progress temp files and cover sidecars (sidecars are deleted
+        // together with their primary `.img`).
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.contains(".part") || name.contains(".r2part") || name.ends_with(".cover") {
+            continue;
+        }
+        if remove_cover_sidecars && (name.ends_with(".mime") || name.ends_with(".src")) {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        files.push((path, len, mtime));
+    }
+    if total <= max_bytes {
+        return 0;
+    }
+    let target = (max_bytes as f64 * 0.80) as i64;
+    files.sort_by_key(|(_, _, mtime)| *mtime);
+    let mut removed = 0usize;
+    for (path, len, _) in files {
+        if total <= target {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            removed += 1;
+            if remove_cover_sidecars {
+                for ext in ["mime", "src"] {
+                    let sidecar = path.with_extension(ext);
+                    if let Ok(m) = std::fs::metadata(&sidecar) {
+                        if std::fs::remove_file(&sidecar).is_ok() {
+                            total -= m.len() as i64;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aux_dir_pruning_evicts_oldest_files_with_cover_sidecars() {
+        let dir = std::env::temp_dir().join(format!("beatlab_aux_prune_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_img = dir.join("aaa.img");
+        let old_mime = dir.join("aaa.mime");
+        let new_img = dir.join("bbb.img");
+        std::fs::write(&old_img, vec![1u8; 600]).unwrap();
+        std::fs::write(&old_mime, b"image/jpeg").unwrap();
+        std::fs::write(&new_img, vec![2u8; 600]).unwrap();
+        // Force old_img to have an older mtime than new_img.
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old_img)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+
+        let removed = prune_dir_by_mtime(&dir, 1000, true);
+        assert_eq!(removed, 1);
+        assert!(!old_img.exists());
+        assert!(!old_mime.exists());
+        assert!(new_img.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn byte_range_parsing_handles_standard_cases() {

@@ -182,12 +182,19 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
             "localCacheBytes": state.store.cache_total_bytes().unwrap_or(0),
             "localCacheEntries": state.store.cache_entry_count().unwrap_or(0),
             "cacheMaxBytes": state.engine.max_cache_bytes,
+            "cacheHighWaterBytes": state.engine.cache_high_water_bytes,
+            "cacheLowWaterBytes": state.engine.cache_low_water_bytes,
+            "localCoversBytes": state.engine.local_covers_bytes(),
+            "localCoversMaxBytes": state.engine.max_cover_cache_bytes,
+            "localEmbedsBytes": state.engine.local_embeds_bytes(),
+            "localEmbedsMaxBytes": state.engine.max_embed_cache_bytes,
             "remoteCacheEnabled": state.engine.remote.is_some(),
             "remoteCacheObjects": state.store.remote_cache_count().unwrap_or(0),
             "remoteCacheBytes": state.store.remote_cache_total_bytes().unwrap_or(0),
             "remoteCacheMaxBytes": state.engine.remote.as_ref().map(|r| r.max_bytes).unwrap_or(0),
             "remoteCacheTarget": state.engine.remote.as_ref().map(|r| r.describe()).unwrap_or_default(),
             "remoteCacheHighWaterBytes": state.engine.remote.as_ref().map(|r| r.high_water_bytes).unwrap_or(0),
+            "remoteCacheLowWaterBytes": state.engine.remote.as_ref().map(|r| r.low_water_bytes).unwrap_or(0),
             "remoteCacheByKind": state.store.remote_cache_kind_stats().unwrap_or_default()
                 .into_iter()
                 .map(|(kind, objects, bytes)| json!({ "kind": kind, "objects": objects, "bytes": bytes }))

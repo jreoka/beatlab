@@ -8,6 +8,8 @@ use crate::models::{err_msg, AppResult};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio_util::io::ReaderStream;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -45,6 +47,16 @@ pub struct RemoteCache {
     pub max_bytes: i64,
     /// Eviction starts here, leaving headroom so the tier is never caught full.
     pub high_water_bytes: i64,
+    /// Eviction trims down to here (hysteresis) so uploads don't thrash eviction.
+    pub low_water_bytes: i64,
+    pruning: Arc<AtomicBool>,
+}
+
+struct ResetFlagGuard<'a>(&'a AtomicBool);
+impl Drop for ResetFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl RemoteCache {
@@ -85,13 +97,20 @@ impl RemoteCache {
             .and_then(|s| s.parse().ok())
             .unwrap_or(100.0);
         let max_bytes = (max_gb.max(1.0) * 1024.0 * 1024.0 * 1024.0) as i64;
-        // Start evicting when the bucket is this full (default 90%), so there is
-        // always headroom for new assets and no surprise source re-pulls.
+        // Start evicting when the bucket is this full (default 90%), and trim
+        // down to the low-water mark (default 80%) so there is always headroom
+        // and no eviction thrashing on every upload.
         let high_water_pct: f64 = env_nonempty("BEATLAB_S3_HIGH_WATER_PCT")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(90.0f64)
             .clamp(1.0f64, 100.0f64);
+        let default_low_pct = (high_water_pct - 10.0).max(50.0).min(high_water_pct);
+        let low_water_pct: f64 = env_nonempty("BEATLAB_S3_LOW_WATER_PCT")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(default_low_pct)
+            .clamp(1.0f64, high_water_pct);
         let high_water_bytes = (max_bytes as f64 * high_water_pct / 100.0) as i64;
+        let low_water_bytes = (max_bytes as f64 * low_water_pct / 100.0) as i64;
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .read_timeout(std::time::Duration::from_secs(60))
@@ -109,6 +128,8 @@ impl RemoteCache {
             prefix,
             max_bytes,
             high_water_bytes,
+            low_water_bytes,
+            pruning: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -358,24 +379,68 @@ impl RemoteCache {
         Ok(bytes.to_vec())
     }
 
-    /// Evicts the least recently used assets once the bucket reaches its
-    /// high-water mark, leaving headroom so the cool tier is never caught full.
+    /// Evicts lowest-scoring assets (recency + frequency + kind + size) once the
+    /// bucket reaches its high-water mark, trimming down to the low-water mark
+    /// so the cool tier keeps headroom without thrashing on every upload.
     pub async fn enforce_quota(&self, store: &crate::store::Store) -> AppResult<usize> {
         let mut total = store.remote_cache_total_bytes()?;
         if total <= self.high_water_bytes {
             return Ok(0);
         }
+        if self
+            .pruning
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(0);
+        }
+        let _guard = ResetFlagGuard(&self.pruning);
+        let target = self.low_water_bytes.min(self.high_water_bytes).max(0);
         let mut removed = 0usize;
-        for (kind, asset_id, key, bytes) in store.remote_cache_eviction_candidates(500)? {
-            if total <= self.high_water_bytes {
+        const BATCH_SIZE: usize = 500;
+        const MAX_BATCHES: usize = 4;
+        for _ in 0..MAX_BATCHES {
+            if total <= target {
                 break;
             }
-            self.delete(&key).await?;
-            let _ = store.delete_asset_cache_entry(&kind, &asset_id);
-            total -= bytes;
-            removed += 1;
+            let candidates = store.remote_cache_eviction_candidates(BATCH_SIZE)?;
+            if candidates.is_empty() {
+                break;
+            }
+            for (kind, asset_id, key, bytes) in candidates {
+                if total <= target {
+                    break;
+                }
+                self.delete(&key).await?;
+                let _ = store.delete_asset_cache_entry(&kind, &asset_id);
+                total -= bytes;
+                removed += 1;
+            }
         }
         Ok(removed)
+    }
+
+    /// Triggers an asynchronous, coalesced quota enforcement pass if the bucket
+    /// has crossed its high-water mark. Safe to call after every upload.
+    pub fn maybe_enforce_quota_async(self: &Arc<Self>, store: crate::store::Store) {
+        if self.pruning.load(Ordering::Acquire) {
+            return;
+        }
+        if store.remote_cache_total_bytes().unwrap_or(0) <= self.high_water_bytes {
+            return;
+        }
+        let remote = Arc::clone(self);
+        tokio::spawn(async move {
+            match remote.enforce_quota(&store).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(removed = n, "pruned S3 cool cache to low-water mark");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e.to_string(), "S3 cool cache prune failed");
+                }
+            }
+        });
     }
 
     pub async fn delete(&self, key: &str) -> AppResult<()> {
@@ -434,6 +499,8 @@ mod tests {
             prefix: "beatlab/audio/".into(),
             max_bytes: 1024,
             high_water_bytes: 900,
+            low_water_bytes: 800,
+            pruning: Arc::new(AtomicBool::new(false)),
         };
         let (_, first) = c
             .signed_request("GET", "beatlab/audio/abc", EMPTY_SHA256, &[])
@@ -465,6 +532,8 @@ mod tests {
             prefix: "".into(),
             max_bytes: 1,
             high_water_bytes: 1,
+            low_water_bytes: 1,
+            pruning: Arc::new(AtomicBool::new(false)),
         };
         let now = chrono::DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
             .unwrap()
@@ -496,6 +565,8 @@ mod tests {
             prefix: "beatlab/audio/".into(),
             max_bytes: 1,
             high_water_bytes: 1,
+            low_water_bytes: 1,
+            pruning: Arc::new(AtomicBool::new(false)),
         };
         let key = c.object_key("track:1");
         assert!(key.starts_with("beatlab/audio/"));

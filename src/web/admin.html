@@ -688,26 +688,31 @@
 
     function renderCache(o) {
       const hotPct = pctOf(o.localCacheBytes, o.cacheMaxBytes);
-      const hotWarn = hotPct > 85;
+      const hotHighPct = o.cacheMaxBytes > 0 && o.cacheHighWaterBytes ? (o.cacheHighWaterBytes / o.cacheMaxBytes) * 100 : 95;
+      const hotLowPct = o.cacheMaxBytes > 0 && o.cacheLowWaterBytes ? (o.cacheLowWaterBytes / o.cacheMaxBytes) * 100 : 85;
+      const hotWarn = hotPct >= hotHighPct;
       let hot = '<div class="card">';
-      hot += tierHead('bolt', 'warn', 'Hot cache', 'Local disk', hotWarn ? '<span class="pill del">Nearly full</span>' : '<span class="pill on">Healthy</span>');
+      hot += tierHead('bolt', 'warn', 'Hot cache', 'Local disk · smart LFU-LRU', hotWarn ? '<span class="pill del">Above high-water</span>' : '<span class="pill on">Healthy</span>');
       hot += '<div class="big">' + mb(o.localCacheBytes) + '</div>';
-      hot += bar(o.localCacheBytes, o.cacheMaxBytes, 0, hotWarn);
-      hot += '<div class="progress-label"><span>' + hotPct.toFixed(1) + '% used</span><span>' + gb(o.cacheMaxBytes) + ' cap</span></div>';
+      hot += bar(o.localCacheBytes, o.cacheMaxBytes, hotHighPct, hotWarn);
+      hot += '<div class="progress-label"><span>' + hotPct.toFixed(1) + '% used</span><span>' + gb(o.cacheMaxBytes) + ' cap · ' + hotHighPct.toFixed(0) + '%/' + hotLowPct.toFixed(0) + '% watermarks</span></div>';
       hot += statRow('Cached tracks', num(o.localCacheEntries));
       hot += statRow('Max per track', mb(o.maxTrackBytes));
+      if (o.localCoversMaxBytes) hot += statRow('Cover art cache', mb(o.localCoversBytes) + ' / ' + mb(o.localCoversMaxBytes));
+      if (o.localEmbedsMaxBytes) hot += statRow('Share embeds cache', mb(o.localEmbedsBytes) + ' / ' + mb(o.localEmbedsMaxBytes));
       hot += '</div>';
 
       let cool;
       if (o.remoteCacheEnabled) {
         const highPct = o.remoteCacheMaxBytes > 0 ? (o.remoteCacheHighWaterBytes / o.remoteCacheMaxBytes) * 100 : 0;
+        const lowPct = o.remoteCacheMaxBytes > 0 && o.remoteCacheLowWaterBytes ? (o.remoteCacheLowWaterBytes / o.remoteCacheMaxBytes) * 100 : highPct;
         const coolPct = pctOf(o.remoteCacheBytes, o.remoteCacheMaxBytes);
         const coolWarn = highPct > 0 && coolPct >= highPct;
         cool = '<div class="card">';
-        cool += tierHead('cloud', 'violet', 'Cool cache', 'S3 / R2 object storage', coolWarn ? '<span class="pill del">Above high-water</span>' : '<span class="pill on">Healthy</span>');
+        cool += tierHead('cloud', 'violet', 'Cool cache', 'S3 / R2 · smart LFU-LRU', coolWarn ? '<span class="pill del">Above high-water</span>' : '<span class="pill on">Healthy</span>');
         cool += '<div class="big">' + mb(o.remoteCacheBytes) + '</div>';
         cool += bar(o.remoteCacheBytes, o.remoteCacheMaxBytes, highPct, coolWarn);
-        cool += '<div class="progress-label"><span>' + coolPct.toFixed(1) + '% used</span><span>' + gb(o.remoteCacheMaxBytes) + ' cap · ' + highPct.toFixed(0) + '% high-water</span></div>';
+        cool += '<div class="progress-label"><span>' + coolPct.toFixed(1) + '% used</span><span>' + gb(o.remoteCacheMaxBytes) + ' cap · ' + highPct.toFixed(0) + '%/' + lowPct.toFixed(0) + '% watermarks</span></div>';
         cool += statRow('Bucket / prefix', o.remoteCacheTarget);
         cool += statRow('Total objects', num(o.remoteCacheObjects));
         const kinds = o.remoteCacheByKind || [];

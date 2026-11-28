@@ -142,27 +142,7 @@ async fn main() -> models::AppResult<()> {
         );
     }
 
-    // Soft-deleted accounts, stale challenges and cool-cache quota are handled
-    // once an hour.
-    let cleanup_store = store.clone();
-    let cleanup_remote = remote_cache.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(3600));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let _ = cleanup_store.purge_expired_deleted_users();
-            let _ = cleanup_store.purge_expired_auth_challenges();
-            if let Some(ref remote) = cleanup_remote {
-                match remote.enforce_quota(&cleanup_store).await {
-                    Ok(n) if n > 0 => info!(removed = n, "pruned S3 cool cache to quota"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e.to_string(), "S3 cool cache prune failed"),
-                }
-            }
-        }
-    });
+    // (Hourly maintenance task is spawned right after `engine` is constructed below.)
 
     let deezer = DeezerSource::new();
     let ytm = YtmSource::new();
@@ -196,6 +176,48 @@ async fn main() -> models::AppResult<()> {
         max_cache_gb,
         remote_cache.clone().map(Arc::new),
     ));
+
+    // Soft-deleted accounts, stale challenges, local cover/embed disk caches,
+    // and cool-cache quota are handled once an hour.
+    let cleanup_store = store.clone();
+    let cleanup_remote = remote_cache.clone();
+    let cleanup_engine = engine.clone();
+    tokio::spawn(async move {
+        // Initial non-blocking trim of local cover/embed caches on startup.
+        let startup_engine = cleanup_engine.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let (covers, embeds) = startup_engine.prune_aux_disk_caches();
+            if covers > 0 || embeds > 0 {
+                info!(covers, embeds, "pruned local cover/embed disk caches on startup");
+            }
+        })
+        .await;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = cleanup_store.purge_expired_deleted_users();
+            let _ = cleanup_store.purge_expired_auth_challenges();
+            let aux_engine = cleanup_engine.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                aux_engine.prune_hot_cache();
+                let (covers, embeds) = aux_engine.prune_aux_disk_caches();
+                if covers > 0 || embeds > 0 {
+                    info!(covers, embeds, "pruned local cover/embed disk caches");
+                }
+            })
+            .await;
+            if let Some(ref remote) = cleanup_remote {
+                match remote.enforce_quota(&cleanup_store).await {
+                    Ok(n) if n > 0 => info!(removed = n, "pruned S3 cool cache to quota"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e.to_string(), "S3 cool cache prune failed"),
+                }
+            }
+        }
+    });
     let taste = Arc::new(TasteEngine::new(store.clone(), sources.clone()));
 
     let state = AppState {
