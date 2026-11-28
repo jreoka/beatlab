@@ -5808,8 +5808,7 @@ html, body {
 }
 
 /* Badges: subtle tinted rectangular fills */
-.quality-badge,
-.quality-badge.lossless {
+.quality-badge {
   display: inline-flex;
   align-items: center;
   padding: 2px 7px;
