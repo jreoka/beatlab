@@ -299,12 +299,23 @@
     radioPlaylistId: null,
   };
 
+  function syncThemeColorMeta() {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (!meta) return;
+    const fs = $('fullscreen-player');
+    if (fs && fs.classList.contains('open') && window.innerWidth <= 780) {
+      const tint = fs.style.getPropertyValue('--fs-tint').trim();
+      meta.setAttribute('content', tint || '#111114');
+      return;
+    }
+    meta.setAttribute('content', state.theme === 'light' ? '#ffffff' : '#0b0b0d');
+  }
+
   function applyTheme(theme) {
     const next = theme === 'light' ? 'light' : 'dark';
     state.theme = next;
     document.documentElement.setAttribute('data-theme', next);
-    const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', next === 'light' ? '#ffffff' : '#0b0b0d');
+    syncThemeColorMeta();
   }
   applyTheme(state.theme);
 
@@ -1251,6 +1262,7 @@
     if (next && window.innerWidth <= 780) {
       setFsMobileView(state.fsMobileView || 'player', true);
     }
+    syncThemeColorMeta();
     const btn = $('btn-expand-player');
     if (btn) {
       btn.classList.toggle('active', next);
@@ -3097,13 +3109,21 @@
     document.body.dataset.route = hash.split(/[/?]/)[0];
     document.querySelectorAll('.nav-item').forEach((el) => {
       const r = el.dataset.route;
+      const isMobileTab = el.classList.contains('mobile-nav-btn');
       const match =
         hash === r ||
         hash.startsWith(`${r}?`) ||
         hash.startsWith(`${r}/`) ||
         (r === 'playlists' && hash.startsWith('playlist/')) ||
         (r === 'profile' && hash.startsWith('user/')) ||
-        (r === 'library' && (hash === 'liked' || hash === 'history'));
+        (r === 'library' &&
+          (hash === 'liked' ||
+            hash === 'history' ||
+            (isMobileTab &&
+              (hash === 'playlists' ||
+                hash.startsWith('playlist/') ||
+                hash === 'mix' ||
+                hash.startsWith('mix/')))));
       el.classList.toggle('active', match);
     });
     const sidebarMixBtn = $('sidebar-instant-mixes-btn');
@@ -8095,10 +8115,15 @@
   let fsTintToken = 0;
   function clearNowPlayingTint() {
     const fs = $('fullscreen-player');
-    if (fs) fs.style.removeProperty('--fs-tint');
+    if (fs) {
+      fs.style.removeProperty('--fs-tint');
+      fs.style.removeProperty('--np-tint-glow');
+    }
     const root = document.documentElement.style;
     root.removeProperty('--np-tint');
     root.removeProperty('--np-tint-light');
+    root.removeProperty('--np-tint-glow');
+    syncThemeColorMeta();
   }
   function setFsTint(url) {
     const fs = $('fullscreen-player');
@@ -8153,10 +8178,14 @@
         const hue = Math.round(h);
         const outS = Math.round(Math.min(sat, 0.5) * 100);
         const dark = `hsl(${hue} ${outS}% 16%)`;
+        const glow = `hsla(${hue} ${Math.min(outS + 14, 72)}% 42% / 0.34)`;
         fs.style.setProperty('--fs-tint', dark);
+        fs.style.setProperty('--np-tint-glow', glow);
         const root = document.documentElement.style;
-        root.setProperty('--np-tint', `hsl(${hue} ${outS}% 22%)`);
-        root.setProperty('--np-tint-light', `hsl(${hue} ${Math.min(outS, 45)}% 91%)`);
+        root.setProperty('--np-tint', `hsl(${hue} ${outS}% 21%)`);
+        root.setProperty('--np-tint-light', `hsl(${hue} ${Math.min(outS, 45)}% 92%)`);
+        root.setProperty('--np-tint-glow', glow);
+        syncThemeColorMeta();
       } catch {
         clearNowPlayingTint();
       }
@@ -11833,6 +11862,16 @@
     navigate('community');
   }
 
+  function goStats() {
+    closeUserMenu();
+    navigate('stats');
+  }
+
+  function goMixes() {
+    closeUserMenu();
+    navigate('mix');
+  }
+
   function goSettings() {
     closeUserMenu();
     openSettingsModal();
@@ -12725,6 +12764,8 @@
     toggleUserMenu,
     closeUserMenu,
     goCommunity,
+    goStats,
+    goMixes,
     goSettings,
     focusSearch: () => {
       haptic('tap');
