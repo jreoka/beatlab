@@ -7074,13 +7074,19 @@ impl TasteEngine {
             })
             .cloned()
             .collect();
-        familiar.sort_by(|a, b| {
-            let sa = score_track_core(a, &sctx.prof, &sctx.stats, ScoreMode::Supermix)
-                - recent_penalties.penalty_for(a);
-            let sb = score_track_core(b, &sctx.prof, &sctx.stats, ScoreMode::Supermix)
-                - recent_penalties.penalty_for(b);
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let mut familiar_scored: Vec<(f64, Track)> = familiar
+            .drain(..)
+            .map(|t| {
+                let mut s = score_track_core(&t, &sctx.prof, &sctx.stats, ScoreMode::Supermix)
+                    - recent_penalties.penalty_for(&t);
+                if mode == RadioMode::Default {
+                    s += default_radio_variety_jitter() - play_count_fatigue(&t, &sctx);
+                }
+                (s, t)
+            })
+            .collect();
+        familiar_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        familiar = familiar_scored.into_iter().map(|(_, t)| t).collect();
 
         let mut fresh_scored: Vec<(f64, Track)> = recs
             .into_iter()
@@ -7089,14 +7095,19 @@ impl TasteEngine {
             .map(|(idx, t)| {
                 scope.record_related_artist(&t);
                 let order_prior = -(idx as f64) * 0.2;
-                let fam_adj = if mode == RadioMode::Discover
-                    && is_familiar_track(&t, &sctx.prof, &sctx.stats)
-                {
-                    -6.0
+                let is_fam = is_familiar_track(&t, &sctx.prof, &sctx.stats);
+                let fam_adj = match mode {
+                    RadioMode::Discover if is_fam => -6.0,
+                    RadioMode::Default if is_fam => -1.8 - play_count_fatigue(&t, &sctx),
+                    RadioMode::Default => 0.4,
+                    _ => 0.0,
+                };
+                let jitter = if mode == RadioMode::Default {
+                    default_radio_variety_jitter()
                 } else {
                     0.0
                 };
-                let s = order_prior + fam_adj - recent_penalties.penalty_for(&t);
+                let s = order_prior + fam_adj + jitter - recent_penalties.penalty_for(&t);
                 (s, t)
             })
             .collect();
@@ -7312,7 +7323,11 @@ impl TasteEngine {
             };
             return self.rank_fallback_with_recent(fallback, &recent_penalties, count);
         }
-        dedup_and_interleave_fill(combined, count)
+        if mode == RadioMode::Default {
+            dedup_and_interleave_fill_with_min_cap(combined, count, 1)
+        } else {
+            dedup_and_interleave_fill(combined, count)
+        }
     }
 
     #[cfg(test)]
@@ -7420,9 +7435,27 @@ impl TasteEngine {
                         filtered.push(t);
                     }
                 }
-            } else if mode == RadioMode::Default && interleaved_capacity(&filtered, count, 2) < count {
-                for t in self
-                    .scoped_external_candidates(
+            } else if mode == RadioMode::Default {
+                let unheard_target = (count * 2).div_ceil(3);
+                let familiar_target = count / 3;
+                let unheard_in_pool: Vec<Track> = filtered
+                    .iter()
+                    .filter(|t| !is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .cloned()
+                    .collect();
+                let familiar_in_pool: Vec<Track> = filtered
+                    .iter()
+                    .filter(|t| is_familiar_track(t, &sctx.prof, &sctx.stats))
+                    .cloned()
+                    .collect();
+                let need_unheard = user_id > 0
+                    && interleaved_capacity(&unheard_in_pool, unheard_target, 1) < unheard_target;
+                let need_familiar = user_id > 0
+                    && familiar_target > 0
+                    && interleaved_capacity(&familiar_in_pool, familiar_target, 1) < familiar_target;
+                let need_total = interleaved_capacity(&filtered, count, 2) < count;
+                if need_unheard || need_total {
+                    for t in self.scoped_external_candidates(
                         user_id,
                         &sctx,
                         &scope,
@@ -7430,9 +7463,15 @@ impl TasteEngine {
                         &seen_keys,
                         false,
                         count * 2,
-                    )
-                    .into_iter()
-                    .chain(self.scoped_external_candidates(
+                    ) {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                            filtered.push(t);
+                        }
+                    }
+                }
+                if need_familiar || interleaved_capacity(&filtered, count, 2) < count {
+                    for t in self.scoped_external_candidates(
                         user_id,
                         &sctx,
                         &scope,
@@ -7440,11 +7479,11 @@ impl TasteEngine {
                         &seen_keys,
                         true,
                         count,
-                    ))
-                {
-                    let key = t.song_key();
-                    if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
-                        filtered.push(t);
+                    ) {
+                        let key = t.song_key();
+                        if seen_ids.insert(t.id.clone()) && seen_keys.insert(key) {
+                            filtered.push(t);
+                        }
                     }
                 }
             }
@@ -7521,13 +7560,39 @@ impl TasteEngine {
                                     1.2
                                 }
                             }
-                            RadioMode::Default => 0.0,
+                            RadioMode::Default => {
+                                default_radio_variety_jitter() - play_count_fatigue(&t, &sctx)
+                            }
                         };
                         let temp_recent_penalty = recent_penalties.penalty_for(&t);
                         (sim_prior + user_fit + mode_adj - temp_recent_penalty, t)
                     })
                     .collect();
                 if !scored.is_empty() {
+                    if mode == RadioMode::Default {
+                        let mut unheard_scored: Vec<(f64, Track)> = Vec::new();
+                        let mut familiar_scored: Vec<(f64, Track)> = Vec::new();
+                        let mut recent_scored: Vec<(f64, Track)> = Vec::new();
+                        for (score, t) in scored {
+                            if recent_penalties.penalty_for(&t) > 0.5 {
+                                recent_scored.push((score, t));
+                            } else if is_familiar_track(&t, &sctx.prof, &sctx.stats) {
+                                familiar_scored.push((score, t));
+                            } else {
+                                unheard_scored.push((score, t));
+                            }
+                        }
+                        unheard_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        familiar_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        recent_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        let mut woven = interleave_fresh_and_familiar(
+                            unheard_scored.into_iter().map(|(_, t)| t).collect(),
+                            familiar_scored.into_iter().map(|(_, t)| t).collect(),
+                            2,
+                        );
+                        woven.extend(recent_scored.into_iter().map(|(_, t)| t));
+                        return dedup_and_interleave_fill_with_min_cap(woven, count, 1);
+                    }
                     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let ranked: Vec<Track> = scored.into_iter().map(|(_, t)| t).collect();
                     return dedup_and_interleave_fill(ranked, count);
@@ -7661,11 +7726,56 @@ impl TasteEngine {
                 }
                 fam
             }
-            RadioMode::Default => self
-                .for_you_tracks(user_id, (count * 4).max(72))
-                .into_iter()
-                .filter(|t| !exclude_ids.contains(&t.id) && !excluded_keys.contains(&t.song_key()))
-                .collect(),
+            RadioMode::Default => {
+                let mut seen_ids: HashSet<String> = exclude_ids.clone();
+                let mut seen_keys: HashSet<String> = excluded_keys.clone();
+                let mut unheard_scored: Vec<(f64, Track)> = Vec::new();
+                let mut familiar_scored: Vec<(f64, Track)> = Vec::new();
+                let mut recent_scored: Vec<(f64, Track)> = Vec::new();
+
+                let disc_pool = self.discover_weekly(user_id, (count * 4).max(72));
+                let for_you_pool = self.for_you_tracks(user_id, (count * 4).max(72));
+                let disc_total = disc_pool.len().max(1) as f64;
+                let fy_total = for_you_pool.len().max(1) as f64;
+
+                let mut push_candidate = |t: Track, rank_prior: f64| {
+                    let key = t.song_key();
+                    if !seen_ids.insert(t.id.clone()) || !seen_keys.insert(key) {
+                        return;
+                    }
+                    let recent_pen = recent_penalties.penalty_for(&t);
+                    let score = rank_prior + default_radio_variety_jitter()
+                        - play_count_fatigue(&t, &sctx)
+                        - recent_pen;
+                    if recent_pen > 0.5 {
+                        recent_scored.push((score, t));
+                    } else if is_familiar_track(&t, &sctx.prof, &sctx.stats) {
+                        familiar_scored.push((score, t));
+                    } else {
+                        unheard_scored.push((score, t));
+                    }
+                };
+
+                for (idx, t) in disc_pool.into_iter().enumerate() {
+                    let prior = ((disc_total - idx as f64) / disc_total) * 4.5;
+                    push_candidate(t, prior);
+                }
+                for (idx, t) in for_you_pool.into_iter().enumerate() {
+                    let prior = ((fy_total - idx as f64) / fy_total) * 4.5;
+                    push_candidate(t, prior);
+                }
+
+                unheard_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                familiar_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                recent_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let mut woven = interleave_fresh_and_familiar(
+                    unheard_scored.into_iter().map(|(_, t)| t).collect(),
+                    familiar_scored.into_iter().map(|(_, t)| t).collect(),
+                    2,
+                );
+                woven.extend(recent_scored.into_iter().map(|(_, t)| t));
+                return dedup_and_interleave_fill_with_min_cap(woven, count, 1);
+            }
         };
         self.rank_fallback_with_recent(picks, &recent_penalties, count)
     }
@@ -12150,21 +12260,87 @@ fn interleaved_capacity(tracks: &[Track], limit: usize, max_per_artist: usize) -
     total
 }
 
+fn default_radio_variety_jitter() -> f64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(0.0..1.4)
+}
+
+fn play_count_fatigue(t: &Track, sctx: &ScoringContext) -> f64 {
+    let by_id = sctx.stats.get(&t.id).map(|s| s.play_count).unwrap_or(0);
+    let by_key = sctx
+        .prof
+        .played_song_keys
+        .get(&t.song_key())
+        .copied()
+        .unwrap_or(0);
+    let plays = by_id.max(by_key).max(0) as f64;
+    if plays <= 0.0 {
+        0.0
+    } else {
+        (plays.ln_1p() * 0.9).min(2.8)
+    }
+}
+
+fn interleave_fresh_and_familiar(
+    fresh: Vec<Track>,
+    familiar: Vec<Track>,
+    fresh_per_familiar: usize,
+) -> Vec<Track> {
+    let batch = fresh_per_familiar.max(1);
+    let mut fi = fresh.into_iter();
+    let mut ki = familiar.into_iter();
+    let mut out = Vec::new();
+    loop {
+        let mut pushed = false;
+        for _ in 0..batch {
+            if let Some(t) = fi.next() {
+                out.push(t);
+                pushed = true;
+            }
+        }
+        if let Some(t) = ki.next() {
+            out.push(t);
+            pushed = true;
+        }
+        if !pushed {
+            break;
+        }
+    }
+    out
+}
+
 /// Interleaves tracks with `max_per_artist = 2` for artist variety, relaxing to 3 (then 4)
 /// only if the pool has enough unique songs to fill `limit` but fewer distinct artists.
 fn dedup_and_interleave_fill(tracks: Vec<Track>, limit: usize) -> Vec<Track> {
+    dedup_and_interleave_fill_with_min_cap(tracks, limit, 2)
+}
+
+/// Interleaves tracks starting at `min_cap` tracks per artist and relaxing up to 4
+/// only when needed to fill `limit`.
+fn dedup_and_interleave_fill_with_min_cap(
+    tracks: Vec<Track>,
+    limit: usize,
+    min_cap: usize,
+) -> Vec<Track> {
     if limit == 0 || tracks.is_empty() {
         return vec![];
     }
-    let strict = dedup_and_interleave(tracks.clone(), limit, 2);
-    if strict.len() >= limit || tracks.len() <= strict.len() {
-        return strict;
+    let start = min_cap.clamp(1, 4);
+    let mut best = dedup_and_interleave(tracks.clone(), limit, start);
+    if best.len() >= limit || tracks.len() <= best.len() {
+        return best;
     }
-    let relaxed = dedup_and_interleave(tracks.clone(), limit, 3);
-    if relaxed.len() >= limit || relaxed.len() == strict.len() {
-        return relaxed;
+    for cap in (start + 1)..=4 {
+        let candidate = dedup_and_interleave(tracks.clone(), limit, cap);
+        if candidate.len() >= limit {
+            return candidate;
+        }
+        if candidate.len() == best.len() {
+            return best;
+        }
+        best = candidate;
     }
-    dedup_and_interleave(tracks, limit, 4)
+    best
 }
 
 /// (with an optional higher cap for an anchor artist), and interleaves artists using a lookahead
@@ -16094,6 +16270,48 @@ mod tests {
             fam_familiar_count >= 12,
             "Familiar should prioritize familiar tracks, got {fam_familiar_count}"
         );
+        // Because all loc:fam-* tracks were just played moments ago, Default should avoid
+        // repeating them and maximize distinct artists across the 18 upcoming tracks.
+        let def_unique_artists: HashSet<String> =
+            def.iter().map(|t| slug(&primary_artist(&t.artist))).collect();
+        assert_eq!(
+            def_unique_artists.len(),
+            18,
+            "Default should prefer 1 track per artist when 18 distinct artists are available"
+        );
+        // Now test a listener whose familiar favorites are starred (not just played seconds ago):
+        // Default should weave ~2 fresh : 1 familiar across 18 distinct artists.
+        let (u2, _) = store.authenticate_or_create_user("radio18_bal", "pw").unwrap();
+        for i in 0..20 {
+            store.star_track(u2.id, &format!("loc:fam-{i}")).unwrap();
+        }
+        taste.mark_taste_dirty(u2.id);
+        let def_bal = taste
+            .radio_next_tracks_with_mode(
+                u2.id,
+                Some(&seed),
+                &HashSet::new(),
+                &[],
+                18,
+                RadioMode::Default,
+            )
+            .await;
+        assert_eq!(def_bal.len(), 18, "Balanced Default should fill 18 tracks");
+        let bal_familiar = def_bal.iter().filter(|t| t.id.starts_with("loc:fam-")).count();
+        let bal_fresh = def_bal.len() - bal_familiar;
+        let bal_artists: HashSet<String> = def_bal
+            .iter()
+            .map(|t| slug(&primary_artist(&t.artist)))
+            .collect();
+        assert!(
+            bal_fresh >= 10 && bal_familiar >= 4,
+            "Default should weave fresh ({bal_fresh}) and familiar ({bal_familiar}) tracks"
+        );
+        assert_eq!(
+            bal_artists.len(),
+            18,
+            "Balanced Default should have 18 distinct artists"
+        );
 
         // 2. Playlist-seeded Default, Familiar, and Discover MUST all return 18 tracks.
         let pl = store
@@ -16140,6 +16358,11 @@ mod tests {
         assert_eq!(sl_def.len(), 18, "Seedless Default should fill 18 tracks");
         assert_eq!(sl_fam.len(), 18, "Seedless Familiar should fill 18 tracks");
         assert_eq!(sl_disc.len(), 18, "Seedless Discover should fill 18 tracks");
+        let sl_def_fresh_count = sl_def.iter().filter(|t| t.id.starts_with("loc:new-")).count();
+        assert!(
+            sl_def_fresh_count >= 6,
+            "Seedless Default should weave fresh tracks alongside familiar ones, got {sl_def_fresh_count}"
+        );
         for t in &sl_disc {
             assert!(
                 !t.id.starts_with("loc:fam-"),
