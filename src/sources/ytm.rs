@@ -540,23 +540,31 @@ impl YtmSource {
         Err(err_msg(format!("{} {}", client.name, last_probe_err)))
     }
 
-    /// Probes 1 KB past the initial ~64 KB container header (`bytes=262144-263167`)
-    /// so PO-token-gated adaptive URLs (which allow the init segment then return
-    /// 403 on real media bytes) are caught before playback starts.
+    /// Marks adaptive audio-only URLs as PO-token gated (HTTP 403) for 10 minutes
+    /// so subsequent plays go straight to the progressive fallback stream.
+    pub fn mark_adaptive_blocked(&self) {
+        self.adaptive_blocked_until
+            .store(Utc::now().timestamp() + 600, Ordering::Relaxed);
+    }
+
+    /// Probes the stream with the same open-ended `Range: bytes=0-` request that
+    /// browser `<audio>` elements send (reading only the response headers, then
+    /// dropping the body) so PO-token-gated adaptive URLs (which allow tiny
+    /// bounded ranges but return 403 on `bytes=0-`) are caught immediately.
     async fn probe_stream_playable(&self, url: &str, user_agent: &str) -> Result<(), u16> {
         let resp = tokio::time::timeout(
             Duration::from_secs(6),
             self.http
                 .get(url)
                 .header("User-Agent", user_agent)
-                .header("Range", "bytes=262144-263167")
+                .header("Range", "bytes=0-")
                 .send(),
         )
         .await
         .map_err(|_| 504u16)?
         .map_err(|_| 502u16)?;
         let code = resp.status().as_u16();
-        if resp.status().is_success() || code == 206 || code == 416 {
+        if resp.status().is_success() || code == 206 {
             Ok(())
         } else {
             Err(code)

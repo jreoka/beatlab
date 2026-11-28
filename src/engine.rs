@@ -1325,8 +1325,11 @@ impl StreamEngine {
                         && (status == reqwest::StatusCode::FORBIDDEN
                             || status == reqwest::StatusCode::GONE) =>
                 {
-                    // Cached upstream signed URL expired or IP-shifted; re-resolve cleanly.
+                    // Cached upstream signed URL expired, IP-shifted, or hit PO-token 403; re-resolve cleanly.
                     debug!(track_id = %track.id, status = %status, "refreshing expired stream URL");
+                    if status == reqwest::StatusCode::FORBIDDEN && !active_has_video {
+                        self.sources.ytm.mark_adaptive_blocked();
+                    }
                     if let Ok(fresh) = self.resolve_ytm_singleflight(track, true).await {
                         if fresh.has_video && self.ffmpeg_available {
                             let target = PlayTarget::RemoteHttp {
