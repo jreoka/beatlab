@@ -8185,7 +8185,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-acct-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -8440,7 +8440,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-web-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -8525,7 +8525,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-web-mix-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -8857,7 +8857,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-web-stats-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -9019,7 +9019,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -9234,7 +9234,7 @@ mod tests {
 
         let sources = crate::sources::SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             std::sync::Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -9325,7 +9325,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.clone()),
@@ -9417,7 +9417,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.clone()),
@@ -9580,7 +9580,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-avatar-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -9838,7 +9838,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.clone()),
@@ -10073,7 +10073,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.clone()),

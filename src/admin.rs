@@ -223,14 +223,7 @@ pub async fn config(State(state): State<AppState>, headers: HeaderMap) -> Respon
             None => "(not set)",
         },
         "llmRefreshHour": state.llm.as_ref().map(|l| format!("{:02}:00 local", l.config.refresh_hour)).unwrap_or_else(|| "—".to_string()),
-        "ytdlpProxyUrl": state.sources.ytm.proxy_config()
-            .map(|p| p.safe_url_label())
-            .unwrap_or_else(|| "(not configured — using local yt-dlp)".to_string()),
-        "ytdlpProxyToken": match state.sources.ytm.proxy_config() {
-            Some(p) if !p.token.is_empty() => "(configured)",
-            Some(_) => "(not set)",
-            None => "—",
-        },
+        "ytmResolver": "direct innertube /player (pure rust)",
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }

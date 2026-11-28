@@ -12400,7 +12400,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("cold", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(
@@ -12441,7 +12441,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -12556,7 +12556,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("curator", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -12730,7 +12730,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("topicuser", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -12827,7 +12827,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("mixuser", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -12902,7 +12902,7 @@ mod tests {
             .unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -12984,7 +12984,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("searchlearner", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13058,7 +13058,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("hideuser", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13146,7 +13146,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("ytmlistener", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13294,7 +13294,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("vibeuser", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13389,7 +13389,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("lana_fan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13544,7 +13544,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("rocker", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13624,7 +13624,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("classic_rocker", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13673,7 +13673,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jrock_fallback", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13728,7 +13728,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jrock_curated_repro", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13779,7 +13779,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jrock_good", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13820,7 +13820,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("lisa_fan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -13999,7 +13999,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("radiouser", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14111,7 +14111,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("fallback80s", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14187,7 +14187,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("daftfan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14249,7 +14249,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jpop_mel", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14315,7 +14315,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("mixedlib", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14381,7 +14381,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("chillq", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14431,7 +14431,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("meluser", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14556,7 +14556,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("partyuser", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14630,7 +14630,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jrock_fan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14769,7 +14769,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jp_mel_fan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14863,7 +14863,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("era80s", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14927,7 +14927,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -14971,7 +14971,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("moodfan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(
                 store.clone(),
@@ -15020,7 +15020,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("countcheck", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(
                 store.clone(),
@@ -15104,7 +15104,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("mixfan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(
                 store.clone(),
@@ -15172,7 +15172,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jpopytm", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -15242,7 +15242,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jpop_only", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -15341,7 +15341,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("rnb_kpop_user", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -15435,7 +15435,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("nightowl", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -15502,7 +15502,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("jpop_fan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -15650,7 +15650,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("xmas_jpop_user", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -15993,7 +15993,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-radio18-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -16177,7 +16177,7 @@ mod tests {
 
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -16347,7 +16347,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("reona_fan", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -16421,7 +16421,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("listener", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -16535,7 +16535,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("cross", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),
@@ -16664,7 +16664,7 @@ mod tests {
         let (u, _) = store.authenticate_or_create_user("cross", "pw").unwrap();
         let sources = SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), std::env::temp_dir()),

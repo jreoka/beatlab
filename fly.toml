@@ -26,9 +26,6 @@ swap_size_mb = 512
   # Limit glibc malloc arenas so worker/blocking threads don't retain fragmented
   # RSS across 8+ 64MB arenas on a constrained VM.
   MALLOC_ARENA_MAX = "2"
-  # Keep yt-dlp's player/signature cache on the volume so restarts and
-  # deploys don't make the first plays re-fetch it.
-  XDG_CACHE_HOME = "/data/.cache"
 
 [http_service]
   internal_port = 4533

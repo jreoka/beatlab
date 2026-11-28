@@ -3320,7 +3320,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-llm-test-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
@@ -3813,7 +3813,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("beatlab-imix-test-{}", uuid::Uuid::new_v4()));
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),

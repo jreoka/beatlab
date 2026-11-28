@@ -84,8 +84,6 @@ async fn main() -> models::AppResult<()> {
     let music_dirs: Vec<PathBuf> = std::env::var_os("BEATLAB_MUSIC_DIRS")
         .map(|raw| std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()).collect())
         .unwrap_or_default();
-    let ytdlp_override = std::env::var("BEATLAB_YTDLP").ok();
-    let ytdlp_proxy = sources::ytm::YtdlpProxyConfig::from_env();
     let allowed_url_raw = std::env::var("URL")
         .ok()
         .map(|s| s.trim().to_string())
@@ -167,14 +165,7 @@ async fn main() -> models::AppResult<()> {
     });
 
     let deezer = DeezerSource::new();
-    if let Some(ref proxy) = ytdlp_proxy {
-        info!(
-            proxy = %proxy.safe_url_label(),
-            auth = !proxy.token.is_empty(),
-            "yt-dlp remote proxy enabled"
-        );
-    }
-    let ytm = YtmSource::with_proxy(ytdlp_override, ytdlp_proxy);
+    let ytm = YtmSource::new();
     let archive = ArchiveSource::new();
     let local = Arc::new(LocalSource::new(store.clone(), music_dirs));
     let soulseek = SoulseekSource::new(store.clone(), data_dir.join("cache").join("soulseek"));

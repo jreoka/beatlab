@@ -905,23 +905,24 @@ impl StreamEngine {
             .ok()
             .flatten()
             .is_some_and(|m| m.exact);
-        if already_known {
-            return self.sources.ytm.resolve_stream(video_id).await;
-        }
-        // Fetch YouTube's pre-computed BS.1770 LKFS (~120ms) concurrently with yt-dlp
-        // stream resolution and persist immediately so `/api/web/loudness` sees it
-        // even before the stream begins.
-        let store = self.store.clone();
-        let tid = track.id.clone();
-        let (stream_res, _) = tokio::join!(
-            self.sources.ytm.resolve_stream(video_id),
-            async move {
-                if let Some(m) = self.sources.ytm.fetch_video_loudness(video_id).await {
-                    let _ = store.upsert_track_loudness(&tid, m, "ytm_lkfs");
-                }
+        let resolved = self.sources.ytm.resolve_stream(video_id).await?;
+        if !already_known {
+            if let Some(m) = resolved.loudness {
+                let _ = self.store.upsert_track_loudness(&track.id, m, "ytm_lkfs");
+            } else {
+                // Fallback loudness lookup if the winning player client omitted `audioConfig`.
+                let sources = self.sources.clone();
+                let store = self.store.clone();
+                let tid = track.id.clone();
+                let vid = video_id.to_string();
+                tokio::spawn(async move {
+                    if let Some(m) = sources.ytm.fetch_video_loudness(&vid).await {
+                        let _ = store.upsert_track_loudness(&tid, m, "ytm_lkfs");
+                    }
+                });
             }
-        );
-        stream_res
+        }
+        Ok(resolved)
     }
 
     async fn perform_ytm_resolve(&self, track: &Track) -> AppResult<CachedResolved> {
@@ -1356,14 +1357,9 @@ impl StreamEngine {
             }
         }
 
-        // Last-resort direct pipe via yt-dlp -o - if upstream direct URL failed.
-        if webpage_url.contains("youtube.com") || webpage_url.contains("youtu.be") {
-            return self.serve_ytdlp_pipe(webpage_url).await;
-        }
-
         // Non-radio HTTP tracks (e.g. Archive.org FLAC returning 403/404/503) fall back cleanly
         // to local/cached siblings or YouTube Music.
-        if track.source != "radio" {
+        if track.source != "radio" && !is_ytm_origin {
             if let Some(PlayTarget::LocalFile { path, content_type }) =
                 self.find_local_or_cached_sibling(track)
             {
@@ -1393,11 +1389,6 @@ impl StreamEngine {
                 {
                     return resp;
                 }
-                if fresh.webpage_url.contains("youtube.com")
-                    || fresh.webpage_url.contains("youtu.be")
-                {
-                    return self.serve_ytdlp_pipe(&fresh.webpage_url).await;
-                }
             }
         }
         (StatusCode::BAD_GATEWAY, "Failed to proxy upstream audio").into_response()
@@ -1413,65 +1404,6 @@ impl StreamEngine {
             Ok(Ok(permit)) => Ok(permit),
             _ => Err((StatusCode::SERVICE_UNAVAILABLE, "Stream processor busy").into_response()),
         }
-    }
-
-    async fn serve_ytdlp_pipe(&self, watch_url: &str) -> Response {
-        let permit = match self.acquire_stream_proc_permit().await {
-            Ok(p) => p,
-            Err(r) => return r,
-        };
-        if let Some(proxy) = self.sources.ytm.proxy_config() {
-            let pipe_url = proxy.endpoint(&format!(
-                "/ytdlp/pipe?url={}",
-                urlencoding::encode(watch_url)
-            ));
-            let mut req = self.stream_http.get(&pipe_url);
-            if let Some(auth) = proxy.auth_header_value() {
-                req = req.header(header::AUTHORIZATION, auth);
-            }
-            return match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let ct = resp
-                        .headers()
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("audio/mp4")
-                        .to_string();
-                    let body_stream = resp.bytes_stream().map(move |res| {
-                        let _keep = &permit;
-                        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                    });
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, ct)
-                        .header(header::CACHE_CONTROL, "no-store")
-                        .body(Body::from_stream(body_stream))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-                }
-                Ok(resp) => {
-                    warn!(status = %resp.status(), "yt-dlp proxy pipe returned non-success");
-                    (StatusCode::BAD_GATEWAY, "Failed to pipe audio via yt-dlp proxy")
-                        .into_response()
-                }
-                Err(e) => {
-                    warn!(error = %e, "yt-dlp proxy pipe request failed");
-                    (StatusCode::BAD_GATEWAY, "Failed to connect to yt-dlp proxy").into_response()
-                }
-            };
-        }
-        let mut cmd = Command::new(self.sources.ytm.ytdlp_bin());
-        cmd.args([
-            "--no-playlist",
-            "--no-warnings",
-            "--extractor-args",
-            "youtube:player_client=android",
-            "-f",
-            "bestaudio[vcodec=none][ext=m4a][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[vcodec=none][protocol!=m3u8][protocol!=m3u8_native]/bestaudio[vcodec=none]/bestaudio",
-            "-o",
-            "-",
-            watch_url,
-        ]);
-        stream_child_stdout(cmd, "audio/mp4", "Failed to spawn yt-dlp pipe", Some(permit))
     }
 
     async fn serve_ffmpeg_transcode(
@@ -2575,7 +2507,7 @@ impl futures::Stream for ChildStdoutStream {
 }
 
 /// Spawns a subprocess with `kill_on_drop(true)` and ties its lifetime to the HTTP response stream
-/// so aborted or seeked client connections never orphan `ffmpeg` or `yt-dlp` processes.
+/// so aborted or seeked client connections never orphan `ffmpeg` processes.
 fn stream_child_stdout(
     mut cmd: Command,
     content_type: &str,
@@ -3469,7 +3401,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), dir.join("slsk")),
@@ -3525,7 +3457,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), dir.join("slsk")),
@@ -3622,7 +3554,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), dir.join("slsk")),
@@ -3714,7 +3646,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let sources = crate::sources::SourceRegistry::new(
             crate::sources::deezer::DeezerSource::new(),
-            crate::sources::ytm::YtmSource::new(None),
+            crate::sources::ytm::YtmSource::new(),
             crate::sources::archive::ArchiveSource::new(),
             Arc::new(crate::sources::local::LocalSource::new(store.clone(), vec![])),
             crate::sources::soulseek::SoulseekSource::new(store.clone(), dir.join("slsk")),

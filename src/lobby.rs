@@ -1694,7 +1694,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let sources = SourceRegistry::new(
             DeezerSource::new(),
-            YtmSource::new(None),
+            YtmSource::new(),
             ArchiveSource::new(),
             Arc::new(LocalSource::new(store.clone(), vec![])),
             SoulseekSource::new(store.clone(), tmp.join("slsk")),
